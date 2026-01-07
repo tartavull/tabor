@@ -73,18 +73,14 @@ configuration. See *alacritty*(5) for full configuration format documentation.
 :[ *mods*
 :[ *mode*
 :[ *action*
-|  _"Space"_
-:  _"Shift|Control"_
-:  _"~Search"_
-:  _"ToggleViMode"_
-|  _"Space"_
-:  _"Shift|Control"_
-:  _"Vi|~Search"_
-:  _"ScrollToBottom"_
 |  _"Escape"_
 :[
 :  _"Vi|~Search"_
 :  _"ClearSelection"_
+|  _":"_
+:  _"Shift"_
+:  _"Vi|~Search"_
+:  _"ToggleCommandBar"_
 |  _"I"_
 :[
 :  _"Vi|~Search"_
@@ -384,6 +380,14 @@ configuration. See *alacritty*(5) for full configuration format documentation.
 :[ *mods*
 :[ *mode*
 :[ *action*
+|  _"Space"_
+:  _"Control|Shift"_
+:  _"~Search"_
+:  _"ToggleViMode"_
+|  _"Space"_
+:  _"Control|Shift"_
+:  _"Vi|~Search"_
+:  _"ScrollToBottom"_
 |  _"V"_
 :  _"Control|Shift"_
 :  _"~Vi"_
@@ -454,6 +458,14 @@ configuration. See *alacritty*(5) for full configuration format documentation.
 :[ *mods*
 :[ *mode*
 :[ *action* / *chars*
+|  _"Escape"_
+:  _"Command"_
+:  _"~Search"_
+:  _"ToggleViMode"_
+|  _"Escape"_
+:  _"Command"_
+:  _"Vi|~Search"_
+:  _"ScrollToBottom"_
 |  _"K"_
 :  _"Command"_
 :  _"~Vi|~Search"_

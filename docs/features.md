@@ -9,7 +9,9 @@ look at [Alacritty's escape sequence support](./escape_support.md).
 The vi mode allows moving around Alacritty's viewport and scrollback using the
 keyboard. It also serves as a jump-off point for other features like search and
 opening URLs with the keyboard. By default you can launch it using
-<kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>Space</kbd>.
+<kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>Space</kbd> on non-macOS, or
+<kbd>Command</kbd> <kbd>Escape</kbd> on macOS. In vi mode, pressing <kbd>:</kbd>
+opens the command bar.
 
 ### Motion
 

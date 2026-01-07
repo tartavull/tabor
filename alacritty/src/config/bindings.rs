@@ -462,9 +462,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         Backspace, ModifiersState::SHIFT,   ~BindingMode::VI, ~BindingMode::SEARCH, ~BindingMode::REPORT_ALL_KEYS_AS_ESC, ~BindingMode::DISAMBIGUATE_ESC_CODES; Action::Esc("\x7f".into());
         Enter => KeyLocation::Numpad, ~BindingMode::VI, ~BindingMode::SEARCH, ~BindingMode::REPORT_ALL_KEYS_AS_ESC, ~BindingMode::DISAMBIGUATE_ESC_CODES; Action::Esc("\n".into());
         // Vi mode.
-        Space, ModifiersState::SHIFT | ModifiersState::CONTROL, ~BindingMode::SEARCH; Action::ToggleViMode;
-        Space, ModifiersState::SHIFT | ModifiersState::CONTROL, +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
         Escape,                             +BindingMode::VI, ~BindingMode::SEARCH; Action::ClearSelection;
+        ":",      ModifiersState::SHIFT,    +BindingMode::VI, ~BindingMode::SEARCH; Action::ToggleCommandBar;
         "i",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::ToggleViMode;
         "i",                                +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
         "c",      ModifiersState::CONTROL,  +BindingMode::VI, ~BindingMode::SEARCH; Action::ToggleViMode;
@@ -548,6 +547,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
 fn common_keybindings() -> Vec<KeyBinding> {
     bindings!(
         KeyBinding;
+        Space, ModifiersState::SHIFT | ModifiersState::CONTROL, ~BindingMode::SEARCH; Action::ToggleViMode;
+        Space, ModifiersState::SHIFT | ModifiersState::CONTROL, +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
         "v",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::VI;                       Action::Paste;
         "v",    ModifiersState::CONTROL | ModifiersState::SHIFT, +BindingMode::VI, +BindingMode::SEARCH; Action::Paste;
         "f",    ModifiersState::CONTROL | ModifiersState::SHIFT, ~BindingMode::SEARCH;                   Action::SearchForward;
@@ -584,6 +585,8 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
     bindings!(
         KeyBinding;
         Insert, ModifiersState::SHIFT, ~BindingMode::VI, ~BindingMode::SEARCH; Action::Esc("\x1b[2;2~".into());
+        Escape, ModifiersState::SUPER, ~BindingMode::SEARCH; Action::ToggleViMode;
+        Escape, ModifiersState::SUPER, +BindingMode::VI, ~BindingMode::SEARCH; Action::ScrollToBottom;
         // Tabbing api.
         "t",    ModifiersState::SUPER;                                         Action::CreateNewTab;
         "]",    ModifiersState::SUPER | ModifiersState::SHIFT;                 Action::SelectNextTab;
