@@ -2124,6 +2124,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     /// Toggle the vi mode status.
     #[inline]
     fn toggle_vi_mode(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_web() {
+            if self.command_state.is_active() {
+                self.cancel_command();
+            } else {
+                self.start_command_prompt(':', "");
+            }
+            return;
+        }
+
         let was_in_vi_mode = self.terminal.mode().contains(TermMode::VI);
         if was_in_vi_mode {
             // If we had search running when leaving Vi mode we should mark terminal fully damaged
