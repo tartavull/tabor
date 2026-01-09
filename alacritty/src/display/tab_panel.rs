@@ -91,6 +91,7 @@ pub struct TabPanel {
     width_cols: usize,
     width_px: f32,
     groups: Vec<TabPanelGroup>,
+    new_group_id: Option<usize>,
     edit: Option<EditState>,
     hover: HoverState,
     drag: Option<DragState>,
@@ -128,14 +129,21 @@ impl TabPanel {
         self.enabled && self.width_cols > 0
     }
 
-    pub fn set_groups(&mut self, groups: Vec<TabPanelGroup>) -> bool {
-        if self.groups == groups {
-            return false;
+    pub fn set_groups(&mut self, groups: Vec<TabPanelGroup>, new_group_id: Option<usize>) -> bool {
+        let mut changed = false;
+
+        if self.groups != groups {
+            self.groups = groups;
+            self.validate_edit_target();
+            changed = true;
         }
 
-        self.groups = groups;
-        self.validate_edit_target();
-        true
+        if self.new_group_id != new_group_id {
+            self.new_group_id = new_group_id;
+            changed = true;
+        }
+
+        changed
     }
 
     pub fn is_editing(&self) -> bool {
@@ -432,13 +440,15 @@ impl TabPanel {
         }
 
         let panel_size_info = self.panel_size_info(size_info);
-        let layout = self.layout(&panel_size_info);
+        let layout = self.render_layout(&panel_size_info);
         let base = config.colors.primary.background;
         let fg = config.colors.primary.foreground;
         let panel_bg = mix(base, fg, 0.04);
         let header_bg = mix(base, fg, 0.08);
         let active_bg = mix(base, fg, 0.18);
-        let drop_bg = mix(base, fg, 0.24);
+        let ghost_bg = mix(base, fg, 0.14);
+        let ghost_header_bg = mix(base, fg, 0.16);
+        let ghost_drag_bg = mix(base, fg, 0.2);
         let divider = mix(base, fg, 0.2);
 
         rects.push(RenderRect::new(0., 0., self.width_px, size_info.height(), panel_bg, 1.));
@@ -457,19 +467,14 @@ impl TabPanel {
         let line_height = panel_size_info.cell_height();
         let start_y = panel_size_info.padding_y();
 
-        for item in layout.items {
+        for item in &layout.items {
             let y = start_y + item.line as f32 * line_height;
-            let bg = match item.kind {
-                PanelItemKind::GroupHeader { group_index } => {
-                    if self.drop_target.is_some_and(|target| target.group_index == group_index) {
-                        drop_bg
-                    } else {
-                        header_bg
-                    }
-                },
-                PanelItemKind::Tab { tab, group_index } => {
-                    if self.drop_target.is_some_and(|target| target.group_index == group_index) {
-                        drop_bg
+            let bg = match &item.kind {
+                PanelItemKind::GroupHeader { .. } => header_bg,
+                PanelItemKind::GhostGroupHeader { .. } => ghost_header_bg,
+                PanelItemKind::Tab { tab } => {
+                    if item.style == RenderStyle::Ghost {
+                        ghost_bg
                     } else if tab.is_active {
                         active_bg
                     } else {
@@ -479,6 +484,24 @@ impl TabPanel {
             };
 
             rects.push(RenderRect::new(0., y, self.width_px, line_height, bg, 1.));
+        }
+
+        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
+            if self.find_tab(drag.tab_id).is_some() {
+                if let Some(position) = self.last_mouse_pos {
+                    if let Some(line) = self.drag_ghost_line(position, &panel_size_info, &layout) {
+                        let y = start_y + line as f32 * line_height;
+                        rects.push(RenderRect::new(
+                            0.,
+                            y,
+                            self.width_px,
+                            line_height,
+                            ghost_drag_bg,
+                            1.,
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -494,7 +517,7 @@ impl TabPanel {
         }
 
         let panel_size_info = self.panel_size_info(size_info);
-        let layout = self.layout(&panel_size_info);
+        let layout = self.render_layout(&panel_size_info);
 
         #[cfg(target_os = "macos")]
         {
@@ -504,7 +527,19 @@ impl TabPanel {
             let mut missing = Vec::new();
 
             for item in &layout.items {
-                if let PanelItemKind::Tab { tab, .. } = &item.kind {
+                if let PanelItemKind::Tab { tab } = &item.kind {
+                    if let Some(favicon) = &tab.favicon {
+                        let key =
+                            GlyphKey { font_key, size: font_size, character: favicon.character };
+                        if !glyph_cache.has_glyph(&key) {
+                            missing.push((key, favicon.clone()));
+                        }
+                    }
+                }
+            }
+
+            if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
+                if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
                     if let Some(favicon) = &tab.favicon {
                         let key =
                             GlyphKey { font_key, size: font_size, character: favicon.character };
@@ -534,14 +569,18 @@ impl TabPanel {
         let panel_bg = mix(base, fg, 0.04);
         let header_bg = mix(base, fg, 0.08);
         let active_bg = mix(base, fg, 0.18);
-        let drop_bg = mix(base, fg, 0.24);
+        let ghost_bg = mix(base, fg, 0.14);
+        let ghost_fg = mix(fg, base, 0.35);
+        let ghost_header_bg = mix(base, fg, 0.16);
+        let ghost_drag_bg = mix(base, fg, 0.2);
         let header_fg = mix(fg, base, 0.2);
         let now = Instant::now();
+        let dragging = self.drag.as_ref().is_some_and(|drag| drag.dragging);
 
-        for item in layout.items {
-            match item.kind {
+        for item in &layout.items {
+            match &item.kind {
                 PanelItemKind::GroupHeader { group_index } => {
-                    if let Some(group) = self.groups.get(group_index) {
+                    if let Some(group) = self.groups.get(*group_index) {
                         let label = match &self.edit {
                             Some(edit)
                                 if edit.target == TabPanelEditTarget::Group(group.id) =>
@@ -553,14 +592,7 @@ impl TabPanel {
                         };
                         let title = format!("{}:", label);
                         let text = truncate_to_columns(&title, self.width_cols.saturating_sub(1));
-                        let bg = if self
-                            .drop_target
-                            .is_some_and(|target| target.group_index == group_index)
-                        {
-                            drop_bg
-                        } else {
-                            header_bg
-                        };
+                        let bg = header_bg;
                         let point = Point::new(item.line, Column(0));
                         renderer.draw_string(
                             point,
@@ -572,10 +604,23 @@ impl TabPanel {
                         );
                     }
                 },
-                PanelItemKind::Tab { tab, group_index } => {
+                PanelItemKind::GhostGroupHeader { label } => {
+                    let title = format!("{}:", label);
+                    let text = truncate_to_columns(&title, self.width_cols.saturating_sub(1));
+                    let point = Point::new(item.line, Column(0));
+                    renderer.draw_string(
+                        point,
+                        ghost_fg,
+                        ghost_header_bg,
+                        text.chars(),
+                        &panel_size_info,
+                        glyph_cache,
+                    );
+                },
+                PanelItemKind::Tab { tab } => {
+                    let is_ghost = item.style == RenderStyle::Ghost;
                     let indent = 1;
-                    let indicator_cols =
-                        if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
+                    let indicator_cols = if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
                     let text_col = indent + indicator_cols;
                     let close_col = self.width_cols.saturating_sub(1);
                     let max_cols = self.width_cols.saturating_sub(text_col + 1);
@@ -594,22 +639,25 @@ impl TabPanel {
                     #[cfg(not(target_os = "macos"))]
                     let label = title;
                     let text = truncate_to_columns(&label, max_cols);
-                    let bg = if self
-                        .drop_target
-                        .is_some_and(|target| target.group_index == group_index)
-                    {
-                        drop_bg
+                    let bg = if is_ghost {
+                        ghost_bg
                     } else if tab.is_active {
                         active_bg
                     } else {
                         panel_bg
                     };
+                    let text_fg = if is_ghost { ghost_fg } else { fg };
 
-                    if let Some(indicator) = tab_activity_indicator(&tab, now, base, fg, config) {
+                    if let Some(indicator) = tab_activity_indicator(tab, now, base, fg, config) {
+                        let indicator_color = if is_ghost {
+                            mix(indicator.color, base, 0.5)
+                        } else {
+                            indicator.color
+                        };
                         let point = Point::new(item.line, Column(indent));
                         renderer.draw_string(
                             point,
-                            indicator.color,
+                            indicator_color,
                             bg,
                             std::iter::once(indicator.glyph),
                             &panel_size_info,
@@ -620,14 +668,18 @@ impl TabPanel {
                     let point = Point::new(item.line, Column(text_col));
                     renderer.draw_string(
                         point,
-                        fg,
+                        text_fg,
                         bg,
                         text.chars(),
                         &panel_size_info,
                         glyph_cache,
                     );
 
-                    if close_col > text_col && self.hover.tab == Some(tab.tab_id) {
+                    if !dragging
+                        && !is_ghost
+                        && close_col > text_col
+                        && self.hover.tab == Some(tab.tab_id)
+                    {
                         let point = Point::new(item.line, Column(close_col));
                         renderer.draw_string(
                             point,
@@ -639,6 +691,52 @@ impl TabPanel {
                         );
                     }
                 },
+            }
+        }
+
+        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
+            if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
+                if let Some(position) = self.last_mouse_pos {
+                    if let Some(line) = self.drag_ghost_line(position, &panel_size_info, &layout) {
+                        let indent = 1;
+                        let indicator_cols =
+                            if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
+                        let text_col = indent + indicator_cols;
+                        let max_cols = self.width_cols.saturating_sub(text_col + 1);
+                        let title = tab.title.clone();
+                        #[cfg(target_os = "macos")]
+                        let label = if let Some(favicon) = &tab.favicon {
+                            format!("{}  {}", favicon.character, title)
+                        } else {
+                            title
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let label = title;
+                        let text = truncate_to_columns(&label, max_cols);
+                        if let Some(indicator) = tab_activity_indicator(&tab, now, base, fg, config)
+                        {
+                            let indicator_color = mix(indicator.color, base, 0.5);
+                            let point = Point::new(line, Column(indent));
+                            renderer.draw_string(
+                                point,
+                                indicator_color,
+                                ghost_drag_bg,
+                                std::iter::once(indicator.glyph),
+                                &panel_size_info,
+                                glyph_cache,
+                            );
+                        }
+                        let point = Point::new(line, Column(text_col));
+                        renderer.draw_string(
+                            point,
+                            ghost_fg,
+                            ghost_drag_bg,
+                            text.chars(),
+                            &panel_size_info,
+                            glyph_cache,
+                        );
+                    }
+                }
             }
         }
 
@@ -828,14 +926,19 @@ impl TabPanel {
         let line = ((position.y - top) / line_height).floor() as usize;
         let layout = self.layout(size_info);
 
-        layout
-            .items
-            .into_iter()
-            .find(|item| item.line == line)
-            .map(|item| match item.kind {
-                PanelItemKind::GroupHeader { group_index } => PanelHit::Group { group_index },
-                PanelItemKind::Tab { tab, .. } => PanelHit::Tab { tab_id: tab.tab_id },
-            })
+        layout.items.into_iter().find_map(|item| {
+            if item.line != line {
+                return None;
+            }
+
+            match item.kind {
+                PanelItemKind::GroupHeader { group_index } => {
+                    Some(PanelHit::Group { group_index })
+                },
+                PanelItemKind::Tab { tab } => Some(PanelHit::Tab { tab_id: tab.tab_id }),
+                PanelItemKind::GhostGroupHeader { .. } => None,
+            }
+        })
     }
 
     fn layout(&self, size_info: &SizeInfo) -> PanelLayout {
@@ -861,8 +964,8 @@ impl TabPanel {
 
                 items.push(PanelItem {
                     line,
-                        kind: PanelItemKind::Tab { tab: tab.clone(), group_index },
-                    });
+                    kind: PanelItemKind::Tab { tab: tab.clone() },
+                });
                 line += 1;
             }
 
@@ -872,6 +975,255 @@ impl TabPanel {
         }
 
         PanelLayout { items }
+    }
+
+    fn render_layout(&self, size_info: &SizeInfo) -> RenderLayout {
+        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
+            if let Some(target) = self.drop_target {
+                if let Some((tab, group_index, tab_index)) = self.find_tab(drag.tab_id) {
+                    return self.preview_layout(size_info, tab, group_index, tab_index, target);
+                }
+            }
+
+            if self
+                .last_mouse_pos
+                .is_some_and(|position| self.is_inside_panel(position))
+            {
+                if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
+                    return self.preview_new_group_layout(size_info, tab);
+                }
+            }
+        }
+
+        let layout = self.layout(size_info);
+        let items = layout
+            .items
+            .into_iter()
+            .map(|item| RenderItem {
+                line: item.line,
+                kind: item.kind,
+                style: RenderStyle::Normal,
+            })
+            .collect();
+
+        RenderLayout { items }
+    }
+
+    fn preview_layout(
+        &self,
+        size_info: &SizeInfo,
+        drag_tab: TabPanelTab,
+        drag_group_index: usize,
+        drag_tab_index: usize,
+        target: DropTarget,
+    ) -> RenderLayout {
+        let mut items = Vec::new();
+        let max_lines = size_info.screen_lines();
+        let mut line = 0;
+
+        let mut target_index = target.index;
+        if target.group_index == drag_group_index && target.index > drag_tab_index {
+            target_index = target_index.saturating_sub(1);
+        }
+
+        for (group_index, group) in self.groups.iter().enumerate() {
+            if line >= max_lines {
+                break;
+            }
+
+            items.push(RenderItem {
+                line,
+                kind: PanelItemKind::GroupHeader { group_index },
+                style: RenderStyle::Normal,
+            });
+            line += 1;
+
+            if line >= max_lines {
+                break;
+            }
+
+            let insert_here = group_index == target.group_index;
+            let max_index = group
+                .tabs
+                .len()
+                .saturating_sub(usize::from(group_index == drag_group_index));
+            let target_index = target_index.min(max_index);
+            let mut inserted = false;
+            let mut visible_tabs = 0usize;
+
+            for tab in &group.tabs {
+                if line >= max_lines {
+                    break;
+                }
+
+                if tab.tab_id == drag_tab.tab_id {
+                    continue;
+                }
+
+                if insert_here && !inserted && visible_tabs == target_index {
+                    items.push(RenderItem {
+                        line,
+                        kind: PanelItemKind::Tab { tab: drag_tab.clone() },
+                        style: RenderStyle::Ghost,
+                    });
+                    line += 1;
+                    inserted = true;
+
+                    if line >= max_lines {
+                        break;
+                    }
+                }
+
+                items.push(RenderItem {
+                    line,
+                    kind: PanelItemKind::Tab { tab: tab.clone() },
+                    style: RenderStyle::Normal,
+                });
+                line += 1;
+                visible_tabs += 1;
+            }
+
+            if line >= max_lines {
+                break;
+            }
+
+            if insert_here && !inserted && visible_tabs == target_index {
+                items.push(RenderItem {
+                    line,
+                    kind: PanelItemKind::Tab { tab: drag_tab.clone() },
+                    style: RenderStyle::Ghost,
+                });
+                line += 1;
+            }
+
+            if line < max_lines {
+                line += 1;
+            }
+        }
+
+        RenderLayout { items }
+    }
+
+    fn preview_group_id(&self) -> usize {
+        self.new_group_id.unwrap_or_else(|| {
+            self.groups
+                .iter()
+                .map(|group| group.id)
+                .max()
+                .unwrap_or(0)
+                + 1
+        })
+    }
+
+    fn preview_new_group_layout(
+        &self,
+        size_info: &SizeInfo,
+        drag_tab: TabPanelTab,
+    ) -> RenderLayout {
+        let mut items = Vec::new();
+        let max_lines = size_info.screen_lines();
+        let mut line = 0;
+        let new_group_id = self.preview_group_id();
+
+        for (group_index, group) in self.groups.iter().enumerate() {
+            if line >= max_lines {
+                break;
+            }
+
+            let has_tabs = group.tabs.iter().any(|tab| tab.tab_id != drag_tab.tab_id);
+            if !has_tabs {
+                continue;
+            }
+
+            items.push(RenderItem {
+                line,
+                kind: PanelItemKind::GroupHeader { group_index },
+                style: RenderStyle::Normal,
+            });
+            line += 1;
+
+            for tab in &group.tabs {
+                if line >= max_lines {
+                    break;
+                }
+
+                if tab.tab_id == drag_tab.tab_id {
+                    continue;
+                }
+
+                items.push(RenderItem {
+                    line,
+                    kind: PanelItemKind::Tab { tab: tab.clone() },
+                    style: RenderStyle::Normal,
+                });
+                line += 1;
+            }
+
+            if line < max_lines {
+                line += 1;
+            }
+        }
+
+        if line < max_lines {
+            items.push(RenderItem {
+                line,
+                kind: PanelItemKind::GhostGroupHeader {
+                    label: new_group_id.to_string(),
+                },
+                style: RenderStyle::Ghost,
+            });
+            line += 1;
+        }
+
+        if line < max_lines {
+            items.push(RenderItem {
+                line,
+                kind: PanelItemKind::Tab { tab: drag_tab },
+                style: RenderStyle::Ghost,
+            });
+        }
+
+        RenderLayout { items }
+    }
+
+    fn find_tab(&self, tab_id: TabId) -> Option<(TabPanelTab, usize, usize)> {
+        for (group_index, group) in self.groups.iter().enumerate() {
+            for (tab_index, tab) in group.tabs.iter().enumerate() {
+                if tab.tab_id == tab_id {
+                    return Some((tab.clone(), group_index, tab_index));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn drag_ghost_line(
+        &self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+        layout: &RenderLayout,
+    ) -> Option<usize> {
+        let max_lines = size_info.screen_lines();
+        if max_lines == 0 {
+            return None;
+        }
+
+        let top = size_info.padding_y() as f64;
+        if position.y < top {
+            return None;
+        }
+
+        let line_height = size_info.cell_height() as f64;
+        let mut line = ((position.y - top) / line_height).floor() as isize;
+        line = line.clamp(0, (max_lines - 1) as isize);
+        let line = line as usize;
+
+        let item = layout.items.iter().find(|item| item.line == line)?;
+        match item.kind {
+            PanelItemKind::GroupHeader { .. } | PanelItemKind::GhostGroupHeader { .. } => None,
+            PanelItemKind::Tab { .. } => Some(line),
+        }
     }
 }
 
@@ -1014,11 +1366,29 @@ struct PanelItem {
 #[derive(Clone)]
 enum PanelItemKind {
     GroupHeader { group_index: usize },
-    Tab { tab: TabPanelTab, group_index: usize },
+    GhostGroupHeader { label: String },
+    Tab { tab: TabPanelTab },
 }
 
 struct PanelLayout {
     items: Vec<PanelItem>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderStyle {
+    Normal,
+    Ghost,
+}
+
+#[derive(Clone)]
+struct RenderItem {
+    line: usize,
+    kind: PanelItemKind,
+    style: RenderStyle,
+}
+
+struct RenderLayout {
+    items: Vec<RenderItem>,
 }
 
 #[derive(Clone)]

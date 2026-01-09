@@ -1367,8 +1367,12 @@ impl Display {
     }
 
     #[cfg(target_os = "macos")]
-    pub fn set_tab_panel_groups(&mut self, groups: Vec<crate::tab_panel::TabPanelGroup>) -> bool {
-        self.tab_panel.set_groups(groups)
+    pub fn set_tab_panel_groups(
+        &mut self,
+        groups: Vec<crate::tab_panel::TabPanelGroup>,
+        new_group_id: Option<usize>,
+    ) -> bool {
+        self.tab_panel.set_groups(groups, new_group_id)
     }
 
     /// Update the mouse/vi mode cursor hint highlighting.

@@ -510,6 +510,13 @@ impl TabManager {
         };
         TabGroup { id, name: None, tabs: Vec::new() }
     }
+
+    fn preview_group_id(&self) -> usize {
+        self.free_group_ids
+            .peek()
+            .map(|entry| entry.0)
+            .unwrap_or(self.next_group_id)
+    }
 }
 
 /// Event context for one individual Alacritty window.
@@ -777,7 +784,8 @@ impl WindowContext {
         }
 
         let groups = self.tabs.panel_groups();
-        if self.display.set_tab_panel_groups(groups) {
+        let new_group_id = Some(self.tabs.preview_group_id());
+        if self.display.set_tab_panel_groups(groups, new_group_id) {
             self.dirty = true;
             if self.display.window.has_frame {
                 self.display.window.request_redraw();
