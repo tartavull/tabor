@@ -26,6 +26,8 @@ use crate::tabs::TabId;
 const RESIZE_HANDLE_WIDTH_PX: f64 = 6.0;
 const PANEL_ICON_SCALE: f32 = 2.0;
 const PANEL_ROW_PADDING_PX: f32 = 4.0;
+const GROUP_HEADER_INDENT_COLS: usize = 1;
+const TAB_INDENT_COLS: usize = 1;
 const ACTIVITY_INDICATOR_COLS: usize = 2;
 const ACTIVITY_INDICATOR_FILLED: char = '\u{25CF}';
 const ACTIVITY_INDICATOR_OUTLINE: char = '\u{25CB}';
@@ -385,7 +387,7 @@ impl TabPanel {
         match state {
             ElementState::Pressed => {
                 if let Some(PanelHit::Tab { tab_id }) = hit {
-                    if !self.is_close_hit(position, &panel_size_info) {
+                    if !self.is_close_hit(position, &panel_size_info, tab_id) {
                         self.drag = Some(DragState::new(tab_id, position));
                         needs_redraw = true;
                     }
@@ -408,7 +410,7 @@ impl TabPanel {
                             });
                         }
                     } else if let Some(PanelHit::Tab { tab_id }) = hit {
-                        if self.is_close_hit(position, &panel_size_info)
+                        if self.is_close_hit(position, &panel_size_info, tab_id)
                             && self.hover.tab == Some(tab_id)
                         {
                             command = Some(TabPanelCommand::Close(tab_id));
@@ -420,7 +422,8 @@ impl TabPanel {
                     self.drop_target = None;
                     needs_redraw = true;
                 } else if let Some(PanelHit::Tab { tab_id }) = hit {
-                    if self.is_close_hit(position, &panel_size_info) && self.hover.tab == Some(tab_id)
+                    if self.is_close_hit(position, &panel_size_info, tab_id)
+                        && self.hover.tab == Some(tab_id)
                     {
                         command = Some(TabPanelCommand::Close(tab_id));
                     } else {
@@ -581,6 +584,7 @@ impl TabPanel {
             match &item.kind {
                 PanelItemKind::GroupHeader { group_index } => {
                     if let Some(group) = self.groups.get(*group_index) {
+                        let indent = GROUP_HEADER_INDENT_COLS;
                         let label = match &self.edit {
                             Some(edit)
                                 if edit.target == TabPanelEditTarget::Group(group.id) =>
@@ -590,9 +594,10 @@ impl TabPanel {
                             _ => group.label.clone(),
                         };
                         let title = format!("{}:", label);
-                        let text = truncate_to_columns(&title, self.width_cols.saturating_sub(1));
+                        let max_cols = self.width_cols.saturating_sub(indent + 1);
+                        let text = truncate_to_columns(&title, max_cols);
                         let bg = header_bg;
-                        let point = Point::new(item.line, Column(0));
+                        let point = Point::new(item.line, Column(indent));
                         renderer.draw_string(
                             point,
                             header_fg,
@@ -604,9 +609,11 @@ impl TabPanel {
                     }
                 },
                 PanelItemKind::GhostGroupHeader { label } => {
+                    let indent = GROUP_HEADER_INDENT_COLS;
                     let title = format!("{}:", label);
-                    let text = truncate_to_columns(&title, self.width_cols.saturating_sub(1));
-                    let point = Point::new(item.line, Column(0));
+                    let max_cols = self.width_cols.saturating_sub(indent + 1);
+                    let text = truncate_to_columns(&title, max_cols);
+                    let point = Point::new(item.line, Column(indent));
                     renderer.draw_string(
                         point,
                         ghost_fg,
@@ -618,7 +625,7 @@ impl TabPanel {
                 },
                 PanelItemKind::Tab { tab } => {
                     let is_ghost = item.style == RenderStyle::Ghost;
-                    let indent = 1;
+                    let indent = TAB_INDENT_COLS;
                     let indicator_cols = if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
                     let text_col = indent + indicator_cols;
                     let close_col = self.width_cols.saturating_sub(1);
@@ -629,9 +636,18 @@ impl TabPanel {
                         },
                         _ => tab.title.clone(),
                     };
+                    let show_close = !dragging && !is_ghost && self.hover.tab == Some(tab.tab_id);
+                    #[cfg(target_os = "macos")]
+                    let show_inline_close_favicon = show_close && tab.favicon.is_some();
+                    #[cfg(not(target_os = "macos"))]
+                    let show_inline_close_favicon = false;
+                    let show_inline_close_indicator = show_close && tab.activity.is_some();
+                    let show_inline_close = show_inline_close_favicon || show_inline_close_indicator;
+                    let show_trailing_close = show_close && !show_inline_close;
                     #[cfg(target_os = "macos")]
                     let label = if let Some(favicon) = &tab.favicon {
-                        format!("{}  {}", favicon.character, title)
+                        let icon = if show_inline_close_favicon { 'x' } else { favicon.character };
+                        format!("{}  {}", icon, title)
                     } else {
                         title
                     };
@@ -653,12 +669,14 @@ impl TabPanel {
                         } else {
                             indicator.color
                         };
+                        let glyph = if show_inline_close_indicator { 'x' } else { indicator.glyph };
+                        let indicator_fg = if show_inline_close_indicator { fg } else { indicator_color };
                         let point = Point::new(item.line, Column(indent));
                         renderer.draw_string(
                             point,
-                            indicator_color,
+                            indicator_fg,
                             bg,
-                            std::iter::once(indicator.glyph),
+                            std::iter::once(glyph),
                             &panel_size_info,
                             glyph_cache,
                         );
@@ -674,10 +692,7 @@ impl TabPanel {
                         glyph_cache,
                     );
 
-                    if !dragging
-                        && !is_ghost
-                        && close_col > text_col
-                        && self.hover.tab == Some(tab.tab_id)
+                    if show_trailing_close && close_col > text_col
                     {
                         let point = Point::new(item.line, Column(close_col));
                         renderer.draw_string(
@@ -697,7 +712,7 @@ impl TabPanel {
             if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
                 if let Some(position) = self.last_mouse_pos {
                     if let Some(line) = self.drag_ghost_line(position, &panel_size_info, &layout) {
-                        let indent = 1;
+                        let indent = TAB_INDENT_COLS;
                         let indicator_cols =
                             if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
                         let text_col = indent + indicator_cols;
@@ -796,7 +811,12 @@ impl TabPanel {
         )
     }
 
-    fn is_close_hit(&self, position: PhysicalPosition<f64>, size_info: &SizeInfo) -> bool {
+    fn is_close_hit(
+        &self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+        tab_id: TabId,
+    ) -> bool {
         if self.width_cols == 0 {
             return false;
         }
@@ -806,13 +826,37 @@ impl TabPanel {
             return false;
         }
 
+        let col = (position.x / cell_width).floor() as usize;
+        if let Some(inline_col) = self.inline_close_col(tab_id) {
+            return col == inline_col;
+        }
+
         let close_col = self.width_cols.saturating_sub(1);
         if close_col <= 1 {
             return false;
         }
 
-        let col = (position.x / cell_width).floor() as usize;
         col == close_col
+    }
+
+    fn inline_close_col(&self, tab_id: TabId) -> Option<usize> {
+        if self.hover.tab != Some(tab_id) {
+            return None;
+        }
+
+        let (tab, _, _) = self.find_tab(tab_id)?;
+
+        #[cfg(target_os = "macos")]
+        if tab.favicon.is_some() {
+            let indicator_cols = if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
+            return Some(TAB_INDENT_COLS + indicator_cols);
+        }
+
+        if tab.activity.is_some() {
+            return Some(TAB_INDENT_COLS);
+        }
+
+        None
     }
 
     fn is_inside_panel(&self, position: PhysicalPosition<f64>) -> bool {
@@ -1484,9 +1528,15 @@ fn tab_activity_indicator(
     }
 
     if activity.has_unseen_output {
+        let base_blue = config.colors.normal.blue;
+        let blue = Rgb::new(
+            base_blue.r,
+            base_blue.g.saturating_sub(0x28),
+            base_blue.b.saturating_add(0x28),
+        );
         return Some(ActivityIndicator {
             glyph: ACTIVITY_INDICATOR_FILLED,
-            color: config.colors.normal.blue,
+            color: blue,
         });
     }
 
