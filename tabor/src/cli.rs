@@ -249,21 +249,25 @@ pub struct MessageOptions {
 
     /// Message which should be sent.
     #[clap(subcommand)]
-    pub message: SocketMessage,
+    pub message: MessageCommand,
 }
 
 /// Available socket messages.
 #[cfg(unix)]
-#[derive(Subcommand, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub enum SocketMessage {
-    /// Create a new window in the same Tabor process.
-    CreateWindow(WindowOptions),
-
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum MessageCommand {
     /// Update the Tabor configuration.
     Config(IpcConfig),
 
     /// Read runtime Tabor configuration.
     GetConfig(IpcGetConfig),
+
+    /// Send raw JSON IPC message.
+    Send {
+        /// JSON payload to send.
+        #[clap(value_name = "JSON")]
+        json: String,
+    },
 }
 
 /// Migrate the configuration file.
@@ -290,7 +294,7 @@ pub struct MigrateOptions {
     pub silent: bool,
 }
 
-/// Subset of options that we pass to 'create-window' IPC subcommand.
+/// Subset of window options that can be passed via IPC.
 #[derive(Serialize, Deserialize, Args, Default, Clone, Debug, PartialEq, Eq)]
 pub struct WindowOptions {
     /// Terminal options which can be passed via IPC.

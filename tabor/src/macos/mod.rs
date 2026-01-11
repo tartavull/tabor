@@ -17,6 +17,7 @@ pub mod proc;
 pub mod web_commands;
 pub mod web_cursor;
 pub mod favicon;
+pub mod remote_inspector;
 pub mod webview;
 
 static WEBVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);

@@ -27,6 +27,17 @@ fn main() {
     embed_resource::compile("./windows/tabor.rc", embed_resource::NONE)
         .manifest_required()
         .unwrap();
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rerun-if-env-changed=SDKROOT");
+        if let Ok(sdkroot) = env::var("SDKROOT") {
+            let system_lib = Path::new(&sdkroot).join("usr/lib/system");
+            if system_lib.exists() {
+                println!("cargo:rustc-link-search=native={}", system_lib.display());
+            }
+        }
+    }
 }
 
 fn commit_hash() -> Option<String> {

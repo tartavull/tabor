@@ -8,7 +8,7 @@ use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::macos::OptionAsAlt;
 
 use tabor_terminal::event::EventListener;
-use tabor_terminal::term::TermMode;
+use tabor_terminal::term::{ClipboardType, TermMode};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::config::{Action, BindingKey, BindingMode, KeyBinding};
@@ -134,6 +134,21 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 return;
             },
             _ => (),
+        }
+
+        let mods = self.ctx.modifiers().state();
+        let is_paste_key = matches!(key.logical_key.as_ref(), Key::Named(NamedKey::Paste));
+        let is_v = matches!(
+            key.logical_key.as_ref(),
+            Key::Character(ch) if ch.eq_ignore_ascii_case("v")
+        );
+        if is_paste_key || (is_v && (mods.super_key() || (mods.control_key() && mods.shift_key())))
+        {
+            let clipboard_text = self.ctx.clipboard_mut().load(ClipboardType::Clipboard);
+            for character in clipboard_text.chars() {
+                self.ctx.command_input(character);
+            }
+            return;
         }
 
         for character in text.chars() {

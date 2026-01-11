@@ -37,8 +37,8 @@ _tabor() {
             tabor__help__msg,config)
                 cmd="tabor__help__msg__config"
                 ;;
-            tabor__help__msg,create-window)
-                cmd="tabor__help__msg__create__window"
+            tabor__help__msg,send)
+                cmd="tabor__help__msg__send"
                 ;;
             tabor__help__msg,get-config)
                 cmd="tabor__help__msg__get__config"
@@ -46,8 +46,8 @@ _tabor() {
             tabor__msg,config)
                 cmd="tabor__msg__config"
                 ;;
-            tabor__msg,create-window)
-                cmd="tabor__msg__create__window"
+            tabor__msg,send)
+                cmd="tabor__msg__send"
                 ;;
             tabor__msg,get-config)
                 cmd="tabor__msg__get__config"
@@ -58,8 +58,8 @@ _tabor() {
             tabor__msg__help,config)
                 cmd="tabor__msg__help__config"
                 ;;
-            tabor__msg__help,create-window)
-                cmd="tabor__msg__help__create__window"
+            tabor__msg__help,send)
+                cmd="tabor__msg__help__send"
                 ;;
             tabor__msg__help,get-config)
                 cmd="tabor__msg__help__get__config"
@@ -207,7 +207,7 @@ _tabor() {
             return 0
             ;;
         tabor__help__msg)
-            opts="create-window config get-config"
+            opts="config get-config send"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -234,7 +234,7 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tabor__help__msg__create__window)
+        tabor__help__msg__send)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -307,7 +307,7 @@ _tabor() {
             return 0
             ;;
         tabor__msg)
-            opts="-s -h --socket --help create-window config get-config help"
+            opts="-s -h --socket --help config get-config send help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -372,56 +372,13 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tabor__msg__create__window)
-            opts="-e -T -o -h --working-directory --hold --command --title --class --option --help"
+        tabor__msg__send)
+            opts="-h --help <JSON>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
-                --working-directory)
-                    local oldifs
-                    if [ -n "${IFS+x}" ]; then
-                        oldifs="$IFS"
-                    fi
-                    IFS=$'\n'
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    if [ -n "${oldifs+x}" ]; then
-                        IFS="$oldifs"
-                    fi
-                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
-                        compopt -o filenames
-                    fi
-                    return 0
-                    ;;
-                --command)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                -e)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --title)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                -T)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --class)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                --option)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
-                -o)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -452,7 +409,7 @@ _tabor() {
             return 0
             ;;
         tabor__msg__help)
-            opts="create-window config get-config help"
+            opts="config get-config send help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -479,7 +436,7 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tabor__msg__help__create__window)
+        tabor__msg__help__send)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

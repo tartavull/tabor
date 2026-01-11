@@ -43,25 +43,19 @@ complete -c tabor -n "__fish_tabor_needs_command" -s V -l version -d 'Print vers
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "msg" -d 'Send a message to the Tabor socket'
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "migrate" -d 'Migrate the configuration file'
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config help" -s s -l socket -d 'IPC socket connection path override' -r -F
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config help" -s h -l help -d 'Print help'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config help" -f -a "create-window" -d 'Create a new window in the same Tabor process'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config help" -f -a "config" -d 'Update the Tabor configuration'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config help" -f -a "get-config" -d 'Read runtime Tabor configuration'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from create-window config get-config help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -l working-directory -d 'Start the shell in the specified working directory' -r -F
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -s e -l command -d 'Command and args to execute (must be last argument)' -r
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -s T -l title -d 'Defines the window title [default: Tabor]' -r
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -l class -d 'Defines window class/app_id on X11/Wayland [default: Tabor]' -r
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -s o -l option -d 'Override configuration file options [example: \'cursor.style="Beam"\']' -r
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -l hold -d 'Remain open after child process exit'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from create-window" -s h -l help -d 'Print help'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config send help" -s s -l socket -d 'IPC socket connection path override' -r -F
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config send help" -s h -l help -d 'Print help'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config send help" -f -a "config" -d 'Update the Tabor configuration'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config send help" -f -a "get-config" -d 'Read runtime Tabor configuration'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config send help" -f -a "send" -d 'Send a raw JSON IPC message'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config send help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from config" -s w -l window-id -d 'Window ID for the new config' -r
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from config" -s r -l reset -d 'Clear all runtime configuration changes'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from config" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from get-config" -s w -l window-id -d 'Window ID for the config request' -r
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from get-config" -s h -l help -d 'Print help (see more with \'--help\')'
-complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from help" -f -a "create-window" -d 'Create a new window in the same Tabor process'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from send" -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from help" -f -a "send" -d 'Send a raw JSON IPC message'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from help" -f -a "config" -d 'Update the Tabor configuration'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from help" -f -a "get-config" -d 'Read runtime Tabor configuration'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
@@ -74,6 +68,6 @@ complete -c tabor -n "__fish_tabor_using_subcommand migrate" -s h -l help -d 'Pr
 complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg migrate help" -f -a "msg" -d 'Send a message to the Tabor socket'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg migrate help" -f -a "migrate" -d 'Migrate the configuration file'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg migrate help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
-complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "create-window" -d 'Create a new window in the same Tabor process'
+complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "send" -d 'Send a raw JSON IPC message'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "config" -d 'Update the Tabor configuration'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "get-config" -d 'Read runtime Tabor configuration'

@@ -37,6 +37,8 @@ use tabor_terminal::vte::ansi::NamedColor;
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
+#[cfg(unix)]
+use crate::config::Action;
 use crate::config::UiConfig;
 #[cfg(not(windows))]
 use crate::daemon::foreground_process_name;
@@ -54,6 +56,11 @@ use crate::event::WebCommand;
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
+#[cfg(unix)]
+use crate::ipc::{
+    IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession, IpcInspectorTarget,
+    IpcTabActivity, IpcTabGroup, IpcTabKind, IpcTabPanelState, IpcTabState, TabSelection,
+};
 use crate::scheduler::Scheduler;
 use crate::tab_panel::TabActivity;
 use crate::tabs::TabId;
@@ -66,6 +73,11 @@ use crate::macos::web_commands::WebCommandState;
 use crate::macos::favicon::{fetch_favicon, resolve_favicon_url, FaviconImage};
 #[cfg(target_os = "macos")]
 use crate::macos::webview::WebView;
+#[cfg(target_os = "macos")]
+use crate::macos::remote_inspector::{
+    match_tab_for_target, match_target_for_tab, InspectorError, InspectorTabInfo,
+    RemoteInspectorClient,
+};
 #[cfg(target_os = "macos")]
 use crate::tab_panel::TabFavicon;
 
@@ -426,6 +438,15 @@ impl TabManager {
             .and_then(|group| group.name.as_deref())
     }
 
+    fn group_for_tab(&self, tab_id: TabId) -> Option<(usize, usize)> {
+        for group in &self.groups {
+            if let Some(index) = group.tabs.iter().position(|id| *id == tab_id) {
+                return Some((group.id, index));
+            }
+        }
+        None
+    }
+
     fn set_program_name(&mut self, tab_id: TabId, program_name: String) -> bool {
         let Some(tab) = self.get_mut(tab_id) else {
             return false;
@@ -522,6 +543,8 @@ pub struct WindowContext {
     next_favicon_id: u64,
     #[cfg(target_os = "macos")]
     next_favicon_char: u32,
+    #[cfg(target_os = "macos")]
+    remote_inspector: Option<RemoteInspectorClient>,
     modifiers: Modifiers,
     occluded: bool,
     window_focused: bool,
@@ -662,6 +685,8 @@ impl WindowContext {
             next_favicon_id: 0,
             #[cfg(target_os = "macos")]
             next_favicon_char: 0xE000,
+            #[cfg(target_os = "macos")]
+            remote_inspector: None,
             dirty: Default::default(),
         };
 
@@ -1215,7 +1240,7 @@ impl WindowContext {
         &mut self,
         options: WindowOptions,
         proxy: &EventLoopProxy<Event>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<TabId, Box<dyn Error>> {
         let mut pty_config = self.config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
         let command_input = options.command_input.clone();
@@ -1236,7 +1261,7 @@ impl WindowContext {
                 self.dirty = true;
             }
         }
-        Ok(())
+        Ok(tab_id)
     }
 
     pub(crate) fn handle_tab_command(&mut self, command: crate::tabs::TabCommand) {
@@ -1302,7 +1327,7 @@ impl WindowContext {
 
         let mut options = WindowOptions::default();
         options.window_kind = closed.kind;
-        self.create_tab(options, proxy)?;
+        let _ = self.create_tab(options, proxy)?;
         Ok(())
     }
 
@@ -1339,9 +1364,753 @@ impl WindowContext {
     ) -> Result<(), Box<dyn Error>> {
         let mut options = WindowOptions::default();
         options.window_kind = WindowKind::Web { url: url.clone() };
-        self.create_tab(options, proxy)?;
+        let _ = self.create_tab(options, proxy)?;
         self.command_history.record_url(url);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_focused(&self) -> bool {
+        self.window_focused
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn has_tab(&self, tab_id: TabId) -> bool {
+        self.tabs.get(tab_id).is_some()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_tab_groups(&self, now: Instant) -> Vec<IpcTabGroup> {
+        let active = self.tabs.active_id();
+        self.tabs
+            .groups
+            .iter()
+            .map(|group| {
+                let tabs = group
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, tab_id)| {
+                        let tab = self.tabs.get(*tab_id)?;
+                        let activity = if tab.kind.is_web() {
+                            None
+                        } else {
+                            Some(Self::ipc_activity(&tab.activity, now))
+                        };
+                        Some(IpcTabState {
+                            tab_id: (*tab_id).into(),
+                            group_id: group.id,
+                            index,
+                            is_active: Some(*tab_id) == active,
+                            title: tab.title.clone(),
+                            custom_title: tab.custom_title.clone(),
+                            program_name: tab.program_name.clone(),
+                            kind: IpcTabKind::from(&tab.kind),
+                            activity,
+                        })
+                    })
+                    .collect();
+
+                IpcTabGroup { id: group.id, name: group.name.clone(), tabs }
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_tab_state(&self, tab_id: TabId, now: Instant) -> Option<IpcTabState> {
+        let tab = self.tabs.get(tab_id)?;
+        let (group_id, index) = self.tabs.group_for_tab(tab_id)?;
+        let activity = if tab.kind.is_web() {
+            None
+        } else {
+            Some(Self::ipc_activity(&tab.activity, now))
+        };
+        Some(IpcTabState {
+            tab_id: tab_id.into(),
+            group_id,
+            index,
+            is_active: Some(tab_id) == self.tabs.active_id(),
+            title: tab.title.clone(),
+            custom_title: tab.custom_title.clone(),
+            program_name: tab.program_name.clone(),
+            kind: IpcTabKind::from(&tab.kind),
+            activity,
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_tab_kind(&self, tab_id: TabId) -> Option<IpcTabKind> {
+        self.tabs.get(tab_id).map(|tab| IpcTabKind::from(&tab.kind))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_create_tab(
+        &mut self,
+        options: WindowOptions,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<TabId, IpcError> {
+        self.create_tab(options, proxy).map_err(|err| {
+            IpcError::new(IpcErrorCode::Internal, format!("Could not create tab: {err}"))
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_close_tab(&mut self, tab_id: TabId) -> Result<bool, IpcError> {
+        if self.tabs.get(tab_id).is_none() {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        }
+        Ok(self.close_tab(tab_id))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_select_tab(&mut self, selection: TabSelection) -> Result<(), IpcError> {
+        let target = match selection {
+            TabSelection::Active => return Ok(()),
+            TabSelection::Next => self.tabs.select_next(),
+            TabSelection::Previous => self.tabs.select_previous(),
+            TabSelection::Last => self.tabs.select_last(),
+            TabSelection::ByIndex { index } => self.tabs.select_by_index(index),
+            TabSelection::ById { tab_id } => {
+                let tab_id = tab_id.into();
+                if self.tabs.get(tab_id).is_some() {
+                    Some(tab_id)
+                } else {
+                    None
+                }
+            },
+        };
+
+        let Some(tab_id) = target else {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        };
+
+        self.set_active_tab(tab_id);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_move_tab(
+        &mut self,
+        tab_id: TabId,
+        target_group_id: Option<usize>,
+        target_index: Option<usize>,
+    ) -> Result<(), IpcError> {
+        if !self.tabs.move_tab(tab_id, target_group_id, target_index) {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        }
+        self.refresh_tab_panel();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_set_tab_title(
+        &mut self,
+        tab_id: TabId,
+        title: Option<String>,
+    ) -> Result<(), IpcError> {
+        if self.tabs.get(tab_id).is_none() {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        }
+        if self.tabs.set_custom_title(tab_id, title) {
+            self.refresh_tab_panel();
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_set_group_name(
+        &mut self,
+        group_id: usize,
+        name: Option<String>,
+    ) -> Result<(), IpcError> {
+        if !self.tabs.set_group_name(group_id, name) {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Group not found"));
+        }
+        self.refresh_tab_panel();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_restore_closed_tab(
+        &mut self,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self
+                .restore_closed_tab(proxy)
+                .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = proxy;
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Restore closed tabs is only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_open_url_in_tab(
+        &mut self,
+        tab_id: TabId,
+        url: String,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = proxy;
+            return self
+                .open_web_url_in_tab(tab_id, url)
+                .map_err(|err| IpcError::new(IpcErrorCode::InvalidRequest, err));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, url, proxy);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web tabs are only supported on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_open_url_new_tab(
+        &mut self,
+        url: String,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<TabId, IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut options = WindowOptions::default();
+            options.window_kind = WindowKind::Web { url: url.clone() };
+            let tab_id = self
+                .create_tab(options, proxy)
+                .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()))?;
+            self.command_history.record_url(url);
+            return Ok(tab_id);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (url, proxy);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web tabs are only supported on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_reload_web(
+        &mut self,
+        tab_id: TabId,
+        event_loop: &ActiveEventLoop,
+        event_proxy: &EventLoopProxy<Event>,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.with_action_context(
+                tab_id,
+                event_loop,
+                event_proxy,
+                clipboard,
+                scheduler,
+                |ctx| {
+                    ctx.reload_web();
+                },
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, event_loop, event_proxy, clipboard, scheduler);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web tabs are only supported on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_open_inspector(
+        &mut self,
+        tab_id: TabId,
+        event_loop: &ActiveEventLoop,
+        event_proxy: &EventLoopProxy<Event>,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.with_action_context(
+                tab_id,
+                event_loop,
+                event_proxy,
+                clipboard,
+                scheduler,
+                |ctx| {
+                    ctx.open_web_inspector();
+                },
+            );
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, event_loop, event_proxy, clipboard, scheduler);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web tabs are only supported on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_tab_panel_state(&self) -> IpcTabPanelState {
+        IpcTabPanelState {
+            enabled: self.config.window.tab_panel.enabled,
+            width: self.config.window.tab_panel.width,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_set_tab_panel(
+        &mut self,
+        enabled: Option<bool>,
+        width: Option<usize>,
+    ) -> Result<(), IpcError> {
+        if enabled.is_none() && width.is_none() {
+            return Err(IpcError::new(
+                IpcErrorCode::InvalidRequest,
+                "No tab panel options provided",
+            ));
+        }
+
+        let mut options = Vec::new();
+        if let Some(enabled) = enabled {
+            options.push(format!("window.tab_panel.enabled={enabled}"));
+        }
+        if let Some(width) = width {
+            options.push(format!("window.tab_panel.width={width}"));
+        }
+
+        let parsed = ParsedOptions::from_options(&options);
+        self.add_window_config(self.config.clone(), &parsed);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_dispatch_action(
+        &mut self,
+        tab_id: TabId,
+        action: Action,
+        event_loop: &ActiveEventLoop,
+        event_proxy: &EventLoopProxy<Event>,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), IpcError> {
+        self.with_action_context(tab_id, event_loop, event_proxy, clipboard, scheduler, |ctx| {
+            input::execute_action(ctx, &action);
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_send_input(&mut self, tab_id: TabId, text: String) -> Result<(), IpcError> {
+        if self.tabs.get(tab_id).is_none() {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        }
+        if self.tabs.active_id() != Some(tab_id) {
+            self.set_active_tab(tab_id);
+        }
+        let Some(tab) = self.tabs.get(tab_id) else {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        };
+        tab.notifier.notify(text.into_bytes());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_run_command_bar(
+        &mut self,
+        tab_id: TabId,
+        input: String,
+        event_loop: &ActiveEventLoop,
+        event_proxy: &EventLoopProxy<Event>,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), IpcError> {
+        self.with_action_context(tab_id, event_loop, event_proxy, clipboard, scheduler, |ctx| {
+            ctx.run_command(input);
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_list_inspector_targets(
+        &mut self,
+    ) -> Result<Vec<IpcInspectorTarget>, IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Remote inspector is only supported on macOS",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.ensure_remote_inspector()?;
+            let targets = self
+                .remote_inspector
+                .as_ref()
+                .expect("remote inspector should be initialized")
+                .list_targets()
+                .map_err(map_inspector_error)?;
+            let tabs = self.inspector_tabs();
+            let pid = std::process::id();
+            let mapped = targets
+                .iter()
+                .map(|target| {
+                    let tab_id = match_tab_for_target(target, &tabs, pid);
+                    IpcInspectorTarget {
+                        target_id: target.target_id,
+                        target_type: target.target_type.clone(),
+                        url: target.url.clone(),
+                        title: target.title.clone(),
+                        override_name: target.override_name.clone(),
+                        host_app_identifier: target.host_app_identifier.clone(),
+                        tab_id: tab_id.map(Into::into),
+                    }
+                })
+                .collect();
+            Ok(mapped)
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_attach_inspector(
+        &mut self,
+        tab_id: Option<TabId>,
+        target_id: Option<u64>,
+    ) -> Result<IpcInspectorSession, IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, target_id);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Remote inspector is only supported on macOS",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if tab_id.is_none() && target_id.is_none() {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "tab_id or target_id must be provided",
+                ));
+            }
+
+            self.ensure_remote_inspector()?;
+            let targets = self
+                .remote_inspector
+                .as_ref()
+                .expect("remote inspector should be initialized")
+                .list_targets()
+                .map_err(map_inspector_error)?;
+            let resolved_target = if let Some(target_id) = target_id {
+                target_id
+            } else {
+                let tab_id =
+                    tab_id.ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+                let tab_info = self.inspector_tab_info(tab_id)?;
+                match_target_for_tab(&targets, &tab_info, std::process::id())
+                    .map_err(map_inspector_error)?
+            };
+
+            let resolved_tab_id = if let Some(tab_id) = tab_id {
+                tab_id
+            } else {
+                let target = targets
+                    .iter()
+                    .find(|target| target.target_id == resolved_target)
+                    .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Target not found"))?;
+                match_tab_for_target(target, &self.inspector_tabs(), std::process::id())
+                    .ok_or_else(|| {
+                        IpcError::new(
+                            IpcErrorCode::Ambiguous,
+                            "Target does not map to a web tab",
+                        )
+                    })?
+            };
+
+            let session = self
+                .remote_inspector
+                .as_ref()
+                .expect("remote inspector should be initialized")
+                .attach(resolved_tab_id, resolved_target)
+                .map_err(map_inspector_error)?;
+
+            Ok(IpcInspectorSession {
+                session_id: session.session_id,
+                target_id: session.target_id,
+                tab_id: session.tab_id.into(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_detach_inspector(&mut self, session_id: String) -> Result<(), IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = session_id;
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Remote inspector is only supported on macOS",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.ensure_remote_inspector()?;
+            self.remote_inspector
+                .as_ref()
+                .expect("remote inspector should be initialized")
+                .detach(&session_id)
+                .map_err(map_inspector_error)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_send_inspector_message(
+        &mut self,
+        session_id: String,
+        message: String,
+    ) -> Result<(), IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (session_id, message);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Remote inspector is only supported on macOS",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.ensure_remote_inspector()?;
+            self.remote_inspector
+                .as_ref()
+                .expect("remote inspector should be initialized")
+                .send_message(&session_id, &message)
+                .map_err(map_inspector_error)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_poll_inspector_messages(
+        &mut self,
+        session_id: String,
+        max: Option<usize>,
+    ) -> Result<Vec<IpcInspectorMessage>, IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (session_id, max);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Remote inspector is only supported on macOS",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.ensure_remote_inspector()?;
+            let messages = self
+                .remote_inspector
+                .as_ref()
+                .expect("remote inspector should be initialized")
+                .poll_messages(&session_id, max)
+                .map_err(map_inspector_error)?;
+            let mapped = messages
+                .into_iter()
+                .map(|message| IpcInspectorMessage {
+                    session_id: message.session_id,
+                    payload: message.payload,
+                })
+                .collect();
+            Ok(mapped)
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn has_inspector_session(&self, session_id: &str) -> bool {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = session_id;
+            false
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.remote_inspector
+                .as_ref()
+                .is_some_and(|inspector| inspector.has_session(session_id))
+        }
+    }
+
+    #[cfg(unix)]
+    fn with_action_context<F>(
+        &mut self,
+        tab_id: TabId,
+        event_loop: &ActiveEventLoop,
+        event_proxy: &EventLoopProxy<Event>,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+        f: F,
+    ) -> Result<(), IpcError>
+    where
+        F: FnOnce(&mut ActionContext<'_, Notifier, EventProxy>),
+    {
+        if self.tabs.get(tab_id).is_none() {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        }
+
+        if self.tabs.active_id() != Some(tab_id) {
+            self.set_active_tab(tab_id);
+        }
+
+        let old_is_searching = self
+            .tabs
+            .active()
+            .is_some_and(|tab| tab.search_state.history_index.is_some());
+
+        {
+            let Some(active_tab) = self.tabs.active_mut() else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+
+            let mut terminal = active_tab.terminal.lock();
+            let mut context = ActionContext {
+                cursor_blink_timed_out: &mut active_tab.cursor_blink_timed_out,
+                prev_bell_cmd: &mut active_tab.prev_bell_cmd,
+                message_buffer: &mut self.message_buffer,
+                inline_search_state: &mut active_tab.inline_search_state,
+                search_state: &mut active_tab.search_state,
+                command_state: &mut active_tab.command_state,
+                command_history: &mut self.command_history,
+                tab_id: active_tab.id,
+                tab_kind: &mut active_tab.kind,
+                #[cfg(target_os = "macos")]
+                web_view: active_tab.web_view.as_mut(),
+                #[cfg(target_os = "macos")]
+                web_command_state: &mut active_tab.web_command_state,
+                modifiers: &mut self.modifiers,
+                notifier: &mut active_tab.notifier,
+                display: &mut self.display,
+                mouse: &mut active_tab.mouse,
+                touch: &mut active_tab.touch,
+                dirty: &mut self.dirty,
+                occluded: &mut self.occluded,
+                terminal: &mut terminal,
+                #[cfg(not(windows))]
+                master_fd: active_tab.master_fd,
+                #[cfg(not(windows))]
+                shell_pid: active_tab.shell_pid,
+                preserve_title: self.preserve_title,
+                config: &self.config,
+                event_proxy,
+                #[cfg(target_os = "macos")]
+                event_loop,
+                clipboard,
+                scheduler,
+            };
+
+            f(&mut context);
+        }
+
+        self.apply_ipc_display_update(old_is_searching);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_remote_inspector(&mut self) -> Result<(), IpcError> {
+        if self.remote_inspector.is_none() {
+            let inspector = RemoteInspectorClient::connect().map_err(map_inspector_error)?;
+            self.remote_inspector = Some(inspector);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn inspector_tabs(&self) -> Vec<InspectorTabInfo> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| {
+                let WindowKind::Web { url } = &tab.kind else {
+                    return None;
+                };
+                Some(InspectorTabInfo {
+                    tab_id: tab.id,
+                    url: if url.is_empty() { None } else { Some(url.clone()) },
+                    title: if tab.title.is_empty() { None } else { Some(tab.title.clone()) },
+                    override_name: tab.custom_title.clone(),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn inspector_tab_info(&self, tab_id: TabId) -> Result<InspectorTabInfo, IpcError> {
+        let tab = self
+            .tabs
+            .get(tab_id)
+            .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+        let WindowKind::Web { url } = &tab.kind else {
+            return Err(IpcError::new(
+                IpcErrorCode::InvalidRequest,
+                "Tab is not a web tab",
+            ));
+        };
+        Ok(InspectorTabInfo {
+            tab_id: tab.id,
+            url: if url.is_empty() { None } else { Some(url.clone()) },
+            title: if tab.title.is_empty() { None } else { Some(tab.title.clone()) },
+            override_name: tab.custom_title.clone(),
+        })
+    }
+
+
+    #[cfg(unix)]
+    fn apply_ipc_display_update(&mut self, old_is_searching: bool) {
+        if self.display.pending_update.dirty {
+            if let Some(active_id) = self.tabs.active_id() {
+                Self::submit_display_update(
+                    active_id,
+                    &mut self.tabs,
+                    &mut self.display,
+                    &self.message_buffer,
+                    old_is_searching,
+                    &self.config,
+                );
+                self.dirty = true;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn ipc_activity(activity: &TabActivity, now: Instant) -> IpcTabActivity {
+        IpcTabActivity {
+            has_unseen_output: activity.has_unseen_output,
+            last_output_ms_ago: activity
+                .last_output
+                .map(|last| now.saturating_duration_since(last).as_millis() as u64),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -2191,6 +2960,26 @@ impl WindowContext {
                 tab_terminal.resize(new_size);
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn map_inspector_error(error: InspectorError) -> IpcError {
+    match error {
+        InspectorError::PermissionDenied => {
+            IpcError::new(IpcErrorCode::PermissionDenied, "Inspector permission denied")
+        },
+        InspectorError::ConnectionFailed(message) => {
+            IpcError::new(IpcErrorCode::Internal, message)
+        },
+        InspectorError::Timeout => {
+            IpcError::new(IpcErrorCode::Timeout, "Inspector request timed out")
+        },
+        InspectorError::NotFound(message) => IpcError::new(IpcErrorCode::NotFound, message),
+        InspectorError::Ambiguous(message) => IpcError::new(IpcErrorCode::Ambiguous, message),
+        InspectorError::InvalidMessage(message) => {
+            IpcError::new(IpcErrorCode::InvalidRequest, message)
+        },
     }
 }
 

@@ -82,5 +82,12 @@ that.
 ## Multi-Window
 
 Tabor supports running multiple terminal emulators from the same Tabor
-instance. New windows can be created either by using the `CreateNewWindow`
-keybinding action, or by executing the `tabor msg create-window` subcommand.
+instance. New windows can be created by using the `CreateNewWindow` keybinding
+action.
+
+## IPC and automation
+
+Tabor exposes a local IPC socket for scripting tab management, actions, and web
+automation. Use `tabor msg send` to post JSON requests and read responses. The
+full protocol, including Remote Inspector commands, is documented in
+[`docs/ipc.md`](./ipc.md).

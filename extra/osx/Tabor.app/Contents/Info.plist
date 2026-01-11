@@ -34,6 +34,19 @@
   <string>Tabor</string>
   <key>NSRequiresAquaSystemAppearance</key>
   <string>NO</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>localhost</key>
+      <dict>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key>
+        <true/>
+        <key>NSIncludesSubdomains</key>
+        <true/>
+      </dict>
+    </dict>
+  </dict>
     <key>NSAppleEventsUsageDescription</key>
     <string>An application in Tabor would like to access AppleScript.</string>
     <key>NSCalendarsUsageDescription</key>

@@ -66,6 +66,7 @@ objc2-foundation = { version = "0.3.1", default-features = false, features = [
     "NSString",
     "NSLocale",
     "NSUserDefaults",
+    "NSValue",
 ] }
 objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "std",

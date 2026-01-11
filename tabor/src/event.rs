@@ -51,9 +51,10 @@ use tabor_terminal::term::{self, ClipboardType, Term, TermMode};
 use tabor_terminal::vte::ansi::NamedColor;
 
 #[cfg(unix)]
-use crate::cli::{IpcConfig, ParsedOptions};
+use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
+use crate::config::Action;
 use crate::config::ui_config::{HintAction, HintInternalAction};
 use crate::config::{self, UiConfig};
 #[cfg(not(windows))]
@@ -65,7 +66,7 @@ use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 #[cfg(unix)]
-use crate::ipc::{self, SocketReply};
+use crate::ipc::{self, IpcRequest, SocketReply};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -260,6 +261,157 @@ pub struct Processor {
     config: Rc<UiConfig>,
 }
 
+#[cfg(unix)]
+struct IpcWindowContext<'a> {
+    window: &'a mut WindowContext,
+    event_loop: &'a ActiveEventLoop,
+    event_proxy: &'a EventLoopProxy<Event>,
+    clipboard: &'a mut Clipboard,
+    scheduler: &'a mut Scheduler,
+}
+
+#[cfg(unix)]
+impl ipc::IpcContext for IpcWindowContext<'_> {
+    fn active_tab_id(&self) -> Option<TabId> {
+        self.window.active_tab_id()
+    }
+
+    fn list_tabs(&self, now: Instant) -> Vec<ipc::IpcTabGroup> {
+        self.window.ipc_tab_groups(now)
+    }
+
+    fn tab_state(&self, tab_id: TabId, now: Instant) -> Option<ipc::IpcTabState> {
+        self.window.ipc_tab_state(tab_id, now)
+    }
+
+    fn tab_kind(&self, tab_id: TabId) -> Option<ipc::IpcTabKind> {
+        self.window.ipc_tab_kind(tab_id)
+    }
+
+    fn create_tab(&mut self, options: WindowOptions) -> Result<TabId, ipc::IpcError> {
+        self.window.ipc_create_tab(options, self.event_proxy)
+    }
+
+    fn close_tab(&mut self, tab_id: TabId) -> Result<bool, ipc::IpcError> {
+        self.window.ipc_close_tab(tab_id)
+    }
+
+    fn select_tab(&mut self, selection: ipc::TabSelection) -> Result<(), ipc::IpcError> {
+        self.window.ipc_select_tab(selection)
+    }
+
+    fn move_tab(
+        &mut self,
+        tab_id: TabId,
+        target_group_id: Option<usize>,
+        target_index: Option<usize>,
+    ) -> Result<(), ipc::IpcError> {
+        self.window
+            .ipc_move_tab(tab_id, target_group_id, target_index)
+    }
+
+    fn set_tab_title(&mut self, tab_id: TabId, title: Option<String>) -> Result<(), ipc::IpcError> {
+        self.window.ipc_set_tab_title(tab_id, title)
+    }
+
+    fn set_group_name(&mut self, group_id: usize, name: Option<String>) -> Result<(), ipc::IpcError> {
+        self.window.ipc_set_group_name(group_id, name)
+    }
+
+    fn restore_closed_tab(&mut self) -> Result<(), ipc::IpcError> {
+        self.window.ipc_restore_closed_tab(self.event_proxy)
+    }
+
+    fn open_url_in_tab(&mut self, tab_id: TabId, url: String) -> Result<(), ipc::IpcError> {
+        self.window.ipc_open_url_in_tab(tab_id, url, self.event_proxy)
+    }
+
+    fn open_url_new_tab(&mut self, url: String) -> Result<TabId, ipc::IpcError> {
+        self.window.ipc_open_url_new_tab(url, self.event_proxy)
+    }
+
+    fn reload_web(&mut self, tab_id: TabId) -> Result<(), ipc::IpcError> {
+        self.window
+            .ipc_reload_web(tab_id, self.event_loop, self.event_proxy, self.clipboard, self.scheduler)
+    }
+
+    fn open_inspector(&mut self, tab_id: TabId) -> Result<(), ipc::IpcError> {
+        self.window.ipc_open_inspector(
+            tab_id,
+            self.event_loop,
+            self.event_proxy,
+            self.clipboard,
+            self.scheduler,
+        )
+    }
+
+    fn tab_panel_state(&self) -> ipc::IpcTabPanelState {
+        self.window.ipc_tab_panel_state()
+    }
+
+    fn set_tab_panel(&mut self, enabled: Option<bool>, width: Option<usize>) -> Result<(), ipc::IpcError> {
+        self.window.ipc_set_tab_panel(enabled, width)
+    }
+
+    fn dispatch_action(&mut self, tab_id: TabId, action: Action) -> Result<(), ipc::IpcError> {
+        self.window.ipc_dispatch_action(
+            tab_id,
+            action,
+            self.event_loop,
+            self.event_proxy,
+            self.clipboard,
+            self.scheduler,
+        )
+    }
+
+    fn send_input(&mut self, tab_id: TabId, text: String) -> Result<(), ipc::IpcError> {
+        self.window.ipc_send_input(tab_id, text)
+    }
+
+    fn run_command_bar(&mut self, tab_id: TabId, input: String) -> Result<(), ipc::IpcError> {
+        self.window.ipc_run_command_bar(
+            tab_id,
+            input,
+            self.event_loop,
+            self.event_proxy,
+            self.clipboard,
+            self.scheduler,
+        )
+    }
+
+    fn list_inspector_targets(&mut self) -> Result<Vec<ipc::IpcInspectorTarget>, ipc::IpcError> {
+        self.window.ipc_list_inspector_targets()
+    }
+
+    fn attach_inspector(
+        &mut self,
+        tab_id: Option<TabId>,
+        target_id: Option<u64>,
+    ) -> Result<ipc::IpcInspectorSession, ipc::IpcError> {
+        self.window.ipc_attach_inspector(tab_id, target_id)
+    }
+
+    fn detach_inspector(&mut self, session_id: String) -> Result<(), ipc::IpcError> {
+        self.window.ipc_detach_inspector(session_id)
+    }
+
+    fn send_inspector_message(
+        &mut self,
+        session_id: String,
+        message: String,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_send_inspector_message(session_id, message)
+    }
+
+    fn poll_inspector_messages(
+        &mut self,
+        session_id: String,
+        max: Option<usize>,
+    ) -> Result<Vec<ipc::IpcInspectorMessage>, ipc::IpcError> {
+        self.window.ipc_poll_inspector_messages(session_id, max)
+    }
+}
+
 impl Processor {
     /// Create a new event processor.
     pub fn new(
@@ -377,6 +529,177 @@ impl Processor {
         }
     }
 
+    #[cfg(unix)]
+    fn handle_ipc_request(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        request: IpcRequest,
+    ) -> SocketReply {
+        match request {
+            IpcRequest::SetConfig(ipc_config) => {
+                let window_id = ipc_config
+                    .window_id
+                    .and_then(|id| u64::try_from(id).ok())
+                    .map(WindowId::from);
+
+                let mut options = ParsedOptions::from_options(&ipc_config.options);
+
+                for (_, window_context) in self
+                    .windows
+                    .iter_mut()
+                    .filter(|(id, _)| window_id.is_none() || window_id == Some(**id))
+                {
+                    if ipc_config.reset {
+                        window_context.reset_window_config(self.config.clone());
+                    } else {
+                        window_context.add_window_config(self.config.clone(), &options);
+                    }
+                }
+
+                if window_id.is_none() {
+                    if ipc_config.reset {
+                        self.global_ipc_options.clear();
+                    } else {
+                        self.global_ipc_options.append(&mut options);
+                    }
+                }
+
+                ipc::reply_ok()
+            },
+            IpcRequest::GetConfig(ipc_config) => {
+                let window_id = ipc_config
+                    .window_id
+                    .and_then(|id| u64::try_from(id).ok())
+                    .map(WindowId::from);
+
+                let config = match self.windows.iter().find(|(id, _)| window_id == Some(**id)) {
+                    Some((_, window_context)) => window_context.config(),
+                    None => &self.global_ipc_options.override_config_rc(self.config.clone()),
+                };
+
+                match serde_json::to_value(config) {
+                    Ok(config_json) => SocketReply::Config { config: config_json },
+                    Err(err) => ipc::reply_error(
+                        ipc::IpcErrorCode::Internal,
+                        format!("Failed config serialization: {err}"),
+                    ),
+                }
+            },
+            request => {
+                let window_id = match self.window_for_ipc_request(&request) {
+                    Ok(window_id) => window_id,
+                    Err(reply) => return reply,
+                };
+
+                let window_context = match self.windows.get_mut(&window_id) {
+                    Some(window_context) => window_context,
+                    None => {
+                        return ipc::reply_error(
+                            ipc::IpcErrorCode::NotFound,
+                            "Target window not found",
+                        );
+                    },
+                };
+
+                let mut ipc_context = IpcWindowContext {
+                    window: window_context,
+                    event_loop,
+                    event_proxy: &self.proxy,
+                    clipboard: &mut self.clipboard,
+                    scheduler: &mut self.scheduler,
+                };
+
+                let response = ipc::handle_request(&mut ipc_context, request);
+                if response.close_window {
+                    self.close_window(event_loop, window_id);
+                }
+
+                response.reply
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn window_for_ipc_request(&self, request: &IpcRequest) -> Result<WindowId, SocketReply> {
+        if let Some(tab_id) = request.target_tab_id() {
+            let tab_id: TabId = tab_id.into();
+            let mut matches = self
+                .windows
+                .iter()
+                .filter_map(|(id, window)| window.has_tab(tab_id).then_some(*id))
+                .collect::<Vec<_>>();
+
+            matches.sort();
+            matches.dedup();
+
+            return match matches.len() {
+                0 => Err(ipc::reply_error(ipc::IpcErrorCode::NotFound, "Tab not found")),
+                1 => Ok(matches[0]),
+                _ => Err(ipc::reply_error(
+                    ipc::IpcErrorCode::Ambiguous,
+                    "Tab exists in multiple windows",
+                )),
+            };
+        }
+
+        if let Some(session_id) = request.target_inspector_session_id() {
+            let mut matches = self
+                .windows
+                .iter()
+                .filter_map(|(id, window)| window.has_inspector_session(session_id).then_some(*id))
+                .collect::<Vec<_>>();
+
+            matches.sort();
+            matches.dedup();
+
+            return match matches.len() {
+                0 => Err(ipc::reply_error(
+                    ipc::IpcErrorCode::NotFound,
+                    "Inspector session not found",
+                )),
+                1 => Ok(matches[0]),
+                _ => Err(ipc::reply_error(
+                    ipc::IpcErrorCode::Ambiguous,
+                    "Inspector session exists in multiple windows",
+                )),
+            };
+        }
+
+        let focused = self
+            .windows
+            .iter()
+            .find_map(|(id, window)| window.is_focused().then_some(*id));
+        if let Some(focused) = focused {
+            return Ok(focused);
+        }
+
+        if self.windows.len() == 1 {
+            return Ok(*self.windows.keys().next().unwrap());
+        }
+
+        Err(ipc::reply_error(
+            ipc::IpcErrorCode::NotFound,
+            "No focused window",
+        ))
+    }
+
+    fn close_window(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
+        let window_context = match self.windows.entry(window_id) {
+            Entry::Occupied(window_context) => window_context.remove(),
+            _ => return,
+        };
+
+        self.scheduler.unschedule_window(window_context.id());
+
+        if self.windows.is_empty() && !self.cli_options.daemon {
+            if self.config.debug.ref_test {
+                window_context.write_ref_test_results();
+            }
+
+            event_loop.exit();
+        }
+    }
+
     /// Check if an event is irrelevant and can be skipped.
     fn skip_window_event(event: &WindowEvent) -> bool {
         matches!(
@@ -469,32 +792,11 @@ impl ApplicationHandler<Event> for Processor {
 
         // Handle events which don't mandate the WindowId.
         match (payload, window_id) {
-            // Process IPC config update.
             #[cfg(unix)]
-            (EventType::IpcConfig(ipc_config), window_id) => {
-                // Try and parse options as toml.
-                let mut options = ParsedOptions::from_options(&ipc_config.options);
-
-                // Override IPC config for each window with matching ID.
-                for (_, window_context) in self
-                    .windows
-                    .iter_mut()
-                    .filter(|(id, _)| window_id.is_none() || window_id == Some(**id))
-                {
-                    if ipc_config.reset {
-                        window_context.reset_window_config(self.config.clone());
-                    } else {
-                        window_context.add_window_config(self.config.clone(), &options);
-                    }
-                }
-
-                // Persist global options for future windows.
-                if window_id.is_none() {
-                    if ipc_config.reset {
-                        self.global_ipc_options.clear();
-                    } else {
-                        self.global_ipc_options.append(&mut options);
-                    }
+            (EventType::IpcRequest(request, stream), _) => {
+                let reply = self.handle_ipc_request(event_loop, request);
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
                 }
             },
             (EventType::CreateTab(options), Some(window_id)) => {
@@ -518,20 +820,7 @@ impl ApplicationHandler<Event> for Processor {
                 let should_close_window = window_context.close_tab(tab_id);
 
                 if should_close_window {
-                    let window_context = match self.windows.entry(window_id) {
-                        Entry::Occupied(window_context) => window_context.remove(),
-                        _ => return,
-                    };
-
-                    self.scheduler.unschedule_window(window_context.id());
-
-                    if self.windows.is_empty() && !self.cli_options.daemon {
-                        if self.config.debug.ref_test {
-                            window_context.write_ref_test_results();
-                        }
-
-                        event_loop.exit();
-                    }
+                    self.close_window(event_loop, window_id);
                 }
             },
             #[cfg(target_os = "macos")]
@@ -546,29 +835,6 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::TabSearch(query), Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(&window_id) {
                     window_context.select_tab_by_query(&query);
-                }
-            },
-            // Process IPC config requests.
-            #[cfg(unix)]
-            (EventType::IpcGetConfig(stream), window_id) => {
-                // Get the config for the requested window ID.
-                let config = match self.windows.iter().find(|(id, _)| window_id == Some(**id)) {
-                    Some((_, window_context)) => window_context.config(),
-                    None => &self.global_ipc_options.override_config_rc(self.config.clone()),
-                };
-
-                // Convert config to JSON format.
-                let config_json = match serde_json::to_string(&config) {
-                    Ok(config_json) => config_json,
-                    Err(err) => {
-                        error!("Failed config serialization: {err}");
-                        return;
-                    },
-                };
-
-                // Send JSON config to the socket.
-                if let Ok(mut stream) = stream.try_clone() {
-                    ipc::send_reply(&mut stream, SocketReply::GetConfig(config_json));
                 }
             },
             (EventType::ConfigReload(path), _) => {
@@ -898,9 +1164,7 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     TabSearch(String),
     #[cfg(unix)]
-    IpcConfig(IpcConfig),
-    #[cfg(unix)]
-    IpcGetConfig(Arc<UnixStream>),
+    IpcRequest(IpcRequest, Arc<UnixStream>),
     BlinkCursor,
     BlinkCursorTimeout,
     TabActivityTick,
@@ -2566,7 +2830,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
     }
 
-    fn run_command(&mut self, input: String) {
+    pub(crate) fn run_command(&mut self, input: String) {
         if let Some(find_query) = input.strip_prefix('/') {
             let query = find_query.trim();
             if query.is_empty() {
@@ -2633,6 +2897,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             "r" => {
                 self.reload_web();
             },
+            "inspect" | "inspector" | "devtools" => {
+                self.open_web_inspector();
+            },
             _ => {
                 self.push_command_error(format!("Unknown command: {command}"));
             },
@@ -2688,7 +2955,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let _ = self.event_proxy.send_event(event);
     }
 
-    fn reload_web(&mut self) {
+    pub(crate) fn reload_web(&mut self) {
         match &*self.tab_kind {
             WindowKind::Web { .. } => {
                 #[cfg(target_os = "macos")]
@@ -2706,6 +2973,24 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             },
             WindowKind::Terminal => {
                 self.push_command_error(String::from("No active web tab to reload"));
+            },
+        }
+    }
+
+    pub(crate) fn open_web_inspector(&mut self) {
+        match &*self.tab_kind {
+            WindowKind::Web { .. } => {
+                #[cfg(target_os = "macos")]
+                if let Some(web_view) = self.web_view.as_mut() {
+                    if web_view.show_inspector() {
+                        return;
+                    }
+                }
+
+                self.push_command_error(String::from("Web inspector is unavailable"));
+            },
+            WindowKind::Terminal => {
+                self.push_command_error(String::from("No active web tab to inspect"));
             },
         }
     }
@@ -3595,7 +3880,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     TerminalEvent::Exit | TerminalEvent::ChildExit(_) | TerminalEvent::Wakeup => (),
                 },
                 #[cfg(unix)]
-                EventType::IpcConfig(_) | EventType::IpcGetConfig(..) => (),
+                EventType::IpcRequest(..) => (),
                 #[cfg(target_os = "macos")]
                 EventType::Message(_)
                 | EventType::ConfigReload(_)

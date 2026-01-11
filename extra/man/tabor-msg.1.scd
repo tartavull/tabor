@@ -17,42 +17,6 @@ making it possible to control Tabor without directly accessing it.
 
 # MESSAGES
 
-*create-window*
-
-	Create a new window in the same Tabor process.
-
-	*FLAGS*
-		*--hold*
-
-			Remain open after child process exits.
-
-	*OPTIONS*
-		*--working-directory* _<WORKING_DIRECTORY>_
-
-			Start the shell in the specified working directory.
-
-		*-T, --title* _<TITLE>_
-
-			Defines the window title.
-
-			Default: _Tabor_
-
-		*--class* _<GENERAL>_ | _<GENERAL>_,_<INSTANCE>_
-
-			Defines window class/app_id on X11/Wayland.
-
-			Default: _Tabor,Tabor_
-
-		*-o, --option* _<OPTION>..._
-
-			Override configuration file options.
-
-			Example: _tabor msg create-window -o 'cursor.style="Beam"'_
-
-		*-e, --command* _<COMMAND>..._
-
-			Command and args to execute (must be last argument).
-
 *config*
 
 	Update the Tabor configuration.
@@ -90,6 +54,22 @@ making it possible to control Tabor without directly accessing it.
 			Use _-1_ to get the global config.
 
 			Default: _$TABOR_WINDOW_ID_
+
+*send*
+
+	Send a raw JSON IPC message.
+
+	*ARGS*
+		*<JSON>*
+
+			JSON payload to send to the IPC socket.
+
+			Example: _tabor msg send '{"type":"list_tabs"}'_
+
+			Inspector example:
+			_tabor msg send '{"type":"send_inspector_message","session_id":"PID:12345-1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}'_
+
+	See _docs/ipc.md_ for the full IPC protocol and request list.
 
 # SEE ALSO
 

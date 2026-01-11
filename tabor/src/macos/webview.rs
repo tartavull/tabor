@@ -11,9 +11,9 @@ use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::runtime::Bool;
-use objc2::{class, msg_send, MainThreadMarker};
+use objc2::{class, msg_send, sel, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType};
-use objc2_foundation::{NSPoint, NSString};
+use objc2_foundation::{NSNumber, NSPoint, NSString};
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton};
 use winit::raw_window_handle::RawWindowHandle;
@@ -139,6 +139,7 @@ impl WebView {
                 )
             })?;
             enable_web_authentication(&*config)?;
+            enable_web_inspector(&*config)?;
             let store: *mut AnyObject =
                 unsafe { msg_send![class!(WKWebsiteDataStore), defaultDataStore] };
             unsafe {
@@ -447,8 +448,50 @@ impl WebView {
 
         Some(unsafe { &*(absolute as *const NSString) }.to_string())
     }
+
+    pub fn show_inspector(&mut self) -> bool {
+        let selectors = [
+            sel!(showWebInspector),
+            sel!(showInspector),
+            sel!(_showInspector),
+            sel!(_showWebInspector),
+            sel!(toggleWebInspector),
+            sel!(toggleInspector),
+            sel!(_toggleInspector),
+        ];
+
+        for selector in selectors {
+            let responds: Bool = unsafe { msg_send![&*self.view, respondsToSelector: selector] };
+            if responds.as_bool() {
+                unsafe {
+                    let _: *mut AnyObject = msg_send![&*self.view, performSelector: selector];
+                }
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
+fn enable_web_inspector(config: &AnyObject) -> Result<(), Box<dyn Error>> {
+    let prefs: *mut AnyObject = unsafe { msg_send![config, preferences] };
+    if prefs.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "WKWebViewConfiguration has no preferences",
+        )
+        .into());
+    }
+
+    let enabled = NSNumber::numberWithBool(true);
+    let key = NSString::from_str("developerExtrasEnabled");
+    unsafe {
+        let _: () = msg_send![prefs, setValue: &*enabled forKey: &*key];
+    }
+
+    Ok(())
+}
 
 // WebAuthn/passkeys are guarded by WebKit preferences; enable them explicitly.
 fn enable_web_authentication(config: &AnyObject) -> Result<(), Box<dyn Error>> {

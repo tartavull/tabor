@@ -59,8 +59,6 @@ mod gl {
 
 #[cfg(unix)]
 use crate::cli::MessageOptions;
-#[cfg(not(any(target_os = "macos", windows)))]
-use crate::cli::SocketMessage;
 use crate::cli::{Options, Subcommands};
 use crate::config::UiConfig;
 use crate::config::monitor::ConfigMonitor;
@@ -97,12 +95,34 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 #[allow(unused_mut)]
 fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
-    #[cfg(not(any(target_os = "macos", windows)))]
-    if let SocketMessage::CreateWindow(window_options) = &mut options.message {
-        window_options.activation_token =
-            env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
+    match options.message {
+        crate::cli::MessageCommand::Config(config) => {
+            let reply = ipc::send_message(options.socket, ipc::IpcRequest::SetConfig(config))?;
+            if let Some(ipc::SocketReply::Error { error }) = reply {
+                return Err(error.message.into());
+            }
+        },
+        crate::cli::MessageCommand::GetConfig(config) => {
+            let reply = ipc::send_message(options.socket, ipc::IpcRequest::GetConfig(config))?;
+            match reply {
+                Some(ipc::SocketReply::Config { config }) => {
+                    println!("{}", serde_json::to_string(&config)?);
+                },
+                Some(ipc::SocketReply::Error { error }) => {
+                    return Err(error.message.into());
+                },
+                _ => (),
+            }
+        },
+        crate::cli::MessageCommand::Send { json } => {
+            let reply = ipc::send_raw_message(options.socket, &json)?;
+            if let Some(reply) = reply {
+                println!("{}", serde_json::to_string(&reply)?);
+            }
+        },
     }
-    ipc::send_message(options.socket, options.message).map_err(|err| err.into())
+
+    Ok(())
 }
 
 /// Temporary files stored for Tabor.

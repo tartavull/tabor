@@ -467,6 +467,10 @@ impl<T: EventListener> Execute<T> for Action {
     }
 }
 
+pub(crate) fn execute_action<T: EventListener, A: ActionContext<T>>(ctx: &mut A, action: &Action) {
+    action.execute(ctx);
+}
+
 impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn new(ctx: A) -> Self {
         Self { ctx, _phantom: Default::default() }

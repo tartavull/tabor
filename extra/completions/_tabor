@@ -61,21 +61,6 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:tabor-msg-command-$line[1]:"
         case $line[1] in
-            (create-window)
-_arguments "${_arguments_options[@]}" : \
-'--working-directory=[Start the shell in the specified working directory]:WORKING_DIRECTORY:_files' \
-'*-e+[Command and args to execute (must be last argument)]:COMMAND:_default' \
-'*--command=[Command and args to execute (must be last argument)]:COMMAND:_default' \
-'-T+[Defines the window title \[default\: Tabor\]]:TITLE:_default' \
-'--title=[Defines the window title \[default\: Tabor\]]:TITLE:_default' \
-'--class=[Defines window class/app_id on X11/Wayland \[default\: Tabor\]]:general> | <general>,<instance:_default' \
-'*-o+[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
-'*--option=[Override configuration file options \[example\: '\''cursor.style="Beam"'\''\]]:OPTION:_default' \
-'--hold[Remain open after child process exit]' \
-'-h[Print help]' \
-'--help[Print help]' \
-&& ret=0
-;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 '-w+[Window ID for the new config]:WINDOW_ID:_default' \
@@ -95,6 +80,13 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(send)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'*::json -- JSON payload to send to the IPC socket:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_tabor__msg__help_commands" \
@@ -107,15 +99,15 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:tabor-msg-help-command-$line[1]:"
         case $line[1] in
-            (create-window)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
 (config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (get-config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(send)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -170,11 +162,7 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:tabor-help-msg-command-$line[1]:"
         case $line[1] in
-            (create-window)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(config)
+            (config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -234,9 +222,9 @@ _tabor__help__migrate_commands() {
 (( $+functions[_tabor__help__msg_commands] )) ||
 _tabor__help__msg_commands() {
     local commands; commands=(
-'create-window:Create a new window in the same Tabor process' \
 'config:Update the Tabor configuration' \
 'get-config:Read runtime Tabor configuration' \
+'send:Send a raw JSON IPC message' \
     )
     _describe -t commands 'tabor help msg commands' commands "$@"
 }
@@ -244,11 +232,6 @@ _tabor__help__msg_commands() {
 _tabor__help__msg__config_commands() {
     local commands; commands=()
     _describe -t commands 'tabor help msg config commands' commands "$@"
-}
-(( $+functions[_tabor__help__msg__create-window_commands] )) ||
-_tabor__help__msg__create-window_commands() {
-    local commands; commands=()
-    _describe -t commands 'tabor help msg create-window commands' commands "$@"
 }
 (( $+functions[_tabor__help__msg__get-config_commands] )) ||
 _tabor__help__msg__get-config_commands() {
@@ -263,9 +246,9 @@ _tabor__migrate_commands() {
 (( $+functions[_tabor__msg_commands] )) ||
 _tabor__msg_commands() {
     local commands; commands=(
-'create-window:Create a new window in the same Tabor process' \
 'config:Update the Tabor configuration' \
 'get-config:Read runtime Tabor configuration' \
+'send:Send a raw JSON IPC message' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor msg commands' commands "$@"
@@ -275,11 +258,6 @@ _tabor__msg__config_commands() {
     local commands; commands=()
     _describe -t commands 'tabor msg config commands' commands "$@"
 }
-(( $+functions[_tabor__msg__create-window_commands] )) ||
-_tabor__msg__create-window_commands() {
-    local commands; commands=()
-    _describe -t commands 'tabor msg create-window commands' commands "$@"
-}
 (( $+functions[_tabor__msg__get-config_commands] )) ||
 _tabor__msg__get-config_commands() {
     local commands; commands=()
@@ -288,9 +266,9 @@ _tabor__msg__get-config_commands() {
 (( $+functions[_tabor__msg__help_commands] )) ||
 _tabor__msg__help_commands() {
     local commands; commands=(
-'create-window:Create a new window in the same Tabor process' \
 'config:Update the Tabor configuration' \
 'get-config:Read runtime Tabor configuration' \
+'send:Send a raw JSON IPC message' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor msg help commands' commands "$@"
@@ -299,11 +277,6 @@ _tabor__msg__help_commands() {
 _tabor__msg__help__config_commands() {
     local commands; commands=()
     _describe -t commands 'tabor msg help config commands' commands "$@"
-}
-(( $+functions[_tabor__msg__help__create-window_commands] )) ||
-_tabor__msg__help__create-window_commands() {
-    local commands; commands=()
-    _describe -t commands 'tabor msg help create-window commands' commands "$@"
 }
 (( $+functions[_tabor__msg__help__get-config_commands] )) ||
 _tabor__msg__help__get-config_commands() {
