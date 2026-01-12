@@ -386,36 +386,74 @@ impl TabPanel {
 
         match state {
             ElementState::Pressed => {
-                if let Some(PanelHit::Tab { tab_id }) = hit {
-                    if !self.is_close_hit(position, &panel_size_info, tab_id) {
-                        self.drag = Some(DragState::new(tab_id, position));
-                        needs_redraw = true;
-                    }
+                match hit {
+                    Some(PanelHit::Tab { tab_id }) => {
+                        if !self.is_close_hit(position, &panel_size_info, tab_id) {
+                            self.drag = Some(DragState::new(DragItem::Tab(tab_id), position));
+                            needs_redraw = true;
+                        }
+                    },
+                    Some(PanelHit::Group { group_index }) => {
+                        if let Some(group) = self.groups.get(group_index) {
+                            self.drag =
+                                Some(DragState::new(DragItem::Group { group_id: group.id }, position));
+                            needs_redraw = true;
+                        }
+                    },
+                    None => (),
                 }
             },
             ElementState::Released => {
                 if let Some(drag) = self.drag.take() {
                     if drag.dragging {
-                        if let Some(target) = self.compute_drop_target(position, &panel_size_info) {
-                            command = Some(TabPanelCommand::Move {
-                                tab_id: drag.tab_id,
-                                target_group_id: Some(target.group_id),
-                                target_index: Some(target.index),
-                            });
-                        } else if self.is_inside_panel(position) {
-                            command = Some(TabPanelCommand::Move {
-                                tab_id: drag.tab_id,
-                                target_group_id: None,
-                                target_index: None,
-                            });
+                        match drag.item {
+                            DragItem::Tab(tab_id) => {
+                                match self.compute_drop_target(
+                                    position,
+                                    &panel_size_info,
+                                    &drag.item,
+                                ) {
+                                    Some(DropTarget::Tab(target)) => {
+                                        command = Some(TabPanelCommand::Move {
+                                            tab_id,
+                                            target_group_id: Some(target.group_id),
+                                            target_index: Some(target.index),
+                                        });
+                                    },
+                                    None if self.is_inside_panel(position) => {
+                                        command = Some(TabPanelCommand::Move {
+                                            tab_id,
+                                            target_group_id: None,
+                                            target_index: None,
+                                        });
+                                    },
+                                    _ => (),
+                                }
+                            },
+                            DragItem::Group { group_id } => {
+                                if let Some(DropTarget::Group(target)) = self.compute_drop_target(
+                                    position,
+                                    &panel_size_info,
+                                    &drag.item,
+                                ) {
+                                    command = Some(TabPanelCommand::MoveGroup {
+                                        group_id,
+                                        target_index: target.index,
+                                    });
+                                }
+                            },
                         }
-                    } else if let Some(PanelHit::Tab { tab_id }) = hit {
-                        if self.is_close_hit(position, &panel_size_info, tab_id)
-                            && self.hover.tab == Some(tab_id)
-                        {
-                            command = Some(TabPanelCommand::Close(tab_id));
-                        } else {
-                            command = Some(TabPanelCommand::Focus(tab_id));
+                    } else if let (DragItem::Tab(tab_id), Some(PanelHit::Tab { tab_id: hit_tab })) =
+                        (drag.item, hit)
+                    {
+                        if tab_id == hit_tab {
+                            if self.is_close_hit(position, &panel_size_info, tab_id)
+                                && self.hover.tab == Some(tab_id)
+                            {
+                                command = Some(TabPanelCommand::Close(tab_id));
+                            } else {
+                                command = Some(TabPanelCommand::Focus(tab_id));
+                            }
                         }
                     }
 
@@ -489,8 +527,10 @@ impl TabPanel {
             rects.push(RenderRect::new(0., y, self.width_px, line_height, bg, 1.));
         }
 
-        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
-            if self.find_tab(drag.tab_id).is_some() {
+        if let Some(DragState { item: DragItem::Tab(tab_id), dragging: true, .. }) =
+            self.drag.as_ref()
+        {
+            if self.find_tab(*tab_id).is_some() {
                 if let Some(position) = self.last_mouse_pos {
                     if let Some(line) = self.drag_ghost_line(position, &panel_size_info, &layout) {
                         let y = start_y + line as f32 * line_height;
@@ -541,8 +581,10 @@ impl TabPanel {
                 }
             }
 
-            if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
-                if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
+            if let Some(DragState { item: DragItem::Tab(tab_id), dragging: true, .. }) =
+                self.drag.as_ref()
+            {
+                if let Some((tab, _, _)) = self.find_tab(*tab_id) {
                     if let Some(favicon) = &tab.favicon {
                         let key =
                             GlyphKey { font_key, size: font_size, character: favicon.character };
@@ -708,8 +750,10 @@ impl TabPanel {
             }
         }
 
-        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
-            if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
+        if let Some(DragState { item: DragItem::Tab(tab_id), dragging: true, .. }) =
+            self.drag.as_ref()
+        {
+            if let Some((tab, _, _)) = self.find_tab(*tab_id) {
                 if let Some(position) = self.last_mouse_pos {
                     if let Some(line) = self.drag_ghost_line(position, &panel_size_info, &layout) {
                         let indent = TAB_INDENT_COLS;
@@ -874,15 +918,14 @@ impl TabPanel {
     }
 
     fn update_drop_target(&mut self, position: PhysicalPosition<f64>, size_info: &SizeInfo) -> bool {
-        let dragging = self.drag.as_ref().is_some_and(|drag| drag.dragging);
-        if !dragging {
+        let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) else {
             if self.drop_target.take().is_some() {
                 return true;
             }
             return false;
-        }
+        };
 
-        let next = self.compute_drop_target(position, size_info);
+        let next = self.compute_drop_target(position, size_info, &drag.item);
         if next != self.drop_target {
             self.drop_target = next;
             return true;
@@ -895,7 +938,23 @@ impl TabPanel {
         &self,
         position: PhysicalPosition<f64>,
         size_info: &SizeInfo,
+        drag_item: &DragItem,
     ) -> Option<DropTarget> {
+        match drag_item {
+            DragItem::Tab(_) => {
+                self.compute_tab_drop_target(position, size_info).map(DropTarget::Tab)
+            },
+            DragItem::Group { .. } => {
+                self.compute_group_drop_target(position, size_info).map(DropTarget::Group)
+            },
+        }
+    }
+
+    fn compute_tab_drop_target(
+        &self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+    ) -> Option<TabDropTarget> {
         if !self.is_inside_panel(position) {
             return None;
         }
@@ -942,7 +1001,7 @@ impl TabPanel {
                 } else {
                     visible_tabs
                 };
-                return Some(DropTarget {
+                return Some(TabDropTarget {
                     group_index,
                     group_id: group.id,
                     index,
@@ -953,6 +1012,53 @@ impl TabPanel {
         }
 
         None
+    }
+
+    fn compute_group_drop_target(
+        &self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+    ) -> Option<GroupDropTarget> {
+        if !self.is_inside_panel(position) {
+            return None;
+        }
+
+        let top = size_info.padding_y() as f64;
+        if position.y < top {
+            return None;
+        }
+
+        let max_lines = size_info.screen_lines();
+        if max_lines == 0 {
+            return None;
+        }
+
+        let line_height = size_info.cell_height() as f64;
+        let mut line = ((position.y - top) / line_height).floor() as isize;
+        line = line.clamp(0, (max_lines - 1) as isize);
+        let line = line as usize;
+
+        let layout = self.layout(size_info);
+        let mut headers = Vec::new();
+        for item in layout.items.iter() {
+            if let PanelItemKind::GroupHeader { group_index } = item.kind {
+                headers.push((item.line, group_index));
+            }
+        }
+
+        if headers.is_empty() {
+            return None;
+        }
+
+        let mut target_index = headers.len();
+        for (slot, (header_line, _)) in headers.iter().enumerate() {
+            if line <= *header_line {
+                target_index = slot;
+                break;
+            }
+        }
+
+        Some(GroupDropTarget { index: target_index })
     }
 
     fn hit_test(&self, position: PhysicalPosition<f64>, size_info: &SizeInfo) -> Option<PanelHit> {
@@ -1021,20 +1127,42 @@ impl TabPanel {
     }
 
     fn render_layout(&self, size_info: &SizeInfo) -> RenderLayout {
-        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) {
-            if let Some(target) = self.drop_target {
-                if let Some((tab, group_index, tab_index)) = self.find_tab(drag.tab_id) {
-                    return self.preview_layout(size_info, tab, group_index, tab_index, target);
-                }
-            }
+        if let Some(DragState { item, dragging: true, .. }) = self.drag.as_ref() {
+            match item {
+                DragItem::Tab(tab_id) => {
+                    if let Some(DropTarget::Tab(target)) = self.drop_target {
+                        if let Some((tab, group_index, tab_index)) = self.find_tab(*tab_id) {
+                            return self.preview_tab_layout(
+                                size_info,
+                                tab,
+                                group_index,
+                                tab_index,
+                                target,
+                            );
+                        }
+                    }
 
-            if self
-                .last_mouse_pos
-                .is_some_and(|position| self.is_inside_panel(position))
-            {
-                if let Some((tab, _, _)) = self.find_tab(drag.tab_id) {
-                    return self.preview_new_group_layout(size_info, tab);
-                }
+                    if self
+                        .last_mouse_pos
+                        .is_some_and(|position| self.is_inside_panel(position))
+                    {
+                        if let Some((tab, _, _)) = self.find_tab(*tab_id) {
+                            return self.preview_new_group_layout(size_info, tab);
+                        }
+                    }
+                },
+                DragItem::Group { group_id } => {
+                    if let Some(DropTarget::Group(target)) = self.drop_target {
+                        if let Some((group, drag_group_index)) = self.find_group(*group_id) {
+                            return self.preview_group_move_layout(
+                                size_info,
+                                group,
+                                drag_group_index,
+                                target,
+                            );
+                        }
+                    }
+                },
             }
         }
 
@@ -1052,13 +1180,13 @@ impl TabPanel {
         RenderLayout { items }
     }
 
-    fn preview_layout(
+    fn preview_tab_layout(
         &self,
         size_info: &SizeInfo,
         drag_tab: TabPanelTab,
         drag_group_index: usize,
         drag_tab_index: usize,
-        target: DropTarget,
+        target: TabDropTarget,
     ) -> RenderLayout {
         let mut items = Vec::new();
         let max_lines = size_info.screen_lines();
@@ -1142,6 +1270,125 @@ impl TabPanel {
             if line < max_lines {
                 line += 1;
             }
+        }
+
+        RenderLayout { items }
+    }
+
+    fn push_group_render_items(
+        &self,
+        items: &mut Vec<RenderItem>,
+        max_lines: usize,
+        line: &mut usize,
+        group_index: usize,
+        group: &TabPanelGroup,
+        style: RenderStyle,
+        ghost_label: Option<String>,
+    ) {
+        if *line >= max_lines {
+            return;
+        }
+
+        items.push(RenderItem {
+            line: *line,
+            kind: match style {
+                RenderStyle::Ghost => {
+                    if let Some(label) = ghost_label {
+                        PanelItemKind::GhostGroupHeader { label }
+                    } else {
+                        PanelItemKind::GroupHeader { group_index }
+                    }
+                },
+                RenderStyle::Normal => PanelItemKind::GroupHeader { group_index },
+            },
+            style,
+        });
+        *line += 1;
+
+        for tab in &group.tabs {
+            if *line >= max_lines {
+                break;
+            }
+
+            items.push(RenderItem {
+                line: *line,
+                kind: PanelItemKind::Tab { tab: tab.clone() },
+                style,
+            });
+            *line += 1;
+        }
+
+        if *line < max_lines {
+            *line += 1;
+        }
+    }
+
+    fn preview_group_move_layout(
+        &self,
+        size_info: &SizeInfo,
+        drag_group: TabPanelGroup,
+        drag_group_index: usize,
+        target: GroupDropTarget,
+    ) -> RenderLayout {
+        let mut items = Vec::new();
+        let max_lines = size_info.screen_lines();
+        let mut line = 0;
+
+        let effective_len = self.groups.len().saturating_sub(1);
+        let mut target_index = target.index.min(self.groups.len());
+        if target_index > drag_group_index {
+            target_index = target_index.saturating_sub(1);
+        }
+        target_index = target_index.min(effective_len);
+
+        let mut current_group_pos = 0;
+
+        for (group_index, group) in self.groups.iter().enumerate() {
+            if group_index == drag_group_index {
+                continue;
+            }
+
+            if line >= max_lines {
+                break;
+            }
+
+            if current_group_pos == target_index {
+                self.push_group_render_items(
+                    &mut items,
+                    max_lines,
+                    &mut line,
+                    drag_group_index,
+                    &drag_group,
+                    RenderStyle::Ghost,
+                    Some(drag_group.label.clone()),
+                );
+                if line >= max_lines {
+                    break;
+                }
+            }
+
+            self.push_group_render_items(
+                &mut items,
+                max_lines,
+                &mut line,
+                group_index,
+                group,
+                RenderStyle::Normal,
+                None,
+            );
+            current_group_pos += 1;
+        }
+
+        if line < max_lines && target_index >= current_group_pos {
+            self.push_group_render_items(
+                &mut items,
+                max_lines,
+                &mut line,
+                drag_group_index,
+                &drag_group,
+                RenderStyle::Ghost,
+                Some(drag_group.label.clone()),
+            );
         }
 
         RenderLayout { items }
@@ -1239,6 +1486,14 @@ impl TabPanel {
         }
 
         None
+    }
+
+    fn find_group(&self, group_id: usize) -> Option<(TabPanelGroup, usize)> {
+        self.groups
+            .iter()
+            .enumerate()
+            .find(|(_, group)| group.id == group_id)
+            .map(|(index, group)| (group.clone(), index))
     }
 
     fn drag_ghost_line(
@@ -1368,21 +1623,38 @@ impl HoverState {
 }
 
 struct DragState {
-    tab_id: TabId,
+    item: DragItem,
     start_pos: PhysicalPosition<f64>,
     dragging: bool,
 }
 
 impl DragState {
-    fn new(tab_id: TabId, start_pos: PhysicalPosition<f64>) -> Self {
-        Self { tab_id, start_pos, dragging: false }
+    fn new(item: DragItem, start_pos: PhysicalPosition<f64>) -> Self {
+        Self { item, start_pos, dragging: false }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct DropTarget {
+enum DragItem {
+    Tab(TabId),
+    Group { group_id: usize },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropTarget {
+    Tab(TabDropTarget),
+    Group(GroupDropTarget),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TabDropTarget {
     group_index: usize,
     group_id: usize,
+    index: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GroupDropTarget {
     index: usize,
 }
 

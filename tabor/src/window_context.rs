@@ -376,6 +376,24 @@ impl TabManager {
         true
     }
 
+    fn move_group(&mut self, group_id: usize, target_index: usize) -> bool {
+        let Some(from_index) = self.groups.iter().position(|group| group.id == group_id) else {
+            return false;
+        };
+
+        let target_index = target_index.min(self.groups.len());
+        let insert_index =
+            if target_index > from_index { target_index.saturating_sub(1) } else { target_index };
+
+        if insert_index == from_index {
+            return false;
+        }
+
+        let group = self.groups.remove(from_index);
+        self.groups.insert(insert_index, group);
+        true
+    }
+
     fn ordered_tabs(&self) -> Vec<TabId> {
         self.groups
             .iter()
@@ -750,7 +768,7 @@ impl WindowContext {
             WindowKind::Terminal => config.window.identity.title.clone(),
             WindowKind::Web { url } => {
                 if url.is_empty() {
-                    String::from("Web")
+                    String::from("Browser")
                 } else {
                     url.clone()
                 }
@@ -2361,16 +2379,11 @@ impl WindowContext {
 
         match draw_mode(&tab.kind) {
             DrawMode::Web => {
-                #[cfg(target_os = "macos")]
-                let status_label = tab.web_command_state.status_label();
-                #[cfg(not(target_os = "macos"))]
-                let status_label = "NORMAL";
                 self.display.draw_web(
                     scheduler,
                     &self.message_buffer,
                     &self.config,
                     &tab.command_state,
-                    status_label,
                 );
             },
             DrawMode::Terminal => {
@@ -2655,6 +2668,11 @@ impl WindowContext {
                             target_index,
                         } => {
                             if self.tabs.move_tab(tab_id, target_group_id, target_index) {
+                                self.refresh_tab_panel();
+                            }
+                        },
+                        crate::tab_panel::TabPanelCommand::MoveGroup { group_id, target_index } => {
+                            if self.tabs.move_group(group_id, target_index) {
                                 self.refresh_tab_panel();
                             }
                         },

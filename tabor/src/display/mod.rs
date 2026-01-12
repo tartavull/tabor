@@ -1194,7 +1194,6 @@ impl Display {
         message_buffer: &MessageBuffer,
         config: &UiConfig,
         command_state: &CommandState,
-        status_label: &str,
     ) {
         let size_info = self.size_info;
         let metrics = self.glyph_cache.font_metrics();
@@ -1259,10 +1258,6 @@ impl Display {
             }
         }
 
-        let status_text = Self::format_footer(&format!("-- {status_label} --"), size_info.columns());
-        let status_line = size_info.screen_lines() + message_lines;
-        let status_text = format!("{status_text:<num_cols$}", num_cols = size_info.columns());
-
         if let Some(message) = message_buffer.message() {
             let text = message.text(&size_info);
 
@@ -1301,36 +1296,11 @@ impl Display {
                     glyph_cache,
                 );
             }
-
-            let point = Point::new(status_line, Column(0));
-            let fg = config.colors.footer_bar_foreground();
-            let bg = config.colors.footer_bar_background();
-            self.renderer.draw_string(
-                point,
-                fg,
-                bg,
-                status_text.chars(),
-                &size_info,
-                glyph_cache,
-            );
         } else {
             self.renderer.draw_rects(&size_info, &metrics, rects);
 
             #[cfg(target_os = "macos")]
             self.tab_panel.draw_text(&size_info, config, &mut self.renderer, &mut self.glyph_cache);
-
-            let glyph_cache = &mut self.glyph_cache;
-            let point = Point::new(status_line, Column(0));
-            let fg = config.colors.footer_bar_foreground();
-            let bg = config.colors.footer_bar_background();
-            self.renderer.draw_string(
-                point,
-                fg,
-                bg,
-                status_text.chars(),
-                &size_info,
-                glyph_cache,
-            );
         }
 
         self.draw_render_timer(config);
@@ -1603,15 +1573,6 @@ impl Display {
         // Add place for cursor.
         bar_text.push(' ');
         bar_text
-    }
-
-    /// Format status footer to account for available width.
-    fn format_footer(text: &str, max_width: usize) -> String {
-        if max_width == 0 {
-            return String::new();
-        }
-
-        StrShortener::new(text, max_width, ShortenDirection::Right, Some(SHORTENER)).collect()
     }
 
     /// Draw preview for the currently highlighted `Hyperlink`.

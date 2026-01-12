@@ -119,6 +119,10 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn web_mouse_input(&mut self, _state: ElementState, _button: MouseButton) {}
     #[cfg(target_os = "macos")]
+    fn web_copy_selection(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn web_paste_text(&mut self, _text: &str) {}
+    #[cfg(target_os = "macos")]
     fn select_next_tab(&mut self) {}
     #[cfg(target_os = "macos")]
     fn select_previous_tab(&mut self) {}
@@ -352,12 +356,25 @@ impl<T: EventListener> Execute<T> for Action {
             Action::Mouse(MouseAction::ExpandSelection) => ctx.expand_selection(),
             Action::SearchForward => ctx.start_search(Direction::Right),
             Action::SearchBackward => ctx.start_search(Direction::Left),
-            Action::Copy => ctx.copy_selection(ClipboardType::Clipboard),
+            Action::Copy => {
+                #[cfg(target_os = "macos")]
+                if ctx.window_kind().is_web() {
+                    ctx.web_copy_selection();
+                    return;
+                }
+
+                ctx.copy_selection(ClipboardType::Clipboard);
+            },
             #[cfg(not(any(target_os = "macos", windows)))]
             Action::CopySelection => ctx.copy_selection(ClipboardType::Selection),
             Action::ClearSelection => ctx.clear_selection(),
             Action::Paste => {
                 let text = ctx.clipboard_mut().load(ClipboardType::Clipboard);
+                #[cfg(target_os = "macos")]
+                if ctx.window_kind().is_web() {
+                    ctx.web_paste_text(&text);
+                    return;
+                }
                 ctx.paste(&text, true);
             },
             Action::PasteSelection => {

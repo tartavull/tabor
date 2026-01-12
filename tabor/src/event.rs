@@ -2083,10 +2083,9 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 self.cancel_search();
             }
             #[cfg(target_os = "macos")]
-            if self.tab_kind.is_web() {
-                let url = normalize_web_url("chat.com");
+            if self.modifiers.state().super_key() {
                 let mut options = WindowOptions::default();
-                options.window_kind = WindowKind::Web { url: url.clone() };
+                options.window_kind = WindowKind::Web { url: String::new() };
                 options.command_input = Some(String::from("o "));
                 #[cfg(not(windows))]
                 {
@@ -2095,7 +2094,6 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 }
 
                 let event = Event::new(EventType::CreateTab(options), self.display.window.id());
-                self.command_history.record_url(url);
                 let _ = self.event_proxy.send_event(event);
                 return;
             }
@@ -2543,6 +2541,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             return false;
         }
 
+        // Allow Shift+Enter to reach the page unchanged (used for newlines in chat inputs).
+        if self.modifiers().state().shift_key()
+            && matches!(key.logical_key.as_ref(), Key::Named(NamedKey::Enter))
+        {
+            return false;
+        }
+
         let web_key = web_key_from_event(key);
         self.with_web_command_state(|state, ctx| {
             let before = state.status_label();
@@ -2576,6 +2581,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             button,
             modifiers,
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_copy_selection(&mut self) {
+        ActionContext::web_copy_selection(self);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_paste_text(&mut self, text: &str) {
+        let script =
+            format!("document.execCommand('insertText', false, {});", Self::js_string(text));
+        self.web_exec_js(&script);
     }
 }
 
@@ -3162,7 +3179,23 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let proxy = self.event_proxy.clone();
         let window_id = self.display.window.id();
         let tab_id = self.tab_id;
-        self.web_eval_js_string("window.getSelection().toString()", move |result| {
+        let script = r#"(function() {
+  const active = document.activeElement;
+  if (active) {
+    const tag = active.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") {
+      const value = active.value;
+      const start = active.selectionStart;
+      const end = active.selectionEnd;
+      if (typeof value === "string" && typeof start === "number" && typeof end === "number" && start !== end) {
+        return value.substring(start, end);
+      }
+    }
+  }
+  const sel = window.getSelection();
+  return sel ? sel.toString() : "";
+})();"#;
+        self.web_eval_js_string(script, move |result| {
             let Some(text) = result.filter(|text| !text.is_empty()) else {
                 return;
             };

@@ -36,7 +36,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return;
         }
 
-        let text = key.text_with_all_modifiers().unwrap_or_default();
+        let mut text = key.text_with_all_modifiers().unwrap_or_default();
+        if matches!(text.as_ref(), "\n" | "\r") {
+            text = "\r".into();
+        }
 
         // All key bindings are disabled while a hint is being selected.
         if self.ctx.display().hint_state.active() {
@@ -133,6 +136,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 self.ctx.command_input('\x7f');
                 return;
             },
+            Key::Named(NamedKey::Delete) => {
+                self.ctx.command_input('\x7f');
+                return;
+            },
             _ => (),
         }
 
@@ -209,6 +216,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return true;
         }
 
+        let is_newline_text = matches!(text, "\n" | "\r");
         let disambiguate = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
             && (key.logical_key == Key::Named(NamedKey::Escape)
                 || key.location == KeyLocation::Numpad
@@ -219,7 +227,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                             Key::Named(NamedKey::Tab)
                                 | Key::Named(NamedKey::Enter)
                                 | Key::Named(NamedKey::Backspace)
-                        ))));
+                        )
+                        || is_newline_text)));
 
         match key.logical_key {
             _ if disambiguate => true,
@@ -243,23 +252,28 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         // We don't want the key without modifier, because it means something else most of
         // the time. However what we want is to manually lowercase the character to account
         // for both small and capital letters on regular characters at the same time.
-        let logical_key = if let Key::Character(ch) = key.logical_key.as_ref() {
-            // Match `Alt` bindings without `Alt` being applied, otherwise they use the
-            // composed chars, which are not intuitive to bind.
-            //
-            // On Windows, the `Ctrl + Alt` mangles `logical_key` to unidentified values, thus
-            // preventing them from being used in bindings
-            //
-            // For more see https://github.com/rust-windowing/winit/issues/2945.
-            if (cfg!(target_os = "macos") || (cfg!(windows) && mods.control_key()))
-                && mods.alt_key()
-            {
-                key.key_without_modifiers()
-            } else {
-                Key::Character(ch.to_lowercase().into())
-            }
-        } else {
-            key.logical_key.clone()
+        let logical_key = match key.logical_key.as_ref() {
+            Key::Named(NamedKey::Copy) => Key::Character("c".into()),
+            Key::Named(NamedKey::Paste) => Key::Character("v".into()),
+            Key::Named(NamedKey::Cut) => Key::Character("x".into()),
+            Key::Character(ch) if ch == "\r" || ch == "\n" => Key::Named(NamedKey::Enter),
+            Key::Character(ch) => {
+                // Match `Alt` bindings without `Alt` being applied, otherwise they use the
+                // composed chars, which are not intuitive to bind.
+                //
+                // On Windows, the `Ctrl + Alt` mangles `logical_key` to unidentified values, thus
+                // preventing them from being used in bindings
+                //
+                // For more see https://github.com/rust-windowing/winit/issues/2945.
+                if (cfg!(target_os = "macos") || (cfg!(windows) && mods.control_key()))
+                    && mods.alt_key()
+                {
+                    key.key_without_modifiers()
+                } else {
+                    Key::Character(ch.to_lowercase().into())
+                }
+            },
+            _ => key.logical_key.clone(),
         };
 
         // Get the action of a key binding.

@@ -347,10 +347,17 @@ mod smoke {
                 },
             };
 
+            let probe_script = |x: f64, y: f64| {
+                format!(
+                    "{};{}",
+                    web_cursor::WEB_CURSOR_BOOTSTRAP,
+                    web_cursor::web_cursor_script(x, y)
+                )
+            };
             self.probes = vec![
-                CursorProbe::new("link", web_cursor::web_cursor_script(30.0, 30.0), CursorIcon::Pointer),
-                CursorProbe::new("input", web_cursor::web_cursor_script(30.0, 70.0), CursorIcon::Text),
-                CursorProbe::new("plain", web_cursor::web_cursor_script(30.0, 110.0), CursorIcon::Default),
+                CursorProbe::new("link", probe_script(30.0, 30.0), CursorIcon::Pointer),
+                CursorProbe::new("input", probe_script(30.0, 70.0), CursorIcon::Text),
+                CursorProbe::new("plain", probe_script(30.0, 110.0), CursorIcon::Default),
             ];
             self.started_at = Instant::now();
             self.window = Some(window);

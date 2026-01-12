@@ -86,6 +86,10 @@ pub enum TabPanelCommand {
         target_group_id: Option<usize>,
         target_index: Option<usize>,
     },
+    MoveGroup {
+        group_id: usize,
+        target_index: usize,
+    },
     RenameTab(TabId),
     RenameGroup(usize),
 }

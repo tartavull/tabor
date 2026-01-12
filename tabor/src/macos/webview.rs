@@ -487,7 +487,7 @@ fn enable_web_inspector(config: &AnyObject) -> Result<(), Box<dyn Error>> {
     let enabled = NSNumber::numberWithBool(true);
     let key = NSString::from_str("developerExtrasEnabled");
     unsafe {
-        let _: () = msg_send![prefs, setValue: &*enabled forKey: &*key];
+        let _: () = msg_send![prefs, setValue: &*enabled, forKey: &*key];
     }
 
     Ok(())
