@@ -46,10 +46,11 @@
             python3
             gnumake
             (writeShellScriptBin "run" ''
+              set -euo pipefail
               if [ -x "$HOME/.nix-profile/bin/zsh" ]; then
                 export SHELL="$HOME/.nix-profile/bin/zsh"
               fi
-              exec cargo run -p tabor --bin tabor
+              exec "$PWD/scripts/run.sh" "$@"
             '')
           ] ++ darwinLibraries ++ linuxLibraries;
 

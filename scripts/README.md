@@ -31,8 +31,8 @@ Runs a popup smoke test using IPC to verify `window.open` creates a new web tab
 and `window.opener.postMessage` reaches the opener. The popup is created from
 `about:blank` with a `link[rel="icon"]` so the script also checks that a favicon
 request hits the local HTTP server. Requires macOS and `python3`. If
-`./target/debug/tabor` exists it is used automatically, otherwise `tabor` is
-resolved from `PATH`.
+`./scripts/run.sh` is available it is used automatically. Set `TABOR_BIN` to
+override.
 
 ```sh
 ./web-popup-smoke.sh

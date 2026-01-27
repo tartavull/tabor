@@ -19,7 +19,6 @@ APP_BINARY = $(RELEASE_DIR)/$(TARGET)
 APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
 APP_EXTRAS_DIR = $(APP_DIR)/$(APP_NAME)/Contents/Resources
 APP_COMPLETIONS_DIR = $(APP_EXTRAS_DIR)/completions
-CODESIGN_ENTITLEMENTS ?=
 
 DMG_NAME = Tabor.dmg
 DMG_DIR = $(RELEASE_DIR)/osx
@@ -35,6 +34,8 @@ help: ## Print this help message
 
 binary: $(TARGET)-native ## Build a release binary
 binary-universal: $(TARGET)-universal ## Build a universal release binary
+app: $(APP_NAME)-native ## Create an Tabor.app
+app-universal: $(APP_NAME)-universal ## Create a universal Tabor.app
 $(TARGET)-native:
 	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release
 $(TARGET)-universal:
@@ -42,8 +43,6 @@ $(TARGET)-universal:
 	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release --target=aarch64-apple-darwin
 	@lipo target/{x86_64,aarch64}-apple-darwin/release/$(TARGET) -create -output $(APP_BINARY)
 
-app: $(APP_NAME)-native ## Create an Tabor.app
-app-universal: $(APP_NAME)-universal ## Create a universal Tabor.app
 $(APP_NAME)-%: $(TARGET)-%
 	@mkdir -p $(APP_BINARY_DIR)
 	@mkdir -p $(APP_EXTRAS_DIR)
@@ -57,8 +56,6 @@ $(APP_NAME)-%: $(TARGET)-%
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
 	@cp -fp $(COMPLETIONS) $(APP_COMPLETIONS_DIR)
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
-	@codesign --remove-signature "$(APP_DIR)/$(APP_NAME)"
-	@codesign --force --deep --sign - $(if $(CODESIGN_ENTITLEMENTS),--entitlements "$(CODESIGN_ENTITLEMENTS)") "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 
 dmg: $(DMG_NAME)-native ## Create an Tabor.dmg
@@ -78,7 +75,7 @@ install-universal: $(INSTALL)-native ## Mount universal disk image
 $(INSTALL)-%: $(DMG_NAME)-%
 	@open $(DMG_DIR)/$(DMG_NAME)
 
-.PHONY: app binary clean dmg install $(TARGET) $(TARGET)-universal
+.PHONY: app app-universal binary clean dmg install $(TARGET) $(TARGET)-universal
 
 clean: ## Remove all build artifacts
 	@cargo clean

@@ -2,7 +2,9 @@
 set -euo pipefail
 
 if [[ -z "${TABOR_BIN:-}" ]]; then
-  if [[ -x "./target/debug/tabor" ]]; then
+  if [[ "$(uname)" == "Darwin" ]]; then
+    TABOR_BIN="./scripts/run.sh"
+  elif [[ -x "./target/debug/tabor" ]]; then
     TABOR_BIN="./target/debug/tabor"
   else
     TABOR_BIN="tabor"
