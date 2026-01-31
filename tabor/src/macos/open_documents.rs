@@ -1,180 +1,206 @@
 use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+use std::fmt::Write;
+use std::mem;
+use std::sync::Once;
 
-use objc2::ffi::NSUInteger;
+use objc2::encode::{Encode, Encoding};
+use objc2::ffi;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, ProtocolObject};
-use objc2::{class, define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSApplicationDelegate, NSApplicationDelegateReply};
-use objc2_foundation::{NSObjectProtocol, NSString};
+use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+use objc2::{MainThreadMarker, sel};
+use objc2_app_kit::{NSApplication, NSApplicationDelegateReply};
+use objc2_foundation::{NSArray, NSString, NSURL};
 use winit::event_loop::EventLoopProxy;
 
 use crate::event::{Event, EventType};
 
-struct OpenDocumentsDelegateIvars {
-    proxy: EventLoopProxy<Event>,
-    forward: Retained<ProtocolObject<dyn NSApplicationDelegate>>,
-}
-
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = OpenDocumentsDelegateIvars]
-    struct OpenDocumentsDelegate;
-
-    impl OpenDocumentsDelegate {
-        #[unsafe(method(applicationDidFinishLaunching:))]
-        fn application_did_finish_launching(&self, notification: *mut AnyObject) {
-            let forward = &self.ivars().forward;
-            unsafe {
-                let _: () = msg_send![&**forward, applicationDidFinishLaunching: notification];
-            }
-        }
-
-        #[unsafe(method(applicationWillTerminate:))]
-        fn application_will_terminate(&self, notification: *mut AnyObject) {
-            let forward = &self.ivars().forward;
-            unsafe {
-                let _: () = msg_send![&**forward, applicationWillTerminate: notification];
-            }
-        }
-
-        #[unsafe(method(application:openFiles:))]
-        fn application_open_files(&self, app: *mut AnyObject, files: *mut AnyObject) {
-            let urls = urls_from_file_list(files);
-            self.send_open_urls(urls);
-            unsafe {
-                let _: () =
-                    msg_send![app, replyToOpenOrPrint: NSApplicationDelegateReply::Success];
-            }
-        }
-
-        #[unsafe(method(application:openFile:))]
-        fn application_open_file(&self, _app: *mut AnyObject, filename: *mut AnyObject) -> bool {
-            if filename.is_null() {
-                return false.into();
-            }
-
-            let urls = url_from_file_string(filename);
-            self.send_open_urls(urls);
-            true.into()
-        }
-
-        #[unsafe(method(application:openURLs:))]
-        fn application_open_urls(&self, _app: *mut AnyObject, urls: *mut AnyObject) {
-            let urls = urls_from_url_list(urls);
-            self.send_open_urls(urls);
-        }
-    }
-);
-
-unsafe impl NSObjectProtocol for OpenDocumentsDelegate {}
-unsafe impl NSApplicationDelegate for OpenDocumentsDelegate {}
-
 thread_local! {
-    static OPEN_DOCUMENTS_DELEGATE: RefCell<Option<Retained<OpenDocumentsDelegate>>> = RefCell::new(None);
+    static OPEN_DOCUMENTS_PROXY: RefCell<Option<EventLoopProxy<Event>>> = RefCell::new(None);
 }
 
-impl OpenDocumentsDelegate {
-    fn new(
-        proxy: EventLoopProxy<Event>,
-        forward: Retained<ProtocolObject<dyn NSApplicationDelegate>>,
-        mtm: MainThreadMarker,
-    ) -> Retained<Self> {
-        let this = OpenDocumentsDelegate::alloc(mtm)
-            .set_ivars(OpenDocumentsDelegateIvars { proxy, forward });
-        unsafe { msg_send![super(this), init] }
+fn dispatch_open_urls(urls: Vec<String>) {
+    if urls.is_empty() {
+        return;
     }
 
-    fn send_open_urls(&self, urls: Vec<String>) {
-        if urls.is_empty() {
-            return;
+    OPEN_DOCUMENTS_PROXY.with(|cell| {
+        if let Some(proxy) = cell.borrow().as_ref() {
+            let _ = proxy.send_event(Event::new(EventType::OpenUrls(urls), None));
         }
-
-        let _ = self
-            .ivars()
-            .proxy
-            .send_event(Event::new(EventType::OpenUrls(urls), None));
-    }
+    });
 }
 
-fn urls_from_url_list(urls: *mut AnyObject) -> Vec<String> {
-    if urls.is_null() {
-        return Vec::new();
-    }
+unsafe extern "C-unwind" fn application_open_urls(
+    _this: &AnyObject,
+    _sel: Sel,
+    _application: &NSApplication,
+    urls: &NSArray<NSURL>,
+) {
+    let urls = collect_urls_from_nsurls(urls);
+    dispatch_open_urls(urls);
+}
 
-    let count: NSUInteger = unsafe { msg_send![urls, count] };
-    let mut entries = Vec::new();
+unsafe extern "C-unwind" fn application_open_file(
+    _this: &AnyObject,
+    _sel: Sel,
+    _application: &NSApplication,
+    filename: &NSString,
+) -> Bool {
+    let Some(url) = url_from_path(filename) else {
+        return Bool::NO;
+    };
+
+    dispatch_open_urls(vec![url]);
+    Bool::YES
+}
+
+unsafe extern "C-unwind" fn application_open_files(
+    _this: &AnyObject,
+    _sel: Sel,
+    application: &NSApplication,
+    filenames: &NSArray<NSString>,
+) {
+    let urls = collect_urls_from_paths(filenames);
+    dispatch_open_urls(urls);
+
+    application.replyToOpenOrPrint(NSApplicationDelegateReply::Success);
+}
+
+fn open_documents_delegate_class(superclass: &AnyClass) -> &'static AnyClass {
+    static REGISTER: Once = Once::new();
+    static mut CLASS: *const AnyClass = std::ptr::null();
+
+    REGISTER.call_once(|| {
+        let name = delegate_class_name();
+        let cls = if let Some(existing) = AnyClass::get(name) {
+            existing
+        } else {
+            let super_ptr = superclass as *const AnyClass;
+            let cls = unsafe { ffi::objc_allocateClassPair(super_ptr, name.as_ptr(), 0) };
+            let cls = std::ptr::NonNull::new(cls)
+                .expect("failed to allocate open documents delegate class");
+
+            unsafe {
+                add_method_raw(
+                    cls.as_ptr(),
+                    sel!(application:openURLs:),
+                    mem::transmute::<
+                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &NSApplication, &NSArray<NSURL>),
+                        Imp,
+                    >(application_open_urls),
+                    Encoding::Void,
+                    &[Encoding::Object, Encoding::Object],
+                );
+                add_method_raw(
+                    cls.as_ptr(),
+                    sel!(application:openFile:),
+                    mem::transmute::<
+                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &NSApplication, &NSString) -> Bool,
+                        Imp,
+                    >(application_open_file),
+                    Bool::ENCODING,
+                    &[Encoding::Object, Encoding::Object],
+                );
+                add_method_raw(
+                    cls.as_ptr(),
+                    sel!(application:openFiles:),
+                    mem::transmute::<
+                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &NSApplication, &NSArray<NSString>),
+                        Imp,
+                    >(application_open_files),
+                    Encoding::Void,
+                    &[Encoding::Object, Encoding::Object],
+                );
+
+                ffi::objc_registerClassPair(cls.as_ptr());
+            }
+
+            unsafe { cls.as_ref() }
+        };
+
+        unsafe {
+            CLASS = cls as *const AnyClass;
+        }
+    });
+
+    unsafe { &*CLASS }
+}
+
+fn delegate_class_name() -> &'static CStr {
+    CStr::from_bytes_with_nul(b"TaborOpenDocumentsDelegate\0").expect("static class name")
+}
+
+unsafe fn add_method_raw(
+    cls: *mut AnyClass,
+    selector: Sel,
+    imp: Imp,
+    ret: Encoding,
+    args: &[Encoding],
+) {
+    let encoding = method_type_encoding(ret, args);
+    let success = unsafe { ffi::class_addMethod(cls, selector, imp, encoding.as_ptr()) };
+    assert!(success.as_bool(), "failed to add open documents method");
+}
+
+fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
+    let mut types = format!("{ret}{}{}", Encoding::Object, Encoding::Sel);
+    for enc in args {
+        let _ = write!(&mut types, "{enc}");
+    }
+    CString::new(types).expect("method type encoding")
+}
+
+fn url_from_path(path: &NSString) -> Option<String> {
+    let url = NSURL::fileURLWithPath(path);
+    url.absoluteString().map(|url| url.to_string())
+}
+
+fn collect_urls_from_paths(paths: &NSArray<NSString>) -> Vec<String> {
+    let mut urls = Vec::new();
+    let count = paths.count();
     for index in 0..count {
-        let item: *mut AnyObject = unsafe { msg_send![urls, objectAtIndex: index] };
-        if item.is_null() {
-            continue;
+        let path = paths.objectAtIndex(index);
+        if let Some(url) = url_from_path(&path) {
+            urls.push(url);
         }
-
-        let absolute: *mut AnyObject = unsafe { msg_send![item, absoluteString] };
-        if absolute.is_null() {
-            continue;
-        }
-
-        let url = unsafe { &*(absolute as *const NSString) }.to_string();
-        entries.push(url);
     }
-
-    entries
+    urls
 }
 
-fn urls_from_file_list(files: *mut AnyObject) -> Vec<String> {
-    if files.is_null() {
-        return Vec::new();
-    }
-
-    let count: NSUInteger = unsafe { msg_send![files, count] };
-    let mut entries = Vec::new();
+fn collect_urls_from_nsurls(urls: &NSArray<NSURL>) -> Vec<String> {
+    let mut out = Vec::new();
+    let count = urls.count();
     for index in 0..count {
-        let item: *mut AnyObject = unsafe { msg_send![files, objectAtIndex: index] };
-        if item.is_null() {
-            continue;
+        let url = urls.objectAtIndex(index);
+        if let Some(value) = url.absoluteString() {
+            out.push(value.to_string());
         }
-
-        entries.extend(url_from_file_string(item));
     }
-
-    entries
-}
-
-fn url_from_file_string(filename: *mut AnyObject) -> Vec<String> {
-    if filename.is_null() {
-        return Vec::new();
-    }
-
-    let path = unsafe { &*(filename as *const NSString) };
-    let ns_url: *mut AnyObject = unsafe { msg_send![class!(NSURL), fileURLWithPath: path] };
-    if ns_url.is_null() {
-        return Vec::new();
-    }
-
-    let absolute: *mut AnyObject = unsafe { msg_send![ns_url, absoluteString] };
-    if absolute.is_null() {
-        return Vec::new();
-    }
-
-    vec![unsafe { &*(absolute as *const NSString) }.to_string()]
+    out
 }
 
 pub(crate) fn register_open_documents_handler(proxy: EventLoopProxy<Event>) {
     let mtm = MainThreadMarker::new().expect("open document handler must be on the main thread");
     let app = NSApplication::sharedApplication(mtm);
+    let delegate = app
+        .delegate()
+        .expect("open document handler requires an application delegate");
+    let delegate_obj = unsafe { &*(Retained::as_ptr(&delegate) as *const AnyObject) };
 
-    OPEN_DOCUMENTS_DELEGATE.with(|cell| {
-        if cell.borrow().is_some() {
-            return;
-        }
-
-        let Some(forward) = app.delegate() else {
-            return;
-        };
-
-        let delegate = OpenDocumentsDelegate::new(proxy, forward, mtm);
-        app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-        *cell.borrow_mut() = Some(delegate);
+    OPEN_DOCUMENTS_PROXY.with(|cell| {
+        *cell.borrow_mut() = Some(proxy);
     });
+
+    let current_class = delegate_obj.class();
+    if current_class.name() == delegate_class_name() {
+        return;
+    }
+
+    let subclass = open_documents_delegate_class(current_class);
+    unsafe {
+        let old_class = AnyObject::set_class(delegate_obj, subclass);
+        debug_assert_eq!(old_class, current_class);
+    }
+    app.setDelegate(Some(&*delegate));
 }

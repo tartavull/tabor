@@ -58,6 +58,8 @@ png = { version = "0.17.5", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
+base64 = "0.22.1"
+cef = { version = "144.2.0+144.0.11", default-features = false }
 image = { version = "0.25.2", default-features = false, features = ["png", "ico", "jpeg", "gif", "bmp"] }
 objc2 = "0.6.1"
 objc2-foundation = { version = "0.3.1", default-features = false, features = [
@@ -65,6 +67,7 @@ objc2-foundation = { version = "0.3.1", default-features = false, features = [
     "NSGeometry",
     "NSString",
     "NSLocale",
+    "NSProcessInfo",
     "NSUserDefaults",
     "NSValue",
 ] }
@@ -74,7 +77,9 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "NSColorSpace",
     "NSEvent",
     "NSGraphicsContext",
+    "NSApplication",
     "NSResponder",
+    "NSRunningApplication",
     "NSView",
     "NSWindow",
 ] }

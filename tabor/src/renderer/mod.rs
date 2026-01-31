@@ -238,11 +238,7 @@ impl Renderer {
     }
 
     /// Update text projection with a pixel offset without changing the viewport.
-    pub fn set_text_projection_with_offset(
-        &mut self,
-        size_info: &SizeInfo,
-        offset: (f32, f32),
-    ) {
+    pub fn set_text_projection_with_offset(&mut self, size_info: &SizeInfo, offset: (f32, f32)) {
         match &mut self.text_renderer {
             TextRendererProvider::Gles2(renderer) => {
                 renderer.set_projection_with_offset(size_info, offset)

@@ -512,7 +512,12 @@ pub fn handle_key(
     true
 }
 
-pub fn find(state: &mut WebCommandState, actions: &mut impl WebActions, query: &str, backwards: bool) {
+pub fn find(
+    state: &mut WebCommandState,
+    actions: &mut impl WebActions,
+    query: &str,
+    backwards: bool,
+) {
     actions.find(query, backwards);
     state.last_find = Some(query.to_string());
     state.last_find_backward = backwards;
@@ -644,11 +649,7 @@ fn start_hints(state: &mut WebCommandState, actions: &mut impl WebActions, actio
     actions.hints_start(action);
 }
 
-fn handle_mark_set(
-    state: &mut WebCommandState,
-    actions: &mut impl WebActions,
-    text: &str,
-) -> bool {
+fn handle_mark_set(state: &mut WebCommandState, actions: &mut impl WebActions, text: &str) -> bool {
     let Some(name) = single_char(text) else {
         return true;
     };
@@ -692,11 +693,7 @@ fn handle_mark_jump(
     true
 }
 
-fn handle_visual(
-    state: &mut WebCommandState,
-    actions: &mut impl WebActions,
-    text: &str,
-) -> bool {
+fn handle_visual(state: &mut WebCommandState, actions: &mut impl WebActions, text: &str) -> bool {
     let Some(ch) = single_char(text) else {
         return true;
     };
@@ -732,11 +729,7 @@ fn handle_visual(
     true
 }
 
-fn toggle_visual(
-    state: &mut WebCommandState,
-    actions: &mut impl WebActions,
-    line_mode: bool,
-) {
+fn toggle_visual(state: &mut WebCommandState, actions: &mut impl WebActions, line_mode: bool) {
     let target = if line_mode { WebMode::VisualLine } else { WebMode::Visual };
     if state.mode == target {
         actions.clear_selection();

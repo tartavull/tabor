@@ -131,8 +131,11 @@ impl EventHandler {
                 tracing::error!("tried to run event handler, but no handler was set");
             },
             Err(_) => {
-                // Prevent re-entrancy.
-                panic!("tried to handle event while another event is currently being handled");
+                // Prevent re-entrancy. Drop the event instead of panicking since some callbacks
+                // can arrive re-entrantly (e.g. external pumps) in our embedding.
+                tracing::error!(
+                    "tried to handle event while another event is currently being handled"
+                );
             },
         }
     }

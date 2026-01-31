@@ -5,14 +5,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use block2::RcBlock;
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool};
-use objc2::{msg_send, sel, MainThreadMarker};
-use objc2_foundation::{NSDictionary, NSString, NSUserDefaults, ns_string};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ProtocolObject};
+use objc2::{MainThreadMarker, msg_send, sel};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_foundation::{
+    NSDictionary, NSActivityOptions, NSProcessInfo, NSObjectProtocol, NSString, NSUserDefaults,
+    ns_string,
+};
 
 #[link(name = "AuthenticationServices", kind = "framework")]
 unsafe extern "C" {}
 
 pub mod favicon;
+pub mod cef;
 pub mod locale;
 pub mod open_documents;
 pub mod proc;
@@ -20,14 +25,17 @@ pub mod remote_inspector;
 pub mod web_commands;
 pub mod web_cursor;
 pub mod webview;
+mod webview_cef;
+mod webview_webkit;
 
 pub(crate) use open_documents::register_open_documents_handler;
 
 static WEBVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PASSKEY_AUTH_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 thread_local! {
     static PASSKEY_AUTH_BLOCK: RefCell<Option<RcBlock<dyn Fn(NSInteger)>>> = RefCell::new(None);
+    static APP_NAP_ACTIVITY: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>> =
+        RefCell::new(None);
 }
 
 pub fn disable_autofill() {
@@ -41,6 +49,40 @@ pub fn disable_autofill() {
     }
     NSUserDefaults::standardUserDefaults()
         .removeObjectForKey(ns_string!("NSAutoFillHeuristicControllerEnabled"));
+}
+
+pub fn disable_app_nap() {
+    let _mtm = match MainThreadMarker::new() {
+        Some(mtm) => mtm,
+        None => return,
+    };
+
+    APP_NAP_ACTIVITY.with(|cell| {
+        if cell.borrow().is_some() {
+            return;
+        }
+
+        let process_info = NSProcessInfo::processInfo();
+        let reason = NSString::from_str("Tabor background activity");
+        let activity = process_info.beginActivityWithOptions_reason(
+            NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+            &reason,
+        );
+        *cell.borrow_mut() = Some(activity);
+    });
+}
+
+pub fn set_background_activation() {
+    if std::env::var("TABOR_BACKGROUND").is_err() {
+        return;
+    }
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
 
 pub(crate) fn register_webview() {
@@ -82,10 +124,9 @@ fn request_passkey_authorization() {
         None => return,
     };
 
-    let class_name = CStr::from_bytes_with_nul(
-        b"ASAuthorizationWebBrowserPublicKeyCredentialManager\0",
-    )
-    .expect("static CStr");
+    let class_name =
+        CStr::from_bytes_with_nul(b"ASAuthorizationWebBrowserPublicKeyCredentialManager\0")
+            .expect("static CStr");
     let Some(manager_class) = AnyClass::get(class_name) else {
         return;
     };

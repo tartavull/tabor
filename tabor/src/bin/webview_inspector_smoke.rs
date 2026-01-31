@@ -9,7 +9,7 @@ mod smoke {
     use objc2::encode::{Encode, Encoding};
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send, MainThreadMarker};
+    use objc2::{MainThreadMarker, class, msg_send};
     use objc2_foundation::{NSNumber, NSString};
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
@@ -112,10 +112,7 @@ mod smoke {
                 let _: () = msg_send![parent, addSubview: &*view];
             }
 
-            let mut web_view = Self {
-                view,
-                last_title: None,
-            };
+            let mut web_view = Self { view, last_title: None };
             if !web_view.load_url(url) {
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, "Invalid URL").into());
             }
@@ -229,10 +226,7 @@ mod smoke {
         let width = (size.width as f64 / scale_factor) as CGFloat;
         let height = (size.height as f64 / scale_factor) as CGFloat;
 
-        CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        }
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width, height } }
     }
 
     struct App {
@@ -357,10 +351,10 @@ mod smoke {
 
         match app.result {
             Some(true) => Ok(()),
-            _ => Err(
-                std::io::Error::new(std::io::ErrorKind::Other, "Web inspector smoke failed")
-                    .into(),
-            ),
+            _ => {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "Web inspector smoke failed")
+                    .into())
+            },
         }
     }
 }

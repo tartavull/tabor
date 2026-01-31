@@ -14,7 +14,7 @@ mod smoke {
     use objc2::encode::{Encode, Encoding};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{class, msg_send, MainThreadMarker};
+    use objc2::{MainThreadMarker, class, msg_send};
     use objc2_foundation::NSString;
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
@@ -131,16 +131,22 @@ mod smoke {
         }
 
         fn load_file(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
-            let path = path
-                .to_str()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "PDF path is not utf-8"))?;
+            let path = path.to_str().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "PDF path is not utf-8")
+            })?;
             let ns_path = NSString::from_str(path);
-            let ns_url: *mut AnyObject = unsafe { msg_send![class!(NSURL), fileURLWithPath: &*ns_path] };
+            let ns_url: *mut AnyObject =
+                unsafe { msg_send![class!(NSURL), fileURLWithPath: &*ns_path] };
             if ns_url.is_null() {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to create file URL").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Failed to create file URL",
+                )
+                .into());
             }
 
-            let access_url: *mut AnyObject = unsafe { msg_send![ns_url, URLByDeletingLastPathComponent] };
+            let access_url: *mut AnyObject =
+                unsafe { msg_send![ns_url, URLByDeletingLastPathComponent] };
             let access_url = if access_url.is_null() { ns_url } else { access_url };
             unsafe {
                 let _: *mut AnyObject = msg_send![
@@ -183,8 +189,7 @@ mod smoke {
             });
 
             unsafe {
-                let _: () =
-                    msg_send![&*self.view, evaluateJavaScript: &*script, completionHandler: &*block];
+                let _: () = msg_send![&*self.view, evaluateJavaScript: &*script, completionHandler: &*block];
             }
         }
 
@@ -268,10 +273,7 @@ mod smoke {
         let width = (size.width as f64 / scale_factor) as CGFloat;
         let height = (size.height as f64 / scale_factor) as CGFloat;
 
-        CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        }
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width, height } }
     }
 
     fn build_pdf_bytes() -> Vec<u8> {
@@ -279,13 +281,17 @@ mod smoke {
         let objects = vec![
             String::from("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
             String::from("2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n"),
-            String::from("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"),
+            String::from(
+                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+            ),
             format!(
                 "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
                 stream.len(),
                 stream
             ),
-            String::from("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"),
+            String::from(
+                "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+            ),
         ];
 
         let mut pdf = String::from("%PDF-1.4\n");
@@ -461,10 +467,10 @@ mod smoke {
 
         match app.result {
             Some(true) => Ok(()),
-            _ => Err(
-                std::io::Error::new(std::io::ErrorKind::Other, "WebView PDF smoke failed")
-                    .into(),
-            ),
+            _ => {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "WebView PDF smoke failed")
+                    .into())
+            },
         }
     }
 }

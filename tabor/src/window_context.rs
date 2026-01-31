@@ -1,15 +1,22 @@
 //! Terminal window context.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::mem;
 #[cfg(not(windows))]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
+use base64::engine::general_purpose::STANDARD as BASE64;
+#[cfg(unix)]
+use base64::Engine;
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
@@ -19,21 +26,22 @@ use log::info;
 use serde::Deserialize;
 use serde_json as json;
 use winit::event::{Event as WinitEvent, Ime, Modifiers, WindowEvent};
+use winit::event::{ElementState, MouseButton};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
-use winit::window::WindowId;
 #[cfg(target_os = "macos")]
 use winit::window::CursorIcon;
+use winit::window::WindowId;
 
 use tabor_terminal::event::{Event as TerminalEvent, Notify, OnResize};
 use tabor_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use tabor_terminal::grid::{Dimensions, Scroll};
 use tabor_terminal::index::Direction;
 use tabor_terminal::sync::FairMutex;
-use tabor_terminal::term::test::TermSize;
-use tabor_terminal::term::{Term, TermMode};
 #[cfg(target_os = "macos")]
 use tabor_terminal::term::MIN_COLUMNS;
+use tabor_terminal::term::test::TermSize;
+use tabor_terminal::term::{Term, TermMode};
 use tabor_terminal::tty;
 use tabor_terminal::vte::ansi::NamedColor;
 
@@ -49,20 +57,23 @@ use crate::display::color::Rgb;
 use crate::display::window::Window;
 #[cfg(target_os = "macos")]
 use crate::display::{TabPanelEditOutcome, TabPanelEditTarget};
-use crate::event::{
-    request_web_cursor_update, ActionContext, CommandHistory, CommandState, Event, EventProxy,
-    EventType, InlineSearchState, Mouse, SearchState, TouchPurpose,
-};
 #[cfg(target_os = "macos")]
 use crate::event::WebCommand;
-#[cfg(unix)]
-use crate::logging::LOG_TARGET_IPC_CONFIG;
-use crate::message_bar::MessageBuffer;
+use crate::event::{
+    ActionContext, CommandHistory, CommandState, Event, EventProxy, EventType, InlineSearchState,
+    Mouse, SearchState, TouchPurpose, request_web_cursor_update,
+};
 #[cfg(unix)]
 use crate::ipc::{
     IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession, IpcInspectorTarget,
-    IpcTabActivity, IpcTabGroup, IpcTabKind, IpcTabPanelState, IpcTabState, TabSelection,
+    IpcTabActivity, IpcTabGroup, IpcTabKind, IpcTabPanelState, IpcTabState, SocketReply,
+    TabSelection, WebNetworkAction, WebNetworkEntry, WebMouseAction, WebMouseButton,
 };
+#[cfg(unix)]
+use crate::ipc;
+#[cfg(unix)]
+use crate::logging::LOG_TARGET_IPC_CONFIG;
+use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
 use crate::tab_panel::TabActivity;
 use crate::tabs::TabId;
@@ -70,18 +81,22 @@ use crate::window_kind::WindowKind;
 use crate::{input, renderer};
 
 #[cfg(target_os = "macos")]
+use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
+#[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
-use crate::macos::favicon::{fetch_favicon, resolve_favicon_url, FaviconImage};
-#[cfg(target_os = "macos")]
-use crate::macos::webview::{take_pending_popup, PendingPopup, WebView};
+use crate::macos::webview::{PendingPopup, WebView, take_pending_popup};
 #[cfg(not(target_os = "macos"))]
 type PendingPopup = ();
 #[cfg(target_os = "macos")]
 use crate::macos::remote_inspector::{
-    match_tab_for_target, match_target_for_tab, InspectorError, InspectorTabInfo,
-    RemoteInspectorClient,
+    InspectorError, InspectorTabInfo, RemoteInspectorClient, match_tab_for_target,
+    match_target_for_tab,
 };
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSEventModifierFlags;
+#[cfg(target_os = "macos")]
+use serde_json::Value as JsonValue;
 #[cfg(target_os = "macos")]
 use crate::tab_panel::TabFavicon;
 
@@ -118,6 +133,14 @@ struct TabState {
 #[cfg(target_os = "macos")]
 struct ClosedTab {
     kind: WindowKind,
+}
+
+#[cfg(target_os = "macos")]
+struct WebNetworkState {
+    session_id: String,
+    next_id: u64,
+    entries: Vec<WebNetworkEntry>,
+    index: HashMap<String, usize>,
 }
 
 #[cfg(target_os = "macos")]
@@ -211,11 +234,7 @@ enum DrawMode {
 }
 
 fn draw_mode(kind: &WindowKind) -> DrawMode {
-    if kind.is_web() {
-        DrawMode::Web
-    } else {
-        DrawMode::Terminal
-    }
+    if kind.is_web() { DrawMode::Web } else { DrawMode::Terminal }
 }
 
 struct TabManager {
@@ -256,10 +275,8 @@ impl TabManager {
         group_name: Option<String>,
     ) -> Result<(), String> {
         if self.slots.len() <= tab_id.slot_index() {
-            self.slots.resize_with(tab_id.slot_index() + 1, || TabSlot {
-                generation: 0,
-                tab: None,
-            });
+            self.slots
+                .resize_with(tab_id.slot_index() + 1, || TabSlot { generation: 0, tab: None });
         }
 
         let slot = &mut self.slots[tab_id.slot_index()];
@@ -277,7 +294,8 @@ impl TabManager {
                 .position(|group| group.id == group_id)
                 .ok_or_else(|| String::from("Group not found"))?
         } else if let Some(name) = group_name {
-            if let Some(index) = self.groups.iter().position(|group| group.name.as_deref() == Some(&name))
+            if let Some(index) =
+                self.groups.iter().position(|group| group.name.as_deref() == Some(&name))
             {
                 index
             } else {
@@ -288,7 +306,9 @@ impl TabManager {
             }
         } else {
             self.active
-                .and_then(|active| self.groups.iter().position(|group| group.tabs.contains(&active)))
+                .and_then(|active| {
+                    self.groups.iter().position(|group| group.tabs.contains(&active))
+                })
                 .unwrap_or(0)
         };
 
@@ -646,6 +666,8 @@ pub struct WindowContext {
     next_favicon_char: u32,
     #[cfg(target_os = "macos")]
     remote_inspector: Option<RemoteInspectorClient>,
+    #[cfg(target_os = "macos")]
+    web_network: HashMap<TabId, WebNetworkState>,
     modifiers: Modifiers,
     occluded: bool,
     window_focused: bool,
@@ -802,6 +824,8 @@ impl WindowContext {
             next_favicon_char: 0xE000,
             #[cfg(target_os = "macos")]
             remote_inspector: None,
+            #[cfg(target_os = "macos")]
+            web_network: HashMap::new(),
             dirty: Default::default(),
         };
 
@@ -864,13 +888,9 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         let web_view = match (&window_kind, pending_popup) {
-            (WindowKind::Web { url }, None) => Some(WebView::new(
-                &display.window,
-                &display.size_info,
-                tab_id,
-                url,
-                proxy,
-            )?),
+            (WindowKind::Web { url }, None) => {
+                Some(WebView::new(&display.window, &display.size_info, tab_id, url, proxy)?)
+            },
             (WindowKind::Web { .. }, Some(popup)) => Some(WebView::from_existing(
                 &display.window,
                 &display.size_info,
@@ -967,9 +987,7 @@ impl WindowContext {
     }
 
     pub(crate) fn has_active_terminal_output(&self, now: Instant) -> bool {
-        self.tabs
-            .iter()
-            .any(|tab| !tab.kind.is_web() && tab.activity.is_active(now))
+        self.tabs.iter().any(|tab| !tab.kind.is_web() && tab.activity.is_active(now))
     }
 
     #[cfg(target_os = "macos")]
@@ -1058,8 +1076,7 @@ impl WindowContext {
         }
 
         let option = format!("window.tab_panel.width={target_logical}");
-        let parsed = toml::from_str(&option)
-            .expect("failed to parse tab panel width override");
+        let parsed = toml::from_str(&option).expect("failed to parse tab panel width override");
 
         if let Some(existing) = self
             .window_config
@@ -1203,12 +1220,7 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
-    fn handle_web_favicon(
-        &mut self,
-        tab_id: TabId,
-        page_url: String,
-        icon: Option<FaviconImage>,
-    ) {
+    fn handle_web_favicon(&mut self, tab_id: TabId, page_url: String, icon: Option<FaviconImage>) {
         let Some(tab) = self.tabs.get(tab_id) else {
             return;
         };
@@ -1353,7 +1365,8 @@ impl WindowContext {
                 }
             }
             if !self.preserve_title && self.config.window.dynamic_title {
-                let title = active_tab.custom_title.clone().unwrap_or_else(|| active_tab.title.clone());
+                let title =
+                    active_tab.custom_title.clone().unwrap_or_else(|| active_tab.title.clone());
                 self.display.window.set_title(title);
             }
         }
@@ -1458,17 +1471,13 @@ impl WindowContext {
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
         let Some(popup) = take_pending_popup(popup_id) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Popup WebView not found",
-            )
-            .into());
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::Other, "Popup WebView not found").into()
+            );
         };
 
         let mut options = WindowOptions::default();
-        options.window_kind = WindowKind::Web {
-            url: popup.url.clone().unwrap_or_default(),
-        };
+        options.window_kind = WindowKind::Web { url: popup.url.clone().unwrap_or_default() };
 
         self.create_tab_with_popup(options, proxy, Some(popup), None, None)
     }
@@ -1502,13 +1511,12 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         if tab.kind.is_web() {
-            self.closed_tabs.push(ClosedTab {
-                kind: tab.kind.clone(),
-            });
+            self.closed_tabs.push(ClosedTab { kind: tab.kind.clone() });
             const MAX_CLOSED_TABS: usize = 10;
             if self.closed_tabs.len() > MAX_CLOSED_TABS {
                 self.closed_tabs.remove(0);
             }
+            self.web_network.remove(&tab_id);
         }
 
         let _ = tab.notifier.0.send(Msg::Shutdown);
@@ -1541,11 +1549,7 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn open_web_url_in_tab(
-        &mut self,
-        tab_id: TabId,
-        url: String,
-    ) -> Result<(), String> {
+    pub(crate) fn open_web_url_in_tab(&mut self, tab_id: TabId, url: String) -> Result<(), String> {
         let Some(tab) = self.tabs.get_mut(tab_id) else {
             return Err(String::from("Tab not found"));
         };
@@ -1629,11 +1633,8 @@ impl WindowContext {
     pub(crate) fn ipc_tab_state(&self, tab_id: TabId, now: Instant) -> Option<IpcTabState> {
         let tab = self.tabs.get(tab_id)?;
         let (group_id, index) = self.tabs.group_for_tab(tab_id)?;
-        let activity = if tab.kind.is_web() {
-            None
-        } else {
-            Some(Self::ipc_activity(&tab.activity, now))
-        };
+        let activity =
+            if tab.kind.is_web() { None } else { Some(Self::ipc_activity(&tab.activity, now)) };
         Some(IpcTabState {
             tab_id: tab_id.into(),
             group_id,
@@ -1693,11 +1694,7 @@ impl WindowContext {
             TabSelection::ByIndex { index } => self.tabs.select_by_index(index),
             TabSelection::ById { tab_id } => {
                 let tab_id = tab_id.into();
-                if self.tabs.get(tab_id).is_some() {
-                    Some(tab_id)
-                } else {
-                    None
-                }
+                if self.tabs.get(tab_id).is_some() { Some(tab_id) } else { None }
             },
         };
 
@@ -1791,10 +1788,7 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (tab_id, url, proxy);
-            Err(IpcError::new(
-                IpcErrorCode::Unsupported,
-                "Web tabs are only supported on macOS",
-            ))
+            Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are only supported on macOS"))
         }
     }
 
@@ -1818,10 +1812,7 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (url, proxy);
-            Err(IpcError::new(
-                IpcErrorCode::Unsupported,
-                "Web tabs are only supported on macOS",
-            ))
+            Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are only supported on macOS"))
         }
     }
 
@@ -1851,10 +1842,7 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (tab_id, event_loop, event_proxy, clipboard, scheduler);
-            Err(IpcError::new(
-                IpcErrorCode::Unsupported,
-                "Web tabs are only supported on macOS",
-            ))
+            Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are only supported on macOS"))
         }
     }
 
@@ -1884,10 +1872,7 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (tab_id, event_loop, event_proxy, clipboard, scheduler);
-            Err(IpcError::new(
-                IpcErrorCode::Unsupported,
-                "Web tabs are only supported on macOS",
-            ))
+            Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are only supported on macOS"))
         }
     }
 
@@ -2062,10 +2047,7 @@ impl WindowContext {
                     .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Target not found"))?;
                 match_tab_for_target(target, &self.inspector_tabs(), std::process::id())
                     .ok_or_else(|| {
-                        IpcError::new(
-                            IpcErrorCode::Ambiguous,
-                            "Target does not map to a web tab",
-                        )
+                        IpcError::new(IpcErrorCode::Ambiguous, "Target does not map to a web tab")
                     })?
             };
 
@@ -2186,6 +2168,355 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
+    pub(crate) fn ipc_web_eval(
+        &mut self,
+        tab_id: Option<TabId>,
+        script: String,
+        stream: Arc<UnixStream>,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, script);
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Web automation is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::Unsupported,
+                    "Web view is unavailable",
+                );
+                return;
+            };
+
+            let stream = Arc::clone(&stream);
+            web_view.eval_js_string(&script, move |result| {
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, SocketReply::WebEval { result });
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_web_snapshot(
+        &mut self,
+        tab_id: Option<TabId>,
+        full: bool,
+        stream: Arc<UnixStream>,
+        _event_loop: &ActiveEventLoop,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, full);
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Web automation is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::Unsupported,
+                    "Web view is unavailable",
+                );
+                return;
+            };
+
+            let stream = Arc::clone(&stream);
+            web_view.snapshot_png(full, move |result| {
+                let reply = match result {
+                    Ok(bytes) => SocketReply::WebSnapshot { data: BASE64.encode(bytes) },
+                    Err(err) => ipc::reply_error(IpcErrorCode::Internal, err),
+                };
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_web_pdf(
+        &mut self,
+        tab_id: Option<TabId>,
+        stream: Arc<UnixStream>,
+        _event_loop: &ActiveEventLoop,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = tab_id;
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Web automation is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::Unsupported,
+                    "Web view is unavailable",
+                );
+                return;
+            };
+
+            let stream = Arc::clone(&stream);
+            web_view.pdf(move |result| {
+                let reply = match result {
+                    Ok(bytes) => SocketReply::WebPdf { data: BASE64.encode(bytes) },
+                    Err(err) => ipc::reply_error(IpcErrorCode::Internal, err),
+                };
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_web_network(
+        &mut self,
+        tab_id: TabId,
+        action: WebNetworkAction,
+    ) -> Result<Vec<WebNetworkEntry>, IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, action);
+            return Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web automation is only supported on macOS",
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            {
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+                };
+                if !tab.kind.is_web() {
+                    return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
+                }
+
+                if let Some(web_view) = tab.web_view.as_mut() {
+                    if let Some(entries) = web_view.network_entries(action.clone()) {
+                        return Ok(entries);
+                    }
+                }
+            }
+
+            self.ensure_web_network_state(tab_id)?;
+            self.drain_network_messages_for_tab(tab_id)?;
+
+            match action {
+                WebNetworkAction::Clear => {
+                    if let Some(state) = self.web_network.get_mut(&tab_id) {
+                        state.entries.clear();
+                        state.index.clear();
+                    }
+                    Ok(Vec::new())
+                },
+                WebNetworkAction::List { filter } => {
+                    let Some(state) = self.web_network.get(&tab_id) else {
+                        return Ok(Vec::new());
+                    };
+                    let entries = if let Some(filter) = filter {
+                        state
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.url.contains(&filter))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    } else {
+                        state.entries.clone()
+                    };
+                    Ok(entries)
+                },
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_web_mouse(
+        &mut self,
+        tab_id: TabId,
+        action: WebMouseAction,
+        x: f64,
+        y: f64,
+        button: WebMouseButton,
+        _event_loop: &ActiveEventLoop,
+    ) -> Result<(), IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, action, x, y, button);
+            return Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web automation is only supported on macOS",
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+            if !tab.kind.is_web() {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
+            }
+
+            let Some(web_view) = tab.web_view.as_mut() else {
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+            };
+
+            let scale = self.display.window.scale_factor;
+            let padding_x = f64::from(self.display.size_info.padding_x());
+            let padding_y = f64::from(self.display.size_info.padding_y());
+            let physical_x = padding_x + x * scale;
+            let physical_y = padding_y + y * scale;
+            let position = winit::dpi::PhysicalPosition::new(physical_x, physical_y);
+
+            let button = match button {
+                WebMouseButton::Left => MouseButton::Left,
+                WebMouseButton::Right => MouseButton::Right,
+                WebMouseButton::Middle => MouseButton::Middle,
+            };
+
+            let modifiers = NSEventModifierFlags::empty();
+
+            match action {
+                WebMouseAction::Down => {
+                    web_view.handle_mouse_input(
+                        &self.display.window,
+                        &self.display.size_info,
+                        position,
+                        ElementState::Pressed,
+                        button,
+                        modifiers,
+                    );
+                },
+                WebMouseAction::Up => {
+                    web_view.handle_mouse_input(
+                        &self.display.window,
+                        &self.display.size_info,
+                        position,
+                        ElementState::Released,
+                        button,
+                        modifiers,
+                    );
+                },
+                WebMouseAction::Click => {
+                    web_view.handle_mouse_input(
+                        &self.display.window,
+                        &self.display.size_info,
+                        position,
+                        ElementState::Pressed,
+                        button,
+                        modifiers,
+                    );
+                    web_view.handle_mouse_input(
+                        &self.display.window,
+                        &self.display.size_info,
+                        position,
+                        ElementState::Released,
+                        button,
+                        modifiers,
+                    );
+                },
+                WebMouseAction::DoubleClick => {
+                    for _ in 0..2 {
+                        web_view.handle_mouse_input(
+                            &self.display.window,
+                            &self.display.size_info,
+                            position,
+                            ElementState::Pressed,
+                            button,
+                            modifiers,
+                        );
+                        web_view.handle_mouse_input(
+                            &self.display.window,
+                            &self.display.size_info,
+                            position,
+                            ElementState::Released,
+                            button,
+                            modifiers,
+                        );
+                    }
+                },
+                WebMouseAction::Move => {
+                    return Err(IpcError::new(
+                        IpcErrorCode::Unsupported,
+                        "Web mouse move is not supported",
+                    ));
+                },
+            }
+
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
     fn with_action_context<F>(
         &mut self,
         tab_id: TabId,
@@ -2206,10 +2537,8 @@ impl WindowContext {
             self.set_active_tab(tab_id);
         }
 
-        let old_is_searching = self
-            .tabs
-            .active()
-            .is_some_and(|tab| tab.search_state.history_index.is_some());
+        let old_is_searching =
+            self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some());
 
         {
             let Some(active_tab) = self.tabs.active_mut() else {
@@ -2269,6 +2598,232 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
+    fn ensure_web_network_state(&mut self, tab_id: TabId) -> Result<(), IpcError> {
+        if self.web_network.contains_key(&tab_id) {
+            return Ok(());
+        }
+
+        let session = self.ipc_attach_inspector(Some(tab_id), None)?;
+        let state = WebNetworkState {
+            session_id: session.session_id,
+            next_id: 1,
+            entries: Vec::new(),
+            index: HashMap::new(),
+        };
+        self.web_network.insert(tab_id, state);
+
+        self.send_network_command(tab_id, "Network.enable", json::json!({}))?;
+        self.send_network_command(tab_id, "Page.enable", json::json!({}))?;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_network_command(
+        &mut self,
+        tab_id: TabId,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<(), IpcError> {
+        self.ensure_remote_inspector()?;
+
+        let (session_id, id) = {
+            let state = self.web_network.get_mut(&tab_id).ok_or_else(|| {
+                IpcError::new(IpcErrorCode::NotFound, "Network session not initialized")
+            })?;
+            let id = state.next_id;
+            state.next_id += 1;
+            (state.session_id.clone(), id)
+        };
+
+        let Some(inspector) = self.remote_inspector.as_ref() else {
+            return Err(IpcError::new(IpcErrorCode::Internal, "Inspector unavailable"));
+        };
+
+        let message = json::json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        inspector
+            .send_message(&session_id, &message.to_string())
+            .map_err(map_inspector_error)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn drain_network_messages_for_tab(&mut self, tab_id: TabId) -> Result<(), IpcError> {
+        self.ensure_remote_inspector()?;
+
+        let session_id = match self.web_network.get(&tab_id) {
+            Some(state) => state.session_id.clone(),
+            None => return Ok(()),
+        };
+
+        let messages = {
+            let Some(inspector) = self.remote_inspector.as_ref() else {
+                return Err(IpcError::new(IpcErrorCode::Internal, "Inspector unavailable"));
+            };
+            inspector
+                .poll_messages(&session_id, None)
+                .map_err(map_inspector_error)?
+        };
+
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(state) = self.web_network.get_mut(&tab_id) {
+            for message in messages {
+                Self::update_network_state(state, &message.payload);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn update_network_state(state: &mut WebNetworkState, payload: &str) {
+        let Ok(value) = serde_json::from_str::<JsonValue>(payload) else {
+            return;
+        };
+        let Some(method) = value.get("method").and_then(|v| v.as_str()) else {
+            return;
+        };
+
+        match method {
+            "Network.requestWillBeSent" => {
+                let params = value.get("params");
+                let request_id = params
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let url = params
+                    .and_then(|p| p.get("request"))
+                    .and_then(|r| r.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if url.is_empty() {
+                    return;
+                }
+                let method_name = params
+                    .and_then(|p| p.get("request"))
+                    .and_then(|r| r.get("method"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let resource_type = params
+                    .and_then(|p| p.get("type"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
+
+                let request_id = request_id.unwrap_or_else(|| url.clone());
+                if state.index.contains_key(&request_id) {
+                    return;
+                }
+                let entry = WebNetworkEntry {
+                    request_id: request_id.clone(),
+                    url,
+                    method: method_name,
+                    status: None,
+                    resource_type,
+                    start_time: timestamp,
+                    end_time: None,
+                    error_text: None,
+                };
+                state.entries.push(entry);
+                state.index.insert(request_id, state.entries.len() - 1);
+            }
+            "Network.responseReceived" => {
+                let params = value.get("params");
+                let request_id = params
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let Some(request_id) = request_id else {
+                    return;
+                };
+                let status = params
+                    .and_then(|p| p.get("response"))
+                    .and_then(|r| r.get("status"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as u16);
+                let resource_type = params
+                    .and_then(|p| p.get("type"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
+                let url = params
+                    .and_then(|p| p.get("response"))
+                    .and_then(|r| r.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+
+                let index = match state.index.get(&request_id) {
+                    Some(index) => *index,
+                    None => {
+                        let entry = WebNetworkEntry {
+                            request_id: request_id.clone(),
+                            url: url.unwrap_or_default(),
+                            method: None,
+                            status,
+                            resource_type,
+                            start_time: None,
+                            end_time: timestamp,
+                            error_text: None,
+                        };
+                        state.entries.push(entry);
+                        state.index.insert(request_id, state.entries.len() - 1);
+                        return;
+                    }
+                };
+
+                let entry = &mut state.entries[index];
+                entry.status = status.or(entry.status);
+                entry.resource_type = resource_type.or_else(|| entry.resource_type.clone());
+                entry.end_time = timestamp.or(entry.end_time);
+                if let Some(url) = url {
+                    entry.url = url;
+                }
+            }
+            "Network.loadingFinished" => {
+                let params = value.get("params");
+                let request_id = params
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let Some(request_id) = request_id else {
+                    return;
+                };
+                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
+                if let Some(index) = state.index.get(&request_id).copied() {
+                    state.entries[index].end_time = timestamp.or(state.entries[index].end_time);
+                }
+            }
+            "Network.loadingFailed" => {
+                let params = value.get("params");
+                let request_id = params
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let Some(request_id) = request_id else {
+                    return;
+                };
+                let error_text = params
+                    .and_then(|p| p.get("errorText"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
+                if let Some(index) = state.index.get(&request_id).copied() {
+                    state.entries[index].error_text = error_text;
+                    state.entries[index].end_time = timestamp.or(state.entries[index].end_time);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn inspector_tabs(&self) -> Vec<InspectorTabInfo> {
         self.tabs
             .iter()
@@ -2293,10 +2848,7 @@ impl WindowContext {
             .get(tab_id)
             .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
         let WindowKind::Web { url } = &tab.kind else {
-            return Err(IpcError::new(
-                IpcErrorCode::InvalidRequest,
-                "Tab is not a web tab",
-            ));
+            return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
         };
         Ok(InspectorTabInfo {
             tab_id: tab.id,
@@ -2305,7 +2857,6 @@ impl WindowContext {
             override_name: tab.custom_title.clone(),
         })
     }
-
 
     #[cfg(unix)]
     fn apply_ipc_display_update(&mut self, old_is_searching: bool) {
@@ -2349,11 +2900,7 @@ impl WindowContext {
                 WindowKind::Terminal => false,
             };
 
-            if title.contains(&needle) || url_match {
-                Some(tab.id)
-            } else {
-                None
-            }
+            if title.contains(&needle) || url_match { Some(tab.id) } else { None }
         });
 
         if let Some(tab_id) = match_id {
@@ -2409,11 +2956,7 @@ impl WindowContext {
                 return None;
             }
 
-            if trimmed == format!("group {group_id}") {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
+            if trimmed == format!("group {group_id}") { None } else { Some(trimmed.to_string()) }
         });
 
         if self.tabs.set_group_name(group_id, name) {
@@ -2638,7 +3181,8 @@ impl WindowContext {
         let events: Vec<_> = self.event_queue.drain(..).collect();
 
         for event in events {
-            if let WinitEvent::WindowEvent { event: WindowEvent::Focused(is_focused), .. } = &event {
+            if let WinitEvent::WindowEvent { event: WindowEvent::Focused(is_focused), .. } = &event
+            {
                 self.window_focused = *is_focused;
             }
 
@@ -2678,11 +3222,7 @@ impl WindowContext {
                             continue;
                         };
 
-                        if self
-                            .tabs
-                            .get(tab_id)
-                            .is_some_and(|tab| tab.kind.is_web())
-                        {
+                        if self.tabs.get(tab_id).is_some_and(|tab| tab.kind.is_web()) {
                             continue;
                         }
 
@@ -2719,10 +3259,8 @@ impl WindowContext {
             pending_events.push(event);
         }
 
-        let old_is_searching = self
-            .tabs
-            .active()
-            .is_some_and(|tab| tab.search_state.history_index.is_some());
+        let old_is_searching =
+            self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some());
 
         {
             let Some(active_tab) = self.tabs.active_mut() else {
@@ -2828,10 +3366,10 @@ impl WindowContext {
 
         match event {
             WinitEvent::WindowEvent {
-                event: WindowEvent::CursorMoved { position, .. },
-                ..
+                event: WindowEvent::CursorMoved { position, .. }, ..
             } => {
-                let update = self.display.tab_panel.cursor_moved(*position, &self.display.size_info);
+                let update =
+                    self.display.tab_panel.cursor_moved(*position, &self.display.size_info);
                 if let Some(width_px) = update.resize_width {
                     self.set_tab_panel_width_px(width_px);
                 }
@@ -2936,10 +3474,9 @@ impl WindowContext {
                 }
                 true
             },
-            WinitEvent::WindowEvent {
-                event: WindowEvent::MouseWheel { .. },
-                ..
-            } => self.display.tab_panel.should_capture_last(),
+            WinitEvent::WindowEvent { event: WindowEvent::MouseWheel { .. }, .. } => {
+                self.display.tab_panel.should_capture_last()
+            },
             _ => false,
         }
     }
@@ -2951,11 +3488,7 @@ impl WindowContext {
             TabPanelEditOutcome::Changed | TabPanelEditOutcome::Cancelled => true,
             TabPanelEditOutcome::Commit(commit) => {
                 let trimmed = commit.text.trim();
-                let name = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
+                let name = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
 
                 match commit.target {
                     TabPanelEditTarget::Tab(tab_id) => self.rename_tab(tab_id, name),
@@ -3013,18 +3546,12 @@ impl WindowContext {
                     tab.web_command_state.reset_mode();
                 }
             },
-            WebCommand::SetMark {
-                name,
-                url,
-                scroll_x,
-                scroll_y,
-            } => {
+            WebCommand::SetMark { name, url, scroll_x, scroll_y } => {
                 let Some(tab_id) = event.tab_id().or(self.tabs.active_id()) else {
                     return;
                 };
                 if let Some(tab) = self.tabs.get_mut(tab_id) {
-                    tab.web_command_state
-                        .set_mark(*name, url.clone(), *scroll_x, *scroll_y);
+                    tab.web_command_state.set_mark(*name, url.clone(), *scroll_x, *scroll_y);
                 }
             },
         }
@@ -3190,9 +3717,7 @@ fn map_inspector_error(error: InspectorError) -> IpcError {
         InspectorError::PermissionDenied => {
             IpcError::new(IpcErrorCode::PermissionDenied, "Inspector permission denied")
         },
-        InspectorError::ConnectionFailed(message) => {
-            IpcError::new(IpcErrorCode::Internal, message)
-        },
+        InspectorError::ConnectionFailed(message) => IpcError::new(IpcErrorCode::Internal, message),
         InspectorError::Timeout => {
             IpcError::new(IpcErrorCode::Timeout, "Inspector request timed out")
         },
@@ -3201,6 +3726,13 @@ fn map_inspector_error(error: InspectorError) -> IpcError {
         InspectorError::InvalidMessage(message) => {
             IpcError::new(IpcErrorCode::InvalidRequest, message)
         },
+    }
+}
+
+#[cfg(unix)]
+fn send_stream_error(stream: &Arc<UnixStream>, code: IpcErrorCode, message: &str) {
+    if let Ok(mut stream) = stream.try_clone() {
+        ipc::send_reply(&mut stream, ipc::reply_error(code, message));
     }
 }
 

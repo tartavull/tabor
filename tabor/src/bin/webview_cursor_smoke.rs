@@ -17,7 +17,7 @@ mod smoke {
     use objc2::encode::{Encode, Encoding};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{class, msg_send, MainThreadMarker};
+    use objc2::{MainThreadMarker, class, msg_send};
     use objc2_foundation::NSString;
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
@@ -184,8 +184,7 @@ mod smoke {
             });
 
             unsafe {
-                let _: () =
-                    msg_send![&*self.view, evaluateJavaScript: &*script, completionHandler: &*block];
+                let _: () = msg_send![&*self.view, evaluateJavaScript: &*script, completionHandler: &*block];
             }
         }
 
@@ -269,10 +268,7 @@ mod smoke {
         let width = (size.width as f64 / scale_factor) as CGFloat;
         let height = (size.height as f64 / scale_factor) as CGFloat;
 
-        CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        }
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width, height } }
     }
 
     struct CursorProbe {
@@ -430,8 +426,7 @@ mod smoke {
                     return;
                 };
 
-                let cursor = web_cursor::web_cursor_from_css(&value)
-                    .unwrap_or(CursorIcon::Default);
+                let cursor = web_cursor::web_cursor_from_css(&value).unwrap_or(CursorIcon::Default);
                 if cursor != probe.expected {
                     eprintln!(
                         "cursor probe {} expected {:?}, got {:?} ({})",
@@ -456,10 +451,8 @@ mod smoke {
 
         match app.result {
             Some(true) => Ok(()),
-            _ => Err(
-                std::io::Error::new(std::io::ErrorKind::Other, "WebView cursor smoke failed")
-                    .into(),
-            ),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "WebView cursor smoke failed")
+                .into()),
         }
     }
 }

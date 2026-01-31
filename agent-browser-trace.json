@@ -1,0 +1,17 @@
+{
+  "console": [
+    {
+      "args": [
+        "console: hello",
+        "{\"ok\":true}"
+      ],
+      "ts": 1769820102032,
+      "type": "log"
+    }
+  ],
+  "endedAt": 1769820102051,
+  "errors": [],
+  "network": [],
+  "startedAt": 1769820102015,
+  "url": "file:///Users/tartavull/code/tabor/tabor/tests/fixtures/agent-browser.html"
+}

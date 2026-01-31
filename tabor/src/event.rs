@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use std::os::unix::io::RawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::Arc;
@@ -32,10 +32,10 @@ use winit::event::{
     Touch as TouchEvent, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::ActiveEventLoopExtMacOS;
 use winit::raw_window_handle::HasDisplayHandle;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
 #[cfg(target_os = "macos")]
 use winit::window::CursorIcon;
 use winit::window::WindowId;
@@ -68,24 +68,25 @@ use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 #[cfg(unix)]
 use crate::ipc::{self, IpcRequest, SocketReply};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
+#[cfg(target_os = "macos")]
+use crate::macos::favicon::FaviconImage;
+#[cfg(target_os = "macos")]
+use crate::macos::cef;
+#[cfg(target_os = "macos")]
+use crate::macos::web_commands::{self, WebActions, WebCommandState, WebHintAction, WebKey};
+#[cfg(target_os = "macos")]
+use crate::macos::web_cursor::{WEB_CURSOR_BOOTSTRAP, web_cursor_from_css, web_cursor_script};
+#[cfg(target_os = "macos")]
+use crate::macos::webview::WebView;
 use crate::message_bar::{Message, MessageBuffer};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::tab_panel::TAB_ACTIVITY_TICK_INTERVAL;
 use crate::tabs::{TabCommand, TabId};
 use crate::web_url::normalize_web_url;
-use crate::window_kind::WindowKind;
 use crate::window_context::WindowContext;
+use crate::window_kind::WindowKind;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSEventModifierFlags;
-#[cfg(target_os = "macos")]
-use crate::macos::web_commands::{self, WebActions, WebCommandState, WebHintAction, WebKey};
-#[cfg(target_os = "macos")]
-use crate::macos::web_cursor::{web_cursor_from_css, web_cursor_script, WEB_CURSOR_BOOTSTRAP};
-#[cfg(target_os = "macos")]
-use crate::macos::favicon::FaviconImage;
-#[cfg(target_os = "macos")]
-use crate::macos::webview::WebView;
-#[cfg(target_os = "macos")]
 use url::Url;
 
 /// Duration after the last user input until an unlimited search is performed.
@@ -317,15 +318,18 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         target_group_id: Option<usize>,
         target_index: Option<usize>,
     ) -> Result<(), ipc::IpcError> {
-        self.window
-            .ipc_move_tab(tab_id, target_group_id, target_index)
+        self.window.ipc_move_tab(tab_id, target_group_id, target_index)
     }
 
     fn set_tab_title(&mut self, tab_id: TabId, title: Option<String>) -> Result<(), ipc::IpcError> {
         self.window.ipc_set_tab_title(tab_id, title)
     }
 
-    fn set_group_name(&mut self, group_id: usize, name: Option<String>) -> Result<(), ipc::IpcError> {
+    fn set_group_name(
+        &mut self,
+        group_id: usize,
+        name: Option<String>,
+    ) -> Result<(), ipc::IpcError> {
         self.window.ipc_set_group_name(group_id, name)
     }
 
@@ -342,8 +346,13 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
     }
 
     fn reload_web(&mut self, tab_id: TabId) -> Result<(), ipc::IpcError> {
-        self.window
-            .ipc_reload_web(tab_id, self.event_loop, self.event_proxy, self.clipboard, self.scheduler)
+        self.window.ipc_reload_web(
+            tab_id,
+            self.event_loop,
+            self.event_proxy,
+            self.clipboard,
+            self.scheduler,
+        )
     }
 
     fn open_inspector(&mut self, tab_id: TabId) -> Result<(), ipc::IpcError> {
@@ -360,7 +369,11 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_tab_panel_state()
     }
 
-    fn set_tab_panel(&mut self, enabled: Option<bool>, width: Option<usize>) -> Result<(), ipc::IpcError> {
+    fn set_tab_panel(
+        &mut self,
+        enabled: Option<bool>,
+        width: Option<usize>,
+    ) -> Result<(), ipc::IpcError> {
         self.window.ipc_set_tab_panel(enabled, width)
     }
 
@@ -421,6 +434,25 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
     ) -> Result<Vec<ipc::IpcInspectorMessage>, ipc::IpcError> {
         self.window.ipc_poll_inspector_messages(session_id, max)
     }
+
+    fn web_network(
+        &mut self,
+        tab_id: TabId,
+        action: ipc::WebNetworkAction,
+    ) -> Result<Vec<ipc::WebNetworkEntry>, ipc::IpcError> {
+        self.window.ipc_web_network(tab_id, action)
+    }
+
+    fn web_mouse(
+        &mut self,
+        tab_id: TabId,
+        action: ipc::WebMouseAction,
+        x: f64,
+        y: f64,
+        button: ipc::WebMouseButton,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_web_mouse(tab_id, action, x, y, button, self.event_loop)
+    }
 }
 
 impl Processor {
@@ -449,6 +481,18 @@ impl Processor {
         if config.live_config_reload() {
             config_monitor =
                 ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let proxy = proxy.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(16));
+                if !cef::is_initialized_global() {
+                    continue;
+                }
+                let _ = proxy.send_event(Event::new(EventType::CefTick, None));
+            });
         }
 
         Processor {
@@ -609,10 +653,8 @@ impl Processor {
     ) -> SocketReply {
         match request {
             IpcRequest::SetConfig(ipc_config) => {
-                let window_id = ipc_config
-                    .window_id
-                    .and_then(|id| u64::try_from(id).ok())
-                    .map(WindowId::from);
+                let window_id =
+                    ipc_config.window_id.and_then(|id| u64::try_from(id).ok()).map(WindowId::from);
 
                 let mut options = ParsedOptions::from_options(&ipc_config.options);
 
@@ -639,10 +681,8 @@ impl Processor {
                 ipc::reply_ok()
             },
             IpcRequest::GetConfig(ipc_config) => {
-                let window_id = ipc_config
-                    .window_id
-                    .and_then(|id| u64::try_from(id).ok())
-                    .map(WindowId::from);
+                let window_id =
+                    ipc_config.window_id.and_then(|id| u64::try_from(id).ok()).map(WindowId::from);
 
                 let config = match self.windows.iter().find(|(id, _)| window_id == Some(**id)) {
                     Some((_, window_context)) => window_context.config(),
@@ -692,6 +732,50 @@ impl Processor {
     }
 
     #[cfg(unix)]
+    fn handle_web_ipc_request(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        request: IpcRequest,
+        stream: Arc<UnixStream>,
+    ) {
+        let window_id = match self.window_for_ipc_request(&request) {
+            Ok(window_id) => window_id,
+            Err(reply) => {
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+                return;
+            },
+        };
+
+        let window_context = match self.windows.get_mut(&window_id) {
+            Some(window_context) => window_context,
+            None => {
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(
+                        &mut stream,
+                        ipc::reply_error(ipc::IpcErrorCode::NotFound, "Target window not found"),
+                    );
+                }
+                return;
+            },
+        };
+
+        match request {
+            IpcRequest::WebEval { tab_id, script } => {
+                window_context.ipc_web_eval(tab_id.map(Into::into), script, stream)
+            },
+            IpcRequest::WebSnapshot { tab_id, full } => {
+                window_context.ipc_web_snapshot(tab_id.map(Into::into), full, stream, event_loop)
+            },
+            IpcRequest::WebPdf { tab_id } => {
+                window_context.ipc_web_pdf(tab_id.map(Into::into), stream, event_loop)
+            },
+            _ => (),
+        }
+    }
+
+    #[cfg(unix)]
     fn window_for_ipc_request(&self, request: &IpcRequest) -> Result<WindowId, SocketReply> {
         if let Some(tab_id) = request.target_tab_id() {
             let tab_id: TabId = tab_id.into();
@@ -737,10 +821,8 @@ impl Processor {
             };
         }
 
-        let focused = self
-            .windows
-            .iter()
-            .find_map(|(id, window)| window.is_focused().then_some(*id));
+        let focused =
+            self.windows.iter().find_map(|(id, window)| window.is_focused().then_some(*id));
         if let Some(focused) = focused {
             return Ok(focused);
         }
@@ -749,10 +831,7 @@ impl Processor {
             return Ok(*self.windows.keys().next().unwrap());
         }
 
-        Err(ipc::reply_error(
-            ipc::IpcErrorCode::NotFound,
-            "No focused window",
-        ))
+        Err(ipc::reply_error(ipc::IpcErrorCode::NotFound, "No focused window"))
     }
 
     fn close_window(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
@@ -854,7 +933,6 @@ impl ApplicationHandler<Event> for Processor {
         if is_redraw {
             window_context.draw(&mut self.scheduler);
         }
-
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
@@ -866,8 +944,21 @@ impl ApplicationHandler<Event> for Processor {
 
         // Handle events which don't mandate the WindowId.
         match (payload, window_id) {
+            #[cfg(target_os = "macos")]
+            (EventType::CefTick, _) => {
+                cef::do_message_loop_work();
+            },
             #[cfg(unix)]
             (EventType::IpcRequest(request, stream), _) => {
+                if matches!(
+                    request,
+                    IpcRequest::WebEval { .. }
+                        | IpcRequest::WebSnapshot { .. }
+                        | IpcRequest::WebPdf { .. }
+                ) {
+                    self.handle_web_ipc_request(event_loop, request, stream);
+                    return;
+                }
                 let reply = self.handle_ipc_request(event_loop, request);
                 if let Ok(mut stream) = stream.try_clone() {
                     ipc::send_reply(&mut stream, reply);
@@ -1034,7 +1125,10 @@ impl ApplicationHandler<Event> for Processor {
                     self.ensure_tab_activity_tick(window_id);
                 }
             },
-            (EventType::Terminal(TerminalEvent::Exit | TerminalEvent::ChildExit(_)), Some(window_id)) => {
+            (
+                EventType::Terminal(TerminalEvent::Exit | TerminalEvent::ChildExit(_)),
+                Some(window_id),
+            ) => {
                 let Some(tab_id) = tab_id else {
                     return;
                 };
@@ -1043,10 +1137,7 @@ impl ApplicationHandler<Event> for Processor {
                     return;
                 };
 
-                if window_context
-                    .tab_kind(tab_id)
-                    .is_some_and(WindowKind::is_web)
-                {
+                if window_context.tab_kind(tab_id).is_some_and(WindowKind::is_web) {
                     return;
                 }
 
@@ -1111,7 +1202,11 @@ impl ApplicationHandler<Event> for Processor {
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
-                        WinitEvent::UserEvent(Event { window_id: Some(window_id), tab_id, payload }),
+                        WinitEvent::UserEvent(Event {
+                            window_id: Some(window_id),
+                            tab_id,
+                            payload,
+                        }),
                     );
                 }
             },
@@ -1135,12 +1230,25 @@ impl ApplicationHandler<Event> for Processor {
             );
         }
 
+        #[cfg(target_os = "macos")]
+        crate::macos::cef::do_message_loop_work();
+
         // Update the scheduler after event processing to ensure
         // the event loop deadline is as accurate as possible.
-        let control_flow = match self.scheduler.update() {
+        let mut control_flow = match self.scheduler.update() {
             Some(instant) => ControlFlow::WaitUntil(instant),
             None => ControlFlow::Wait,
         };
+
+        #[cfg(target_os = "macos")]
+        if cef::is_initialized_global() {
+            let cef_deadline = Instant::now() + Duration::from_millis(10);
+            control_flow = match control_flow {
+                ControlFlow::Wait => ControlFlow::WaitUntil(cef_deadline),
+                ControlFlow::WaitUntil(deadline) => ControlFlow::WaitUntil(min(deadline, cef_deadline)),
+                other => other,
+            };
+        }
         event_loop.set_control_flow(control_flow);
     }
 
@@ -1218,12 +1326,7 @@ impl From<Event> for WinitEvent<Event> {
 pub enum WebCommand {
     OpenUrl { url: String, new_tab: bool },
     CopyToClipboard { text: String },
-    SetMark {
-        name: char,
-        url: String,
-        scroll_x: f64,
-        scroll_y: f64,
-    },
+    SetMark { name: char, url: String, scroll_x: f64, scroll_y: f64 },
 }
 
 #[derive(Debug, Clone)]
@@ -1238,13 +1341,22 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     WebCommand(WebCommand),
     #[cfg(target_os = "macos")]
-    WebPopup { popup_id: usize },
+    WebPopup {
+        popup_id: usize,
+    },
     #[cfg(target_os = "macos")]
-    WebFavicon { page_url: String, icon: Option<FaviconImage> },
+    WebFavicon {
+        page_url: String,
+        icon: Option<FaviconImage>,
+    },
     #[cfg(target_os = "macos")]
-    WebCursor { cursor: Option<CursorIcon> },
+    WebCursor {
+        cursor: Option<CursorIcon>,
+    },
     #[cfg(target_os = "macos")]
     WebCursorRequest,
+    #[cfg(target_os = "macos")]
+    CefTick,
     #[cfg(target_os = "macos")]
     CloseTab(TabId),
     #[cfg(target_os = "macos")]
@@ -1546,8 +1658,8 @@ pub(crate) fn request_web_cursor_update(
     let origin_y = f64::from(size_info.padding_y()) / scale_factor;
     let width = f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
         / scale_factor;
-    let height = f64::from(size_info.cell_height() * size_info.screen_lines() as f32)
-        / scale_factor;
+    let height =
+        f64::from(size_info.cell_height() * size_info.screen_lines() as f32) / scale_factor;
 
     let local_x = position.x / scale_factor - origin_x;
     let local_y = position.y / scale_factor - origin_y;
@@ -1908,6 +2020,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         if !self.message_buffer.is_empty() {
             self.display.pending_update.dirty = true;
             self.message_buffer.pop();
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.display.damage_tracker.next_frame().mark_fully_damaged();
         }
     }
 
@@ -2225,13 +2339,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         };
 
         let prefix = prefix.to_string();
-        let last_index = self.command_state.completion.as_ref().and_then(|state| {
-            if state.prefix == prefix {
-                Some(state.index)
-            } else {
-                None
-            }
-        });
+        let last_index = self
+            .command_state
+            .completion
+            .as_ref()
+            .and_then(|state| if state.prefix == prefix { Some(state.index) } else { None });
 
         let Some((completion, index)) = self.command_history.complete(&prefix, last_index) else {
             return;
@@ -2244,10 +2356,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         input.push_str(&completion);
 
         self.command_state.input = input;
-        self.command_state.completion = Some(CommandCompletion {
-            prefix,
-            index,
-        });
+        self.command_state.completion = Some(CommandCompletion { prefix, index });
 
         self.display.pending_update.dirty = true;
         self.display.damage_tracker.frame().mark_fully_damaged();
@@ -2944,13 +3053,13 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 return;
             }
 
-        #[cfg(target_os = "macos")]
-        if self.tab_kind.is_web() {
-            self.with_web_command_state(|state, ctx| {
-                web_commands::find(state, ctx, query, false);
-            });
-            return;
-        }
+            #[cfg(target_os = "macos")]
+            if self.tab_kind.is_web() {
+                self.with_web_command_state(|state, ctx| {
+                    web_commands::find(state, ctx, query, false);
+                });
+                return;
+            }
 
             self.push_command_error(String::from("Find is only available in web tabs"));
             return;
@@ -2967,18 +3076,40 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         };
 
         match command {
-            "o" | "O" | "b" | "B" => {
-                let url = parts.collect::<Vec<_>>().join(" ");
-                if url.is_empty() {
-                    self.push_command_error(format!("Missing URL for :{command}"));
+            "o" | "O" | "b" | "B" | "t" => {
+                let target = parts.collect::<Vec<_>>().join(" ");
+                if target.is_empty() {
+                    self.push_command_error(format!("Missing target for :{command}"));
                     return;
                 }
 
-                let url = normalize_web_url(&url);
-                if matches!(command, "O" | "B") {
-                    self.open_web_url_new_tab(url);
-                } else {
-                    self.open_web_url(url);
+                let target = match parse_command_target(&target) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        self.push_command_error(message);
+                        return;
+                    },
+                };
+
+                let new_tab = matches!(command, "O" | "B" | "t");
+                match target {
+                    CommandTarget::WebUrl(url) => {
+                        if new_tab {
+                            self.open_web_url_new_tab(url);
+                        } else if self.tab_kind.is_web() {
+                            self.open_web_url(url);
+                        } else {
+                            self.open_web_url_new_tab(url);
+                            self.close_current_tab();
+                        }
+                    },
+                    CommandTarget::TerminalDir(path) => {
+                        if new_tab {
+                            self.open_terminal_dir_new_tab(path);
+                        } else {
+                            self.open_terminal_dir_replace(path);
+                        }
+                    },
                 }
             },
             "T" => {
@@ -2989,10 +3120,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    let event = Event::new(
-                        EventType::TabSearch(query),
-                        self.display.window.id(),
-                    );
+                    let event = Event::new(EventType::TabSearch(query), self.display.window.id());
                     let _ = self.event_proxy.send_event(event);
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -3062,6 +3190,31 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let _ = self.event_proxy.send_event(event);
     }
 
+    fn open_terminal_dir_new_tab(&mut self, path: PathBuf) {
+        let mut options = WindowOptions::default();
+        options.window_kind = WindowKind::Terminal;
+        options.terminal_options.working_directory = Some(path);
+        let event = Event::new(EventType::CreateTab(options), self.display.window.id());
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    fn open_terminal_dir_replace(&mut self, path: PathBuf) {
+        let mut options = WindowOptions::default();
+        options.window_kind = WindowKind::Terminal;
+        options.terminal_options.working_directory = Some(path);
+        let event = Event::new(EventType::CreateTab(options), self.display.window.id());
+        let _ = self.event_proxy.send_event(event);
+        self.close_current_tab();
+    }
+
+    fn close_current_tab(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let event = Event::new(EventType::CloseTab(self.tab_id), self.display.window.id());
+            let _ = self.event_proxy.send_event(event);
+        }
+    }
+
     pub(crate) fn reload_web(&mut self) {
         match &*self.tab_kind {
             WindowKind::Web { .. } => {
@@ -3103,8 +3256,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     }
 
     fn push_command_error(&mut self, message: String) {
-        self.message_buffer
-            .push(Message::new(message, crate::message_bar::MessageType::Error));
+        self.message_buffer.push(Message::new(message, crate::message_bar::MessageType::Error));
         self.display.pending_update.dirty = true;
     }
 }
@@ -3708,6 +3860,118 @@ impl<'a, N: Notify + 'a, T: EventListener> WebActions for ActionContext<'a, N, T
     }
 }
 
+enum CommandTarget {
+    WebUrl(String),
+    TerminalDir(PathBuf),
+}
+
+fn parse_command_target(input: &str) -> Result<CommandTarget, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("Missing target"));
+    }
+
+    if looks_like_explicit_url(trimmed) {
+        return Ok(CommandTarget::WebUrl(normalize_web_url(trimmed)));
+    }
+
+    if is_path_like(trimmed) {
+        let path = expand_tilde_path(trimmed);
+        if path.is_dir() {
+            return Ok(CommandTarget::TerminalDir(path));
+        }
+        if path.is_file() {
+            let url = file_url_from_path(&path)?;
+            return Ok(CommandTarget::WebUrl(url));
+        }
+        return Err(format!("Invalid path: {trimmed}"));
+    }
+
+    Ok(CommandTarget::WebUrl(normalize_web_url(trimmed)))
+}
+
+fn looks_like_explicit_url(input: &str) -> bool {
+    input.contains("://")
+        || input.starts_with("about:")
+        || input.starts_with("file:")
+        || input.starts_with("data:")
+        || input.starts_with("mailto:")
+        || input.starts_with("ipfs:")
+        || input.starts_with("ipns:")
+        || input.starts_with("magnet:")
+        || input.starts_with("gemini://")
+        || input.starts_with("gopher://")
+        || input.starts_with("news:")
+        || input.starts_with("git://")
+        || input.starts_with("ssh:")
+        || input.starts_with("ftp://")
+}
+
+fn is_path_like(input: &str) -> bool {
+    if input == "~"
+        || input.starts_with("~/")
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || input.starts_with('/')
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        if input.len() > 1 && input.as_bytes()[1] == b':' {
+            return true;
+        }
+        if input.starts_with("\\\\") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn expand_tilde_path(input: &str) -> PathBuf {
+    let home_dir = home_dir_from_env().or_else(home::home_dir);
+
+    if input == "~" {
+        if let Some(home_dir) = home_dir {
+            return home_dir;
+        }
+    }
+
+    if let Some(stripped) = input.strip_prefix("~/") {
+        if let Some(home_dir) = home_dir {
+            return home_dir.join(stripped);
+        }
+    }
+
+    PathBuf::from(input)
+}
+
+fn home_dir_from_env() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Some(home) = env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(home));
+    }
+    None
+}
+
+fn file_url_from_path(path: &Path) -> Result<String, String> {
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let cwd = env::current_dir().map_err(|_| String::from("Invalid path"))?;
+        cwd.join(path)
+    };
+
+    Url::from_file_path(&abs_path)
+        .map(|url| url.to_string())
+        .map_err(|_| format!("Invalid file path: {}", abs_path.display()))
+}
+
 fn command_url_prefix(input: &str) -> Option<(usize, &str)> {
     let bytes = input.as_bytes();
     if bytes.len() < 2 || bytes[0] != b':' {
@@ -3715,7 +3979,7 @@ fn command_url_prefix(input: &str) -> Option<(usize, &str)> {
     }
 
     let cmd = bytes[1] as char;
-    if !matches!(cmd, 'o' | 'O' | 'b' | 'B') {
+    if !matches!(cmd, 'o' | 'O' | 'b' | 'B' | 't') {
         return None;
     }
 
@@ -3731,7 +3995,15 @@ fn command_url_prefix(input: &str) -> Option<(usize, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandHistory, command_url_prefix};
+    use std::env;
+    use std::fs;
+
+    use tempfile::tempdir;
+    use url::Url;
+
+    use super::{
+        CommandHistory, CommandTarget, command_url_prefix, parse_command_target,
+    };
 
     #[test]
     fn command_url_prefix_parses_basic() {
@@ -3741,13 +4013,14 @@ mod tests {
         assert_eq!(command_url_prefix(":O test"), Some((3, "test")));
         assert_eq!(command_url_prefix(":b test"), Some((3, "test")));
         assert_eq!(command_url_prefix(":B test"), Some((3, "test")));
+        assert_eq!(command_url_prefix(":t test"), Some((3, "test")));
     }
 
     #[test]
     fn command_url_prefix_rejects_non_open() {
         assert_eq!(command_url_prefix(":r"), None);
         assert_eq!(command_url_prefix(":open"), None);
-        assert_eq!(command_url_prefix(":t"), None);
+        assert_eq!(command_url_prefix(":T"), None);
     }
 
     #[test]
@@ -3774,6 +4047,121 @@ mod tests {
         assert_eq!(second, "https://example.com");
     }
 
+    #[test]
+    fn parse_command_target_expands_tilde_dir() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let target = home.join("projects");
+        fs::create_dir_all(&target).unwrap();
+
+        let old_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", &home);
+        }
+        #[cfg(windows)]
+        let old_userprofile = env::var_os("USERPROFILE");
+        #[cfg(windows)]
+        unsafe {
+            env::set_var("USERPROFILE", &home);
+        }
+
+        let result = parse_command_target("~/projects").unwrap();
+        match result {
+            CommandTarget::TerminalDir(path) => assert_eq!(path, target),
+            _ => panic!("expected terminal dir target"),
+        }
+
+        if let Some(value) = old_home {
+            unsafe {
+                env::set_var("HOME", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("HOME");
+            }
+        }
+        #[cfg(windows)]
+        if let Some(value) = old_userprofile {
+            unsafe {
+                env::set_var("USERPROFILE", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("USERPROFILE");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_command_target_expands_tilde_file_to_file_url() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let file = home.join("doc.pdf");
+        fs::write(&file, b"test").unwrap();
+
+        let old_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", &home);
+        }
+        #[cfg(windows)]
+        let old_userprofile = env::var_os("USERPROFILE");
+        #[cfg(windows)]
+        unsafe {
+            env::set_var("USERPROFILE", &home);
+        }
+
+        let result = parse_command_target("~/doc.pdf").unwrap();
+        match result {
+            CommandTarget::WebUrl(url) => {
+                let parsed = Url::parse(&url).unwrap();
+                assert_eq!(parsed.scheme(), "file");
+                let parsed_path = parsed.to_file_path().unwrap();
+                let expected = fs::canonicalize(&file).unwrap();
+                let actual = fs::canonicalize(parsed_path).unwrap();
+                assert_eq!(actual, expected);
+            },
+            _ => panic!("expected web url target"),
+        }
+
+        if let Some(value) = old_home {
+            unsafe {
+                env::set_var("HOME", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("HOME");
+            }
+        }
+        #[cfg(windows)]
+        if let Some(value) = old_userprofile {
+            unsafe {
+                env::set_var("USERPROFILE", value);
+            }
+        } else {
+            unsafe {
+                env::remove_var("USERPROFILE");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_command_target_defaults_to_https() {
+        let result = parse_command_target("example.com").unwrap();
+        match result {
+            CommandTarget::WebUrl(url) => assert_eq!(url, "https://example.com"),
+            _ => panic!("expected web url target"),
+        }
+    }
+
+    #[test]
+    fn parse_command_target_preserves_explicit_url() {
+        let result = parse_command_target("http://example.com/path").unwrap();
+        match result {
+            CommandTarget::WebUrl(url) => assert_eq!(url, "http://example.com/path"),
+            _ => panic!("expected web url target"),
+        }
+    }
 }
 
 /// Identified purpose of the touch input.
@@ -4018,6 +4406,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::WebFavicon { .. }
                 | EventType::WebCursor { .. }
                 | EventType::WebCursorRequest
+                | EventType::CefTick
                 | EventType::TabSearch(_)
                 | EventType::OpenUrls(_)
                 | EventType::Frame => (),

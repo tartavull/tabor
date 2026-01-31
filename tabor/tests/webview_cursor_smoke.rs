@@ -14,10 +14,7 @@ fn webview_cursor_smoke() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .expect("failed to poll webview_cursor_smoke")
-        {
+        if let Some(status) = child.try_wait().expect("failed to poll webview_cursor_smoke") {
             assert!(status.success(), "webview_cursor_smoke exited with {status}");
             return;
         }

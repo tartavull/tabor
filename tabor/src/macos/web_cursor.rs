@@ -83,9 +83,6 @@ mod tests {
         assert_eq!(web_cursor_from_css("pointer"), Some(CursorIcon::Pointer));
         assert_eq!(web_cursor_from_css("text"), Some(CursorIcon::Text));
         assert_eq!(web_cursor_from_css("auto"), Some(CursorIcon::Default));
-        assert_eq!(
-            web_cursor_from_css("url(test.cur), pointer"),
-            Some(CursorIcon::Pointer)
-        );
+        assert_eq!(web_cursor_from_css("url(test.cur), pointer"), Some(CursorIcon::Pointer));
     }
 }

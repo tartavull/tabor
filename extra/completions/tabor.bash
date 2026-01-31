@@ -16,6 +16,9 @@ _tabor() {
             ",$1")
                 cmd="tabor"
                 ;;
+            tabor,agent-browser)
+                cmd="tabor__agent__browser"
+                ;;
             tabor,help)
                 cmd="tabor__help"
                 ;;
@@ -24,6 +27,9 @@ _tabor() {
                 ;;
             tabor,msg)
                 cmd="tabor__msg"
+                ;;
+            tabor__help,agent-browser)
+                cmd="tabor__help__agent__browser"
                 ;;
             tabor__help,help)
                 cmd="tabor__help__help"
@@ -347,7 +353,7 @@ _tabor() {
 
     case "${cmd}" in
         tabor)
-            opts="-q -v -e -T -o -h -V --print-events --ref-test --embed --config-file --socket --daemon --working-directory --hold --command --title --class --option --help --version msg migrate help"
+            opts="-q -v -e -T -o -h -V --print-events --ref-test --embed --config-file --socket --daemon --working-directory --hold --command --title --class --option --help --version msg agent-browser migrate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -437,9 +443,37 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
-        tabor__help)
-            opts="msg migrate help"
+        tabor__agent__browser)
+            opts="[COMMAND]..."
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help)
+            opts="msg agent-browser migrate help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__agent__browser)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

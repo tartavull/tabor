@@ -54,8 +54,7 @@ impl TabActivity {
     }
 
     pub fn is_active(&self, now: Instant) -> bool {
-        self.last_output
-            .is_some_and(|last| now.duration_since(last) <= TAB_ACTIVITY_ACTIVE_WINDOW)
+        self.last_output.is_some_and(|last| now.duration_since(last) <= TAB_ACTIVITY_ACTIVE_WINDOW)
     }
 }
 
@@ -81,15 +80,8 @@ pub struct TabPanelGroup {
 pub enum TabPanelCommand {
     Focus(TabId),
     Close(TabId),
-    Move {
-        tab_id: TabId,
-        target_group_id: Option<usize>,
-        target_index: Option<usize>,
-    },
-    MoveGroup {
-        group_id: usize,
-        target_index: usize,
-    },
+    Move { tab_id: TabId, target_group_id: Option<usize>, target_index: Option<usize> },
+    MoveGroup { group_id: usize, target_index: usize },
     RenameTab(TabId),
     RenameGroup(usize),
 }

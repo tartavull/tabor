@@ -472,7 +472,6 @@ impl Window {
 
         view.window().unwrap().setHasShadow(has_shadows);
     }
-
 }
 
 bitflags! {

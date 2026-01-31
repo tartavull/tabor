@@ -13,7 +13,7 @@ mod smoke {
     use objc2::encode::{Encode, Encoding};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{class, msg_send, MainThreadMarker};
+    use objc2::{MainThreadMarker, class, msg_send};
     use objc2_foundation::{NSDictionary, NSString, NSUserDefaults, ns_string};
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
@@ -219,12 +219,13 @@ mod smoke {
     impl AutofillOverride {
         fn enable() -> Self {
             unsafe {
-                NSUserDefaults::standardUserDefaults().registerDefaults(
-                    &NSDictionary::<NSString, AnyObject>::from_slices(
-                        &[ns_string!("NSAutoFillHeuristicControllerEnabled")],
-                        &[ns_string!("NO")],
-                    ),
-                );
+                NSUserDefaults::standardUserDefaults().registerDefaults(&NSDictionary::<
+                    NSString,
+                    AnyObject,
+                >::from_slices(
+                    &[ns_string!("NSAutoFillHeuristicControllerEnabled")],
+                    &[ns_string!("NO")],
+                ));
             }
 
             NSUserDefaults::standardUserDefaults()
@@ -372,7 +373,6 @@ mod smoke {
             self.last_title = Some(title.clone());
             Some(title)
         }
-
     }
 
     impl Drop for WebViewSmoke {
@@ -400,10 +400,7 @@ mod smoke {
         let width = (size.width as f64 / scale_factor) as CGFloat;
         let height = (size.height as f64 / scale_factor) as CGFloat;
 
-        CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        }
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width, height } }
     }
 
     fn start_server() -> Result<u16, Box<dyn Error>> {
@@ -561,10 +558,7 @@ mod smoke {
                 return;
             }
             if let Some(reason) = title.strip_prefix(TITLE_UNSUPPORTED_PREFIX) {
-                self.finish(
-                    event_loop,
-                    Err(format!("WebAuthn unsupported: {reason}")),
-                );
+                self.finish(event_loop, Err(format!("WebAuthn unsupported: {reason}")));
                 return;
             }
             if title == TITLE_UNSUPPORTED {
@@ -589,7 +583,9 @@ mod smoke {
 
         match app.result {
             Some(Ok(())) => Ok(()),
-            Some(Err(message)) => Err(std::io::Error::new(std::io::ErrorKind::Other, message).into()),
+            Some(Err(message)) => {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, message).into())
+            },
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "WebView passkey flow smoke failed",

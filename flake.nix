@@ -23,6 +23,12 @@
           extensions = [ "rust-src" "rustfmt" "clippy" ];
         };
 
+        cefTarball = pkgs.fetchzip {
+          url = "https://cef-builds.spotifycdn.com/cef_binary_144.0.11+ge135be2+chromium-144.0.7559.97_macosarm64.tar.bz2";
+          sha256 = "sha256-yLjzvbaVvc+Rs3W3SX678gX7poqlFOlTmFj+T5LIfZ8=";
+          stripRoot = true;
+        };
+
         darwinLibraries = lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
 
         linuxLibraries = lib.optionals pkgs.stdenv.isLinux (with pkgs; [
@@ -58,6 +64,9 @@
 
           shellHook = ''
             echo "Tabor dev shell activated."
+            ${lib.optionalString (pkgs.stdenv.isDarwin && pkgs.stdenv.isAarch64) ''
+              export TABOR_CEF_PATH=${cefTarball}
+            ''}
           '';
         };
       });

@@ -49,9 +49,9 @@ use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
-use crate::display::window::Window;
 #[cfg(target_os = "macos")]
-use crate::display::tab_panel::{compute_panel_dimensions, TabPanel};
+use crate::display::tab_panel::{TabPanel, compute_panel_dimensions};
+use crate::display::window::Window;
 use crate::event::{CommandState, Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
@@ -92,7 +92,6 @@ const SHORTENER: char = '…';
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
-const MESSAGE_BAR_TEXT_INSET_PX: f32 = 1.0;
 
 #[derive(Debug)]
 pub enum Error {
@@ -708,7 +707,7 @@ impl Display {
         &mut self,
         terminal: &mut Term<T>,
         pty_resize_handle: &mut dyn OnResize,
-        message_buffer: &MessageBuffer,
+        _message_buffer: &MessageBuffer,
         search_state: &mut SearchState,
         web_status_bar: bool,
         config: &UiConfig,
@@ -777,9 +776,10 @@ impl Display {
         }
 
         // Update number of column/lines in the viewport.
-        let message_bar_lines = message_buffer.message().map_or(0, |m| m.text(&new_size).len());
+        //
+        // Message bar is rendered inline with the footer bar, so it doesn't reserve extra lines.
         let status_lines = usize::from(web_status_bar);
-        new_size.reserve_lines(message_bar_lines + status_lines);
+        new_size.reserve_lines(status_lines);
 
         // Update resize increments.
         if config.window.resize_increments {
@@ -874,6 +874,8 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
         let command_active = command_state.is_active();
+        let message_visible =
+            message_buffer.message().is_some() && !command_active && search_state.regex().is_none();
 
         let vi_mode = terminal.mode().contains(TermMode::VI);
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
@@ -1001,8 +1003,11 @@ impl Display {
         }
 
         // Handle IME positioning and command/search bar rendering.
-        let footer_offset =
-            if command_active || search_state.regex().is_some() { self.footer_offset() } else { 0. };
+        let footer_offset = if command_active || search_state.regex().is_some() {
+            self.footer_offset()
+        } else {
+            0.
+        };
 
         let ime_position = if command_active {
             let command_text = Self::format_command(command_state.text(), size_info.columns());
@@ -1089,63 +1094,37 @@ impl Display {
             }
         }
 
-        if let Some(message) = message_buffer.message() {
-            let text = message.text(&size_info);
+        // Draw rectangles.
+        self.renderer.draw_rects(&size_info, &metrics, rects);
 
-            let start_line = size_info.screen_lines();
-            let text_offset = self.message_bar_text_offset();
-            let background_offset = if text_offset < 0. { text_offset } else { 0. };
-            let extra_height = if text_offset < 0. { -text_offset } else { 0. };
-            let y =
-                size_info.cell_height().mul_add(start_line as f32, size_info.padding_y())
-                    + background_offset;
+        #[cfg(target_os = "macos")]
+        self.tab_panel.draw_text(&size_info, config, &mut self.renderer, &mut self.glyph_cache);
 
-            let bg = match message.ty() {
-                MessageType::Error => config.colors.normal.red,
-                MessageType::Warning => config.colors.normal.yellow,
-            };
+        if message_visible {
+            if let Some(message) = message_buffer.message() {
+                let message_text = message.text(&size_info).into_iter().next().unwrap_or_default();
+                let fg = config.colors.primary.background;
+                let bg = match message.ty() {
+                    MessageType::Error => config.colors.normal.red,
+                    MessageType::Warning => config.colors.normal.yellow,
+                };
+                let line = size_info.screen_lines().saturating_sub(1);
+                let message_offset = self.footer_offset();
+                let y = size_info
+                    .cell_height()
+                    .mul_add(line as f32, size_info.padding_y())
+                    + message_offset;
+                let width = size_info.width() as i32;
+                let height = size_info.cell_height() as i32;
+                self.damage_tracker
+                    .frame()
+                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
+                self.damage_tracker
+                    .next_frame()
+                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
 
-            let x = 0;
-            let width = size_info.width() as i32;
-            let height = (size_info.cell_height() * text.len() as f32 + extra_height) as i32;
-
-            // Always damage message bar, since it could have messages of the same size in it.
-            self.damage_tracker.frame().add_viewport_rect(&size_info, x, y as i32, width, height);
-
-            // Draw rectangles.
-            self.renderer.draw_rects(&size_info, &metrics, rects);
-
-            #[cfg(target_os = "macos")]
-            self.tab_panel.draw_text(
-                &size_info,
-                config,
-                &mut self.renderer,
-                &mut self.glyph_cache,
-            );
-
-            // Relay messages to the user.
-            let fg = config.colors.primary.background;
-            for (i, message_text) in text.iter().enumerate() {
-                self.draw_footer_bar_line_with_text_offset(
-                    message_text,
-                    fg,
-                    bg,
-                    start_line + i,
-                    0.,
-                    text_offset,
-                );
+                self.draw_footer_bar_line(&message_text, fg, bg, line, message_offset);
             }
-        } else {
-            // Draw rectangles.
-            self.renderer.draw_rects(&size_info, &metrics, rects);
-
-            #[cfg(target_os = "macos")]
-            self.tab_panel.draw_text(
-                &size_info,
-                config,
-                &mut self.renderer,
-                &mut self.glyph_cache,
-            );
         }
 
         self.draw_render_timer(config);
@@ -1197,6 +1176,7 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let background_color = config.colors.primary.background;
         let command_active = command_state.is_active();
+        let message_visible = message_buffer.message().is_some() && !command_active;
 
         self.damage_tracker.frame().mark_fully_damaged();
 
@@ -1233,7 +1213,8 @@ impl Display {
                 let fg = config.colors.footer_bar_foreground();
                 let shape = CursorShape::Underline;
                 let cursor_width = NonZeroU32::new(1).unwrap();
-                let cursor = RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
+                let cursor =
+                    RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
                 let mut cursor_rects: Vec<_> =
                     cursor.rects(&size_info, config.cursor.thickness()).collect();
                 for rect in &mut cursor_rects {
@@ -1255,48 +1236,36 @@ impl Display {
             }
         }
 
-        if let Some(message) = message_buffer.message() {
-            let text = message.text(&size_info);
+        self.renderer.draw_rects(&size_info, &metrics, rects);
 
-            let start_line = size_info.screen_lines();
-            let text_offset = self.message_bar_text_offset();
-            let background_offset = if text_offset < 0. { text_offset } else { 0. };
-            let extra_height = if text_offset < 0. { -text_offset } else { 0. };
-            let y =
-                size_info.cell_height().mul_add(start_line as f32, size_info.padding_y())
-                    + background_offset;
+        #[cfg(target_os = "macos")]
+        self.tab_panel.draw_text(&size_info, config, &mut self.renderer, &mut self.glyph_cache);
 
-            let bg = match message.ty() {
-                MessageType::Error => config.colors.normal.red,
-                MessageType::Warning => config.colors.normal.yellow,
-            };
+        if message_visible {
+            if let Some(message) = message_buffer.message() {
+                let message_text = message.text(&size_info).into_iter().next().unwrap_or_default();
+                let fg = config.colors.primary.background;
+                let bg = match message.ty() {
+                    MessageType::Error => config.colors.normal.red,
+                    MessageType::Warning => config.colors.normal.yellow,
+                };
+                let line = size_info.screen_lines().saturating_sub(1);
+                let message_offset = self.footer_offset();
+                let y = size_info
+                    .cell_height()
+                    .mul_add(line as f32, size_info.padding_y())
+                    + message_offset;
+                let width = size_info.width() as i32;
+                let height = size_info.cell_height() as i32;
+                self.damage_tracker
+                    .frame()
+                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
+                self.damage_tracker
+                    .next_frame()
+                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
 
-            let x = 0;
-            let width = size_info.width() as i32;
-            let height = (size_info.cell_height() * text.len() as f32 + extra_height) as i32;
-            self.damage_tracker.frame().add_viewport_rect(&size_info, x, y as i32, width, height);
-
-            self.renderer.draw_rects(&size_info, &metrics, rects);
-
-            #[cfg(target_os = "macos")]
-            self.tab_panel.draw_text(&size_info, config, &mut self.renderer, &mut self.glyph_cache);
-
-            let fg = config.colors.primary.background;
-            for (i, message_text) in text.iter().enumerate() {
-                self.draw_footer_bar_line_with_text_offset(
-                    message_text,
-                    fg,
-                    bg,
-                    start_line + i,
-                    0.,
-                    text_offset,
-                );
+                self.draw_footer_bar_line(&message_text, fg, bg, line, message_offset);
             }
-        } else {
-            self.renderer.draw_rects(&size_info, &metrics, rects);
-
-            #[cfg(target_os = "macos")]
-            self.tab_panel.draw_text(&size_info, config, &mut self.renderer, &mut self.glyph_cache);
         }
 
         self.draw_render_timer(config);
@@ -1465,8 +1434,7 @@ impl Display {
         let metrics = glyph_cache.font_metrics();
 
         if offset_y != 0. {
-            self.renderer
-                .set_text_projection_with_offset(&self.size_info, (0., offset_y));
+            self.renderer.set_text_projection_with_offset(&self.size_info, (0., offset_y));
         }
 
         self.renderer.draw_string(
@@ -1491,8 +1459,7 @@ impl Display {
 
         // Add underline for preedit text.
         let underline = RenderLine { start, end, color: fg };
-        let mut underline_rects =
-            underline.rects(Flags::UNDERLINE, &metrics, &self.size_info);
+        let mut underline_rects = underline.rects(Flags::UNDERLINE, &metrics, &self.size_info);
         for rect in &mut underline_rects {
             rect.y += offset_y;
         }
@@ -1642,11 +1609,6 @@ impl Display {
         (size_info.height() - grid_bottom).max(0.)
     }
 
-    fn message_bar_text_offset(&self) -> f32 {
-        let scale = self.window.scale_factor as f32;
-        -(MESSAGE_BAR_TEXT_INSET_PX * scale.max(1.0)).round()
-    }
-
     fn draw_footer_bar_background_with_height(
         &mut self,
         bg: Rgb,
@@ -1654,24 +1616,14 @@ impl Display {
         offset_y: f32,
         height: f32,
     ) {
-        let y = self
-            .size_info
-            .cell_height()
-            .mul_add(line as f32, self.size_info.padding_y())
+        let y = self.size_info.cell_height().mul_add(line as f32, self.size_info.padding_y())
             + offset_y;
         let rect = RenderRect::new(0., y, self.size_info.width(), height, bg, 1.);
         let metrics = self.glyph_cache.font_metrics();
         self.renderer.draw_rects(&self.size_info, &metrics, vec![rect]);
     }
 
-    fn draw_footer_bar_line(
-        &mut self,
-        text: &str,
-        fg: Rgb,
-        bg: Rgb,
-        line: usize,
-        offset_y: f32,
-    ) {
+    fn draw_footer_bar_line(&mut self, text: &str, fg: Rgb, bg: Rgb, line: usize, offset_y: f32) {
         self.draw_footer_bar_line_with_text_offset(text, fg, bg, line, offset_y, 0.);
     }
 
@@ -1689,14 +1641,14 @@ impl Display {
         let point = Point::new(line, Column(0));
 
         let extra_height = if text_offset_y < 0. { -text_offset_y } else { 0. };
-        let background_offset = if text_offset_y < 0. { offset_y + text_offset_y } else { offset_y };
+        let background_offset =
+            if text_offset_y < 0. { offset_y + text_offset_y } else { offset_y };
         let height = self.size_info.cell_height() + extra_height;
 
         self.draw_footer_bar_background_with_height(bg, line, background_offset, height);
 
         let text_offset = offset_y + text_offset_y;
-        self.renderer
-            .set_text_projection_with_offset(&self.size_info, (0., text_offset));
+        self.renderer.set_text_projection_with_offset(&self.size_info, (0., text_offset));
 
         self.renderer.draw_string(
             point,

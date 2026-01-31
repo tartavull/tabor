@@ -6,11 +6,12 @@ mod smoke {
     use std::error::Error;
     use std::time::{Duration, Instant};
 
+    use libc::{c_char, c_void};
     use objc2::encode::{Encode, Encoding};
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::runtime::Bool;
-    use objc2::{class, msg_send, MainThreadMarker};
+    use objc2::{MainThreadMarker, class, msg_send};
     use objc2_foundation::NSString;
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
@@ -18,7 +19,6 @@ mod smoke {
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowAttributes};
-    use libc::{c_char, c_void};
 
     const TITLE: &str = "TaborWebSmoke";
     const TIMEOUT: Duration = Duration::from_secs(10);
@@ -232,10 +232,7 @@ mod smoke {
         let width = (size.width as f64 / scale_factor) as CGFloat;
         let height = (size.height as f64 / scale_factor) as CGFloat;
 
-        CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        }
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width, height } }
     }
 
     struct App {
@@ -247,12 +244,7 @@ mod smoke {
 
     impl App {
         fn new() -> Self {
-            Self {
-                window: None,
-                web_view: None,
-                started_at: Instant::now(),
-                result: None,
-            }
+            Self { window: None, web_view: None, started_at: Instant::now(), result: None }
         }
 
         fn finish(&mut self, event_loop: &ActiveEventLoop, ok: bool) {

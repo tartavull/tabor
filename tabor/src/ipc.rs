@@ -19,8 +19,8 @@ use tabor_terminal::thread;
 use tabor_terminal::vi_mode::ViMotion;
 
 use crate::cli::{IpcConfig, IpcGetConfig, Options, WindowOptions};
-use crate::config::{Action, MouseAction, SearchAction, ViAction};
 use crate::config::ui_config::Program;
+use crate::config::{Action, MouseAction, SearchAction, ViAction};
 use crate::event::{Event, EventType};
 use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
@@ -177,7 +177,7 @@ pub enum IpcAction {
     Command { program: Program },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcRequest {
     Ping,
@@ -188,11 +188,7 @@ pub enum IpcRequest {
     CreateGroup { name: Option<String> },
     CloseTab { tab_id: Option<IpcTabId> },
     SelectTab { selection: TabSelection },
-    MoveTab {
-        tab_id: IpcTabId,
-        target_group_id: Option<usize>,
-        target_index: Option<usize>,
-    },
+    MoveTab { tab_id: IpcTabId, target_group_id: Option<usize>, target_index: Option<usize> },
     SetTabTitle { tab_id: Option<IpcTabId>, title: Option<String> },
     SetGroupName { group_id: usize, name: Option<String> },
     RestoreClosedTab,
@@ -210,6 +206,17 @@ pub enum IpcRequest {
     DetachInspector { session_id: String },
     SendInspectorMessage { session_id: String, message: String },
     PollInspectorMessages { session_id: String, max: Option<usize> },
+    WebEval { tab_id: Option<IpcTabId>, script: String },
+    WebSnapshot { tab_id: Option<IpcTabId>, full: bool },
+    WebPdf { tab_id: Option<IpcTabId> },
+    WebNetwork { tab_id: Option<IpcTabId>, action: WebNetworkAction },
+    WebMouse {
+        tab_id: Option<IpcTabId>,
+        action: WebMouseAction,
+        x: f64,
+        y: f64,
+        button: WebMouseButton,
+    },
     SetConfig(IpcConfig),
     GetConfig(IpcGetConfig),
 }
@@ -221,118 +228,45 @@ pub struct IpcRequestHelp {
 
 pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
     &[
-        IpcRequestHelp {
-            name: "ping",
-            summary: "Health check (pong).",
-        },
-        IpcRequestHelp {
-            name: "get_capabilities",
-            summary: "Protocol and platform capabilities.",
-        },
-        IpcRequestHelp {
-            name: "list_tabs",
-            summary: "List tabs grouped by tab group.",
-        },
-        IpcRequestHelp {
-            name: "get_tab_state",
-            summary: "Get state for a specific tab.",
-        },
-        IpcRequestHelp {
-            name: "create_tab",
-            summary: "Create a new terminal or web tab.",
-        },
-        IpcRequestHelp {
-            name: "create_group",
-            summary: "Create a new tab group.",
-        },
-        IpcRequestHelp {
-            name: "close_tab",
-            summary: "Close a tab (defaults to active).",
-        },
-        IpcRequestHelp {
-            name: "select_tab",
-            summary: "Select a tab by position or id.",
-        },
-        IpcRequestHelp {
-            name: "move_tab",
-            summary: "Move a tab to a group/index.",
-        },
-        IpcRequestHelp {
-            name: "set_tab_title",
-            summary: "Set or clear a tab custom title.",
-        },
-        IpcRequestHelp {
-            name: "set_group_name",
-            summary: "Set a tab group name.",
-        },
+        IpcRequestHelp { name: "ping", summary: "Health check (pong)." },
+        IpcRequestHelp { name: "get_capabilities", summary: "Protocol and platform capabilities." },
+        IpcRequestHelp { name: "list_tabs", summary: "List tabs grouped by tab group." },
+        IpcRequestHelp { name: "get_tab_state", summary: "Get state for a specific tab." },
+        IpcRequestHelp { name: "create_tab", summary: "Create a new terminal or web tab." },
+        IpcRequestHelp { name: "create_group", summary: "Create a new tab group." },
+        IpcRequestHelp { name: "close_tab", summary: "Close a tab (defaults to active)." },
+        IpcRequestHelp { name: "select_tab", summary: "Select a tab by position or id." },
+        IpcRequestHelp { name: "move_tab", summary: "Move a tab to a group/index." },
+        IpcRequestHelp { name: "set_tab_title", summary: "Set or clear a tab custom title." },
+        IpcRequestHelp { name: "set_group_name", summary: "Set a tab group name." },
         IpcRequestHelp {
             name: "restore_closed_tab",
             summary: "Restore the most recently closed tab.",
         },
-        IpcRequestHelp {
-            name: "open_url",
-            summary: "Open URL in current or new tab.",
-        },
-        IpcRequestHelp {
-            name: "set_web_url",
-            summary: "Navigate a web tab.",
-        },
-        IpcRequestHelp {
-            name: "reload_web",
-            summary: "Reload a web tab.",
-        },
-        IpcRequestHelp {
-            name: "open_inspector",
-            summary: "Open Web Inspector for a web tab.",
-        },
-        IpcRequestHelp {
-            name: "get_tab_panel",
-            summary: "Get tab panel state.",
-        },
-        IpcRequestHelp {
-            name: "set_tab_panel",
-            summary: "Enable/disable tab panel or set width.",
-        },
-        IpcRequestHelp {
-            name: "dispatch_action",
-            summary: "Dispatch a configured action.",
-        },
-        IpcRequestHelp {
-            name: "send_input",
-            summary: "Send literal input text to a tab.",
-        },
-        IpcRequestHelp {
-            name: "run_command_bar",
-            summary: "Open the command bar with input.",
-        },
-        IpcRequestHelp {
-            name: "list_inspector_targets",
-            summary: "List Web Inspector targets.",
-        },
-        IpcRequestHelp {
-            name: "attach_inspector",
-            summary: "Attach to a Web Inspector target.",
-        },
-        IpcRequestHelp {
-            name: "detach_inspector",
-            summary: "Detach a Web Inspector session.",
-        },
-        IpcRequestHelp {
-            name: "send_inspector_message",
-            summary: "Send raw Web Inspector JSON.",
-        },
+        IpcRequestHelp { name: "open_url", summary: "Open URL in current or new tab." },
+        IpcRequestHelp { name: "set_web_url", summary: "Navigate a web tab." },
+        IpcRequestHelp { name: "reload_web", summary: "Reload a web tab." },
+        IpcRequestHelp { name: "open_inspector", summary: "Open Web Inspector for a web tab." },
+        IpcRequestHelp { name: "get_tab_panel", summary: "Get tab panel state." },
+        IpcRequestHelp { name: "set_tab_panel", summary: "Enable/disable tab panel or set width." },
+        IpcRequestHelp { name: "dispatch_action", summary: "Dispatch a configured action." },
+        IpcRequestHelp { name: "send_input", summary: "Send literal input text to a tab." },
+        IpcRequestHelp { name: "run_command_bar", summary: "Open the command bar with input." },
+        IpcRequestHelp { name: "list_inspector_targets", summary: "List Web Inspector targets." },
+        IpcRequestHelp { name: "attach_inspector", summary: "Attach to a Web Inspector target." },
+        IpcRequestHelp { name: "detach_inspector", summary: "Detach a Web Inspector session." },
+        IpcRequestHelp { name: "send_inspector_message", summary: "Send raw Web Inspector JSON." },
         IpcRequestHelp {
             name: "poll_inspector_messages",
             summary: "Poll queued inspector messages.",
         },
-        IpcRequestHelp {
-            name: "set_config",
-            summary: "Apply runtime config overrides.",
-        },
-        IpcRequestHelp {
-            name: "get_config",
-            summary: "Read runtime config.",
-        },
+        IpcRequestHelp { name: "web_eval", summary: "Evaluate JavaScript in a web tab." },
+        IpcRequestHelp { name: "web_snapshot", summary: "Capture a web tab snapshot." },
+        IpcRequestHelp { name: "web_pdf", summary: "Create a PDF from a web tab." },
+        IpcRequestHelp { name: "web_network", summary: "Inspect web network activity." },
+        IpcRequestHelp { name: "web_mouse", summary: "Dispatch native web mouse input." },
+        IpcRequestHelp { name: "set_config", summary: "Apply runtime config overrides." },
+        IpcRequestHelp { name: "get_config", summary: "Read runtime config." },
     ]
 }
 
@@ -349,7 +283,12 @@ impl IpcRequest {
             IpcRequest::AttachInspector { tab_id, .. } => *tab_id,
             IpcRequest::OpenInspector { tab_id }
             | IpcRequest::ReloadWeb { tab_id }
-            | IpcRequest::SetWebUrl { tab_id, .. } => *tab_id,
+            | IpcRequest::SetWebUrl { tab_id, .. }
+            | IpcRequest::WebEval { tab_id, .. }
+            | IpcRequest::WebSnapshot { tab_id, .. }
+            | IpcRequest::WebPdf { tab_id }
+            | IpcRequest::WebNetwork { tab_id, .. }
+            | IpcRequest::WebMouse { tab_id, .. } => *tab_id,
             IpcRequest::OpenUrl { target, .. } => match target {
                 UrlTarget::TabId { tab_id } => Some(*tab_id),
                 _ => None,
@@ -387,7 +326,48 @@ pub enum SocketReply {
     InspectorAttached { session: IpcInspectorSession },
     InspectorMessages { messages: Vec<IpcInspectorMessage> },
     Config { config: serde_json::Value },
+    WebEval { result: Option<String> },
+    WebSnapshot { data: String },
+    WebPdf { data: String },
+    WebNetwork { entries: Vec<WebNetworkEntry> },
     Error { error: IpcError },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebNetworkAction {
+    List { filter: Option<String> },
+    Clear,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WebNetworkEntry {
+    pub request_id: String,
+    pub url: String,
+    pub method: Option<String>,
+    pub status: Option<u16>,
+    pub resource_type: Option<String>,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+    pub error_text: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebMouseAction {
+    Move,
+    Down,
+    Up,
+    Click,
+    DoubleClick,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebMouseButton {
+    Left,
+    Right,
+    Middle,
 }
 
 impl IpcCapabilities {
@@ -434,10 +414,7 @@ pub fn ipc_action_to_action(action: IpcAction) -> Result<Action, IpcError> {
 }
 
 fn normalize_action_name(name: &str) -> String {
-    name.chars()
-        .filter(|ch| *ch != '_' && *ch != '-')
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect()
+    name.chars().filter(|ch| *ch != '_' && *ch != '-').map(|ch| ch.to_ascii_lowercase()).collect()
 }
 
 fn parse_action_name<T: DeserializeOwned>(name: &str, label: &str) -> Result<T, IpcError> {
@@ -481,7 +458,11 @@ pub trait IpcContext {
     fn reload_web(&mut self, tab_id: TabId) -> Result<(), IpcError>;
     fn open_inspector(&mut self, tab_id: TabId) -> Result<(), IpcError>;
     fn tab_panel_state(&self) -> IpcTabPanelState;
-    fn set_tab_panel(&mut self, enabled: Option<bool>, width: Option<usize>) -> Result<(), IpcError>;
+    fn set_tab_panel(
+        &mut self,
+        enabled: Option<bool>,
+        width: Option<usize>,
+    ) -> Result<(), IpcError>;
     fn dispatch_action(&mut self, tab_id: TabId, action: Action) -> Result<(), IpcError>;
     fn send_input(&mut self, tab_id: TabId, text: String) -> Result<(), IpcError>;
     fn run_command_bar(&mut self, tab_id: TabId, input: String) -> Result<(), IpcError>;
@@ -502,6 +483,19 @@ pub trait IpcContext {
         session_id: String,
         max: Option<usize>,
     ) -> Result<Vec<IpcInspectorMessage>, IpcError>;
+    fn web_network(
+        &mut self,
+        tab_id: TabId,
+        action: WebNetworkAction,
+    ) -> Result<Vec<WebNetworkEntry>, IpcError>;
+    fn web_mouse(
+        &mut self,
+        tab_id: TabId,
+        action: WebMouseAction,
+        x: f64,
+        y: f64,
+        button: WebMouseButton,
+    ) -> Result<(), IpcError>;
 }
 
 pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcResponse {
@@ -518,20 +512,13 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             close_window: false,
         },
         IpcRequest::GetTabState { tab_id } => match ctx.tab_state(tab_id.into(), now) {
-            Some(tab) => IpcResponse {
-                reply: SocketReply::TabState { tab },
-                close_window: false,
-            },
+            Some(tab) => IpcResponse { reply: SocketReply::TabState { tab }, close_window: false },
             None => IpcResponse {
                 reply: reply_error(IpcErrorCode::NotFound, "Tab not found"),
                 close_window: false,
             },
         },
-        IpcRequest::CreateTab {
-            options,
-            group_id,
-            group_name,
-        } => {
+        IpcRequest::CreateTab { options, group_id, group_name } => {
             if group_id.is_some() && group_name.is_some() {
                 return IpcResponse {
                     reply: reply_error(
@@ -542,19 +529,22 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 };
             }
             match ctx.create_tab(options, group_id, group_name) {
-            Ok(tab_id) => IpcResponse {
-                reply: SocketReply::TabCreated { tab_id: tab_id.into() },
-                close_window: false,
-            },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Ok(tab_id) => IpcResponse {
+                    reply: SocketReply::TabCreated { tab_id: tab_id.into() },
+                    close_window: false,
+                },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::CreateGroup { name } => match ctx.create_group(name) {
-            Ok(group_id) => IpcResponse {
-                reply: SocketReply::GroupCreated { group_id },
-                close_window: false,
+            Ok(group_id) => {
+                IpcResponse { reply: SocketReply::GroupCreated { group_id }, close_window: false }
             },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
         IpcRequest::CloseTab { tab_id } => {
             let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
@@ -569,20 +559,24 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
 
             match ctx.close_tab(tab_id) {
                 Ok(close_window) => IpcResponse { reply: reply_ok(), close_window },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::SelectTab { selection } => match ctx.select_tab(selection) {
             Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
-        IpcRequest::MoveTab {
-            tab_id,
-            target_group_id,
-            target_index,
-        } => match ctx.move_tab(tab_id.into(), target_group_id, target_index) {
-            Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+        IpcRequest::MoveTab { tab_id, target_group_id, target_index } => {
+            match ctx.move_tab(tab_id.into(), target_group_id, target_index) {
+                Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
         },
         IpcRequest::SetTabTitle { tab_id, title } => {
             let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
@@ -596,24 +590,34 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
             match ctx.set_tab_title(tab_id, title) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::SetGroupName { group_id, name } => match ctx.set_group_name(group_id, name) {
             Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
         IpcRequest::RestoreClosedTab => match ctx.restore_closed_tab() {
             Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
         IpcRequest::OpenUrl { url, target } => {
             let result = match target {
                 UrlTarget::NewTab => ctx.open_url_new_tab(url).map(|id| Some(id)),
-                UrlTarget::TabId { tab_id } => ctx.open_url_in_tab(tab_id.into(), url).map(|_| None),
+                UrlTarget::TabId { tab_id } => {
+                    ctx.open_url_in_tab(tab_id.into(), url).map(|_| None)
+                },
                 UrlTarget::Current => match ctx.active_tab_id() {
                     Some(tab_id) => match ctx.tab_kind(tab_id) {
-                        Some(IpcTabKind::Web { .. }) => ctx.open_url_in_tab(tab_id, url).map(|_| None),
+                        Some(IpcTabKind::Web { .. }) => {
+                            ctx.open_url_in_tab(tab_id, url).map(|_| None)
+                        },
                         Some(IpcTabKind::Terminal) => ctx.open_url_new_tab(url).map(Some),
                         None => Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found")),
                     },
@@ -627,7 +631,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                     close_window: false,
                 },
                 Ok(None) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::SetWebUrl { tab_id, url } => {
@@ -642,7 +648,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
             match ctx.open_url_in_tab(tab_id, url) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::ReloadWeb { tab_id } => {
@@ -657,7 +665,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
             match ctx.reload_web(tab_id) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::OpenInspector { tab_id } => {
@@ -672,7 +682,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
             match ctx.open_inspector(tab_id) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::GetTabPanel => IpcResponse {
@@ -681,7 +693,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
         },
         IpcRequest::SetTabPanel { enabled, width } => match ctx.set_tab_panel(enabled, width) {
             Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
         IpcRequest::DispatchAction { tab_id, action } => {
             let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
@@ -696,12 +710,17 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             let action = match ipc_action_to_action(action) {
                 Ok(action) => action,
                 Err(err) => {
-                    return IpcResponse { reply: SocketReply::Error { error: err }, close_window: false };
+                    return IpcResponse {
+                        reply: SocketReply::Error { error: err },
+                        close_window: false,
+                    };
                 },
             };
             match ctx.dispatch_action(tab_id, action) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::SendInput { tab_id, text } => {
@@ -716,7 +735,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
             match ctx.send_input(tab_id, text) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::RunCommandBar { tab_id, input } => {
@@ -731,7 +752,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
             match ctx.run_command_bar(tab_id, input) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
             }
         },
         IpcRequest::ListInspectorTargets => match ctx.list_inspector_targets() {
@@ -739,7 +762,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 reply: SocketReply::InspectorTargets { targets },
                 close_window: false,
             },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
         IpcRequest::AttachInspector { tab_id, target_id } => {
             let tab_id = tab_id.map(Into::into);
@@ -755,7 +780,9 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
         },
         IpcRequest::DetachInspector { session_id } => match ctx.detach_inspector(session_id) {
             Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-            Err(err) => IpcResponse { reply: SocketReply::Error { error: err }, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
         },
         IpcRequest::SendInspectorMessage { session_id, message } => {
             match ctx.send_inspector_message(session_id, message) {
@@ -776,8 +803,58 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::WebNetwork { tab_id, action } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.web_network(tab_id, action) {
+                Ok(entries) => {
+                    IpcResponse { reply: SocketReply::WebNetwork { entries }, close_window: false }
+                },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WebMouse { tab_id, action, x, y, button } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.web_mouse(tab_id, action, x, y, button) {
+                Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WebEval { .. }
+        | IpcRequest::WebSnapshot { .. }
+        | IpcRequest::WebPdf { .. } => IpcResponse {
+            reply: reply_error(
+                IpcErrorCode::Unsupported,
+                "Web automation requests must be handled at the IPC router",
+            ),
+            close_window: false,
+        },
         IpcRequest::SetConfig(..) | IpcRequest::GetConfig(..) => IpcResponse {
-            reply: reply_error(IpcErrorCode::InvalidRequest, "Config requests must be handled at the IPC router"),
+            reply: reply_error(
+                IpcErrorCode::InvalidRequest,
+                "Config requests must be handled at the IPC router",
+            ),
             close_window: false,
         },
     };
@@ -841,7 +918,10 @@ pub fn send_message(socket: Option<PathBuf>, message: IpcRequest) -> IoResult<Op
 }
 
 /// Send raw JSON to the active Tabor socket.
-pub fn send_raw_message(socket: Option<PathBuf>, message_json: &str) -> IoResult<Option<SocketReply>> {
+pub fn send_raw_message(
+    socket: Option<PathBuf>,
+    message_json: &str,
+) -> IoResult<Option<SocketReply>> {
     let mut socket = find_socket(socket)?;
 
     socket.write_all(message_json.as_bytes())?;
@@ -1050,15 +1130,13 @@ mod tests {
                     .position(|group| group.id == group_id)
                     .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Group not found"))?
             } else if let Some(name) = group_name {
-                if let Some(index) = self.groups.iter().position(|group| group.name.as_deref() == Some(&name))
+                if let Some(index) =
+                    self.groups.iter().position(|group| group.name.as_deref() == Some(&name))
                 {
                     index
                 } else {
-                    let group = MockGroup {
-                        id: self.next_group_id,
-                        name: Some(name),
-                        tabs: Vec::new(),
-                    };
+                    let group =
+                        MockGroup { id: self.next_group_id, name: Some(name), tabs: Vec::new() };
                     self.next_group_id += 1;
                     self.groups.push(group);
                     self.groups.len() - 1
@@ -1186,17 +1264,17 @@ mod tests {
                 TabSelection::Active => self.active,
                 TabSelection::Next => {
                     let ordered = self.tabs_ordered();
-                    let active = self.active.ok_or_else(|| {
-                        IpcError::new(IpcErrorCode::NotFound, "No active tab")
-                    })?;
+                    let active = self
+                        .active
+                        .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "No active tab"))?;
                     let pos = ordered.iter().position(|id| *id == active).unwrap_or(0);
                     ordered.get((pos + 1) % ordered.len()).copied()
                 },
                 TabSelection::Previous => {
                     let ordered = self.tabs_ordered();
-                    let active = self.active.ok_or_else(|| {
-                        IpcError::new(IpcErrorCode::NotFound, "No active tab")
-                    })?;
+                    let active = self
+                        .active
+                        .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "No active tab"))?;
                     let pos = ordered.iter().position(|id| *id == active).unwrap_or(0);
                     let prev = if pos == 0 { ordered.len() - 1 } else { pos - 1 };
                     ordered.get(prev).copied()
@@ -1270,7 +1348,11 @@ mod tests {
             Ok(())
         }
 
-        fn set_group_name(&mut self, group_id: usize, name: Option<String>) -> Result<(), IpcError> {
+        fn set_group_name(
+            &mut self,
+            group_id: usize,
+            name: Option<String>,
+        ) -> Result<(), IpcError> {
             let group = self
                 .groups
                 .iter_mut()
@@ -1294,19 +1376,15 @@ mod tests {
                     *tab_url = url;
                     Ok(())
                 },
-                IpcTabKind::Terminal => Err(IpcError::new(
-                    IpcErrorCode::InvalidRequest,
-                    "Not a web tab",
-                )),
+                IpcTabKind::Terminal => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
+                },
             }
         }
 
         fn open_url_new_tab(&mut self, url: String) -> Result<TabId, IpcError> {
             if !self.web_supported {
-                return Err(IpcError::new(
-                    IpcErrorCode::Unsupported,
-                    "Web tabs are not supported",
-                ));
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
             }
             self.add_tab(IpcTabKind::Web { url }, None, None)
         }
@@ -1318,10 +1396,9 @@ mod tests {
                 .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
             match tab.kind {
                 IpcTabKind::Web { .. } => Ok(()),
-                IpcTabKind::Terminal => Err(IpcError::new(
-                    IpcErrorCode::InvalidRequest,
-                    "Not a web tab",
-                )),
+                IpcTabKind::Terminal => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
+                },
             }
         }
 
@@ -1333,7 +1410,11 @@ mod tests {
             self.tab_panel.clone()
         }
 
-        fn set_tab_panel(&mut self, enabled: Option<bool>, width: Option<usize>) -> Result<(), IpcError> {
+        fn set_tab_panel(
+            &mut self,
+            enabled: Option<bool>,
+            width: Option<usize>,
+        ) -> Result<(), IpcError> {
             if enabled.is_none() && width.is_none() {
                 return Err(IpcError::new(
                     IpcErrorCode::InvalidRequest,
@@ -1394,10 +1475,7 @@ mod tests {
 
         fn detach_inspector(&mut self, session_id: String) -> Result<(), IpcError> {
             if self.inspector_sessions.remove(&session_id).is_none() {
-                return Err(IpcError::new(
-                    IpcErrorCode::NotFound,
-                    "Inspector session not found",
-                ));
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"));
             }
             self.inspector_messages.remove(&session_id);
             Ok(())
@@ -1409,15 +1487,9 @@ mod tests {
             message: String,
         ) -> Result<(), IpcError> {
             if !self.inspector_sessions.contains_key(&session_id) {
-                return Err(IpcError::new(
-                    IpcErrorCode::NotFound,
-                    "Inspector session not found",
-                ));
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"));
             }
-            self.inspector_messages
-                .entry(session_id)
-                .or_default()
-                .push_back(message);
+            self.inspector_messages.entry(session_id).or_default().push_back(message);
             Ok(())
         }
 
@@ -1427,10 +1499,7 @@ mod tests {
             max: Option<usize>,
         ) -> Result<Vec<IpcInspectorMessage>, IpcError> {
             let Some(messages) = self.inspector_messages.get_mut(&session_id) else {
-                return Err(IpcError::new(
-                    IpcErrorCode::NotFound,
-                    "Inspector session not found",
-                ));
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"));
             };
 
             let take = max.unwrap_or(messages.len());
@@ -1439,12 +1508,46 @@ mod tests {
                 let Some(payload) = messages.pop_front() else {
                     break;
                 };
-                drained.push(IpcInspectorMessage {
-                    session_id: session_id.clone(),
-                    payload,
-                });
+                drained.push(IpcInspectorMessage { session_id: session_id.clone(), payload });
             }
             Ok(drained)
+        }
+
+        fn web_network(
+            &mut self,
+            tab_id: TabId,
+            _action: WebNetworkAction,
+        ) -> Result<Vec<WebNetworkEntry>, IpcError> {
+            if !self.tabs.contains_key(&tab_id) {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            }
+            if !self.web_supported {
+                return Err(IpcError::new(
+                    IpcErrorCode::Unsupported,
+                    "Web tabs are not supported",
+                ));
+            }
+            Ok(Vec::new())
+        }
+
+        fn web_mouse(
+            &mut self,
+            tab_id: TabId,
+            _action: WebMouseAction,
+            _x: f64,
+            _y: f64,
+            _button: WebMouseButton,
+        ) -> Result<(), IpcError> {
+            if !self.tabs.contains_key(&tab_id) {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            }
+            if !self.web_supported {
+                return Err(IpcError::new(
+                    IpcErrorCode::Unsupported,
+                    "Web tabs are not supported",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -1470,9 +1573,7 @@ mod tests {
 
         let response = handle_request(
             &mut ctx,
-            IpcRequest::SelectTab {
-                selection: TabSelection::ByIndex { index: 0 },
-            },
+            IpcRequest::SelectTab { selection: TabSelection::ByIndex { index: 0 } },
         );
         assert!(matches!(response.reply, SocketReply::Ok));
 
@@ -1484,10 +1585,7 @@ mod tests {
             },
         );
         assert!(matches!(response.reply, SocketReply::Ok));
-        assert_eq!(
-            ctx.tabs.get(&initial_tab).unwrap().custom_title.as_deref(),
-            Some("renamed")
-        );
+        assert_eq!(ctx.tabs.get(&initial_tab).unwrap().custom_title.as_deref(), Some("renamed"));
 
         let response = handle_request(
             &mut ctx,
@@ -1500,12 +1598,8 @@ mod tests {
         assert!(matches!(response.reply, SocketReply::Ok));
         assert_eq!(ctx.groups.len(), 2);
 
-        let response = handle_request(
-            &mut ctx,
-            IpcRequest::CloseTab {
-                tab_id: Some(initial_tab.into()),
-            },
-        );
+        let response =
+            handle_request(&mut ctx, IpcRequest::CloseTab { tab_id: Some(initial_tab.into()) });
         assert!(matches!(response.reply, SocketReply::Ok));
         assert!(!response.close_window);
 
@@ -1520,9 +1614,7 @@ mod tests {
 
         let response = handle_request(
             &mut ctx,
-            IpcRequest::CreateGroup {
-                name: Some(String::from("notifications")),
-            },
+            IpcRequest::CreateGroup { name: Some(String::from("notifications")) },
         );
 
         let SocketReply::GroupCreated { group_id } = response.reply else {
@@ -1534,9 +1626,9 @@ mod tests {
     #[test]
     fn ipc_handles_list_and_state() {
         let mut ctx = MockContext::new(true);
-        let web_id =
-            ctx.add_tab(IpcTabKind::Web { url: String::from("https://example.com") }, None, None)
-                .expect("add tab");
+        let web_id = ctx
+            .add_tab(IpcTabKind::Web { url: String::from("https://example.com") }, None, None)
+            .expect("add tab");
 
         let response = handle_request(&mut ctx, IpcRequest::ListTabs);
         let SocketReply::TabList { groups } = response.reply else {
@@ -1545,12 +1637,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].tabs.len(), 2);
 
-        let response = handle_request(
-            &mut ctx,
-            IpcRequest::GetTabState {
-                tab_id: web_id.into(),
-            },
-        );
+        let response = handle_request(&mut ctx, IpcRequest::GetTabState { tab_id: web_id.into() });
         let SocketReply::TabState { tab } = response.reply else {
             panic!("expected tab_state reply");
         };
@@ -1589,10 +1676,7 @@ mod tests {
 
         let response = handle_request(
             &mut ctx,
-            IpcRequest::SetTabPanel {
-                enabled: Some(false),
-                width: Some(200),
-            },
+            IpcRequest::SetTabPanel { enabled: Some(false), width: Some(200) },
         );
         assert!(matches!(response.reply, SocketReply::Ok));
         assert!(!ctx.tab_panel.enabled);
@@ -1623,9 +1707,7 @@ mod tests {
             &mut ctx,
             IpcRequest::DispatchAction {
                 tab_id: Some(tab_id.into()),
-                action: IpcAction::ViAction {
-                    action: String::from("toggle_normal_selection"),
-                },
+                action: IpcAction::ViAction { action: String::from("toggle_normal_selection") },
             },
         );
         assert!(matches!(response.reply, SocketReply::Ok));
@@ -1633,10 +1715,7 @@ mod tests {
 
         let response = handle_request(
             &mut ctx,
-            IpcRequest::SendInput {
-                tab_id: Some(tab_id.into()),
-                text: String::from("ls\n"),
-            },
+            IpcRequest::SendInput { tab_id: Some(tab_id.into()), text: String::from("ls\n") },
         );
         assert!(matches!(response.reply, SocketReply::Ok));
         assert_eq!(ctx.last_input.as_deref(), Some("ls\n"));

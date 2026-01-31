@@ -33,6 +33,8 @@ mod config;
 mod daemon;
 mod display;
 mod event;
+#[cfg(unix)]
+mod agent_browser;
 mod input;
 #[cfg(unix)]
 mod ipc;
@@ -49,8 +51,8 @@ mod string;
 mod tab_panel;
 mod tabs;
 mod web_url;
-mod window_kind;
 mod window_context;
+mod window_kind;
 
 mod gl {
     #![allow(clippy::all, unsafe_op_in_unsafe_fn)]
@@ -58,19 +60,19 @@ mod gl {
 }
 
 #[cfg(unix)]
+use crate::cli::WindowOptions;
+#[cfg(unix)]
 use crate::cli::{
     MessageOptions, MsgCloseTab, MsgCreateGroup, MsgCreateTab, MsgDispatchAction, MsgGetTabState,
     MsgInspector, MsgInspectorAttach, MsgInspectorDetach, MsgInspectorPoll, MsgInspectorSend,
     MsgMoveTab, MsgOpenInspector, MsgOpenUrl, MsgReloadWeb, MsgRunCommandBar, MsgSelectTab,
     MsgSendInput, MsgSetGroupName, MsgSetTabPanel, MsgSetTabTitle, MsgSetWebUrl, TabIdArg,
 };
-#[cfg(unix)]
-use crate::cli::WindowOptions;
 use crate::cli::{Options, Subcommands};
 use crate::config::UiConfig;
+use crate::config::monitor::ConfigMonitor;
 #[cfg(unix)]
 use crate::config::ui_config::Program;
-use crate::config::monitor::ConfigMonitor;
 use crate::event::{Event, Processor};
 #[cfg(target_os = "macos")]
 use crate::macos::locale;
@@ -89,12 +91,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
+    #[cfg(target_os = "macos")]
+    if let Some(exit_code) = macos::cef::maybe_execute_subprocess()? {
+        std::process::exit(exit_code);
+    }
+
     // Load command line options.
     let options = Options::new();
 
     match options.subcommands {
         #[cfg(unix)]
         Some(Subcommands::Msg(options)) => msg(options)?,
+        #[cfg(unix)]
+        Some(Subcommands::AgentBrowser(options)) => agent_browser::run(options)?,
         Some(Subcommands::Migrate(options)) => migrate::migrate(options),
         None => tabor(options)?,
     }
@@ -159,12 +168,7 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
             send_request(&socket, ipc::IpcRequest::ListTabs)?;
         },
         crate::cli::MessageCommand::GetTabState(MsgGetTabState { tab_id }) => {
-            send_request(
-                &socket,
-                ipc::IpcRequest::GetTabState {
-                    tab_id: ipc_tab_id(tab_id),
-                },
-            )?;
+            send_request(&socket, ipc::IpcRequest::GetTabState { tab_id: ipc_tab_id(tab_id) })?;
         },
         crate::cli::MessageCommand::CreateTab(MsgCreateTab {
             web,
@@ -182,23 +186,14 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
             };
             send_request(
                 &socket,
-                ipc::IpcRequest::CreateTab {
-                    options: tab_options,
-                    group_id,
-                    group_name,
-                },
+                ipc::IpcRequest::CreateTab { options: tab_options, group_id, group_name },
             )?;
         },
         crate::cli::MessageCommand::CreateGroup(MsgCreateGroup { name }) => {
             send_request(&socket, ipc::IpcRequest::CreateGroup { name })?;
         },
         crate::cli::MessageCommand::CloseTab(MsgCloseTab { tab_id }) => {
-            send_request(
-                &socket,
-                ipc::IpcRequest::CloseTab {
-                    tab_id: tab_id.map(ipc_tab_id),
-                },
-            )?;
+            send_request(&socket, ipc::IpcRequest::CloseTab { tab_id: tab_id.map(ipc_tab_id) })?;
         },
         crate::cli::MessageCommand::SelectTab(MsgSelectTab {
             active,
@@ -241,18 +236,12 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
             let title = if clear { None } else { title };
             send_request(
                 &socket,
-                ipc::IpcRequest::SetTabTitle {
-                    tab_id: tab_id.map(ipc_tab_id),
-                    title,
-                },
+                ipc::IpcRequest::SetTabTitle { tab_id: tab_id.map(ipc_tab_id), title },
             )?;
         },
         crate::cli::MessageCommand::SetGroupName(MsgSetGroupName { group_id, name, clear }) => {
             let name = if clear { None } else { name };
-            send_request(
-                &socket,
-                ipc::IpcRequest::SetGroupName { group_id, name },
-            )?;
+            send_request(&socket, ipc::IpcRequest::SetGroupName { group_id, name })?;
         },
         crate::cli::MessageCommand::RestoreClosedTab => {
             send_request(&socket, ipc::IpcRequest::RestoreClosedTab)?;
@@ -270,36 +259,22 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
         crate::cli::MessageCommand::SetWebUrl(MsgSetWebUrl { url, tab_id }) => {
             send_request(
                 &socket,
-                ipc::IpcRequest::SetWebUrl {
-                    tab_id: tab_id.map(ipc_tab_id),
-                    url,
-                },
+                ipc::IpcRequest::SetWebUrl { tab_id: tab_id.map(ipc_tab_id), url },
             )?;
         },
         crate::cli::MessageCommand::ReloadWeb(MsgReloadWeb { tab_id }) => {
-            send_request(
-                &socket,
-                ipc::IpcRequest::ReloadWeb {
-                    tab_id: tab_id.map(ipc_tab_id),
-                },
-            )?;
+            send_request(&socket, ipc::IpcRequest::ReloadWeb { tab_id: tab_id.map(ipc_tab_id) })?;
         },
         crate::cli::MessageCommand::OpenInspector(MsgOpenInspector { tab_id }) => {
             send_request(
                 &socket,
-                ipc::IpcRequest::OpenInspector {
-                    tab_id: tab_id.map(ipc_tab_id),
-                },
+                ipc::IpcRequest::OpenInspector { tab_id: tab_id.map(ipc_tab_id) },
             )?;
         },
         crate::cli::MessageCommand::GetTabPanel => {
             send_request(&socket, ipc::IpcRequest::GetTabPanel)?;
         },
-        crate::cli::MessageCommand::SetTabPanel(MsgSetTabPanel {
-            enable,
-            disable,
-            width,
-        }) => {
+        crate::cli::MessageCommand::SetTabPanel(MsgSetTabPanel { enable, disable, width }) => {
             let enabled = if enable {
                 Some(true)
             } else if disable {
@@ -336,10 +311,7 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
                 let program = if args.is_empty() {
                     Program::Just(program.clone())
                 } else {
-                    Program::WithArgs {
-                        program: program.clone(),
-                        args: args.to_vec(),
-                    }
+                    Program::WithArgs { program: program.clone(), args: args.to_vec() }
                 };
                 ipc::IpcAction::Command { program }
             } else {
@@ -347,28 +319,19 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
             };
             send_request(
                 &socket,
-                ipc::IpcRequest::DispatchAction {
-                    tab_id: tab_id.map(ipc_tab_id),
-                    action,
-                },
+                ipc::IpcRequest::DispatchAction { tab_id: tab_id.map(ipc_tab_id), action },
             )?;
         },
         crate::cli::MessageCommand::SendInput(MsgSendInput { text, tab_id }) => {
             send_request(
                 &socket,
-                ipc::IpcRequest::SendInput {
-                    tab_id: tab_id.map(ipc_tab_id),
-                    text,
-                },
+                ipc::IpcRequest::SendInput { tab_id: tab_id.map(ipc_tab_id), text },
             )?;
         },
         crate::cli::MessageCommand::RunCommandBar(MsgRunCommandBar { input, tab_id }) => {
             send_request(
                 &socket,
-                ipc::IpcRequest::RunCommandBar {
-                    tab_id: tab_id.map(ipc_tab_id),
-                    input,
-                },
+                ipc::IpcRequest::RunCommandBar { tab_id: tab_id.map(ipc_tab_id), input },
             )?;
         },
         crate::cli::MessageCommand::Inspector { command } => match command {
@@ -378,10 +341,7 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
             MsgInspector::Attach(MsgInspectorAttach { tab_id, target_id }) => {
                 send_request(
                     &socket,
-                    ipc::IpcRequest::AttachInspector {
-                        tab_id: tab_id.map(ipc_tab_id),
-                        target_id,
-                    },
+                    ipc::IpcRequest::AttachInspector { tab_id: tab_id.map(ipc_tab_id), target_id },
                 )?;
             },
             MsgInspector::Detach(MsgInspectorDetach { session_id }) => {
@@ -394,10 +354,7 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
                 )?;
             },
             MsgInspector::Poll(MsgInspectorPoll { session_id, max }) => {
-                send_request(
-                    &socket,
-                    ipc::IpcRequest::PollInspectorMessages { session_id, max },
-                )?;
+                send_request(&socket, ipc::IpcRequest::PollInspectorMessages { session_id, max })?;
             },
         },
         crate::cli::MessageCommand::Send { json } => {
@@ -501,6 +458,12 @@ fn tabor(mut options: Options) -> Result<(), Box<dyn Error>> {
     locale::set_locale_environment();
 
     #[cfg(target_os = "macos")]
+    macos::disable_app_nap();
+
+    #[cfg(target_os = "macos")]
+    macos::set_background_activation();
+
+    #[cfg(target_os = "macos")]
     macos::disable_autofill();
 
     // Create the IPC socket listener.
@@ -550,6 +513,12 @@ fn tabor(mut options: Options) -> Result<(), Box<dyn Error>> {
     if let Some(config_monitor) = processor.config_monitor.take() {
         config_monitor.shutdown();
     }
+
+    // Drop processor before shutting down platform services.
+    drop(processor);
+
+    #[cfg(target_os = "macos")]
+    macos::cef::shutdown();
 
     // Without explicitly detaching the console cmd won't redraw it's prompt.
     #[cfg(windows)]

@@ -1,0 +1,13 @@
+[99721:12162947:0130/210407.669054:ERROR:ui/gl/gl_implementation.cc:522] Failed to load /Users/tartavull/code/tabor/target/debug/libGLESv2.dylib: dlopen(/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib, 0x0005): tried: '/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib' (no such file), '/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib' (no such file)
+[99721:12162947:0130/210407.679195:ERROR:components/viz/service/main/viz_main_impl.cc:189] Exiting GPU process due to errors during initialization
+Invalid UTF-16 string
+Invalid UTF-16 string
+[99768:12163193:0130/210407.959004:ERROR:ui/gl/gl_implementation.cc:522] Failed to load /Users/tartavull/code/tabor/target/debug/libGLESv2.dylib: dlopen(/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib, 0x0005): tried: '/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib' (no such file), '/System/Volumes/Preboot/Cryptexes/OS/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib' (no such file), '/Users/tartavull/code/tabor/target/debug/libGLESv2.dylib' (no such file)
+[99768:12163193:0130/210407.965583:ERROR:components/viz/service/main/viz_main_impl.cc:189] Exiting GPU process due to errors during initialization
+[99465:12162905:0130/210410.302238:ERROR:google_apis/gcm/engine/registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+[99465:12162905:0130/210431.770426:ERROR:google_apis/gcm/engine/registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+[99465:12162905:0130/210527.091470:ERROR:google_apis/gcm/engine/registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+[7440:12172800:0130/210707.766666:ERROR:services/on_device_model/ml/gpu_blocklist.cc:118] Unable to get gpu adapter
+[7440:12172808:0130/210707.767547:ERROR:services/on_device_model/ml/gpu_blocklist.cc:118] Unable to get gpu adapter
+[99465:12162905:0130/210712.487994:ERROR:google_apis/gcm/engine/registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+[99465:12162905:0130/210953.530914:ERROR:google_apis/gcm/engine/registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT

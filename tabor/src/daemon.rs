@@ -167,10 +167,7 @@ pub fn foreground_process_path(
 }
 
 #[cfg(not(windows))]
-pub fn foreground_process_name(
-    master_fd: RawFd,
-    shell_pid: u32,
-) -> Result<String, Box<dyn Error>> {
+pub fn foreground_process_name(master_fd: RawFd, shell_pid: u32) -> Result<String, Box<dyn Error>> {
     let mut pid = unsafe { libc::tcgetpgrp(master_fd) };
     if pid < 0 {
         pid = shell_pid as pid_t;

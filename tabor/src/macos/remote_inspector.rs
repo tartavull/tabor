@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::ffi::{CStr, CString};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use libc::{c_char, c_void, free, size_t};
+use log::debug;
 use parking_lot::{Condvar, Mutex};
 
 use crate::tabs::TabId;
@@ -147,18 +150,25 @@ struct RemoteInspectorInner {
 
 impl RemoteInspectorClient {
     pub fn connect() -> Result<Self, InspectorError> {
-        let queue_label =
-            CString::new("tabor.remote_inspector").map_err(|_| InspectorError::invalid("Bad label"))?;
+        let queue_label = CString::new("tabor.remote_inspector")
+            .map_err(|_| InspectorError::invalid("Bad label"))?;
         let queue = unsafe { xpc::dispatch_queue_create(queue_label.as_ptr(), std::ptr::null()) };
         if queue.is_null() {
-            return Err(InspectorError::ConnectionFailed(String::from("Failed to create dispatch queue")));
+            return Err(InspectorError::ConnectionFailed(String::from(
+                "Failed to create dispatch queue",
+            )));
         }
 
-        let mach_name =
-            CString::new(WIR_XPC_MACH_PORT_NAME).map_err(|_| InspectorError::invalid("Bad mach name"))?;
-        let connection = unsafe { xpc::xpc_connection_create_mach_service(mach_name.as_ptr(), queue, 0) };
+        let mach_name = env::var("TABOR_WEBINSPECTOR_SERVICE")
+            .unwrap_or_else(|_| WIR_XPC_MACH_PORT_NAME.to_string());
+        let mach_name = CString::new(mach_name)
+            .map_err(|_| InspectorError::invalid("Bad mach name"))?;
+        let connection =
+            unsafe { xpc::xpc_connection_create_mach_service(mach_name.as_ptr(), queue, 0) };
         if connection.is_null() {
-            return Err(InspectorError::ConnectionFailed(String::from("Failed to connect to webinspectord")));
+            return Err(InspectorError::ConnectionFailed(String::from(
+                "Failed to connect to webinspectord",
+            )));
         }
 
         let sender = format!("PID:{}", std::process::id());
@@ -217,7 +227,11 @@ impl RemoteInspectorClient {
         }
     }
 
-    pub fn attach(&self, tab_id: TabId, target_id: u64) -> Result<InspectorSession, InspectorError> {
+    pub fn attach(
+        &self,
+        tab_id: TabId,
+        target_id: u64,
+    ) -> Result<InspectorSession, InspectorError> {
         let connection_id = self.next_connection_id();
         let session_id = format!("{}-{connection_id}", self.inner.sender);
         let mut state = self.inner.state.lock();
@@ -238,11 +252,7 @@ impl RemoteInspectorClient {
         drop(state);
 
         self.send_socket_setup(target_id, &session_id)?;
-        Ok(InspectorSession {
-            session_id,
-            target_id,
-            tab_id,
-        })
+        Ok(InspectorSession { session_id, target_id, tab_id })
     }
 
     pub fn detach(&self, session_id: &str) -> Result<(), InspectorError> {
@@ -283,10 +293,7 @@ impl RemoteInspectorClient {
             let Some(payload) = session.pending_messages.pop_front() else {
                 break;
             };
-            messages.push(InspectorMessage {
-                session_id: session_id.to_string(),
-                payload,
-            });
+            messages.push(InspectorMessage { session_id: session_id.to_string(), payload });
         }
 
         Ok(messages)
@@ -346,6 +353,11 @@ impl RemoteInspectorClient {
         if message.is_null() {
             return Err(InspectorError::invalid("Failed to build XPC message"));
         }
+        if inspector_debug_enabled() {
+            if let Some(desc) = xpc::copy_description(message.as_raw()) {
+                debug!("WebInspector XPC -> {desc}");
+            }
+        }
         unsafe {
             xpc::xpc_connection_send_message(self.inner.connection, message.as_raw());
         }
@@ -355,6 +367,11 @@ impl RemoteInspectorClient {
 
 impl RemoteInspectorInner {
     fn handle_message(self: Arc<Self>, message: xpc::xpc_object_t) {
+        if inspector_debug_enabled() {
+            if let Some(desc) = xpc::copy_description(message) {
+                debug!("WebInspector XPC <- {desc}");
+            }
+        }
         if xpc::is_error(message) {
             self.handle_error(message);
             return;
@@ -405,15 +422,18 @@ impl RemoteInspectorInner {
     }
 
     fn handle_raw_data(&self, message: xpc::xpc_object_t) {
-        let Some(session_id) = xpc::dictionary_string(message, WIR_CONNECTION_IDENTIFIER_KEY) else {
+        let Some(session_id) = xpc::dictionary_string(message, WIR_CONNECTION_IDENTIFIER_KEY)
+        else {
             return;
         };
         let Some(payload) = xpc::dictionary_data(message, WIR_RAW_DATA_KEY) else {
             return;
         };
 
-        let data_type =
-            MessageDataType::parse(xpc::dictionary_string(message, WIR_MESSAGE_DATA_TYPE_KEY), xpc::dictionary_uint64(message, WIR_MESSAGE_DATA_TYPE_KEY));
+        let data_type = MessageDataType::parse(
+            xpc::dictionary_string(message, WIR_MESSAGE_DATA_TYPE_KEY),
+            xpc::dictionary_uint64(message, WIR_MESSAGE_DATA_TYPE_KEY),
+        );
 
         let mut state = self.state.lock();
         let Some(session) = state.sessions.get_mut(&session_id) else {
@@ -438,6 +458,17 @@ impl RemoteInspectorInner {
             },
         }
     }
+}
+
+fn inspector_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match env::var("TABOR_WEBINSPECTOR_DEBUG") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !(value.is_empty() || value == "0" || value == "false")
+        }
+        Err(_) => false,
+    })
 }
 
 impl Drop for RemoteInspectorInner {
@@ -524,7 +555,8 @@ fn match_score(
         }
     }
 
-    let normalized_url = tab.url.as_deref().filter(|value| !value.is_empty()).map(normalize_url_key);
+    let normalized_url =
+        tab.url.as_deref().filter(|value| !value.is_empty()).map(normalize_url_key);
     let title = tab.title.as_deref().filter(|value| !value.is_empty());
     let override_name = tab.override_name.as_deref().filter(|value| !value.is_empty());
 
@@ -603,16 +635,8 @@ mod xpc {
             key: *const c_char,
             value: *const c_char,
         );
-        pub fn xpc_dictionary_set_uint64(
-            dict: xpc_object_t,
-            key: *const c_char,
-            value: u64,
-        );
-        pub fn xpc_dictionary_set_bool(
-            dict: xpc_object_t,
-            key: *const c_char,
-            value: bool,
-        );
+        pub fn xpc_dictionary_set_uint64(dict: xpc_object_t, key: *const c_char, value: u64);
+        pub fn xpc_dictionary_set_bool(dict: xpc_object_t, key: *const c_char, value: bool);
         pub fn xpc_dictionary_set_data(
             dict: xpc_object_t,
             key: *const c_char,
@@ -637,7 +661,8 @@ mod xpc {
         pub fn xpc_copy_description(object: xpc_object_t) -> *mut c_char;
         pub fn xpc_release(object: xpc_object_t);
 
-        pub fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> dispatch_queue_t;
+        pub fn dispatch_queue_create(label: *const c_char, attr: *const c_void)
+        -> dispatch_queue_t;
         pub fn dispatch_release(object: *const c_void);
     }
 
@@ -750,11 +775,7 @@ mod xpc {
         }
         let key = CString::new(key).ok()?;
         let value = unsafe { xpc_dictionary_get_value(dict, key.as_ptr()) };
-        if value.is_null() {
-            None
-        } else {
-            Some(value)
-        }
+        if value.is_null() { None } else { Some(value) }
     }
 
     pub fn dictionary_string(dict: xpc_object_t, key: &str) -> Option<String> {
@@ -811,20 +832,22 @@ mod xpc {
                     url: dictionary_string(root, WIR_URL_KEY),
                     title: dictionary_string(root, WIR_TITLE_KEY),
                     override_name: dictionary_string(root, WIR_OVERRIDE_NAME_KEY),
-                    host_app_identifier: dictionary_string(root, WIR_HOST_APPLICATION_IDENTIFIER_KEY),
+                    host_app_identifier: dictionary_string(
+                        root,
+                        WIR_HOST_APPLICATION_IDENTIFIER_KEY,
+                    ),
                 };
                 targets.push(target);
             }
 
             let targets_ptr = targets as *mut Vec<InspectorTarget>;
-            let applier =
-                StackBlock::new(move |_key: *const c_void, value: xpc_object_t| -> u8 {
-                    // SAFETY: xpc_dictionary_apply invokes the block synchronously.
-                    unsafe {
-                        collect_targets_inner(value, &mut *targets_ptr);
-                    }
-                    1
-                });
+            let applier = StackBlock::new(move |_key: *const c_void, value: xpc_object_t| -> u8 {
+                // SAFETY: xpc_dictionary_apply invokes the block synchronously.
+                unsafe {
+                    collect_targets_inner(value, &mut *targets_ptr);
+                }
+                1
+            });
             let _ = unsafe { xpc_dictionary_apply(root, &applier) };
         } else if is_array(root) {
             let count = unsafe { xpc_array_get_count(root) };
@@ -862,9 +885,7 @@ mod tests {
             let session = state.sessions.get_mut("sess-1").unwrap();
             session.pending_chunk.extend_from_slice(b"\"result\":{}}");
             let payload = std::mem::take(&mut session.pending_chunk);
-            session
-                .pending_messages
-                .push_back(String::from_utf8(payload).expect("utf8"));
+            session.pending_messages.push_back(String::from_utf8(payload).expect("utf8"));
         }
 
         let session = state.sessions.get_mut("sess-1").unwrap();
@@ -943,9 +964,6 @@ mod tests {
             MessageDataType::parse(Some(String::from("finalchunk")), None),
             MessageDataType::FinalChunk
         ));
-        assert!(matches!(
-            MessageDataType::parse(None, Some(2)),
-            MessageDataType::FinalChunk
-        ));
+        assert!(matches!(MessageDataType::parse(None, Some(2)), MessageDataType::FinalChunk));
     }
 }

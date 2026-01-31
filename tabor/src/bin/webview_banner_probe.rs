@@ -12,7 +12,7 @@ mod probe {
     use objc2::encode::{Encode, Encoding};
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, Bool};
-    use objc2::{class, msg_send, sel, MainThreadMarker};
+    use objc2::{MainThreadMarker, class, msg_send, sel};
     use objc2_foundation::NSString;
     use serde::Deserialize;
     use serde_json;
@@ -79,11 +79,7 @@ mod probe {
 
     impl Default for ProbeState {
         fn default() -> Self {
-            Self {
-                pending: false,
-                last_eval: Instant::now(),
-                last_result: None,
-            }
+            Self { pending: false, last_eval: Instant::now(), last_result: None }
         }
     }
 
@@ -205,8 +201,7 @@ mod probe {
             });
 
             unsafe {
-                let _: () =
-                    msg_send![&*self.view, evaluateJavaScript: &*script, completionHandler: &*block];
+                let _: () = msg_send![&*self.view, evaluateJavaScript: &*script, completionHandler: &*block];
             }
         }
     }
@@ -243,7 +238,9 @@ mod probe {
         }
 
         if bundle.is_null() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Safari.app not found").into());
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::Other, "Safari.app not found").into()
+            );
         }
 
         let key = NSString::from_str("CFBundleShortVersionString");
@@ -260,8 +257,9 @@ mod probe {
     }
 
     fn safari_user_agent(view: &AnyObject) -> Result<String, Box<dyn Error>> {
-        let base_agent = webview_user_agent(view)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "WKWebView has no userAgent"))?;
+        let base_agent = webview_user_agent(view).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "WKWebView has no userAgent")
+        })?;
         if base_agent.contains("Safari/") {
             return Ok(base_agent);
         }
@@ -270,7 +268,10 @@ mod probe {
             .split_whitespace()
             .find_map(|token| token.strip_prefix("AppleWebKit/"))
             .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "WKWebView userAgent missing AppleWebKit")
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "WKWebView userAgent missing AppleWebKit",
+                )
             })?;
 
         let safari_version = safari_version_from_bundle()?;
@@ -314,10 +315,7 @@ mod probe {
         let width = (size.width as f64 / scale_factor) as CGFloat;
         let height = (size.height as f64 / scale_factor) as CGFloat;
 
-        CGRect {
-            origin: CGPoint { x: 0.0, y: 0.0 },
-            size: CGSize { width, height },
-        }
+        CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width, height } }
     }
 
     struct App {

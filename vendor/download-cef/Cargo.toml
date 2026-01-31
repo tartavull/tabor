@@ -1,0 +1,14 @@
+[package]
+name = "download-cef"
+version = "2.3.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "download_cef"
+path = "src/lib.rs"

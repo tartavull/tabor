@@ -2,3 +2,5 @@ target
 .direnv/
 extra/osx/.metadata_never_index
 extra/osx/Tabor.app/Contents/MacOS/
+vendor/cef/
+.cargo/config.toml

@@ -1,13 +1,14 @@
 use std::cmp::max;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use tabor_config::SerdeReplace;
 use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueHint};
 use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
+use tabor_config::SerdeReplace;
 use toml::Value;
 
 use tabor_terminal::tty::Options as PtyOptions;
@@ -159,12 +160,9 @@ fn parse_tab_id(input: &str) -> Result<TabIdArg, String> {
         .split_once(':')
         .or_else(|| input.split_once(','))
         .ok_or_else(|| String::from("tab id must be <index>:<generation>"))?;
-    let index = index
-        .parse::<u32>()
-        .map_err(|_| String::from("tab id index must be a u32"))?;
-    let generation = generation
-        .parse::<u32>()
-        .map_err(|_| String::from("tab id generation must be a u32"))?;
+    let index = index.parse::<u32>().map_err(|_| String::from("tab id index must be a u32"))?;
+    let generation =
+        generation.parse::<u32>().map_err(|_| String::from("tab id generation must be a u32"))?;
     Ok(TabIdArg { index, generation })
 }
 
@@ -320,6 +318,8 @@ impl WindowIdentity {
 pub enum Subcommands {
     #[cfg(unix)]
     Msg(MessageOptions),
+    #[cfg(unix)]
+    AgentBrowser(AgentBrowserOptions),
     Migrate(MigrateOptions),
 }
 
@@ -334,6 +334,16 @@ pub struct MessageOptions {
     /// Message which should be sent.
     #[clap(subcommand)]
     pub message: MessageCommand,
+}
+
+/// Agent-browser CLI compatibility shim.
+#[cfg(unix)]
+#[derive(Args, Debug, Clone)]
+#[clap(disable_help_flag = true, disable_version_flag = true)]
+pub struct AgentBrowserOptions {
+    /// Command and args to pass through.
+    #[clap(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
+    pub args: Vec<OsString>,
 }
 
 /// Available socket messages.
@@ -1014,11 +1024,9 @@ mod tests {
     fn completions() {
         let mut clap = Options::command();
 
-        for (shell, file) in &[
-            (Shell::Bash, "tabor.bash"),
-            (Shell::Fish, "tabor.fish"),
-            (Shell::Zsh, "_tabor"),
-        ] {
+        for (shell, file) in
+            &[(Shell::Bash, "tabor.bash"), (Shell::Fish, "tabor.fish"), (Shell::Zsh, "_tabor")]
+        {
             if std::env::var("TABOR_GEN_COMPLETIONS").is_ok() {
                 let mut file = File::create(format!("../extra/completions/{file}")).unwrap();
                 clap_complete::generate(*shell, &mut clap, "tabor", &mut file);

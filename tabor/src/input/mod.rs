@@ -43,11 +43,11 @@ use crate::config::{
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, SizeInfo};
+#[cfg(target_os = "macos")]
+use crate::event::WebCommand;
 use crate::event::{
     ClickState, Event, EventType, InlineSearchState, Mouse, TouchPurpose, TouchZoom,
 };
-#[cfg(target_os = "macos")]
-use crate::event::WebCommand;
 use crate::message_bar::{self, Message};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::window_kind::WindowKind;
@@ -573,10 +573,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             x.saturating_sub(size_info.padding_x() as usize) % size_info.cell_width() as usize;
         let half_cell_width = (size_info.cell_width() / 2.0) as usize;
 
-        let additional_padding = (size_info.width()
-            - size_info.padding_x()
-            - size_info.padding_right())
-            % size_info.cell_width();
+        let additional_padding =
+            (size_info.width() - size_info.padding_x() - size_info.padding_right())
+                % size_info.cell_width();
         let end_of_grid = size_info.width() - size_info.padding_right() - additional_padding;
 
         if cell_x > half_cell_width
@@ -1142,20 +1141,26 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Check mouse icon state in relation to the message bar.
     fn message_bar_cursor_state(&self) -> Option<CursorIcon> {
-        // Calculate Y position of the end of the last terminal line.
         let size = self.ctx.size_info();
-        let terminal_end = size.padding_y() as usize
-            + size.cell_height() as usize * size.screen_lines();
-
         let mouse = self.ctx.mouse();
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
 
-        if self.ctx.message().is_none() || (mouse.y <= terminal_end) {
-            None
-        } else if mouse.y <= terminal_end + size.cell_height() as usize
-            && point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns()
-        {
+        if self.ctx.message().is_none() || self.ctx.command_active() || self.ctx.search_active() {
+            return None;
+        }
+
+        if !size.contains_point(mouse.x, mouse.y) {
+            return None;
+        }
+
+        let display_offset = self.ctx.terminal().grid().display_offset();
+        let point = self.ctx.mouse().point(&size, display_offset);
+        let last_line = size.screen_lines().saturating_sub(1);
+
+        if point.line != last_line {
+            return None;
+        }
+
+        if point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns() {
             Some(CursorIcon::Pointer)
         } else {
             Some(CursorIcon::Default)

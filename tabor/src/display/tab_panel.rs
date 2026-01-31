@@ -16,8 +16,8 @@ use tabor_terminal::index::{Column, Point};
 use tabor_terminal::term::MIN_COLUMNS;
 
 use crate::config::UiConfig;
-use crate::display::color::Rgb;
 use crate::display::SizeInfo;
+use crate::display::color::Rgb;
 use crate::renderer::rects::RenderRect;
 use crate::renderer::{GlyphCache, Renderer};
 use crate::tab_panel::{TabPanelCommand, TabPanelGroup, TabPanelTab};
@@ -255,10 +255,9 @@ impl TabPanel {
         };
 
         let valid = match edit.target {
-            TabPanelEditTarget::Tab(tab_id) => self
-                .groups
-                .iter()
-                .any(|group| group.tabs.iter().any(|tab| tab.tab_id == tab_id)),
+            TabPanelEditTarget::Tab(tab_id) => {
+                self.groups.iter().any(|group| group.tabs.iter().any(|tab| tab.tab_id == tab_id))
+            },
             TabPanelEditTarget::Group(group_id) => {
                 self.groups.iter().any(|group| group.id == group_id)
             },
@@ -353,18 +352,13 @@ impl TabPanel {
             let hit = self.hit_test(position, &panel_size_info);
             let command = match hit {
                 Some(PanelHit::Tab { tab_id }) => Some(TabPanelCommand::RenameTab(tab_id)),
-                Some(PanelHit::Group { group_index }) => self
-                    .groups
-                    .get(group_index)
-                    .map(|group| TabPanelCommand::RenameGroup(group.id)),
+                Some(PanelHit::Group { group_index }) => {
+                    self.groups.get(group_index).map(|group| TabPanelCommand::RenameGroup(group.id))
+                },
                 None => None,
             };
 
-            return TabPanelMouseUpdate {
-                capture,
-                needs_redraw: command.is_some(),
-                command,
-            };
+            return TabPanelMouseUpdate { capture, needs_redraw: command.is_some(), command };
         }
 
         if button != MouseButton::Left {
@@ -385,23 +379,21 @@ impl TabPanel {
         let mut command = None;
 
         match state {
-            ElementState::Pressed => {
-                match hit {
-                    Some(PanelHit::Tab { tab_id }) => {
-                        if !self.is_close_hit(position, &panel_size_info, tab_id) {
-                            self.drag = Some(DragState::new(DragItem::Tab(tab_id), position));
-                            needs_redraw = true;
-                        }
-                    },
-                    Some(PanelHit::Group { group_index }) => {
-                        if let Some(group) = self.groups.get(group_index) {
-                            self.drag =
-                                Some(DragState::new(DragItem::Group { group_id: group.id }, position));
-                            needs_redraw = true;
-                        }
-                    },
-                    None => (),
-                }
+            ElementState::Pressed => match hit {
+                Some(PanelHit::Tab { tab_id }) => {
+                    if !self.is_close_hit(position, &panel_size_info, tab_id) {
+                        self.drag = Some(DragState::new(DragItem::Tab(tab_id), position));
+                        needs_redraw = true;
+                    }
+                },
+                Some(PanelHit::Group { group_index }) => {
+                    if let Some(group) = self.groups.get(group_index) {
+                        self.drag =
+                            Some(DragState::new(DragItem::Group { group_id: group.id }, position));
+                        needs_redraw = true;
+                    }
+                },
+                None => (),
             },
             ElementState::Released => {
                 if let Some(drag) = self.drag.take() {
@@ -431,11 +423,9 @@ impl TabPanel {
                                 }
                             },
                             DragItem::Group { group_id } => {
-                                if let Some(DropTarget::Group(target)) = self.compute_drop_target(
-                                    position,
-                                    &panel_size_info,
-                                    &drag.item,
-                                ) {
+                                if let Some(DropTarget::Group(target)) =
+                                    self.compute_drop_target(position, &panel_size_info, &drag.item)
+                                {
                                     command = Some(TabPanelCommand::MoveGroup {
                                         group_id,
                                         target_index: target.index,
@@ -598,8 +588,11 @@ impl TabPanel {
             if !missing.is_empty() {
                 renderer.with_loader(|mut api| {
                     for (key, favicon) in missing {
-                        let rasterized =
-                            favicon.image.rasterized_glyph(favicon.character, &panel_size_info, metrics);
+                        let rasterized = favicon.image.rasterized_glyph(
+                            favicon.character,
+                            &panel_size_info,
+                            metrics,
+                        );
                         glyph_cache.insert_custom_glyph(key, rasterized, &mut api);
                     }
                 });
@@ -628,9 +621,7 @@ impl TabPanel {
                     if let Some(group) = self.groups.get(*group_index) {
                         let indent = GROUP_HEADER_INDENT_COLS;
                         let label = match &self.edit {
-                            Some(edit)
-                                if edit.target == TabPanelEditTarget::Group(group.id) =>
-                            {
+                            Some(edit) if edit.target == TabPanelEditTarget::Group(group.id) => {
                                 render_edit_text(&edit.text, edit.cursor)
                             },
                             _ => group.label.clone(),
@@ -668,7 +659,8 @@ impl TabPanel {
                 PanelItemKind::Tab { tab } => {
                     let is_ghost = item.style == RenderStyle::Ghost;
                     let indent = TAB_INDENT_COLS;
-                    let indicator_cols = if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
+                    let indicator_cols =
+                        if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
                     let text_col = indent + indicator_cols;
                     let close_col = self.width_cols.saturating_sub(1);
                     let max_cols = self.width_cols.saturating_sub(text_col + 1);
@@ -684,7 +676,8 @@ impl TabPanel {
                     #[cfg(not(target_os = "macos"))]
                     let show_inline_close_favicon = false;
                     let show_inline_close_indicator = show_close && tab.activity.is_some();
-                    let show_inline_close = show_inline_close_favicon || show_inline_close_indicator;
+                    let show_inline_close =
+                        show_inline_close_favicon || show_inline_close_indicator;
                     let show_trailing_close = show_close && !show_inline_close;
                     #[cfg(target_os = "macos")]
                     let label = if let Some(favicon) = &tab.favicon {
@@ -712,7 +705,8 @@ impl TabPanel {
                             indicator.color
                         };
                         let glyph = if show_inline_close_indicator { 'x' } else { indicator.glyph };
-                        let indicator_fg = if show_inline_close_indicator { fg } else { indicator_color };
+                        let indicator_fg =
+                            if show_inline_close_indicator { fg } else { indicator_color };
                         let point = Point::new(item.line, Column(indent));
                         renderer.draw_string(
                             point,
@@ -734,8 +728,7 @@ impl TabPanel {
                         glyph_cache,
                     );
 
-                    if show_trailing_close && close_col > text_col
-                    {
+                    if show_trailing_close && close_col > text_col {
                         let point = Point::new(item.line, Column(close_col));
                         renderer.draw_string(
                             point,
@@ -917,7 +910,11 @@ impl TabPanel {
         position.x >= left && position.x <= right
     }
 
-    fn update_drop_target(&mut self, position: PhysicalPosition<f64>, size_info: &SizeInfo) -> bool {
+    fn update_drop_target(
+        &mut self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+    ) -> bool {
         let Some(drag) = self.drag.as_ref().filter(|drag| drag.dragging) else {
             if self.drop_target.take().is_some() {
                 return true;
@@ -986,11 +983,7 @@ impl TabPanel {
             let visible_tabs = group.tabs.len().min(remaining_lines);
             let tabs_start = header_line + 1;
             let tabs_end = header_line + visible_tabs;
-            let blank_line = if visible_tabs < remaining_lines {
-                Some(tabs_end + 1)
-            } else {
-                None
-            };
+            let blank_line = if visible_tabs < remaining_lines { Some(tabs_end + 1) } else { None };
             let group_end = blank_line.unwrap_or(tabs_end);
 
             if line >= header_line && line <= group_end {
@@ -1001,11 +994,7 @@ impl TabPanel {
                 } else {
                     visible_tabs
                 };
-                return Some(TabDropTarget {
-                    group_index,
-                    group_id: group.id,
-                    index,
-                });
+                return Some(TabDropTarget { group_index, group_id: group.id, index });
             }
 
             current_line = group_end + 1;
@@ -1081,9 +1070,7 @@ impl TabPanel {
             }
 
             match item.kind {
-                PanelItemKind::GroupHeader { group_index } => {
-                    Some(PanelHit::Group { group_index })
-                },
+                PanelItemKind::GroupHeader { group_index } => Some(PanelHit::Group { group_index }),
                 PanelItemKind::Tab { tab } => Some(PanelHit::Tab { tab_id: tab.tab_id }),
                 PanelItemKind::GhostGroupHeader { .. } => None,
             }
@@ -1100,10 +1087,7 @@ impl TabPanel {
                 break;
             }
 
-            items.push(PanelItem {
-                line,
-                kind: PanelItemKind::GroupHeader { group_index },
-            });
+            items.push(PanelItem { line, kind: PanelItemKind::GroupHeader { group_index } });
             line += 1;
 
             for tab in &group.tabs {
@@ -1111,10 +1095,7 @@ impl TabPanel {
                     break;
                 }
 
-                items.push(PanelItem {
-                    line,
-                    kind: PanelItemKind::Tab { tab: tab.clone() },
-                });
+                items.push(PanelItem { line, kind: PanelItemKind::Tab { tab: tab.clone() } });
                 line += 1;
             }
 
@@ -1142,10 +1123,7 @@ impl TabPanel {
                         }
                     }
 
-                    if self
-                        .last_mouse_pos
-                        .is_some_and(|position| self.is_inside_panel(position))
-                    {
+                    if self.last_mouse_pos.is_some_and(|position| self.is_inside_panel(position)) {
                         if let Some((tab, _, _)) = self.find_tab(*tab_id) {
                             return self.preview_new_group_layout(size_info, tab);
                         }
@@ -1170,11 +1148,7 @@ impl TabPanel {
         let items = layout
             .items
             .into_iter()
-            .map(|item| RenderItem {
-                line: item.line,
-                kind: item.kind,
-                style: RenderStyle::Normal,
-            })
+            .map(|item| RenderItem { line: item.line, kind: item.kind, style: RenderStyle::Normal })
             .collect();
 
         RenderLayout { items }
@@ -1214,10 +1188,8 @@ impl TabPanel {
             }
 
             let insert_here = group_index == target.group_index;
-            let max_index = group
-                .tabs
-                .len()
-                .saturating_sub(usize::from(group_index == drag_group_index));
+            let max_index =
+                group.tabs.len().saturating_sub(usize::from(group_index == drag_group_index));
             let target_index = target_index.min(max_index);
             let mut inserted = false;
             let mut visible_tabs = 0usize;
@@ -1395,14 +1367,8 @@ impl TabPanel {
     }
 
     fn preview_group_id(&self) -> usize {
-        self.new_group_id.unwrap_or_else(|| {
-            self.groups
-                .iter()
-                .map(|group| group.id)
-                .max()
-                .unwrap_or(0)
-                + 1
-        })
+        self.new_group_id
+            .unwrap_or_else(|| self.groups.iter().map(|group| group.id).max().unwrap_or(0) + 1)
     }
 
     fn preview_new_group_layout(
@@ -1457,9 +1423,7 @@ impl TabPanel {
         if line < max_lines {
             items.push(RenderItem {
                 line,
-                kind: PanelItemKind::GhostGroupHeader {
-                    label: format!("group {}", new_group_id),
-                },
+                kind: PanelItemKind::GhostGroupHeader { label: format!("group {}", new_group_id) },
                 style: RenderStyle::Ghost,
             });
             line += 1;
@@ -1752,10 +1716,7 @@ fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
         return 0;
     }
 
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(idx, _)| idx)
-        .unwrap_or_else(|| text.len())
+    text.char_indices().nth(char_idx).map(|(idx, _)| idx).unwrap_or_else(|| text.len())
 }
 
 fn truncate_to_columns(text: &str, max_cols: usize) -> String {
@@ -1806,16 +1767,10 @@ fn tab_activity_indicator(
             base_blue.g.saturating_sub(0x28),
             base_blue.b.saturating_add(0x28),
         );
-        return Some(ActivityIndicator {
-            glyph: ACTIVITY_INDICATOR_FILLED,
-            color: blue,
-        });
+        return Some(ActivityIndicator { glyph: ACTIVITY_INDICATOR_FILLED, color: blue });
     }
 
-    Some(ActivityIndicator {
-        glyph: ACTIVITY_INDICATOR_OUTLINE,
-        color: mix(fg, base, 0.5),
-    })
+    Some(ActivityIndicator { glyph: ACTIVITY_INDICATOR_OUTLINE, color: mix(fg, base, 0.5) })
 }
 
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {

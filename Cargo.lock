@@ -108,6 +108,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -228,14 +234,36 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.40"
+version = "1.2.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1d05d92f4b1fd76aad469d46cdd858ca761576082cd37df81416691e50199fb"
+checksum = "47b26a0954ae34af09b50f0de26458fa95369a0d478d8236d3f93082b219bd29"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
  "shlex",
+]
+
+[[package]]
+name = "cef"
+version = "144.2.0+144.0.11"
+dependencies = [
+ "cef-dll-sys",
+ "libloading 0.9.0",
+ "objc2 0.6.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "cef-dll-sys"
+version = "144.2.0+144.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf6882e1e10fe7ff0c9b1815e8a2943c0975be5bb48f15ca3b4cbb9dc4329d0e"
+dependencies = [
+ "anyhow",
+ "cmake",
+ "download-cef",
+ "serde_json",
 ]
 
 [[package]]
@@ -321,6 +349,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
+]
+
+[[package]]
+name = "cmake"
+version = "0.1.57"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -531,7 +568,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330c60081dcc4c72131f8eb70510f1ac07223e5d4163db481a04a0befcffa412"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -539,6 +576,10 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "download-cef"
+version = "2.3.0"
 
 [[package]]
 name = "dpi"
@@ -616,9 +657,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.3"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0399f9d26e5191ce32c498bebd31e7a3ceabc2745f0ac54af3f335126c3f24b3"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flate2"
@@ -770,7 +811,7 @@ dependencies = [
  "glutin_egl_sys",
  "glutin_glx_sys",
  "glutin_wgl_sys",
- "libloading",
+ "libloading 0.8.9",
  "objc2 0.6.3",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -1084,6 +1125,14 @@ name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
 dependencies = [
  "cfg-if",
  "windows-link",
@@ -2125,8 +2174,10 @@ name = "tabor"
 version = "0.17.0-dev"
 dependencies = [
  "ahash",
+ "base64",
  "bitflags 2.9.4",
  "block2 0.6.2",
+ "cef",
  "clap",
  "clap_complete",
  "copypasta",
@@ -3123,7 +3174,7 @@ dependencies = [
  "as-raw-xcb-connection",
  "gethostname",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "once_cell",
  "rustix 1.1.2",
  "x11rb-protocol",

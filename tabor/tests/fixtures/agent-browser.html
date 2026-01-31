@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Agent Browser Fixture</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        padding: 24px;
+        line-height: 1.4;
+      }
+      .row {
+        margin-bottom: 12px;
+      }
+      .item {
+        padding: 4px 0;
+      }
+      #drag-src {
+        width: 120px;
+        padding: 8px;
+        background: #e0f0ff;
+        border: 1px solid #88a;
+        cursor: grab;
+      }
+      #drag-dst {
+        width: 200px;
+        height: 50px;
+        border: 2px dashed #888;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #spacer {
+        height: 1200px;
+      }
+      #bottom-target {
+        padding: 8px;
+        background: #ffe9c6;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 id="title">Agent Browser Fixture</h1>
+
+    <div class="row">
+      <button id="btn-alert">Alert</button>
+      <button id="btn-confirm">Confirm</button>
+      <button id="btn-prompt">Prompt</button>
+    </div>
+    <div class="row">
+      <div id="prompt-result">Prompt result: none</div>
+      <div id="confirm-result">Confirm result: none</div>
+    </div>
+
+    <div class="row">
+      <label for="email-input">Email</label>
+      <input id="email-input" type="text" placeholder="Email" aria-label="Email">
+    </div>
+
+    <div class="row">
+      <textarea id="notes" aria-label="Notes"></textarea>
+    </div>
+
+    <div class="row">
+      <div id="editable" contenteditable="true">Editable</div>
+    </div>
+
+    <div class="row">
+      <input id="check-me" type="checkbox">
+      <label for="check-me">Check me</label>
+    </div>
+
+    <div class="row">
+      <select id="select-me" aria-label="Select">
+        <option value="">Choose</option>
+        <option value="a">Option A</option>
+        <option value="b">Option B</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <div id="drag-src" draggable="true">Drag me</div>
+      <div id="drag-dst">Drop here</div>
+    </div>
+
+    <div class="row">
+      <input id="file-input" type="file" multiple>
+      <div id="file-output">No files</div>
+    </div>
+
+    <div class="row">
+      <button id="fetch-btn">Fetch data</button>
+      <div id="fetch-output">Fetch output: none</div>
+    </div>
+
+    <div class="row">
+      <button id="console-btn" data-testid="console-button">Console log</button>
+      <button id="error-btn">Throw error</button>
+      <img id="logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="Logo">
+      <div id="title-tip" title="Close">Tooltip target</div>
+    </div>
+
+    <div class="row">
+      <div class="item">Item 1</div>
+      <div class="item">Item 2</div>
+      <div class="item">Item 3</div>
+    </div>
+
+    <div class="row">
+      <button id="frame-launch">Frame Ready</button>
+      <iframe id="inner-frame" srcdoc="<html><body><button id='frame-btn'>Frame Button</button><div id='frame-text'>Frame text</div></body></html>"></iframe>
+    </div>
+
+    <div id="spacer"></div>
+    <div id="bottom-target">Bottom target</div>
+
+    <script>
+      const alertBtn = document.getElementById('btn-alert');
+      const confirmBtn = document.getElementById('btn-confirm');
+      const promptBtn = document.getElementById('btn-prompt');
+      const promptResult = document.getElementById('prompt-result');
+      const confirmResult = document.getElementById('confirm-result');
+      const dragSrc = document.getElementById('drag-src');
+      const dragDst = document.getElementById('drag-dst');
+      const fileInput = document.getElementById('file-input');
+      const fileOutput = document.getElementById('file-output');
+      const fetchBtn = document.getElementById('fetch-btn');
+      const fetchOutput = document.getElementById('fetch-output');
+      const consoleBtn = document.getElementById('console-btn');
+      const errorBtn = document.getElementById('error-btn');
+
+      alertBtn.addEventListener('click', () => {
+        alert('Hello from alert');
+      });
+
+      confirmBtn.addEventListener('click', () => {
+        const ok = confirm('Confirm me');
+        confirmResult.textContent = ok ? 'Confirm result: accepted' : 'Confirm result: dismissed';
+      });
+
+      promptBtn.addEventListener('click', () => {
+        const value = prompt('Prompt me', 'default');
+        promptResult.textContent = value == null ? 'Prompt result: cancelled' : `Prompt result: ${value}`;
+      });
+
+      dragSrc.addEventListener('dragstart', (event) => {
+        event.dataTransfer.setData('text/plain', 'drag-data');
+      });
+
+      dragDst.addEventListener('dragover', (event) => {
+        event.preventDefault();
+      });
+
+      dragDst.addEventListener('drop', (event) => {
+        event.preventDefault();
+        const data = event.dataTransfer.getData('text/plain');
+        dragDst.textContent = data || 'dropped';
+      });
+
+      fileInput.addEventListener('change', () => {
+        const names = Array.from(fileInput.files || []).map((f) => f.name).join(', ');
+        fileOutput.textContent = names ? `Files: ${names}` : 'No files';
+      });
+
+      fetchBtn.addEventListener('click', async () => {
+        fetchOutput.textContent = 'Fetch output: loading';
+        try {
+          const response = await fetch('https://example.com/route-test');
+          const text = await response.text();
+          fetchOutput.textContent = `Fetch output: ${text.slice(0, 40)}`;
+        } catch (err) {
+          fetchOutput.textContent = `Fetch output: error`;
+        }
+      });
+
+      consoleBtn.addEventListener('click', () => {
+        console.log('console: hello', { ok: true });
+      });
+
+      errorBtn.addEventListener('click', () => {
+        setTimeout(() => {
+          throw new Error('fixture error');
+        }, 0);
+      });
+    </script>
+  </body>
+</html>

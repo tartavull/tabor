@@ -524,6 +524,11 @@ esac
     ;;
 esac
 ;;
+(agent-browser)
+_arguments "${_arguments_options[@]}" : \
+'*::args -- Command and args to pass through:_default' \
+&& ret=0
+;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
 '-c+[Path to the configuration file]:CONFIG_FILE:_files' \
@@ -703,6 +708,10 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(agent-browser)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -724,19 +733,31 @@ esac
 _tabor_commands() {
     local commands; commands=(
 'msg:Send a message to the Tabor socket' \
+'agent-browser:Agent-browser CLI compatibility shim' \
 'migrate:Migrate the configuration file' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor commands' commands "$@"
 }
+(( $+functions[_tabor__agent-browser_commands] )) ||
+_tabor__agent-browser_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent-browser commands' commands "$@"
+}
 (( $+functions[_tabor__help_commands] )) ||
 _tabor__help_commands() {
     local commands; commands=(
 'msg:Send a message to the Tabor socket' \
+'agent-browser:Agent-browser CLI compatibility shim' \
 'migrate:Migrate the configuration file' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor help commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent-browser_commands] )) ||
+_tabor__help__agent-browser_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent-browser commands' commands "$@"
 }
 (( $+functions[_tabor__help__help_commands] )) ||
 _tabor__help__help_commands() {

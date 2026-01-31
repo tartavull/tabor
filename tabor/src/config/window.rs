@@ -215,10 +215,7 @@ pub struct TabPanelConfig {
 
 impl Default for TabPanelConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            width: 250,
-        }
+        Self { enabled: true, width: 250 }
     }
 }
 

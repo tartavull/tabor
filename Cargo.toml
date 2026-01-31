@@ -22,3 +22,6 @@ toml_edit = "0.23.1"
 
 [patch.crates-io]
 winit = { path = "vendor/winit" }
+download-cef = { path = "vendor/download-cef" }
+libloading = { path = "vendor/libloading" }
+cef = { path = "vendor/cef-crate" }
