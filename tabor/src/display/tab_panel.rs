@@ -841,6 +841,12 @@ impl TabPanel {
     }
 
     fn panel_size_info(&self, size_info: &SizeInfo) -> SizeInfo {
+        let top_inset = if self.top_inset_px > 0.0 {
+            self.top_inset_px.max(self.panel_cell_height(size_info))
+        } else {
+            0.0
+        };
+
         SizeInfo::new(
             self.width_px,
             size_info.height(),
@@ -848,7 +854,7 @@ impl TabPanel {
             self.panel_cell_height(size_info),
             0.,
             0.,
-            size_info.padding_y() + self.top_inset_px,
+            size_info.padding_y() + top_inset,
             false,
         )
     }
