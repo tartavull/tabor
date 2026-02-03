@@ -22,7 +22,8 @@ use std::fmt::{self, Display, Formatter};
 
 #[cfg(target_os = "macos")]
 use {
-    objc2::MainThreadMarker,
+    objc2::{MainThreadMarker, msg_send},
+    objc2::runtime::AnyObject,
     objc2_app_kit::{NSColor, NSColorSpace, NSView, NSWindowButton},
     objc2_foundation::NSPoint,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
@@ -575,6 +576,25 @@ impl Window {
         let blue = f64::from(color.b) / 255.0;
         let ns_color = NSColor::colorWithSRGBRed_green_blue_alpha(red, green, blue, 1.0);
         window.setBackgroundColor(Some(&ns_color));
+
+        if let Some(close) = window.standardWindowButton(NSWindowButton::CloseButton) {
+            if let Some(titlebar_view) = unsafe { close.superview() } {
+                set_view_layer_background(&titlebar_view, &ns_color);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_view_layer_background(view: &NSView, color: &NSColor) {
+    unsafe {
+        let _: () = msg_send![view, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let cg_color: *mut AnyObject = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg_color];
     }
 }
 
