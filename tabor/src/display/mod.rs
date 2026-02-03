@@ -567,10 +567,13 @@ impl Display {
                 Decorations::Full | Decorations::Transparent
             );
             let top_inset = if tab_panel.is_enabled() && has_controls {
+                let panel_bg = TabPanel::background_color(config);
+                window.set_macos_background_color(panel_bg);
                 window
                     .layout_macos_window_controls(panel_dimensions.width, padding.1)
                     .unwrap_or(0.0)
             } else {
+                window.set_macos_background_color(config.colors.primary.background);
                 0.0
             };
             tab_panel.set_top_inset_px(top_inset);
@@ -792,10 +795,13 @@ impl Display {
                 Decorations::Full | Decorations::Transparent
             );
             let top_inset = if self.tab_panel.is_enabled() && has_controls {
+                let panel_bg = TabPanel::background_color(config);
+                self.window.set_macos_background_color(panel_bg);
                 self.window
                     .layout_macos_window_controls(panel_dimensions.width, padding.1)
                     .unwrap_or(0.0)
             } else {
+                self.window.set_macos_background_color(config.colors.primary.background);
                 0.0
             };
             self.tab_panel.set_top_inset_px(top_inset);

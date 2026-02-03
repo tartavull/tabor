@@ -23,7 +23,7 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::MainThreadMarker,
-    objc2_app_kit::{NSColorSpace, NSView, NSWindowButton},
+    objc2_app_kit::{NSColor, NSColorSpace, NSView, NSWindowButton},
     objc2_foundation::NSPoint,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
@@ -46,6 +46,8 @@ use crate::cli::WindowOptions;
 use crate::config::UiConfig;
 use crate::config::window::{Decorations, Identity, WindowConfig};
 use crate::display::SizeInfo;
+#[cfg(target_os = "macos")]
+use crate::display::color::Rgb;
 
 /// Window icon for `_NET_WM_ICON` property.
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
@@ -549,6 +551,30 @@ impl Window {
 
         let top_inset_points = button_height + top_margin;
         Some((top_inset_points * scale_factor) as f32)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_macos_background_color(&self, color: Rgb) {
+        let _mtm = match MainThreadMarker::new() {
+            Some(mtm) => mtm,
+            None => return,
+        };
+
+        let view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
+            _ => return,
+        };
+
+        let window = match view.window() {
+            Some(window) => window,
+            None => return,
+        };
+
+        let red = f64::from(color.r) / 255.0;
+        let green = f64::from(color.g) / 255.0;
+        let blue = f64::from(color.b) / 255.0;
+        let ns_color = NSColor::colorWithSRGBRed_green_blue_alpha(red, green, blue, 1.0);
+        window.setBackgroundColor(Some(&ns_color));
     }
 }
 

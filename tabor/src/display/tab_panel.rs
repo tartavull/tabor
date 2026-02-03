@@ -115,6 +115,12 @@ impl TabPanel {
         Self::default()
     }
 
+    pub fn background_color(config: &UiConfig) -> Rgb {
+        let base = config.colors.primary.background;
+        let fg = config.colors.primary.foreground;
+        mix(base, fg, 0.04)
+    }
+
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -479,7 +485,7 @@ impl TabPanel {
         let layout = self.render_layout(&panel_size_info);
         let base = config.colors.primary.background;
         let fg = config.colors.primary.foreground;
-        let panel_bg = mix(base, fg, 0.04);
+        let panel_bg = Self::background_color(config);
         let header_bg = mix(base, fg, 0.08);
         let active_bg = mix(base, fg, 0.18);
         let ghost_bg = mix(base, fg, 0.14);
@@ -609,7 +615,7 @@ impl TabPanel {
 
         let base = config.colors.primary.background;
         let fg = config.colors.primary.foreground;
-        let panel_bg = mix(base, fg, 0.04);
+        let panel_bg = Self::background_color(config);
         let header_bg = mix(base, fg, 0.08);
         let active_bg = mix(base, fg, 0.18);
         let ghost_bg = mix(base, fg, 0.14);
