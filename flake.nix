@@ -25,7 +25,7 @@
 
         cefTarball = pkgs.fetchzip {
           url = "https://cef-builds.spotifycdn.com/cef_binary_144.0.11+ge135be2+chromium-144.0.7559.97_macosarm64.tar.bz2";
-          sha256 = "sha256-yLjzvbaVvc+Rs3W3SX678gX7poqlFOlTmFj+T5LIfZ8=";
+          sha256 = "sha256-Opk2RsuA7q8QErQX6k7MgLRNo1Yhy/hc1UCKGcxmakc=";
           stripRoot = true;
         };
 
@@ -66,6 +66,7 @@
             echo "Tabor dev shell activated."
             ${lib.optionalString (pkgs.stdenv.isDarwin && pkgs.stdenv.isAarch64) ''
               export TABOR_CEF_PATH=${cefTarball}
+              export CEF_PATH=${cefTarball}
             ''}
           '';
         };

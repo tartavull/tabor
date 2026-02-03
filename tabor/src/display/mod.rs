@@ -40,6 +40,8 @@ use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
 use crate::config::font::Font;
 use crate::config::window::Dimensions;
+#[cfg(target_os = "macos")]
+use crate::config::window::Decorations;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
@@ -560,6 +562,18 @@ impl Display {
         {
             tab_panel.set_enabled(config.window.tab_panel.enabled);
             tab_panel.set_dimensions(panel_dimensions);
+            let has_controls = matches!(
+                config.window.decorations,
+                Decorations::Full | Decorations::Transparent
+            );
+            let top_inset = if tab_panel.is_enabled() && has_controls {
+                window
+                    .layout_macos_window_controls(panel_dimensions.width, padding.1)
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            tab_panel.set_top_inset_px(top_inset);
         }
 
         // Disable vsync.
@@ -773,6 +787,18 @@ impl Display {
         {
             self.tab_panel.set_enabled(config.window.tab_panel.enabled);
             self.tab_panel.set_dimensions(panel_dimensions);
+            let has_controls = matches!(
+                config.window.decorations,
+                Decorations::Full | Decorations::Transparent
+            );
+            let top_inset = if self.tab_panel.is_enabled() && has_controls {
+                self.window
+                    .layout_macos_window_controls(panel_dimensions.width, padding.1)
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            self.tab_panel.set_top_inset_px(top_inset);
         }
 
         // Update number of column/lines in the viewport.

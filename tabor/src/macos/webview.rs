@@ -110,13 +110,6 @@ impl WebView {
         }
     }
 
-    pub fn invalidate_cursor_rects(&self) {
-        match &self.inner {
-            WebViewInner::WebKit(view) => view.invalidate_cursor_rects(),
-            WebViewInner::Cef(view) => view.invalidate_cursor_rects(),
-        }
-    }
-
     pub fn load_url(&mut self, url: &str) -> bool {
         match &mut self.inner {
             WebViewInner::WebKit(view) => view.load_url(url),

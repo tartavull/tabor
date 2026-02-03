@@ -412,8 +412,6 @@ impl WebView {
         }
     }
 
-    pub fn invalidate_cursor_rects(&self) {}
-
     pub fn load_url(&mut self, url: &str) -> bool {
         self.last_title = None;
         self.last_url = None;

@@ -92,6 +92,7 @@ pub struct TabPanel {
     enabled: bool,
     width_cols: usize,
     width_px: f32,
+    top_inset_px: f32,
     groups: Vec<TabPanelGroup>,
     new_group_id: Option<usize>,
     edit: Option<EditState>,
@@ -121,6 +122,10 @@ impl TabPanel {
     pub fn set_dimensions(&mut self, dimensions: PanelDimensions) {
         self.width_cols = dimensions.columns;
         self.width_px = dimensions.width;
+    }
+
+    pub fn set_top_inset_px(&mut self, inset: f32) {
+        self.top_inset_px = inset.max(0.0);
     }
 
     pub fn width(&self) -> f32 {
@@ -843,7 +848,7 @@ impl TabPanel {
             self.panel_cell_height(size_info),
             0.,
             0.,
-            size_info.padding_y(),
+            size_info.padding_y() + self.top_inset_px,
             false,
         )
     }

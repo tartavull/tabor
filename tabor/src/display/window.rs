@@ -23,7 +23,8 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::MainThreadMarker,
-    objc2_app_kit::{NSColorSpace, NSView},
+    objc2_app_kit::{NSColorSpace, NSView, NSWindowButton},
+    objc2_foundation::NSPoint,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -53,6 +54,11 @@ const WINDOW_ICON: &[u8] = include_bytes!("../../extra/logo/compat/tabor-term.pn
 /// This should match the definition of IDI_ICON from `tabor.rc`.
 #[cfg(windows)]
 const IDI_ICON: u16 = 0x101;
+
+#[cfg(target_os = "macos")]
+const MACOS_TRAFFIC_LIGHT_MARGIN_X: f64 = 12.0;
+#[cfg(target_os = "macos")]
+const MACOS_TRAFFIC_LIGHT_MARGIN_Y: f64 = 8.0;
 
 /// Window errors.
 #[derive(Debug)]
@@ -334,7 +340,16 @@ impl Window {
             WinitWindow::default_attributes().with_option_as_alt(window_config.option_as_alt());
 
         match window_config.decorations {
-            Decorations::Full => window,
+            Decorations::Full => {
+                if window_config.tab_panel.enabled {
+                    window
+                        .with_title_hidden(true)
+                        .with_titlebar_transparent(true)
+                        .with_fullsize_content_view(true)
+                } else {
+                    window
+                }
+            },
             Decorations::Transparent => window
                 .with_title_hidden(true)
                 .with_titlebar_transparent(true)
@@ -471,6 +486,69 @@ impl Window {
         };
 
         view.window().unwrap().setHasShadow(has_shadows);
+    }
+
+    /// Position macOS window controls inside the left panel.
+    #[cfg(target_os = "macos")]
+    pub fn layout_macos_window_controls(
+        &self,
+        panel_width_px: f32,
+        padding_y_px: f32,
+    ) -> Option<f32> {
+        let _mtm = MainThreadMarker::new()?;
+
+        let view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
+            _ => return None,
+        };
+
+        let window = view.window()?;
+
+        let close = window.standardWindowButton(NSWindowButton::CloseButton)?;
+        let mini = window.standardWindowButton(NSWindowButton::MiniaturizeButton)?;
+        let zoom = window.standardWindowButton(NSWindowButton::ZoomButton)?;
+
+        if panel_width_px <= 0.0 {
+            return None;
+        }
+
+        let scale_factor = self.scale_factor as f64;
+
+        let close_frame = close.frame();
+        let mini_frame = mini.frame();
+        let zoom_frame = zoom.frame();
+
+        let button_height = close_frame
+            .size
+            .height
+            .max(mini_frame.size.height)
+            .max(zoom_frame.size.height);
+        let mini_dx = mini_frame.origin.x - close_frame.origin.x;
+        let zoom_dx = zoom_frame.origin.x - close_frame.origin.x;
+        let left_margin = MACOS_TRAFFIC_LIGHT_MARGIN_X;
+        let top_margin = (f64::from(padding_y_px) / scale_factor).max(MACOS_TRAFFIC_LIGHT_MARGIN_Y);
+
+        let y = if view.isFlipped() {
+            top_margin
+        } else {
+            let bounds = view.bounds();
+            bounds.size.height - top_margin - button_height
+        };
+
+        view.addSubview(&close);
+        view.addSubview(&mini);
+        view.addSubview(&zoom);
+
+        close.setHidden(false);
+        mini.setHidden(false);
+        zoom.setHidden(false);
+
+        close.setFrameOrigin(NSPoint::new(left_margin, y));
+        mini.setFrameOrigin(NSPoint::new(left_margin + mini_dx, y));
+        zoom.setFrameOrigin(NSPoint::new(left_margin + zoom_dx, y));
+
+        let top_inset_points = button_height + top_margin;
+        Some((top_inset_points * scale_factor) as f32)
     }
 }
 
