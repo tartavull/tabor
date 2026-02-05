@@ -18,6 +18,7 @@ unsafe extern "C" {}
 
 pub mod favicon;
 pub mod cef;
+pub(crate) mod keycodes;
 pub mod locale;
 pub mod open_documents;
 pub mod proc;
@@ -26,7 +27,6 @@ pub mod web_commands;
 pub mod web_cursor;
 pub mod webview;
 mod webview_cef;
-mod webview_webkit;
 
 pub(crate) use open_documents::register_open_documents_handler;
 

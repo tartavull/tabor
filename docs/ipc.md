@@ -217,17 +217,19 @@ Request:
 
 ## Remote Inspector (macOS)
 
-These commands require macOS and a web tab. They return `unsupported` on other
-platforms.
+These commands require macOS and a web tab. On the CEF backend they speak the
+Chromium DevTools Protocol (CDP).
 
 ### list_inspector_targets
+Targets are the open web tabs. `target_id` is derived from the tab id (generation
+in the high 32 bits, index in the low 32 bits).
 Request:
 ```json
 {"type":"list_inspector_targets"}
 ```
 Reply:
 ```json
-{"type":"inspector_targets","targets":[{"target_id":42,"target_type":"WIRTypeWebPage","url":"https://example.com","title":"Example","override_name":null,"host_app_identifier":"PID:12345","tab_id":{"index":1,"generation":1}}]}
+{"type":"inspector_targets","targets":[{"target_id":1,"target_type":"page","url":"https://example.com","title":"Example","override_name":null,"host_app_identifier":"tabor","tab_id":{"index":1,"generation":0}}]}
 ```
 
 ### attach_inspector
@@ -241,31 +243,31 @@ Request (by target id):
 ```
 Reply:
 ```json
-{"type":"inspector_attached","session":{"session_id":"PID:12345-1","target_id":42,"tab_id":{"index":1,"generation":1}}}
+{"type":"inspector_attached","session":{"session_id":"cef:1:1","target_id":1,"tab_id":{"index":1,"generation":0}}}
 ```
 
 ### send_inspector_message
-Sends a raw WebKit Inspector Protocol JSON string.
-Request:
+Sends a raw DevTools Protocol JSON string.
+Request (CDP JSON string):
 ```json
-{"type":"send_inspector_message","session_id":"PID:12345-1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}
+{"type":"send_inspector_message","session_id":"cef:1:1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}
 ```
 Reply: `{"type":"ok"}`
 
 ### poll_inspector_messages
 Request:
 ```json
-{"type":"poll_inspector_messages","session_id":"PID:12345-1","max":50}
+{"type":"poll_inspector_messages","session_id":"cef:1:1","max":50}
 ```
 Reply:
 ```json
-{"type":"inspector_messages","messages":[{"session_id":"PID:12345-1","payload":"{\"method\":\"Network.requestWillBeSent\",...}"}]}
+{"type":"inspector_messages","messages":[{"session_id":"cef:1:1","payload":"{\"method\":\"Network.requestWillBeSent\",...}"}]}
 ```
 
 ### detach_inspector
 Request:
 ```json
-{"type":"detach_inspector","session_id":"PID:12345-1"}
+{"type":"detach_inspector","session_id":"cef:1:1"}
 ```
 Reply: `{"type":"ok"}`
 
@@ -273,10 +275,10 @@ Reply: `{"type":"ok"}`
 
 ```sh
 tabor msg send '{"type":"open_url","url":"https://example.com","target":{"type":"new_tab"}}'
-tabor msg send '{"type":"attach_inspector","tab_id":{"index":1,"generation":1}}'
-tabor msg send '{"type":"send_inspector_message","session_id":"PID:12345-1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}'
-tabor msg send '{"type":"reload_web","tab_id":{"index":1,"generation":1}}'
-tabor msg send '{"type":"poll_inspector_messages","session_id":"PID:12345-1","max":100}'
+tabor msg send '{"type":"attach_inspector","tab_id":{"index":1,"generation":0}}'
+tabor msg send '{"type":"send_inspector_message","session_id":"cef:1:1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}'
+tabor msg send '{"type":"reload_web","tab_id":{"index":1,"generation":0}}'
+tabor msg send '{"type":"poll_inspector_messages","session_id":"cef:1:1","max":100}'
 ```
 
 ## Errors

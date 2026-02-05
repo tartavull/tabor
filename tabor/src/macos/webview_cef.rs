@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::rc::Rc as StdRc;
 
@@ -9,15 +9,18 @@ use cef::{
     rc::Rc,
     CefString, Client, DevToolsMessageObserver, DisplayHandler, ImplBrowser, ImplBrowserHost,
     ImplClient, ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplFrame,
-    WrapClient, WrapDevToolsMessageObserver, WrapDisplayHandler,
+    ImplListValue, ImplTask, Task, WrapClient, WrapDevToolsMessageObserver, WrapDisplayHandler,
+    WrapTask,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, MainThreadMarker};
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton};
+use winit::event::{ElementState, KeyEvent, MouseButton};
+use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::raw_window_handle::RawWindowHandle;
 
 use crate::display::window::Window;
@@ -27,6 +30,7 @@ use crate::ipc::{WebNetworkAction, WebNetworkEntry};
 use crate::tabs::TabId;
 use tabor_terminal::grid::Dimensions;
 
+use super::keycodes::macos_scancode_from_physical_key;
 #[cfg(target_pointer_width = "32")]
 type CGFloat = f32;
 #[cfg(target_pointer_width = "64")]
@@ -67,11 +71,20 @@ unsafe impl Encode for CGRect {
 
 type DevToolsCallback = Box<dyn FnOnce(Result<JsonValue, String>)>;
 
+const MAX_DEVTOOLS_EVENTS: usize = 2048;
+
+struct DevToolsEvent {
+    id: u64,
+    payload: String,
+}
+
 struct DevToolsState {
     next_message_id: i32,
     pending: HashMap<i32, DevToolsCallback>,
     entries: Vec<WebNetworkEntry>,
     index: HashMap<String, usize>,
+    events: VecDeque<DevToolsEvent>,
+    next_event_id: u64,
 }
 
 impl DevToolsState {
@@ -81,6 +94,8 @@ impl DevToolsState {
             pending: HashMap::new(),
             entries: Vec::new(),
             index: HashMap::new(),
+            events: VecDeque::new(),
+            next_event_id: 1,
         }
     }
 
@@ -88,6 +103,45 @@ impl DevToolsState {
         let id = self.next_message_id;
         self.next_message_id += 1;
         id
+    }
+
+    fn record_event(&mut self, method: &str, params: Option<&JsonValue>) {
+        let mut object = JsonMap::new();
+        object.insert("method".to_string(), JsonValue::String(method.to_string()));
+        if let Some(params) = params {
+            object.insert("params".to_string(), params.clone());
+        }
+        let payload = JsonValue::Object(object).to_string();
+        self.push_event(payload);
+    }
+
+    fn push_event(&mut self, payload: String) {
+        let id = self.next_event_id;
+        self.next_event_id = self.next_event_id.saturating_add(1);
+        self.events.push_back(DevToolsEvent { id, payload });
+        while self.events.len() > MAX_DEVTOOLS_EVENTS {
+            self.events.pop_front();
+        }
+    }
+
+    fn latest_event_id(&self) -> u64 {
+        self.next_event_id.saturating_sub(1)
+    }
+
+    fn events_since(&self, last_id: u64, max: usize) -> (Vec<String>, u64) {
+        let mut out = Vec::new();
+        let mut newest = last_id;
+        for event in &self.events {
+            if event.id <= last_id {
+                continue;
+            }
+            out.push(event.payload.clone());
+            newest = event.id;
+            if out.len() >= max {
+                break;
+            }
+        }
+        (out, newest)
     }
 
     fn update_network_state(&mut self, method: &str, params: Option<&JsonValue>) {
@@ -268,9 +322,9 @@ cef::wrap_dev_tools_message_observer! {
                 return;
             }
             let params = params.and_then(|bytes| serde_json::from_slice::<JsonValue>(bytes).ok());
-            self.state
-                .borrow_mut()
-                .update_network_state(&method, params.as_ref());
+            let mut state = self.state.borrow_mut();
+            state.record_event(&method, params.as_ref());
+            state.update_network_state(&method, params.as_ref());
         }
     }
 }
@@ -297,6 +351,24 @@ cef::wrap_client! {
     impl Client {
         fn display_handler(&self) -> Option<cef::DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+    }
+}
+
+cef::wrap_task! {
+    struct SendKeyTask {
+        browser: cef::Browser,
+        events: Vec<cef::KeyEvent>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Some(host) = self.browser.host() else {
+                return;
+            };
+            for event in &self.events {
+                host.send_key_event(Some(event));
+            }
         }
     }
 }
@@ -400,6 +472,12 @@ impl WebView {
         }
     }
 
+    pub fn set_focus(&mut self, focus: bool) {
+        if let Some(host) = self.browser.host() {
+            host.set_focus(if focus { 1 } else { 0 });
+        }
+    }
+
     pub fn update_frame(&mut self, window: &Window, size_info: &SizeInfo) {
         if let Some(view) = browser_view(&self.browser) {
             let frame = webview_frame(window, size_info);
@@ -490,6 +568,205 @@ impl WebView {
         }
 
         true
+    }
+
+    pub fn handle_key_input(
+        &mut self,
+        _window: &Window,
+        key: &KeyEvent,
+        text: &str,
+        modifiers: ModifiersState,
+    ) -> bool {
+        let key_without_modifiers = key.key_without_modifiers();
+        self.handle_key_input_inner(
+            &key_without_modifiers,
+            text,
+            key.state,
+            modifiers,
+            key.repeat,
+            key.location,
+            key.physical_key,
+        )
+    }
+
+    pub fn handle_key_input_raw(
+        &mut self,
+        key: &Key,
+        text: &str,
+        state: ElementState,
+        modifiers: ModifiersState,
+        repeat: bool,
+        location: KeyLocation,
+        physical_key: winit::keyboard::PhysicalKey,
+    ) -> bool {
+        self.handle_key_input_inner(key, text, state, modifiers, repeat, location, physical_key)
+    }
+
+    pub fn dispatch_key_event(
+        &self,
+        key: &Key,
+        key_code_override: Option<&str>,
+        text: &str,
+        unmodified_text: &str,
+        state: ElementState,
+        modifiers: ModifiersState,
+        repeat: bool,
+        location: KeyLocation,
+        physical_key: winit::keyboard::PhysicalKey,
+    ) -> bool {
+        let Some(_host) = self.browser.host() else {
+            return false;
+        };
+
+        let key_string = dom_key_string(key, text);
+        let code_string = key_code_override
+            .map(|value| value.to_string())
+            .or_else(|| dom_code_from_physical_key(physical_key));
+        let windows_key_code = cef_windows_key_code_from_key(key);
+        let scancode = macos_scancode_from_physical_key(physical_key).unwrap_or(0) as i32;
+        let modifier_bits = devtools_modifier_bits(modifiers);
+        let is_keypad = matches!(location, KeyLocation::Numpad);
+        let location_value = devtools_location_value(location);
+        let should_send_char =
+            !text.is_empty() && !modifiers.super_key() && !modifiers.control_key();
+
+        let fire_event = |event_type: &str, text_value: Option<&str>, unmodified: Option<&str>| {
+            let mut params = match cef::dictionary_value_create() {
+                Some(params) => params,
+                None => return,
+            };
+            dict_set_string(&mut params, "type", event_type);
+            if !key_string.is_empty() {
+                dict_set_string(&mut params, "key", &key_string);
+            }
+            if let Some(code) = code_string.as_deref() {
+                if !code.is_empty() {
+                    dict_set_string(&mut params, "code", code);
+                }
+            }
+            if let Some(text_value) = text_value {
+                if !text_value.is_empty() {
+                    dict_set_string(&mut params, "text", text_value);
+                }
+            }
+            if let Some(unmodified) = unmodified {
+                if !unmodified.is_empty() {
+                    dict_set_string(&mut params, "unmodifiedText", unmodified);
+                }
+            }
+            dict_set_int(&mut params, "modifiers", modifier_bits);
+            if windows_key_code != 0 {
+                dict_set_int(&mut params, "windowsVirtualKeyCode", windows_key_code);
+            }
+            if scancode != 0 {
+                dict_set_int(&mut params, "nativeVirtualKeyCode", scancode);
+            }
+            dict_set_bool(&mut params, "autoRepeat", repeat);
+            dict_set_bool(&mut params, "isKeypad", is_keypad);
+            dict_set_bool(&mut params, "isSystemKey", false);
+            dict_set_int(&mut params, "location", location_value);
+            self.devtools_fire("Input.dispatchKeyEvent", Some(params));
+        };
+
+        match state {
+            ElementState::Pressed => {
+                fire_event("rawKeyDown", None, None);
+                if should_send_char {
+                    fire_event("char", Some(text), Some(unmodified_text));
+                }
+            }
+            ElementState::Released => {
+                fire_event("keyUp", None, None);
+            }
+        }
+
+        true
+    }
+
+    fn handle_key_input_inner(
+        &mut self,
+        key: &Key,
+        text: &str,
+        state: ElementState,
+        modifiers: ModifiersState,
+        repeat: bool,
+        location: KeyLocation,
+        physical_key: winit::keyboard::PhysicalKey,
+    ) -> bool {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+
+        let base_flags = cef_event_flags(modifiers, repeat, location);
+        let windows_key_code = cef_windows_key_code_from_key(key);
+        let scancode = macos_scancode_from_physical_key(physical_key).unwrap_or(0);
+        let native_key_code = cef_native_key_code(scancode, modifiers);
+        let (character, unmodified_character) =
+            cef_characters_from_key_text(key, if text.is_empty() { "" } else { text });
+        let should_send_char =
+            character != 0 && !modifiers.super_key() && !modifiers.control_key();
+
+        let focus_on_editable_field = 1;
+        let mut events = Vec::new();
+
+        match state {
+            ElementState::Pressed => {
+                if windows_key_code != 0 {
+                    let mut down = cef::KeyEvent::default();
+                    down.type_ = cef::KeyEventType::KEYDOWN;
+                    down.modifiers = base_flags;
+                    down.windows_key_code = windows_key_code;
+                    down.native_key_code = native_key_code;
+                    down.is_system_key = 0;
+                    down.character = character;
+                    down.unmodified_character = unmodified_character;
+                    down.focus_on_editable_field = focus_on_editable_field;
+                    events.push(down);
+                }
+
+                if should_send_char {
+                    let mut ch = cef::KeyEvent::default();
+                    ch.type_ = cef::KeyEventType::CHAR;
+                    ch.modifiers = base_flags;
+                    ch.windows_key_code = character as i32;
+                    ch.native_key_code = native_key_code;
+                    ch.is_system_key = 0;
+                    ch.character = character;
+                    ch.unmodified_character = unmodified_character;
+                    ch.focus_on_editable_field = focus_on_editable_field;
+                    events.push(ch);
+                }
+            }
+            ElementState::Released => {
+                if windows_key_code != 0 {
+                    let mut up = cef::KeyEvent::default();
+                    up.type_ = cef::KeyEventType::KEYUP;
+                    up.modifiers = base_flags;
+                    up.windows_key_code = windows_key_code;
+                    up.native_key_code = native_key_code;
+                    up.is_system_key = 0;
+                    up.character = 0;
+                    up.unmodified_character = 0;
+                    up.focus_on_editable_field = focus_on_editable_field;
+                    events.push(up);
+                }
+            }
+        }
+
+        if events.is_empty() {
+            return false;
+        }
+
+        if cef::currently_on(cef::ThreadId::UI) == 1 {
+            if let Some(host) = self.browser.host() {
+                for event in &events {
+                    host.send_key_event(Some(event));
+                }
+            }
+        } else {
+            let mut task = SendKeyTask::new(self.browser.clone(), events);
+            let _ = cef::post_task(cef::ThreadId::UI, Some(&mut task));
+        }
+
+        windows_key_code != 0 || should_send_char
     }
 
     pub fn exec_js(&mut self, script: &str) {
@@ -584,6 +861,34 @@ impl WebView {
                 Err(err) => callback(Err(err)),
             }
         });
+    }
+
+    pub fn devtools_command_json<F>(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+        callback: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Result<JsonValue, String>) + 'static,
+    {
+        let params = match params {
+            None => None,
+            Some(JsonValue::Null) => None,
+            Some(value) => Some(json_to_cef_dictionary(&value)?),
+        };
+
+        self.devtools_execute_checked(method, params, callback)
+    }
+
+    pub fn devtools_events_since(&self, last_id: u64, max: usize) -> (Vec<String>, u64) {
+        let state = self.devtools_state.borrow();
+        state.events_since(last_id, max)
+    }
+
+    pub fn latest_devtools_event_id(&self) -> u64 {
+        let state = self.devtools_state.borrow();
+        state.latest_event_id()
     }
 
     pub fn poll_title(&mut self) -> Option<String> {
@@ -700,6 +1005,40 @@ impl WebView {
             }
         }
     }
+
+    fn devtools_execute_checked<F>(
+        &self,
+        method: &str,
+        params: Option<cef::DictionaryValue>,
+        callback: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Result<JsonValue, String>) + 'static,
+    {
+        let Some(host) = self.browser.host() else {
+            return Err(String::from("DevTools host unavailable"));
+        };
+
+        let method = CefString::from(method);
+        let mut params = params;
+        let id = {
+            let mut state = self.devtools_state.borrow_mut();
+            let id = state.next_id();
+            state.pending.insert(id, Box::new(callback));
+            id
+        };
+
+        let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
+        if ok == 0 {
+            let _ = {
+                let mut state = self.devtools_state.borrow_mut();
+                state.pending.remove(&id)
+            };
+            return Err(String::from("DevTools method dispatch failed"));
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for WebView {
@@ -709,6 +1048,130 @@ impl Drop for WebView {
         }
         super::unregister_webview();
     }
+}
+
+fn cef_event_flags(modifiers: ModifiersState, repeat: bool, location: KeyLocation) -> u32 {
+    use cef::sys::cef_event_flags_t;
+
+    let mut flags = cef_event_flags_t::EVENTFLAG_NONE;
+    if modifiers.shift_key() {
+        flags |= cef_event_flags_t::EVENTFLAG_SHIFT_DOWN;
+    }
+    if modifiers.control_key() {
+        flags |= cef_event_flags_t::EVENTFLAG_CONTROL_DOWN;
+    }
+    if modifiers.alt_key() {
+        flags |= cef_event_flags_t::EVENTFLAG_ALT_DOWN;
+    }
+    if modifiers.super_key() {
+        flags |= cef_event_flags_t::EVENTFLAG_COMMAND_DOWN;
+    }
+    if repeat {
+        flags |= cef_event_flags_t::EVENTFLAG_IS_REPEAT;
+    }
+    if matches!(location, KeyLocation::Numpad) {
+        flags |= cef_event_flags_t::EVENTFLAG_IS_KEY_PAD;
+    }
+
+    flags.0
+}
+
+fn cef_native_key_code(scancode: u16, modifiers: ModifiersState) -> i32 {
+    let mut flags: i32 = 0;
+    if modifiers.shift_key() {
+        flags |= 1 << 17;
+    }
+    if modifiers.control_key() {
+        flags |= 1 << 18;
+    }
+    if modifiers.alt_key() {
+        flags |= 1 << 19;
+    }
+    if modifiers.super_key() {
+        flags |= 1 << 20;
+    }
+    scancode as i32 | flags
+}
+
+fn cef_windows_key_code_from_key(key: &Key) -> i32 {
+    match key {
+        Key::Character(ch) => {
+            let mut chars = ch.chars();
+            let Some(c) = chars.next() else {
+                return 0;
+            };
+            if chars.next().is_some() {
+                return 0;
+            }
+
+            if c.is_ascii_alphabetic() {
+                return c.to_ascii_uppercase() as i32;
+            }
+            if c.is_ascii_digit() {
+                return c as i32;
+            }
+
+            match c {
+                ' ' => 0x20,
+                ';' => 0xBA,
+                '=' => 0xBB,
+                ',' => 0xBC,
+                '-' => 0xBD,
+                '.' => 0xBE,
+                '/' => 0xBF,
+                '`' => 0xC0,
+                '[' => 0xDB,
+                '\\' => 0xDC,
+                ']' => 0xDD,
+                '\'' => 0xDE,
+                _ => 0,
+            }
+        }
+        Key::Named(named) => match named {
+            NamedKey::Backspace => 0x08,
+            NamedKey::Tab => 0x09,
+            NamedKey::Enter => 0x0D,
+            NamedKey::Escape => 0x1B,
+            NamedKey::Space => 0x20,
+            NamedKey::PageUp => 0x21,
+            NamedKey::PageDown => 0x22,
+            NamedKey::End => 0x23,
+            NamedKey::Home => 0x24,
+            NamedKey::ArrowLeft => 0x25,
+            NamedKey::ArrowUp => 0x26,
+            NamedKey::ArrowRight => 0x27,
+            NamedKey::ArrowDown => 0x28,
+            NamedKey::Delete => 0x2E,
+            NamedKey::Copy => 0x43,
+            NamedKey::Paste => 0x56,
+            NamedKey::Cut => 0x58,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn cef_characters_from_key_text(key: &Key, text: &str) -> (u16, u16) {
+    let character = first_char_u16(text);
+    let unmodified = match key {
+        Key::Character(ch) => first_char_u16(ch),
+        _ => 0,
+    };
+    (character, unmodified)
+}
+
+fn first_char_u16(text: &str) -> u16 {
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return 0;
+    };
+    if chars.next().is_some() {
+        return 0;
+    }
+    if (ch as u32) > 0xFFFF {
+        return 0;
+    }
+    ch as u16
 }
 
 fn runtime_result_to_string(payload: &JsonValue) -> Option<String> {
@@ -739,6 +1202,202 @@ fn dict_set_string(dict: &mut cef::DictionaryValue, key: &str, value: &str) {
 fn dict_set_bool(dict: &mut cef::DictionaryValue, key: &str, value: bool) {
     let key = CefString::from(key);
     dict.set_bool(Some(&key), if value { 1 } else { 0 });
+}
+
+fn dict_set_int(dict: &mut cef::DictionaryValue, key: &str, value: i32) {
+    let key = CefString::from(key);
+    dict.set_int(Some(&key), value);
+}
+
+fn dict_set_double(dict: &mut cef::DictionaryValue, key: &str, value: f64) {
+    let key = CefString::from(key);
+    dict.set_double(Some(&key), value);
+}
+
+fn dict_set_null(dict: &mut cef::DictionaryValue, key: &str) {
+    let key = CefString::from(key);
+    dict.set_null(Some(&key));
+}
+
+fn json_to_cef_dictionary(value: &JsonValue) -> Result<cef::DictionaryValue, String> {
+    let Some(object) = value.as_object() else {
+        return Err(String::from("params must be an object"));
+    };
+    let mut dict = cef::dictionary_value_create()
+        .ok_or_else(|| String::from("Failed to create dictionary value"))?;
+    for (key, value) in object {
+        set_dict_value(&mut dict, key, value)?;
+    }
+    Ok(dict)
+}
+
+fn set_dict_value(
+    dict: &mut cef::DictionaryValue,
+    key: &str,
+    value: &JsonValue,
+) -> Result<(), String> {
+    match value {
+        JsonValue::Null => {
+            dict_set_null(dict, key);
+        }
+        JsonValue::Bool(value) => {
+            dict_set_bool(dict, key, *value);
+        }
+        JsonValue::Number(value) => {
+            if let Some(int) = value.as_i64() {
+                if int >= i64::from(i32::MIN) && int <= i64::from(i32::MAX) {
+                    dict_set_int(dict, key, int as i32);
+                } else {
+                    dict_set_double(dict, key, int as f64);
+                }
+            } else if let Some(uint) = value.as_u64() {
+                if uint <= i64::from(i32::MAX) as u64 {
+                    dict_set_int(dict, key, uint as i32);
+                } else {
+                    dict_set_double(dict, key, uint as f64);
+                }
+            } else if let Some(float) = value.as_f64() {
+                dict_set_double(dict, key, float);
+            } else {
+                return Err(String::from("Invalid numeric parameter"));
+            }
+        }
+        JsonValue::String(value) => {
+            dict_set_string(dict, key, value);
+        }
+        JsonValue::Array(values) => {
+            let mut list = json_to_cef_list(values)?;
+            let key = CefString::from(key);
+            dict.set_list(Some(&key), Some(&mut list));
+        }
+        JsonValue::Object(_) => {
+            let mut nested = json_to_cef_dictionary(value)?;
+            let key = CefString::from(key);
+            dict.set_dictionary(Some(&key), Some(&mut nested));
+        }
+    }
+    Ok(())
+}
+
+fn json_to_cef_list(values: &[JsonValue]) -> Result<cef::ListValue, String> {
+    let mut list = cef::list_value_create()
+        .ok_or_else(|| String::from("Failed to create list value"))?;
+    list.set_size(values.len());
+    for (index, value) in values.iter().enumerate() {
+        set_list_value(&mut list, index, value)?;
+    }
+    Ok(list)
+}
+
+fn set_list_value(
+    list: &mut cef::ListValue,
+    index: usize,
+    value: &JsonValue,
+) -> Result<(), String> {
+    match value {
+        JsonValue::Null => {
+            list.set_null(index);
+        }
+        JsonValue::Bool(value) => {
+            list.set_bool(index, if *value { 1 } else { 0 });
+        }
+        JsonValue::Number(value) => {
+            if let Some(int) = value.as_i64() {
+                if int >= i64::from(i32::MIN) && int <= i64::from(i32::MAX) {
+                    list.set_int(index, int as i32);
+                } else {
+                    list.set_double(index, int as f64);
+                }
+            } else if let Some(uint) = value.as_u64() {
+                if uint <= i64::from(i32::MAX) as u64 {
+                    list.set_int(index, uint as i32);
+                } else {
+                    list.set_double(index, uint as f64);
+                }
+            } else if let Some(float) = value.as_f64() {
+                list.set_double(index, float);
+            } else {
+                return Err(String::from("Invalid numeric parameter"));
+            }
+        }
+        JsonValue::String(value) => {
+            let value = CefString::from(value.as_str());
+            list.set_string(index, Some(&value));
+        }
+        JsonValue::Array(values) => {
+            let mut nested = json_to_cef_list(values)?;
+            list.set_list(index, Some(&mut nested));
+        }
+        JsonValue::Object(_) => {
+            let mut nested = json_to_cef_dictionary(value)?;
+            list.set_dictionary(index, Some(&mut nested));
+        }
+    }
+    Ok(())
+}
+
+fn dom_key_string(key: &Key, text: &str) -> String {
+    match key {
+        Key::Character(ch) => {
+            if text.is_empty() {
+                ch.to_string()
+            } else {
+                text.to_string()
+            }
+        }
+        Key::Named(named) => match named {
+            NamedKey::Space => " ".to_string(),
+            NamedKey::Enter => "Enter".to_string(),
+            NamedKey::Tab => "Tab".to_string(),
+            NamedKey::Escape => "Escape".to_string(),
+            NamedKey::Backspace => "Backspace".to_string(),
+            NamedKey::Delete => "Delete".to_string(),
+            NamedKey::ArrowLeft => "ArrowLeft".to_string(),
+            NamedKey::ArrowRight => "ArrowRight".to_string(),
+            NamedKey::ArrowUp => "ArrowUp".to_string(),
+            NamedKey::ArrowDown => "ArrowDown".to_string(),
+            NamedKey::Home => "Home".to_string(),
+            NamedKey::End => "End".to_string(),
+            NamedKey::PageUp => "PageUp".to_string(),
+            NamedKey::PageDown => "PageDown".to_string(),
+            NamedKey::Insert => "Insert".to_string(),
+            _ => format!("{named:?}"),
+        },
+        _ => String::new(),
+    }
+}
+
+fn dom_code_from_physical_key(physical_key: winit::keyboard::PhysicalKey) -> Option<String> {
+    match physical_key {
+        winit::keyboard::PhysicalKey::Code(code) => Some(format!("{code:?}")),
+        _ => None,
+    }
+}
+
+fn devtools_modifier_bits(modifiers: ModifiersState) -> i32 {
+    let mut bits = 0;
+    if modifiers.alt_key() {
+        bits |= 1;
+    }
+    if modifiers.control_key() {
+        bits |= 2;
+    }
+    if modifiers.super_key() {
+        bits |= 4;
+    }
+    if modifiers.shift_key() {
+        bits |= 8;
+    }
+    bits
+}
+
+fn devtools_location_value(location: KeyLocation) -> i32 {
+    match location {
+        KeyLocation::Standard => 0,
+        KeyLocation::Left => 1,
+        KeyLocation::Right => 2,
+        KeyLocation::Numpad => 3,
+    }
 }
 
 fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
@@ -780,8 +1439,4 @@ fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
     let host = browser.host()?;
     let view = host.window_handle() as *mut AnyObject;
     if view.is_null() { None } else { Some(view) }
-}
-
-pub fn is_available() -> bool {
-    crate::macos::cef::is_available()
 }

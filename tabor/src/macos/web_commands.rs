@@ -82,6 +82,10 @@ pub struct WebCommandState {
 }
 
 impl WebCommandState {
+    pub(crate) fn mode(&self) -> WebMode {
+        self.mode
+    }
+
     fn reset_pending(&mut self) {
         self.pending = WebPending::default();
     }

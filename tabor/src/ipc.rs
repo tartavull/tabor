@@ -217,6 +217,10 @@ pub enum IpcRequest {
         y: f64,
         button: WebMouseButton,
     },
+    WebKey {
+        tab_id: Option<IpcTabId>,
+        input: WebKeyInput,
+    },
     SetConfig(IpcConfig),
     GetConfig(IpcGetConfig),
 }
@@ -265,6 +269,7 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
         IpcRequestHelp { name: "web_pdf", summary: "Create a PDF from a web tab." },
         IpcRequestHelp { name: "web_network", summary: "Inspect web network activity." },
         IpcRequestHelp { name: "web_mouse", summary: "Dispatch native web mouse input." },
+        IpcRequestHelp { name: "web_key", summary: "Dispatch native web key input." },
         IpcRequestHelp { name: "set_config", summary: "Apply runtime config overrides." },
         IpcRequestHelp { name: "get_config", summary: "Read runtime config." },
     ]
@@ -288,7 +293,8 @@ impl IpcRequest {
             | IpcRequest::WebSnapshot { tab_id, .. }
             | IpcRequest::WebPdf { tab_id }
             | IpcRequest::WebNetwork { tab_id, .. }
-            | IpcRequest::WebMouse { tab_id, .. } => *tab_id,
+            | IpcRequest::WebMouse { tab_id, .. }
+            | IpcRequest::WebKey { tab_id, .. } => *tab_id,
             IpcRequest::OpenUrl { target, .. } => match target {
                 UrlTarget::TabId { tab_id } => Some(*tab_id),
                 _ => None,
@@ -368,6 +374,39 @@ pub enum WebMouseButton {
     Left,
     Right,
     Middle,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebKeyState {
+    Down,
+    Up,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WebKeyModifiers {
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub control: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub super_key: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebKeyInput {
+    pub key: String,
+    #[serde(default)]
+    pub key_code: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub modifiers: WebKeyModifiers,
+    #[serde(default)]
+    pub repeat: bool,
+    pub state: WebKeyState,
 }
 
 impl IpcCapabilities {
@@ -496,6 +535,7 @@ pub trait IpcContext {
         y: f64,
         button: WebMouseButton,
     ) -> Result<(), IpcError>;
+    fn web_key(&mut self, tab_id: TabId, input: WebKeyInput) -> Result<(), IpcError>;
 }
 
 pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcResponse {
@@ -835,6 +875,24 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             };
 
             match ctx.web_mouse(tab_id, action, x, y, button) {
+                Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WebKey { tab_id, input } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.web_key(tab_id, input) {
                 Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
                 Err(err) => {
                     IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
@@ -1538,6 +1596,19 @@ mod tests {
             _y: f64,
             _button: WebMouseButton,
         ) -> Result<(), IpcError> {
+            if !self.tabs.contains_key(&tab_id) {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            }
+            if !self.web_supported {
+                return Err(IpcError::new(
+                    IpcErrorCode::Unsupported,
+                    "Web tabs are not supported",
+                ));
+            }
+            Ok(())
+        }
+
+        fn web_key(&mut self, tab_id: TabId, _input: WebKeyInput) -> Result<(), IpcError> {
             if !self.tabs.contains_key(&tab_id) {
                 return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
             }

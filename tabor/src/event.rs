@@ -73,7 +73,9 @@ use crate::macos::favicon::FaviconImage;
 #[cfg(target_os = "macos")]
 use crate::macos::cef;
 #[cfg(target_os = "macos")]
-use crate::macos::web_commands::{self, WebActions, WebCommandState, WebHintAction, WebKey};
+use crate::macos::web_commands::{
+    self, WebActions, WebCommandState, WebHintAction, WebKey, WebMode,
+};
 #[cfg(target_os = "macos")]
 use crate::macos::web_cursor::{WEB_CURSOR_BOOTSTRAP, web_cursor_from_css, web_cursor_script};
 #[cfg(target_os = "macos")]
@@ -452,6 +454,14 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         button: ipc::WebMouseButton,
     ) -> Result<(), ipc::IpcError> {
         self.window.ipc_web_mouse(tab_id, action, x, y, button, self.event_loop)
+    }
+
+    fn web_key(
+        &mut self,
+        tab_id: TabId,
+        input: ipc::WebKeyInput,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_web_key(tab_id, input)
     }
 }
 
@@ -989,14 +999,6 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             #[cfg(target_os = "macos")]
-            (EventType::WebPopup { popup_id }, Some(window_id)) => {
-                if let Some(window_context) = self.windows.get_mut(&window_id) {
-                    if let Err(err) = window_context.create_web_popup_tab(popup_id, &self.proxy) {
-                        error!("Could not create popup tab: {err:?}");
-                    }
-                }
-            },
-            #[cfg(target_os = "macos")]
             (EventType::RestoreTab, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(&window_id) {
                     if let Err(err) = window_context.restore_closed_tab(&self.proxy) {
@@ -1340,10 +1342,6 @@ pub enum EventType {
     TabCommand(TabCommand),
     #[cfg(target_os = "macos")]
     WebCommand(WebCommand),
-    #[cfg(target_os = "macos")]
-    WebPopup {
-        popup_id: usize,
-    },
     #[cfg(target_os = "macos")]
     WebFavicon {
         page_url: String,
@@ -2740,15 +2738,43 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             return false;
         }
 
+        if self.handle_web_clipboard_shortcuts(key) {
+            return true;
+        }
+
         // Allow Shift+Enter to reach the page unchanged (used for newlines in chat inputs).
         if self.modifiers().state().shift_key()
             && matches!(key.logical_key.as_ref(), Key::Named(NamedKey::Enter))
         {
-            return false;
+            let modifiers = self.modifiers().state();
+            let Some(web_view) = self.web_view.as_mut() else {
+                return false;
+            };
+            return web_view.handle_key_input(
+                &self.display.window,
+                key,
+                text,
+                modifiers,
+            );
         }
 
         let web_key = web_key_from_event(key);
         self.with_web_command_state(|state, ctx| {
+            if state.mode() == WebMode::Insert && !matches!(web_key, WebKey::Escape) {
+                let modifiers = ctx.modifiers().state();
+                if let Some(web_view) = ctx.web_view.as_mut() {
+                    let forwarded = web_view.handle_key_input(
+                        &ctx.display.window,
+                        key,
+                        text,
+                        modifiers,
+                    );
+                    if forwarded {
+                        return true;
+                    }
+                }
+            }
+
             let before = state.status_label();
             let handled = web_commands::handle_key(state, ctx, web_key, text);
             if handled && before != state.status_label() {
@@ -2756,6 +2782,34 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             }
             handled
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_handle_key_release(&mut self, key: &KeyEvent, text: &str) -> bool {
+        if self.web_view.is_none() {
+            return false;
+        }
+
+        // Match Shift+Enter keyup to avoid stuck state in web inputs.
+        if self.modifiers().state().shift_key()
+            && matches!(key.logical_key.as_ref(), Key::Named(NamedKey::Enter))
+        {
+            let modifiers = self.modifiers().state();
+            let Some(web_view) = self.web_view.as_mut() else {
+                return false;
+            };
+            return web_view.handle_key_input(&self.display.window, key, text, modifiers);
+        }
+
+        let web_key = web_key_from_event(key);
+        if self.web_command_state.mode() == WebMode::Insert && !matches!(web_key, WebKey::Escape) {
+            let modifiers = self.modifiers().state();
+            if let Some(web_view) = self.web_view.as_mut() {
+                return web_view.handle_key_input(&self.display.window, key, text, modifiers);
+            }
+        }
+
+        false
     }
 
     #[cfg(target_os = "macos")]
@@ -2792,6 +2846,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let script =
             format!("document.execCommand('insertText', false, {});", Self::js_string(text));
         self.web_exec_js(&script);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_is_insert_mode(&self) -> bool {
+        self.tab_kind.is_web() && self.web_command_state.mode() == WebMode::Insert
     }
 }
 
@@ -2839,6 +2898,94 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         // SAFETY: WebCommandState is stored outside ActionContext; WebActions implementations
         // do not access web_command_state directly, so we can split the mutable borrow here.
         unsafe { f(&mut *state_ptr, self) }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_web_clipboard_shortcuts(&mut self, key: &KeyEvent) -> bool {
+        let mods = self.modifiers().state();
+        if !mods.super_key() || mods.control_key() || mods.alt_key() {
+            return false;
+        }
+
+        let key_text = match key.logical_key.as_ref() {
+            Key::Named(NamedKey::Copy) => "c",
+            Key::Named(NamedKey::Paste) => "v",
+            Key::Named(NamedKey::Cut) => "x",
+            Key::Character(ch) => ch.as_ref(),
+            _ => return false,
+        };
+
+        if key_text.eq_ignore_ascii_case("c") {
+            self.web_copy_selection();
+            return true;
+        }
+        if key_text.eq_ignore_ascii_case("x") {
+            self.web_cut_selection();
+            return true;
+        }
+        if key_text.eq_ignore_ascii_case("v") {
+            self.web_paste();
+            return true;
+        }
+
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_cut_selection(&mut self) {
+        let Some(web_view) = self.web_view.as_mut() else {
+            return;
+        };
+        let proxy = self.event_proxy.clone();
+        let window_id = self.display.window.id();
+        let tab_id = self.tab_id;
+        let script = r#"(function() {
+  const el = document.activeElement;
+  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+    if (typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      const text = el.value.substring(start, end);
+      if (start !== end) {
+        const value = el.value;
+        el.value = value.slice(0, start) + value.slice(end);
+        el.setSelectionRange(start, start);
+        el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteByCut', data: text}));
+      }
+      return text;
+    }
+  }
+  const sel = window.getSelection();
+  const text = sel ? sel.toString() : '';
+  if (text && sel && sel.rangeCount) {
+    sel.deleteFromDocument();
+  }
+  return text;
+})()"#;
+        web_view.eval_js_string(script, move |result| {
+            let Some(text) = result.filter(|text| !text.is_empty()) else {
+                return;
+            };
+            let command = WebCommand::CopyToClipboard { text };
+            let event = Event::for_tab(EventType::WebCommand(command), window_id, tab_id);
+            let _ = proxy.send_event(event);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_paste(&mut self) {
+        let Some(web_view) = self.web_view.as_mut() else {
+            return;
+        };
+        let text = self.clipboard.load(ClipboardType::Clipboard);
+        if text.is_empty() {
+            return;
+        }
+        let text_json = serde_json::to_string(&text).unwrap_or_else(|_| String::from("\"\""));
+        let script = format!(
+            "(function() {{\n  const text = {text_json};\n  const el = document.activeElement;\n  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {{\n    if (typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {{\n      const start = el.selectionStart;\n      const end = el.selectionEnd;\n      const value = el.value;\n      el.value = value.slice(0, start) + text + value.slice(end);\n      const pos = start + text.length;\n      el.setSelectionRange(pos, pos);\n      el.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertFromPaste', data: text}}));\n      return true;\n    }}\n  }}\n  if (el && el.isContentEditable) {{\n    document.execCommand('insertText', false, text);\n    return true;\n  }}\n  return false;\n}})()",
+        );
+        web_view.exec_js(&script);
     }
 
     fn update_search(&mut self) {
@@ -4401,7 +4548,6 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
                 | EventType::CloseTab(_)
-                | EventType::WebPopup { .. }
                 | EventType::RestoreTab
                 | EventType::WebFavicon { .. }
                 | EventType::WebCursor { .. }

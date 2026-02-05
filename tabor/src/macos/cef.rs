@@ -2,6 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString};
+use std::fs;
+use std::io;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,16 +66,13 @@ thread_local! {
 
 static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-pub fn is_available() -> bool {
-    framework_dir().is_some()
-}
-
 pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
     let Some(framework_dir) = framework_dir() else {
         return Ok(None);
     };
 
     load_library(&framework_dir)?;
+    ensure_cef_sidecar_libs(&framework_dir)?;
 
     let args = Args::new();
     let mut app = TaborCefApp::new();
@@ -99,6 +99,7 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     })?;
 
     load_library(&framework_dir)?;
+    ensure_cef_sidecar_libs(&framework_dir)?;
 
     let args = Args::new();
     let mut app = TaborCefApp::new();
@@ -314,6 +315,87 @@ fn load_library(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
 
     debug!("CEF framework loaded from {}", framework_lib.display());
     Ok(())
+}
+
+fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let exe_path = env::current_exe()
+        .ok()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path"))?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path"))?;
+
+    let bundle_root = main_bundle_path();
+    let (dest_dir, link_dir, link_prefix) = if let Some(bundle_root) = bundle_root {
+        let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
+        let link_prefix = PathBuf::from("..").join("Frameworks");
+        (frameworks_dir, Some(exe_dir.to_path_buf()), link_prefix)
+    } else {
+        (exe_dir.to_path_buf(), None, PathBuf::new())
+    };
+
+    fs::create_dir_all(&dest_dir)?;
+
+    let libs = ["libGLESv2.dylib", "libEGL.dylib"];
+    let src_dir = find_cef_sidecar_dir(framework_dir, &libs).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Missing CEF sidecar libraries ({}). Check CEF distribution near {}",
+                libs.join(", "),
+                framework_dir.display()
+            ),
+        )
+    })?;
+
+    for lib in libs {
+        let dst = dest_dir.join(lib);
+        if !dst.exists() {
+            let src = src_dir.join(lib);
+            if !src.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Missing CEF sidecar library {} in {}",
+                        lib,
+                        src_dir.display()
+                    ),
+                )
+                .into());
+            }
+            fs::copy(&src, &dst)?;
+        }
+
+        if let Some(link_dir) = &link_dir {
+            let link_path = link_dir.join(lib);
+            if !link_path.exists() {
+                let target = link_prefix.join(lib);
+                symlink(&target, &link_path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn find_cef_sidecar_dir(framework_dir: &Path, libs: &[&str]) -> Option<PathBuf> {
+    let candidates = [
+        framework_dir.parent().map(|path| path.to_path_buf()),
+        Some(framework_dir.join("Libraries")),
+        framework_dir
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.to_path_buf()),
+        Some(framework_dir.to_path_buf()),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if libs.iter().all(|lib| candidate.join(lib).exists()) {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 pub fn is_initialized() -> bool {

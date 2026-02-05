@@ -1,6 +1,8 @@
 //! Terminal window context.
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
@@ -11,6 +13,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -31,6 +35,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 #[cfg(target_os = "macos")]
 use winit::window::CursorIcon;
+#[cfg(target_os = "macos")]
+use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey};
 use winit::window::WindowId;
 
 use tabor_terminal::event::{Event as TerminalEvent, Notify, OnResize};
@@ -66,8 +72,8 @@ use crate::event::{
 #[cfg(unix)]
 use crate::ipc::{
     IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession, IpcInspectorTarget,
-    IpcTabActivity, IpcTabGroup, IpcTabKind, IpcTabPanelState, IpcTabState, SocketReply,
-    TabSelection, WebNetworkAction, WebNetworkEntry, WebMouseAction, WebMouseButton,
+    IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, SocketReply,
+    TabSelection, WebNetworkAction, WebNetworkEntry, WebMouseAction, WebMouseButton, WebKeyInput,
 };
 #[cfg(unix)]
 use crate::ipc;
@@ -85,13 +91,10 @@ use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
-use crate::macos::webview::{PendingPopup, WebView, take_pending_popup};
-#[cfg(not(target_os = "macos"))]
-type PendingPopup = ();
+use crate::macos::webview::WebView;
 #[cfg(target_os = "macos")]
 use crate::macos::remote_inspector::{
-    InspectorError, InspectorTabInfo, RemoteInspectorClient, match_tab_for_target,
-    match_target_for_tab,
+    InspectorError, InspectorTabInfo, RemoteInspectorClient,
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSEventModifierFlags;
@@ -141,6 +144,73 @@ struct WebNetworkState {
     next_id: u64,
     entries: Vec<WebNetworkEntry>,
     index: HashMap<String, usize>,
+}
+
+#[cfg(target_os = "macos")]
+struct CefInspectorSession {
+    tab_id: TabId,
+    last_event_id: u64,
+}
+
+#[cfg(target_os = "macos")]
+struct CefInspectorState {
+    next_session_id: u64,
+    sessions: HashMap<String, CefInspectorSession>,
+    pending: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl CefInspectorState {
+    fn new() -> Self {
+        Self {
+            next_session_id: 1,
+            sessions: HashMap::new(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn next_session_id(&mut self, target_id: u64) -> String {
+        let id = self.next_session_id;
+        self.next_session_id = self.next_session_id.saturating_add(1);
+        format!("cef:{target_id}:{id}")
+    }
+
+    fn register_session(&self, session_id: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.entry(session_id.to_string()).or_insert_with(VecDeque::new);
+    }
+
+    fn remove_session(&self, session_id: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.remove(session_id);
+    }
+
+    fn remove_sessions_for_tab(&mut self, tab_id: TabId) {
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter_map(|(session_id, session)| (session.tab_id == tab_id).then(|| session_id.clone()))
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            self.sessions.remove(&session_id);
+            self.remove_session(&session_id);
+        }
+    }
+
+    fn drain_messages(&self, session_id: &str, max: usize) -> Vec<String> {
+        let mut pending = self.pending.lock().unwrap();
+        let Some(queue) = pending.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while out.len() < max {
+            let Some(payload) = queue.pop_front() else {
+                break;
+            };
+            out.push(payload);
+        }
+        out
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -667,6 +737,8 @@ pub struct WindowContext {
     #[cfg(target_os = "macos")]
     remote_inspector: Option<RemoteInspectorClient>,
     #[cfg(target_os = "macos")]
+    cef_inspector: CefInspectorState,
+    #[cfg(target_os = "macos")]
     web_network: HashMap<TabId, WebNetworkState>,
     modifiers: Modifiers,
     occluded: bool,
@@ -800,7 +872,6 @@ impl WindowContext {
             options.window_kind,
             None,
             None,
-            None,
         )?;
 
         // Create context for the Tabor window.
@@ -825,6 +896,8 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             remote_inspector: None,
             #[cfg(target_os = "macos")]
+            cef_inspector: CefInspectorState::new(),
+            #[cfg(target_os = "macos")]
             web_network: HashMap::new(),
             dirty: Default::default(),
         };
@@ -842,7 +915,6 @@ impl WindowContext {
         pty_config: tty::Options,
         proxy: &EventLoopProxy<Event>,
         window_kind: WindowKind,
-        pending_popup: Option<PendingPopup>,
         group_id: Option<usize>,
         group_name: Option<String>,
     ) -> Result<TabId, Box<dyn Error>> {
@@ -875,9 +947,6 @@ impl WindowContext {
         }
 
         #[cfg(not(target_os = "macos"))]
-        let _ = pending_popup;
-
-        #[cfg(not(target_os = "macos"))]
         if matches!(window_kind, WindowKind::Web { .. }) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -887,25 +956,11 @@ impl WindowContext {
         }
 
         #[cfg(target_os = "macos")]
-        let web_view = match (&window_kind, pending_popup) {
-            (WindowKind::Web { url }, None) => {
+        let web_view = match &window_kind {
+            WindowKind::Web { url } => {
                 Some(WebView::new(&display.window, &display.size_info, tab_id, url, proxy)?)
-            },
-            (WindowKind::Web { .. }, Some(popup)) => Some(WebView::from_existing(
-                &display.window,
-                &display.size_info,
-                tab_id,
-                popup.view,
-                popup.delegate,
-            )?),
-            (WindowKind::Terminal, None) => None,
-            (WindowKind::Terminal, Some(_)) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Popup WebView requires a web tab",
-                )
-                .into());
-            },
+            }
+            WindowKind::Terminal => None,
         };
 
         let title = match &window_kind {
@@ -1102,6 +1157,7 @@ impl WindowContext {
 
                 let visible = Some(tab.id) == active_id;
                 web_view.set_visible(visible);
+                web_view.set_focus(visible);
                 if visible {
                     web_view.update_frame(&self.display.window, &self.display.size_info);
                 }
@@ -1398,7 +1454,7 @@ impl WindowContext {
         options: WindowOptions,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_with_popup(options, proxy, None, None, None)
+        self.create_tab_internal(options, proxy, None, None)
     }
 
     pub(crate) fn create_tab_in_group(
@@ -1408,14 +1464,13 @@ impl WindowContext {
         group_name: Option<String>,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_with_popup(options, proxy, None, group_id, group_name)
+        self.create_tab_internal(options, proxy, group_id, group_name)
     }
 
-    fn create_tab_with_popup(
+    fn create_tab_internal(
         &mut self,
         options: WindowOptions,
         proxy: &EventLoopProxy<Event>,
-        pending_popup: Option<PendingPopup>,
         group_id: Option<usize>,
         group_name: Option<String>,
     ) -> Result<TabId, Box<dyn Error>> {
@@ -1434,7 +1489,6 @@ impl WindowContext {
             pty_config,
             proxy,
             options.window_kind,
-            pending_popup,
             group_id,
             group_name,
         )?;
@@ -1462,24 +1516,6 @@ impl WindowContext {
             return;
         };
         tab.notifier.notify(input.into_bytes());
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn create_web_popup_tab(
-        &mut self,
-        popup_id: usize,
-        proxy: &EventLoopProxy<Event>,
-    ) -> Result<TabId, Box<dyn Error>> {
-        let Some(popup) = take_pending_popup(popup_id) else {
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::Other, "Popup WebView not found").into()
-            );
-        };
-
-        let mut options = WindowOptions::default();
-        options.window_kind = WindowKind::Web { url: popup.url.clone().unwrap_or_default() };
-
-        self.create_tab_with_popup(options, proxy, Some(popup), None, None)
     }
 
     pub(crate) fn handle_tab_command(&mut self, command: crate::tabs::TabCommand) {
@@ -1517,6 +1553,7 @@ impl WindowContext {
                 self.closed_tabs.remove(0);
             }
             self.web_network.remove(&tab_id);
+            self.cef_inspector.remove_sessions_for_tab(tab_id);
         }
 
         let _ = tab.notifier.0.send(Msg::Shutdown);
@@ -1969,31 +2006,23 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            self.ensure_remote_inspector()?;
             let targets = self
-                .remote_inspector
-                .as_ref()
-                .expect("remote inspector should be initialized")
-                .list_targets()
-                .map_err(map_inspector_error)?;
-            let tabs = self.inspector_tabs();
-            let pid = std::process::id();
-            let mapped = targets
-                .iter()
-                .map(|target| {
-                    let tab_id = match_tab_for_target(target, &tabs, pid);
+                .inspector_tabs()
+                .into_iter()
+                .map(|tab| {
+                    let target_id = Self::cef_target_id(tab.tab_id);
                     IpcInspectorTarget {
-                        target_id: target.target_id,
-                        target_type: target.target_type.clone(),
-                        url: target.url.clone(),
-                        title: target.title.clone(),
-                        override_name: target.override_name.clone(),
-                        host_app_identifier: target.host_app_identifier.clone(),
-                        tab_id: tab_id.map(Into::into),
+                        target_id,
+                        target_type: Some(String::from("page")),
+                        url: tab.url,
+                        title: tab.title,
+                        override_name: tab.override_name,
+                        host_app_identifier: Some(String::from("tabor")),
+                        tab_id: Some(IpcTabId::from(tab.tab_id)),
                     }
                 })
                 .collect();
-            Ok(mapped)
+            Ok(targets)
         }
     }
 
@@ -2014,54 +2043,39 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            if tab_id.is_none() && target_id.is_none() {
-                return Err(IpcError::new(
-                    IpcErrorCode::InvalidRequest,
-                    "tab_id or target_id must be provided",
-                ));
-            }
-
-            self.ensure_remote_inspector()?;
-            let targets = self
-                .remote_inspector
-                .as_ref()
-                .expect("remote inspector should be initialized")
-                .list_targets()
-                .map_err(map_inspector_error)?;
-            let resolved_target = if let Some(target_id) = target_id {
-                target_id
-            } else {
-                let tab_id =
-                    tab_id.ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
-                let tab_info = self.inspector_tab_info(tab_id)?;
-                match_target_for_tab(&targets, &tab_info, std::process::id())
-                    .map_err(map_inspector_error)?
-            };
-
             let resolved_tab_id = if let Some(tab_id) = tab_id {
                 tab_id
+            } else if let Some(target_id) = target_id {
+                Self::tab_id_from_target_id(target_id)
             } else {
-                let target = targets
-                    .iter()
-                    .find(|target| target.target_id == resolved_target)
-                    .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Target not found"))?;
-                match_tab_for_target(target, &self.inspector_tabs(), std::process::id())
-                    .ok_or_else(|| {
-                        IpcError::new(IpcErrorCode::Ambiguous, "Target does not map to a web tab")
-                    })?
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "tab_id or target_id required",
+                ));
             };
 
-            let session = self
-                .remote_inspector
-                .as_ref()
-                .expect("remote inspector should be initialized")
-                .attach(resolved_tab_id, resolved_target)
-                .map_err(map_inspector_error)?;
+            let info = self.inspector_tab_info(resolved_tab_id)?;
+            let target_id = Self::cef_target_id(info.tab_id);
+
+            let Some(tab) = self.tabs.get_mut(info.tab_id) else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+            let Some(web_view) = tab.web_view.as_mut() else {
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+            };
+
+            let last_event_id = web_view.latest_devtools_event_id();
+            let session_id = self.cef_inspector.next_session_id(target_id);
+            self.cef_inspector.sessions.insert(
+                session_id.clone(),
+                CefInspectorSession { tab_id: info.tab_id, last_event_id },
+            );
+            self.cef_inspector.register_session(&session_id);
 
             Ok(IpcInspectorSession {
-                session_id: session.session_id,
-                target_id: session.target_id,
-                tab_id: session.tab_id.into(),
+                session_id,
+                target_id,
+                tab_id: IpcTabId::from(info.tab_id),
             })
         }
     }
@@ -2079,12 +2093,11 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            self.ensure_remote_inspector()?;
-            self.remote_inspector
-                .as_ref()
-                .expect("remote inspector should be initialized")
-                .detach(&session_id)
-                .map_err(map_inspector_error)?;
+            let existed = self.cef_inspector.sessions.remove(&session_id);
+            if existed.is_none() {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"));
+            }
+            self.cef_inspector.remove_session(&session_id);
             Ok(())
         }
     }
@@ -2106,12 +2119,64 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            self.ensure_remote_inspector()?;
-            self.remote_inspector
-                .as_ref()
-                .expect("remote inspector should be initialized")
-                .send_message(&session_id, &message)
-                .map_err(map_inspector_error)?;
+            let tab_id = self
+                .cef_inspector
+                .sessions
+                .get(&session_id)
+                .map(|session| session.tab_id)
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"))?;
+
+            let value: JsonValue = json::from_str(&message).map_err(|err| {
+                IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    format!("Invalid inspector message: {err}"),
+                )
+            })?;
+            let Some(object) = value.as_object() else {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "Inspector message must be a JSON object",
+                ));
+            };
+            let method = object
+                .get("method")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Inspector message missing method",
+                    )
+                })?;
+            let id = object.get("id").and_then(|value| value.as_i64()).ok_or_else(|| {
+                IpcError::new(IpcErrorCode::InvalidRequest, "Inspector message missing id")
+            })?;
+            let params = object.get("params").cloned();
+
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+            let Some(web_view) = tab.web_view.as_mut() else {
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+            };
+
+            let pending = Arc::clone(&self.cef_inspector.pending);
+            let session_id = session_id.clone();
+            let callback = move |result: Result<JsonValue, String>| {
+                let payload = match result {
+                    Ok(result) => json::json!({ "id": id, "result": result }),
+                    Err(err) => json::json!({ "id": id, "error": { "message": err } }),
+                };
+                let message = payload.to_string();
+                let mut pending = pending.lock().unwrap();
+                if let Some(queue) = pending.get_mut(&session_id) {
+                    queue.push_back(message);
+                }
+            };
+
+            web_view
+                .devtools_command_json(method, params, callback)
+                .map_err(|err| IpcError::new(IpcErrorCode::Internal, err))?;
+
             Ok(())
         }
     }
@@ -2133,21 +2198,41 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            self.ensure_remote_inspector()?;
-            let messages = self
-                .remote_inspector
-                .as_ref()
-                .expect("remote inspector should be initialized")
-                .poll_messages(&session_id, max)
-                .map_err(map_inspector_error)?;
-            let mapped = messages
+            const DEFAULT_MAX: usize = 256;
+            let max = max.unwrap_or(DEFAULT_MAX);
+
+            let (tab_id, last_event_id) = self
+                .cef_inspector
+                .sessions
+                .get(&session_id)
+                .map(|session| (session.tab_id, session.last_event_id))
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"))?;
+
+            let mut payloads = self.cef_inspector.drain_messages(&session_id, max);
+
+            if payloads.len() < max {
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+                };
+                let Some(web_view) = tab.web_view.as_mut() else {
+                    return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+                };
+                let remaining = max - payloads.len();
+                let (events, newest_id) =
+                    web_view.devtools_events_since(last_event_id, remaining);
+                if newest_id != last_event_id {
+                    if let Some(session) = self.cef_inspector.sessions.get_mut(&session_id) {
+                        session.last_event_id = newest_id;
+                    }
+                }
+                payloads.extend(events);
+            }
+
+            let messages = payloads
                 .into_iter()
-                .map(|message| IpcInspectorMessage {
-                    session_id: message.session_id,
-                    payload: message.payload,
-                })
+                .map(|payload| IpcInspectorMessage { session_id: session_id.clone(), payload })
                 .collect();
-            Ok(mapped)
+            Ok(messages)
         }
     }
 
@@ -2161,9 +2246,7 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            self.remote_inspector
-                .as_ref()
-                .is_some_and(|inspector| inspector.has_session(session_id))
+            self.cef_inspector.sessions.contains_key(session_id)
         }
     }
 
@@ -2517,6 +2600,93 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
+    pub(crate) fn ipc_web_key(
+        &mut self,
+        tab_id: TabId,
+        input: WebKeyInput,
+    ) -> Result<(), IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, input);
+            return Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Web automation is only supported on macOS",
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+            if !tab.kind.is_web() {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
+            }
+
+            let Some(web_view) = tab.web_view.as_mut() else {
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+            };
+
+            let key_code = input.key_code.clone();
+            let parsed = Self::parse_web_key_input(input)?;
+            let unmodified_text = default_text_for_key(&parsed.key);
+            let dispatched = web_view.dispatch_key_event(
+                &parsed.key,
+                key_code.as_deref(),
+                &parsed.text,
+                &unmodified_text,
+                parsed.state,
+                parsed.modifiers,
+                parsed.repeat,
+                parsed.location,
+                parsed.physical_key,
+            );
+            if !dispatched {
+                return Err(IpcError::new(
+                    IpcErrorCode::Unsupported,
+                    "DevTools host unavailable",
+                ));
+            }
+
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn parse_web_key_input(input: WebKeyInput) -> Result<ParsedWebKeyInput, IpcError> {
+        let key = parse_ipc_key(&input.key)?;
+        let key_code = if let Some(code) = input.key_code.as_deref() {
+            parse_ipc_key_code(code)?
+        } else {
+            derive_key_code_from_key(&key)
+        };
+        let physical_key = match key_code {
+            Some(code) => PhysicalKey::Code(code),
+            None => PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
+        };
+        let location = match key_code {
+            Some(code) if is_numpad_key(code) => KeyLocation::Numpad,
+            _ => KeyLocation::Standard,
+        };
+        let text = input.text.unwrap_or_else(|| default_text_for_key(&key));
+        let state = match input.state {
+            crate::ipc::WebKeyState::Down => ElementState::Pressed,
+            crate::ipc::WebKeyState::Up => ElementState::Released,
+        };
+        let modifiers = modifiers_from_ipc(input.modifiers);
+
+        Ok(ParsedWebKeyInput {
+            key,
+            text,
+            state,
+            modifiers,
+            repeat: input.repeat,
+            location,
+            physical_key,
+        })
+    }
+
+    #[cfg(unix)]
     fn with_action_context<F>(
         &mut self,
         tab_id: TabId,
@@ -2821,6 +2991,18 @@ impl WindowContext {
             }
             _ => {}
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cef_target_id(tab_id: TabId) -> u64 {
+        (u64::from(tab_id.generation) << 32) | u64::from(tab_id.index)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tab_id_from_target_id(target_id: u64) -> TabId {
+        let index = (target_id & 0xFFFF_FFFF) as u32;
+        let generation = (target_id >> 32) as u32;
+        TabId::new(index, generation)
     }
 
     #[cfg(target_os = "macos")]
@@ -3727,6 +3909,293 @@ fn map_inspector_error(error: InspectorError) -> IpcError {
             IpcError::new(IpcErrorCode::InvalidRequest, message)
         },
     }
+}
+
+#[cfg(target_os = "macos")]
+struct ParsedWebKeyInput {
+    key: Key,
+    text: String,
+    state: ElementState,
+    modifiers: ModifiersState,
+    repeat: bool,
+    location: KeyLocation,
+    physical_key: PhysicalKey,
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ipc_key(value: &str) -> Result<Key, IpcError> {
+    let trimmed = value.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let key = match lowered.as_str() {
+        "enter" => Key::Named(NamedKey::Enter),
+        "escape" | "esc" => Key::Named(NamedKey::Escape),
+        "backspace" => Key::Named(NamedKey::Backspace),
+        "delete" => Key::Named(NamedKey::Delete),
+        "tab" => Key::Named(NamedKey::Tab),
+        "space" => Key::Named(NamedKey::Space),
+        "arrowleft" | "left" => Key::Named(NamedKey::ArrowLeft),
+        "arrowright" | "right" => Key::Named(NamedKey::ArrowRight),
+        "arrowup" | "up" => Key::Named(NamedKey::ArrowUp),
+        "arrowdown" | "down" => Key::Named(NamedKey::ArrowDown),
+        _ => {
+            let mut chars = trimmed.chars();
+            let Some(ch) = chars.next() else {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "key is empty"));
+            };
+            if chars.next().is_some() {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "key must be a single character or named key",
+                ));
+            }
+            Key::Character(ch.to_string().into())
+        }
+    };
+
+    Ok(key)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_ipc_key_code(value: &str) -> Result<Option<KeyCode>, IpcError> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(rest) = lowered.strip_prefix("key") {
+        let mut chars = rest.chars();
+        if let (Some(letter), None) = (chars.next(), chars.next()) {
+            if letter.is_ascii_alphabetic() {
+                let code = match letter.to_ascii_uppercase() {
+                    'A' => KeyCode::KeyA,
+                    'B' => KeyCode::KeyB,
+                    'C' => KeyCode::KeyC,
+                    'D' => KeyCode::KeyD,
+                    'E' => KeyCode::KeyE,
+                    'F' => KeyCode::KeyF,
+                    'G' => KeyCode::KeyG,
+                    'H' => KeyCode::KeyH,
+                    'I' => KeyCode::KeyI,
+                    'J' => KeyCode::KeyJ,
+                    'K' => KeyCode::KeyK,
+                    'L' => KeyCode::KeyL,
+                    'M' => KeyCode::KeyM,
+                    'N' => KeyCode::KeyN,
+                    'O' => KeyCode::KeyO,
+                    'P' => KeyCode::KeyP,
+                    'Q' => KeyCode::KeyQ,
+                    'R' => KeyCode::KeyR,
+                    'S' => KeyCode::KeyS,
+                    'T' => KeyCode::KeyT,
+                    'U' => KeyCode::KeyU,
+                    'V' => KeyCode::KeyV,
+                    'W' => KeyCode::KeyW,
+                    'X' => KeyCode::KeyX,
+                    'Y' => KeyCode::KeyY,
+                    'Z' => KeyCode::KeyZ,
+                    _ => {
+                        return Err(IpcError::new(
+                            IpcErrorCode::InvalidRequest,
+                            "invalid key_code",
+                        ))
+                    }
+                };
+                return Ok(Some(code));
+            }
+        }
+    }
+
+    if let Some(rest) = lowered.strip_prefix("digit") {
+        let mut chars = rest.chars();
+        if let (Some(digit), None) = (chars.next(), chars.next()) {
+            let code = match digit {
+                '0' => KeyCode::Digit0,
+                '1' => KeyCode::Digit1,
+                '2' => KeyCode::Digit2,
+                '3' => KeyCode::Digit3,
+                '4' => KeyCode::Digit4,
+                '5' => KeyCode::Digit5,
+                '6' => KeyCode::Digit6,
+                '7' => KeyCode::Digit7,
+                '8' => KeyCode::Digit8,
+                '9' => KeyCode::Digit9,
+                _ => {
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "invalid key_code",
+                    ))
+                }
+            };
+            return Ok(Some(code));
+        }
+    }
+
+    let code = match lowered.as_str() {
+        "enter" => Some(KeyCode::Enter),
+        "escape" | "esc" => Some(KeyCode::Escape),
+        "backspace" => Some(KeyCode::Backspace),
+        "delete" => Some(KeyCode::Delete),
+        "tab" => Some(KeyCode::Tab),
+        "space" => Some(KeyCode::Space),
+        "arrowleft" | "left" => Some(KeyCode::ArrowLeft),
+        "arrowright" | "right" => Some(KeyCode::ArrowRight),
+        "arrowup" | "up" => Some(KeyCode::ArrowUp),
+        "arrowdown" | "down" => Some(KeyCode::ArrowDown),
+        _ => None,
+    };
+
+    if code.is_some() {
+        return Ok(code);
+    }
+
+    Err(IpcError::new(
+        IpcErrorCode::InvalidRequest,
+        "unsupported key_code",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn derive_key_code_from_key(key: &Key) -> Option<KeyCode> {
+    match key {
+        Key::Named(named) => match named {
+            NamedKey::Enter => Some(KeyCode::Enter),
+            NamedKey::Escape => Some(KeyCode::Escape),
+            NamedKey::Backspace => Some(KeyCode::Backspace),
+            NamedKey::Delete => Some(KeyCode::Delete),
+            NamedKey::Tab => Some(KeyCode::Tab),
+            NamedKey::Space => Some(KeyCode::Space),
+            NamedKey::ArrowLeft => Some(KeyCode::ArrowLeft),
+            NamedKey::ArrowRight => Some(KeyCode::ArrowRight),
+            NamedKey::ArrowUp => Some(KeyCode::ArrowUp),
+            NamedKey::ArrowDown => Some(KeyCode::ArrowDown),
+            _ => None,
+        },
+        Key::Character(ch) => {
+            let mut chars = ch.chars();
+            let Some(c) = chars.next() else {
+                return None;
+            };
+            if chars.next().is_some() {
+                return None;
+            }
+            if c.is_ascii_alphabetic() {
+                return match c.to_ascii_uppercase() {
+                    'A' => Some(KeyCode::KeyA),
+                    'B' => Some(KeyCode::KeyB),
+                    'C' => Some(KeyCode::KeyC),
+                    'D' => Some(KeyCode::KeyD),
+                    'E' => Some(KeyCode::KeyE),
+                    'F' => Some(KeyCode::KeyF),
+                    'G' => Some(KeyCode::KeyG),
+                    'H' => Some(KeyCode::KeyH),
+                    'I' => Some(KeyCode::KeyI),
+                    'J' => Some(KeyCode::KeyJ),
+                    'K' => Some(KeyCode::KeyK),
+                    'L' => Some(KeyCode::KeyL),
+                    'M' => Some(KeyCode::KeyM),
+                    'N' => Some(KeyCode::KeyN),
+                    'O' => Some(KeyCode::KeyO),
+                    'P' => Some(KeyCode::KeyP),
+                    'Q' => Some(KeyCode::KeyQ),
+                    'R' => Some(KeyCode::KeyR),
+                    'S' => Some(KeyCode::KeyS),
+                    'T' => Some(KeyCode::KeyT),
+                    'U' => Some(KeyCode::KeyU),
+                    'V' => Some(KeyCode::KeyV),
+                    'W' => Some(KeyCode::KeyW),
+                    'X' => Some(KeyCode::KeyX),
+                    'Y' => Some(KeyCode::KeyY),
+                    'Z' => Some(KeyCode::KeyZ),
+                    _ => None,
+                };
+            }
+            if c.is_ascii_digit() {
+                return match c {
+                    '0' => Some(KeyCode::Digit0),
+                    '1' => Some(KeyCode::Digit1),
+                    '2' => Some(KeyCode::Digit2),
+                    '3' => Some(KeyCode::Digit3),
+                    '4' => Some(KeyCode::Digit4),
+                    '5' => Some(KeyCode::Digit5),
+                    '6' => Some(KeyCode::Digit6),
+                    '7' => Some(KeyCode::Digit7),
+                    '8' => Some(KeyCode::Digit8),
+                    '9' => Some(KeyCode::Digit9),
+                    _ => None,
+                };
+            }
+            match c {
+                ' ' => Some(KeyCode::Space),
+                '-' => Some(KeyCode::Minus),
+                '=' => Some(KeyCode::Equal),
+                '[' => Some(KeyCode::BracketLeft),
+                ']' => Some(KeyCode::BracketRight),
+                '\\' => Some(KeyCode::Backslash),
+                ';' => Some(KeyCode::Semicolon),
+                '\'' => Some(KeyCode::Quote),
+                '`' => Some(KeyCode::Backquote),
+                ',' => Some(KeyCode::Comma),
+                '.' => Some(KeyCode::Period),
+                '/' => Some(KeyCode::Slash),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn default_text_for_key(key: &Key) -> String {
+    match key {
+        Key::Named(NamedKey::Enter) => "\r".to_string(),
+        Key::Named(NamedKey::Tab) => "\t".to_string(),
+        Key::Named(NamedKey::Backspace) => "\u{8}".to_string(),
+        Key::Character(ch) => ch.to_string(),
+        _ => String::new(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn modifiers_from_ipc(modifiers: crate::ipc::WebKeyModifiers) -> ModifiersState {
+    let mut state = ModifiersState::empty();
+    if modifiers.shift {
+        state.insert(ModifiersState::SHIFT);
+    }
+    if modifiers.control {
+        state.insert(ModifiersState::CONTROL);
+    }
+    if modifiers.alt {
+        state.insert(ModifiersState::ALT);
+    }
+    if modifiers.super_key {
+        state.insert(ModifiersState::SUPER);
+    }
+    state
+}
+
+#[cfg(target_os = "macos")]
+fn is_numpad_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::NumLock
+            | KeyCode::NumpadDecimal
+            | KeyCode::NumpadMultiply
+            | KeyCode::NumpadAdd
+            | KeyCode::NumpadDivide
+            | KeyCode::NumpadEnter
+            | KeyCode::NumpadSubtract
+            | KeyCode::NumpadEqual
+            | KeyCode::Numpad0
+            | KeyCode::Numpad1
+            | KeyCode::Numpad2
+            | KeyCode::Numpad3
+            | KeyCode::Numpad4
+            | KeyCode::Numpad5
+            | KeyCode::Numpad6
+            | KeyCode::Numpad7
+            | KeyCode::Numpad8
+            | KeyCode::Numpad9
+    )
 }
 
 #[cfg(unix)]

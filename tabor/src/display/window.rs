@@ -22,6 +22,7 @@ use std::fmt::{self, Display, Formatter};
 
 #[cfg(target_os = "macos")]
 use {
+    objc2::encode::{Encode, Encoding, RefEncode},
     objc2::{MainThreadMarker, msg_send},
     objc2::runtime::AnyObject,
     objc2_app_kit::{NSColor, NSColorSpace, NSView, NSWindowButton},
@@ -62,6 +63,24 @@ const IDI_ICON: u16 = 0x101;
 const MACOS_TRAFFIC_LIGHT_MARGIN_X: f64 = 12.0;
 #[cfg(target_os = "macos")]
 const MACOS_TRAFFIC_LIGHT_MARGIN_Y: f64 = 8.0;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CGColor {
+    _priv: [u8; 0],
+}
+
+#[cfg(target_os = "macos")]
+// SAFETY: `CGColor` is an opaque Core Graphics type.
+unsafe impl Encode for CGColor {
+    const ENCODING: Encoding = Encoding::Struct("CGColor", &[]);
+}
+
+#[cfg(target_os = "macos")]
+// SAFETY: References to `CGColor` are represented as pointers to the opaque type.
+unsafe impl RefEncode for CGColor {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
+}
 
 /// Window errors.
 #[derive(Debug)]
@@ -593,7 +612,7 @@ fn set_view_layer_background(view: &NSView, color: &NSColor) {
         if layer.is_null() {
             return;
         }
-        let cg_color: *mut AnyObject = msg_send![color, CGColor];
+        let cg_color: *mut CGColor = msg_send![color, CGColor];
         let _: () = msg_send![layer, setBackgroundColor: cg_color];
     }
 }
