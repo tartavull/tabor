@@ -199,6 +199,15 @@ pub(crate) fn framework_dir() -> Option<PathBuf> {
         }
     }
 
+    // When running from a macOS `.app`, prefer a bundled framework so web tabs work even when
+    // launched outside a shell environment (Finder/Spotlight/open).
+    if let Some(bundle_root) = main_bundle_path() {
+        let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
+        if let Some(framework) = resolve_framework_dir(&frameworks_dir) {
+            return Some(framework);
+        }
+    }
+
     let arch_tag = if env::consts::ARCH == "aarch64" {
         "macosarm64"
     } else {
@@ -246,11 +255,6 @@ fn resolve_framework_dir(path: &Path) -> Option<PathBuf> {
         return path.canonicalize().ok();
     }
 
-    let direct = path.join("Chromium Embedded Framework.framework");
-    if direct.exists() {
-        return direct.canonicalize().ok();
-    }
-
     let release = path
         .join("Release")
         .join("Chromium Embedded Framework.framework");
@@ -263,6 +267,13 @@ fn resolve_framework_dir(path: &Path) -> Option<PathBuf> {
         .join("Chromium Embedded Framework.framework");
     if debug.exists() {
         return debug.canonicalize().ok();
+    }
+
+    // Some CEF distributions include a framework at the root as well as in Release/Debug. Prefer
+    // Release/Debug above, since those contain sidecar libraries in `.../Libraries/`.
+    let direct = path.join("Chromium Embedded Framework.framework");
+    if direct.exists() {
+        return direct.canonicalize().ok();
     }
 
     None

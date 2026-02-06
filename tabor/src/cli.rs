@@ -790,6 +790,14 @@ pub struct WindowOptions {
     #[serde(default)]
     pub command_input: Option<String>,
 
+    /// When set (internal only), close this tab after the new tab is created successfully.
+    ///
+    /// This is intentionally not serialized over IPC: it's used to implement "replace tab"
+    /// semantics without closing the current tab if tab creation fails.
+    #[clap(skip)]
+    #[serde(skip)]
+    pub close_tab_on_success: Option<crate::tabs::TabId>,
+
     #[clap(skip)]
     #[cfg(not(any(target_os = "macos", windows)))]
     /// `ActivationToken` that we pass to winit.

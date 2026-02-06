@@ -974,10 +974,23 @@ impl ApplicationHandler<Event> for Processor {
                     ipc::send_reply(&mut stream, reply);
                 }
             },
-            (EventType::CreateTab(options), Some(window_id)) => {
+            (EventType::CreateTab(mut options), Some(window_id)) => {
+                let close_tab_on_success = options.close_tab_on_success.take();
+
                 if let Some(window_context) = self.windows.get_mut(&window_id) {
-                    if let Err(err) = window_context.create_tab(options, &self.proxy) {
-                        error!("Could not create tab: {err:?}");
+                    match window_context.create_tab(options, &self.proxy) {
+                        Ok(_) => {
+                            #[cfg(target_os = "macos")]
+                            if let Some(tab_id) = close_tab_on_success {
+                                let should_close_window = window_context.close_tab(tab_id);
+                                if should_close_window {
+                                    self.close_window(event_loop, window_id);
+                                }
+                            }
+                        },
+                        Err(err) => {
+                            error!("Could not create tab: {err:?}");
+                        },
                     }
                 }
             },
@@ -3246,8 +3259,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                         } else if self.tab_kind.is_web() {
                             self.open_web_url(url);
                         } else {
-                            self.open_web_url_new_tab(url);
-                            self.close_current_tab();
+                            // Replace semantics: only close the current tab if the new tab is
+                            // created successfully.
+                            self.open_web_url_new_tab_replace_current(url);
                         }
                     },
                     CommandTarget::TerminalDir(path) => {
@@ -3337,6 +3351,21 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let _ = self.event_proxy.send_event(event);
     }
 
+    fn open_web_url_new_tab_replace_current(&mut self, url: String) {
+        let mut options = WindowOptions::default();
+        options.window_kind = WindowKind::Web { url: url.clone() };
+        options.close_tab_on_success = Some(self.tab_id);
+        #[cfg(not(windows))]
+        {
+            options.terminal_options.working_directory =
+                foreground_process_path(self.master_fd, self.shell_pid).ok();
+        }
+
+        let event = Event::new(EventType::CreateTab(options), self.display.window.id());
+        self.command_history.record_url(url);
+        let _ = self.event_proxy.send_event(event);
+    }
+
     fn open_terminal_dir_new_tab(&mut self, path: PathBuf) {
         let mut options = WindowOptions::default();
         options.window_kind = WindowKind::Terminal;
@@ -3349,17 +3378,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let mut options = WindowOptions::default();
         options.window_kind = WindowKind::Terminal;
         options.terminal_options.working_directory = Some(path);
+        options.close_tab_on_success = Some(self.tab_id);
         let event = Event::new(EventType::CreateTab(options), self.display.window.id());
         let _ = self.event_proxy.send_event(event);
-        self.close_current_tab();
-    }
-
-    fn close_current_tab(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
-            let event = Event::new(EventType::CloseTab(self.tab_id), self.display.window.id());
-            let _ = self.event_proxy.send_event(event);
-        }
     }
 
     pub(crate) fn reload_web(&mut self) {

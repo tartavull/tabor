@@ -20,13 +20,44 @@ if [[ "$(uname -s)" == "Darwin" && -z "$SKIP_OPEN" ]]; then
   APP_TEMPLATE="$ROOT_DIR/extra/osx/Tabor.app"
   APP_DIR="$ROOT_DIR/target/debug/osx/Tabor.app"
   APP_BIN="$APP_DIR/Contents/MacOS/tabor"
+  APP_FRAMEWORKS="$APP_DIR/Contents/Frameworks"
   if [[ -d "$APP_TEMPLATE" ]]; then
     mkdir -p "$(dirname "$APP_DIR")"
+    if [[ -d "$APP_DIR" ]]; then
+      chmod -R u+w "$APP_DIR" >/dev/null 2>&1 || true
+    fi
     rm -rf "$APP_DIR"
     cp -a "$APP_TEMPLATE" "$APP_DIR"
     mkdir -p "$APP_DIR/Contents/MacOS"
     cp -f "$BIN" "$APP_BIN"
     chmod +x "$APP_BIN"
+
+    # Bundle CEF so the app can open web tabs when launched outside a shell.
+    mkdir -p "$APP_FRAMEWORKS"
+    cef_root="${TABOR_CEF_PATH:-${CEF_PATH:-}}"
+    cef_framework_dir="${TABOR_CEF_FRAMEWORK_DIR:-}"
+    if [[ -z "$cef_framework_dir" && -n "$cef_root" ]]; then
+      if [[ -d "$cef_root/Release/Chromium Embedded Framework.framework" ]]; then
+        cef_framework_dir="$cef_root/Release/Chromium Embedded Framework.framework"
+      elif [[ -d "$cef_root/Debug/Chromium Embedded Framework.framework" ]]; then
+        cef_framework_dir="$cef_root/Debug/Chromium Embedded Framework.framework"
+      elif [[ -d "$cef_root/Chromium Embedded Framework.framework" ]]; then
+        cef_framework_dir="$cef_root/Chromium Embedded Framework.framework"
+      fi
+    fi
+    if [[ -n "$cef_framework_dir" && -d "$cef_framework_dir" ]]; then
+      rm -rf "$APP_FRAMEWORKS/Chromium Embedded Framework.framework"
+      cp -a "$cef_framework_dir" "$APP_FRAMEWORKS/Chromium Embedded Framework.framework"
+
+      for lib in libEGL.dylib libGLESv2.dylib; do
+        src="$cef_framework_dir/Libraries/$lib"
+        if [[ -f "$src" ]]; then
+          cp -f "$src" "$APP_FRAMEWORKS/$lib"
+          ln -sf "../Frameworks/$lib" "$APP_DIR/Contents/MacOS/$lib"
+        fi
+      done
+    fi
+
     USE_OPEN=true
   fi
 fi
