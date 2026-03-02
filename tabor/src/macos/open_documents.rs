@@ -86,7 +86,12 @@ fn open_documents_delegate_class(superclass: &AnyClass) -> &'static AnyClass {
                     cls.as_ptr(),
                     sel!(application:openURLs:),
                     mem::transmute::<
-                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &NSApplication, &NSArray<NSURL>),
+                        unsafe extern "C-unwind" fn(
+                            &AnyObject,
+                            Sel,
+                            &NSApplication,
+                            &NSArray<NSURL>,
+                        ),
                         Imp,
                     >(application_open_urls),
                     Encoding::Void,
@@ -96,7 +101,12 @@ fn open_documents_delegate_class(superclass: &AnyClass) -> &'static AnyClass {
                     cls.as_ptr(),
                     sel!(application:openFile:),
                     mem::transmute::<
-                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &NSApplication, &NSString) -> Bool,
+                        unsafe extern "C-unwind" fn(
+                            &AnyObject,
+                            Sel,
+                            &NSApplication,
+                            &NSString,
+                        ) -> Bool,
                         Imp,
                     >(application_open_file),
                     Bool::ENCODING,
@@ -106,7 +116,12 @@ fn open_documents_delegate_class(superclass: &AnyClass) -> &'static AnyClass {
                     cls.as_ptr(),
                     sel!(application:openFiles:),
                     mem::transmute::<
-                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &NSApplication, &NSArray<NSString>),
+                        unsafe extern "C-unwind" fn(
+                            &AnyObject,
+                            Sel,
+                            &NSApplication,
+                            &NSArray<NSString>,
+                        ),
                         Imp,
                     >(application_open_files),
                     Encoding::Void,
@@ -183,9 +198,7 @@ fn collect_urls_from_nsurls(urls: &NSArray<NSURL>) -> Vec<String> {
 pub(crate) fn register_open_documents_handler(proxy: EventLoopProxy<Event>) {
     let mtm = MainThreadMarker::new().expect("open document handler must be on the main thread");
     let app = NSApplication::sharedApplication(mtm);
-    let delegate = app
-        .delegate()
-        .expect("open document handler requires an application delegate");
+    let delegate = app.delegate().expect("open document handler requires an application delegate");
     let delegate_obj = unsafe { &*(Retained::as_ptr(&delegate) as *const AnyObject) };
 
     OPEN_DOCUMENTS_PROXY.with(|cell| {

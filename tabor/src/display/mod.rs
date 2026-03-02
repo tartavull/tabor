@@ -39,9 +39,9 @@ use tabor_terminal::vte::ansi::{CursorShape, NamedColor};
 use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
 use crate::config::font::Font;
-use crate::config::window::Dimensions;
 #[cfg(target_os = "macos")]
 use crate::config::window::Decorations;
+use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
@@ -562,10 +562,8 @@ impl Display {
         {
             tab_panel.set_enabled(config.window.tab_panel.enabled);
             tab_panel.set_dimensions(panel_dimensions);
-            let has_controls = matches!(
-                config.window.decorations,
-                Decorations::Full | Decorations::Transparent
-            );
+            let has_controls =
+                matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
             let top_inset = if tab_panel.is_enabled() && has_controls {
                 let panel_bg = TabPanel::background_color(config);
                 window.set_macos_background_color(panel_bg);
@@ -790,10 +788,8 @@ impl Display {
         {
             self.tab_panel.set_enabled(config.window.tab_panel.enabled);
             self.tab_panel.set_dimensions(panel_dimensions);
-            let has_controls = matches!(
-                config.window.decorations,
-                Decorations::Full | Decorations::Transparent
-            );
+            let has_controls =
+                matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
             let top_inset = if self.tab_panel.is_enabled() && has_controls {
                 let panel_bg = TabPanel::background_color(config);
                 self.window.set_macos_background_color(panel_bg);
@@ -1142,9 +1138,7 @@ impl Display {
                 };
                 let line = size_info.screen_lines().saturating_sub(1);
                 let message_offset = self.footer_offset();
-                let y = size_info
-                    .cell_height()
-                    .mul_add(line as f32, size_info.padding_y())
+                let y = size_info.cell_height().mul_add(line as f32, size_info.padding_y())
                     + message_offset;
                 let width = size_info.width() as i32;
                 let height = size_info.cell_height() as i32;
@@ -1202,6 +1196,7 @@ impl Display {
         scheduler: &mut Scheduler,
         message_buffer: &MessageBuffer,
         config: &UiConfig,
+        url: &str,
         command_state: &CommandState,
     ) {
         let size_info = self.size_info;
@@ -1232,7 +1227,7 @@ impl Display {
             );
         }
 
-        let footer_offset = if command_active { self.footer_offset() } else { 0. };
+        let footer_offset = self.footer_offset();
 
         let ime_position = if command_active {
             let command_text = Self::format_command(command_state.text(), size_info.columns());
@@ -1282,11 +1277,8 @@ impl Display {
                     MessageType::Warning => config.colors.normal.yellow,
                 };
                 let line = size_info.screen_lines().saturating_sub(1);
-                let message_offset = self.footer_offset();
-                let y = size_info
-                    .cell_height()
-                    .mul_add(line as f32, size_info.padding_y())
-                    + message_offset;
+                let y = size_info.cell_height().mul_add(line as f32, size_info.padding_y())
+                    + footer_offset;
                 let width = size_info.width() as i32;
                 let height = size_info.cell_height() as i32;
                 self.damage_tracker
@@ -1296,8 +1288,20 @@ impl Display {
                     .next_frame()
                     .add_viewport_rect(&size_info, 0, y as i32, width, height);
 
-                self.draw_footer_bar_line(&message_text, fg, bg, line, message_offset);
+                self.draw_footer_bar_line(&message_text, fg, bg, line, footer_offset);
             }
+        } else if !command_active {
+            let url_text: String = StrShortener::new(
+                url,
+                size_info.columns(),
+                ShortenDirection::Right,
+                Some(SHORTENER),
+            )
+            .collect();
+            let fg = config.colors.footer_bar_foreground();
+            let bg = config.colors.footer_bar_background();
+            let line = size_info.screen_lines().saturating_sub(1);
+            self.draw_footer_bar_line(&url_text, fg, bg, line, footer_offset);
         }
 
         self.draw_render_timer(config);

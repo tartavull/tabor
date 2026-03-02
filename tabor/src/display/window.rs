@@ -23,8 +23,8 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::encode::{Encode, Encoding, RefEncode},
-    objc2::{MainThreadMarker, msg_send},
     objc2::runtime::AnyObject,
+    objc2::{MainThreadMarker, msg_send},
     objc2_app_kit::{NSColor, NSColorSpace, NSView, NSWindowButton},
     objc2_foundation::NSPoint,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
@@ -267,6 +267,22 @@ impl Window {
     #[inline]
     pub fn focus_window(&self) {
         self.window.focus_window();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn focus_content_view(&self) {
+        let _mtm = MainThreadMarker::new().expect("focus_content_view requires main thread");
+
+        let view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
+            _ => return,
+        };
+
+        let Some(window) = view.window() else {
+            return;
+        };
+
+        let _ = window.makeFirstResponder(Some(view));
     }
 
     /// Set the window title.
@@ -540,11 +556,8 @@ impl Window {
         let mini_frame = mini.frame();
         let zoom_frame = zoom.frame();
 
-        let button_height = close_frame
-            .size
-            .height
-            .max(mini_frame.size.height)
-            .max(zoom_frame.size.height);
+        let button_height =
+            close_frame.size.height.max(mini_frame.size.height).max(zoom_frame.size.height);
         let mini_dx = mini_frame.origin.x - close_frame.origin.x;
         let zoom_dx = zoom_frame.origin.x - close_frame.origin.x;
         let left_margin = MACOS_TRAFFIC_LIGHT_MARGIN_X;

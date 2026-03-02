@@ -246,8 +246,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
         let mods = self.ctx.modifiers().state();
         #[cfg(target_os = "macos")]
-        let skip_web_clipboard =
-            self.ctx.window_kind().is_web() && self.ctx.web_is_insert_mode();
+        let skip_web_clipboard = self.ctx.window_kind().is_web() && self.ctx.web_is_insert_mode();
         #[cfg(not(target_os = "macos"))]
         let skip_web_clipboard = false;
 

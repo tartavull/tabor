@@ -9,18 +9,18 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
 use crate::cli::AgentBrowserOptions;
+use crate::cli::WindowOptions;
 use crate::ipc::{
-    self, IpcErrorCode, IpcRequest, SocketReply, TabSelection, UrlTarget, WebNetworkAction,
-    WebNetworkEntry,
+    self, IpcAction, IpcErrorCode, IpcRequest, SocketReply, TabSelection, UrlTarget,
+    WebNetworkAction, WebNetworkEntry,
 };
 use crate::web_url::normalize_web_url;
 use crate::window_kind::WindowKind;
-use crate::cli::WindowOptions;
 
 const HELP_TEXT: &str = r#"agent-browser - fast browser automation CLI for AI agents
 
@@ -935,7 +935,6 @@ const JS_HELPER: &str = r#"(() => {
   };
 })();"#;
 
-
 #[derive(Default)]
 struct GlobalOptions {
     json: bool,
@@ -951,11 +950,8 @@ struct GlobalOptions {
 }
 
 pub fn run(options: AgentBrowserOptions) -> Result<(), Box<dyn Error>> {
-    let args = options
-        .args
-        .into_iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+    let args =
+        options.args.into_iter().map(|arg| arg.to_string_lossy().to_string()).collect::<Vec<_>>();
 
     let (globals, command, command_args) = parse_args(args)?;
     if let Some(command) = command {
@@ -969,7 +965,9 @@ pub fn run(options: AgentBrowserOptions) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn parse_args(args: Vec<String>) -> Result<(GlobalOptions, Option<String>, Vec<String>), Box<dyn Error>> {
+fn parse_args(
+    args: Vec<String>,
+) -> Result<(GlobalOptions, Option<String>, Vec<String>), Box<dyn Error>> {
     let mut globals = GlobalOptions::default();
     let mut command: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
@@ -981,11 +979,11 @@ fn parse_args(args: Vec<String>) -> Result<(GlobalOptions, Option<String>, Vec<S
                 "--help" | "-h" => {
                     print_help();
                     return Ok((globals, Some(String::new()), Vec::new()));
-                }
+                },
                 "--version" | "-V" => {
                     println!("tabor agent-browser {}", env!("CARGO_PKG_VERSION"));
                     return Ok((globals, Some(String::new()), Vec::new()));
-                }
+                },
                 "--json" => globals.json = true,
                 "--full" | "-f" => globals.full = true,
                 "--headed" => globals.headed = true,
@@ -993,39 +991,37 @@ fn parse_args(args: Vec<String>) -> Result<(GlobalOptions, Option<String>, Vec<S
                 "--session" => {
                     i += 1;
                     globals.session = args.get(i).cloned();
-                }
+                },
                 "--headers" => {
                     i += 1;
                     globals.headers = args.get(i).cloned();
-                }
+                },
                 "--cdp" => {
                     i += 1;
-                    globals.cdp = args
-                        .get(i)
-                        .and_then(|value| value.parse::<u16>().ok());
-                }
+                    globals.cdp = args.get(i).and_then(|value| value.parse::<u16>().ok());
+                },
                 "--proxy" => {
                     i += 1;
                     globals.proxy = args.get(i).cloned();
-                }
+                },
                 "--executable-path" => {
                     i += 1;
                     globals.executable_path = args.get(i).cloned();
-                }
+                },
                 "--extension" => {
                     i += 1;
                     if let Some(value) = args.get(i) {
                         globals.extensions.push(value.clone());
                     }
-                }
+                },
                 _ if arg.starts_with('-') => {
                     return Err(shim_error(format!("unknown option '{arg}'")));
-                }
+                },
                 _ => {
                     command = Some(arg.clone());
                     command_args = args[i + 1..].to_vec();
                     break;
-                }
+                },
             }
         } else {
             command_args.push(arg.clone());
@@ -1133,11 +1129,11 @@ fn cmd_snapshot(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn 
             "-d" | "--depth" => {
                 i += 1;
                 depth = args.get(i).and_then(|v| v.parse::<usize>().ok());
-            }
+            },
             "-s" | "--selector" => {
                 i += 1;
                 selector = args.get(i).cloned();
-            }
+            },
             _ => return Err(shim_error("invalid snapshot option")),
         }
         i += 1;
@@ -1254,6 +1250,20 @@ fn cmd_press(
     }
     let key = &args[0];
     let key_info = parse_key(key);
+    if matches!(event, PressEvent::Both) && key_info.meta && !key_info.ctrl && !key_info.alt {
+        let action_name = match key_info.key.as_str() {
+            "c" => Some("copy"),
+            "v" => Some("paste"),
+            _ => None,
+        };
+        if let Some(action_name) = action_name {
+            let reply = send_request(IpcRequest::DispatchAction {
+                tab_id: None,
+                action: IpcAction::Action { name: action_name.to_string() },
+            })?;
+            return expect_ok(reply);
+        }
+    }
     let info_json = serde_json::to_string(&key_info)?;
     let event_type = match event {
         PressEvent::Down => "keydown",
@@ -1277,7 +1287,11 @@ fn cmd_hover(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
     eval_ok(script, globals)
 }
 
-fn cmd_check(globals: &GlobalOptions, args: &[String], checked: bool) -> Result<(), Box<dyn Error>> {
+fn cmd_check(
+    globals: &GlobalOptions,
+    args: &[String],
+    checked: bool,
+) -> Result<(), Box<dyn Error>> {
     if args.len() != 1 {
         return Err(shim_error("check requires a selector"));
     }
@@ -1316,9 +1330,8 @@ fn cmd_scroll(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
         "right" => (amount, 0),
         _ => return Err(shim_error("scroll direction must be up/down/left/right")),
     };
-    let script = js_wrap(&format!(
-        "window.scrollBy({dx}, {dy});\nreturn JSON.stringify({{ ok: true }});"
-    ));
+    let script =
+        js_wrap(&format!("window.scrollBy({dx}, {dy});\nreturn JSON.stringify({{ ok: true }});"));
     eval_ok(script, globals)
 }
 
@@ -1365,11 +1378,7 @@ fn cmd_upload(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
             .ok_or_else(|| shim_error("invalid file name"))?
             .to_string();
         let mime = "";
-        files.push(UploadFile {
-            name,
-            data: BASE64.encode(data),
-            mime: mime.to_string(),
-        });
+        files.push(UploadFile { name, data: BASE64.encode(data), mime: mime.to_string() });
     }
     let payload = serde_json::to_string(&files)?;
     let script = js_wrap(&format!(
@@ -1442,15 +1451,17 @@ fn cmd_get(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error
     let kind = args[0].as_str();
     match kind {
         "title" => {
-            let script = js_wrap("const doc = window.__taborAB.doc(); return JSON.stringify({ value: doc.title || '' });");
+            let script = js_wrap(
+                "const doc = window.__taborAB.doc(); return JSON.stringify({ value: doc.title || '' });",
+            );
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
         "url" => {
             let script = js_wrap("return JSON.stringify({ value: window.location.href });");
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
         "count" => {
             let selector = args.get(1).ok_or_else(|| shim_error("count requires selector"))?;
             let script = js_wrap(&format!(
@@ -1459,7 +1470,7 @@ fn cmd_get(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error
             ));
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
         "text" | "html" | "value" | "box" | "styles" | "attr" => {
             let selector = args.get(1).ok_or_else(|| shim_error("get requires selector"))?;
             let attr = if kind == "attr" {
@@ -1474,7 +1485,7 @@ fn cmd_get(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error
             ));
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
         _ => Err(shim_error("unknown get field")),
     }
 }
@@ -1531,7 +1542,7 @@ fn cmd_find(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
             "--name" => {
                 i += 1;
                 name = args.get(i).cloned();
-            }
+            },
             _ => (),
         }
         i += 1;
@@ -1571,26 +1582,26 @@ fn cmd_wait(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             "--text" | "-t" => {
                 i += 1;
                 text = args.get(i).cloned();
-            }
+            },
             "--url" | "-u" => {
                 i += 1;
                 url = args.get(i).cloned();
-            }
+            },
             "--fn" | "-f" => {
                 i += 1;
                 fn_expr = args.get(i).cloned();
-            }
+            },
             "--load" | "-l" => {
                 i += 1;
                 load = args.get(i).cloned().or_else(|| Some(String::from("load")));
-            }
+            },
             value => {
                 if let Ok(ms) = value.parse::<u64>() {
                     duration_ms = Some(ms);
                 } else {
                     selector = Some(value.to_string());
                 }
-            }
+            },
         }
         i += 1;
     }
@@ -1622,9 +1633,8 @@ fn cmd_wait(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             let result = web_eval_json(script)?;
             result.get("value").and_then(|v| v.as_bool()).unwrap_or(false)
         } else if let Some(url) = &url {
-            let script = js_wrap(&format!(
-                "return JSON.stringify({{ value: window.location.href }});"
-            ));
+            let script =
+                js_wrap(&format!("return JSON.stringify({{ value: window.location.href }});"));
             let result = web_eval_json(script)?;
             let value = result.get("value").and_then(|v| v.as_str()).unwrap_or("");
             url_matches(url, value)
@@ -1643,9 +1653,7 @@ fn cmd_wait(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             let result = web_eval_json(script)?;
             result.get("value").and_then(|v| v.as_bool()).unwrap_or(false)
         } else {
-            return Err(shim_error(
-                "wait requires a selector, text, url, fn, load, or duration",
-            ));
+            return Err(shim_error("wait requires a selector, text, url, fn, load, or duration"));
         };
 
         if ready {
@@ -1672,7 +1680,7 @@ fn cmd_mouse(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
                 "const doc = window.__taborAB.doc();\nconst el = doc.elementFromPoint({}, {});\nif (el) el.dispatchEvent(new MouseEvent('mousemove', {{ bubbles: true, clientX: {}, clientY: {} }}));\nreturn JSON.stringify({{ ok: true }});",
                 x, y, x, y
             ))
-        }
+        },
         "down" | "up" => {
             let button = args.get(1).map(|v| v.as_str()).unwrap_or("left");
             let button_code = match button {
@@ -1685,7 +1693,7 @@ fn cmd_mouse(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             js_wrap(&format!(
                 "const doc = window.__taborAB.doc();\ndoc.dispatchEvent(new MouseEvent('{event}', {{ bubbles: true, button: {button_code} }}));\nreturn JSON.stringify({{ ok: true }});"
             ))
-        }
+        },
         "wheel" => {
             if args.len() < 2 {
                 return Err(shim_error("mouse wheel requires delta"));
@@ -1696,7 +1704,7 @@ fn cmd_mouse(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
                 "window.scrollBy({}, {});\nreturn JSON.stringify({{ ok: true }});",
                 dx, dy
             ))
-        }
+        },
         _ => return Err(shim_error("unknown mouse action")),
     };
     eval_ok(script, globals)
@@ -1744,9 +1752,8 @@ fn cmd_tab(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error
     } else if args[0] == "close" {
         if let Some(index) = args.get(1) {
             let index = index.parse::<usize>().map_err(|_| shim_error("invalid tab index"))?;
-            let reply = send_request(IpcRequest::SelectTab {
-                selection: TabSelection::ByIndex { index },
-            })?;
+            let reply =
+                send_request(IpcRequest::SelectTab { selection: TabSelection::ByIndex { index } })?;
             expect_ok(reply)?;
             let reply = send_request(IpcRequest::CloseTab { tab_id: None })?;
             expect_ok(reply)
@@ -1756,9 +1763,8 @@ fn cmd_tab(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error
         }
     } else {
         let index = args[0].parse::<usize>().map_err(|_| shim_error("invalid tab index"))?;
-        let reply = send_request(IpcRequest::SelectTab {
-            selection: TabSelection::ByIndex { index },
-        })?;
+        let reply =
+            send_request(IpcRequest::SelectTab { selection: TabSelection::ByIndex { index } })?;
         expect_ok(reply)
     }
 }
@@ -1780,7 +1786,7 @@ fn cmd_cookies(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
             let script = js_wrap("return JSON.stringify({ value: document.cookie || '' });");
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
         "set" => {
             if args.len() < 3 {
                 return Err(shim_error("cookies set requires name and value"));
@@ -1791,13 +1797,13 @@ fn cmd_cookies(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                 js_string(&cookie)
             ));
             eval_ok(script, globals)
-        }
+        },
         "clear" => {
             let script = js_wrap(
                 "document.cookie.split(';').forEach((c) => { const name = c.split('=')[0].trim(); document.cookie = name + '=; Max-Age=0; path=/'; });\nreturn JSON.stringify({ ok: true });",
             );
             eval_ok(script, globals)
-        }
+        },
         _ => Err(shim_error("unknown cookies action")),
     }
 }
@@ -1819,7 +1825,7 @@ fn cmd_storage(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
             ));
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
         "set" => {
             if args.len() < 4 {
                 return Err(shim_error("storage set requires key and value"));
@@ -1832,11 +1838,12 @@ fn cmd_storage(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                 js_string(val)
             ));
             eval_ok(script, globals)
-        }
+        },
         "clear" => {
-            let script = js_wrap(&format!("{store}.clear(); return JSON.stringify({{ ok: true }});"));
+            let script =
+                js_wrap(&format!("{store}.clear(); return JSON.stringify({{ ok: true }});"));
             eval_ok(script, globals)
-        }
+        },
         key => {
             let script = js_wrap(&format!(
                 "return JSON.stringify({{ value: {store}.getItem({}) }});",
@@ -1844,7 +1851,7 @@ fn cmd_storage(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
             ));
             let value = web_eval_json(script)?;
             print_value(globals, &value)
-        }
+        },
     }
 }
 
@@ -1858,7 +1865,9 @@ fn cmd_session(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
         }
     } else {
         if globals.json {
-            print_json(json!({ "session": globals.session.clone().unwrap_or_else(|| "default".to_string()) }))
+            print_json(
+                json!({ "session": globals.session.clone().unwrap_or_else(|| "default".to_string()) }),
+            )
         } else {
             println!("{}", globals.session.clone().unwrap_or_else(|| "default".to_string()));
             Ok(())
@@ -1881,7 +1890,7 @@ fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                     "--filter" => {
                         i += 1;
                         filter = args.get(i).cloned();
-                    }
+                    },
                     "--clear" => clear = true,
                     _ => (),
                 }
@@ -1909,7 +1918,7 @@ fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                     } else {
                         return Err(shim_error(error.message));
                     }
-                }
+                },
                 _ => return Err(shim_error("unexpected IPC reply")),
             };
             if !clear {
@@ -1925,16 +1934,14 @@ fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                 print_json(json!({ "requests": entries }))
             } else {
                 for entry in entries {
-                    let status = entry
-                        .status
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string());
+                    let status =
+                        entry.status.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
                     let method = entry.method.unwrap_or_else(|| "-".to_string());
                     println!("{status} {method} {}", entry.url);
                 }
                 Ok(())
             }
-        }
+        },
         "route" => {
             let pattern = args.get(1).ok_or_else(|| shim_error("route requires a url pattern"))?;
             let mut action = "continue".to_string();
@@ -1950,23 +1957,21 @@ fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                         i += 1;
                         body = args.get(i).cloned();
                         action = "fulfill".to_string();
-                    }
+                    },
                     "--status" => {
                         i += 1;
-                        status = args
-                            .get(i)
-                            .and_then(|v| v.parse::<u16>().ok());
-                    }
+                        status = args.get(i).and_then(|v| v.parse::<u16>().ok());
+                    },
                     "--content-type" => {
                         i += 1;
                         content_type = args.get(i).cloned();
-                    }
+                    },
                     "--headers" => {
                         i += 1;
                         if let Some(value) = args.get(i) {
                             headers = serde_json::from_str::<Value>(value).ok();
                         }
-                    }
+                    },
                     _ => (),
                 }
                 i += 1;
@@ -1985,7 +1990,7 @@ fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                 route
             ));
             eval_ok(script, globals)
-        }
+        },
         "unroute" => {
             let pattern = args.get(1).map(|v| v.as_str()).unwrap_or("");
             let script = js_wrap(&format!(
@@ -1993,7 +1998,7 @@ fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                 js_string(pattern)
             ));
             eval_ok(script, globals)
-        }
+        },
         _ => Err(shim_error("unknown network action")),
     }
 }
@@ -2012,7 +2017,7 @@ fn cmd_state(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
             let state = value.get("state").cloned().unwrap_or_else(|| json!({}));
             fs::write(path, serde_json::to_string_pretty(&state)?)?;
             Ok(())
-        }
+        },
         "load" => {
             let path = args.get(1).ok_or_else(|| shim_error("state load requires a path"))?;
             let contents = fs::read_to_string(path)?;
@@ -2022,7 +2027,7 @@ fn cmd_state(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
                 state
             ));
             eval_ok(script, _globals)
-        }
+        },
         _ => Err(shim_error("state requires save or load")),
     }
 }
@@ -2051,7 +2056,7 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
                 width, height
             ));
             eval_ok(script, _globals)
-        }
+        },
         "device" => {
             if args.len() < 2 {
                 return Err(shim_error("set device requires a name"));
@@ -2062,7 +2067,7 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
                 js_string(&name)
             ));
             eval_ok(script, _globals)
-        }
+        },
         "geo" | "geolocation" => {
             if args.len() < 3 {
                 return Err(shim_error("set geo requires latitude and longitude"));
@@ -2074,7 +2079,7 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
                 lat, lng
             ));
             eval_ok(script, _globals)
-        }
+        },
         "offline" => {
             let mode = args.get(1).map(|v| v.as_str()).unwrap_or("on");
             let offline = matches!(mode, "on" | "true" | "1");
@@ -2083,7 +2088,7 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
                 if offline { "true" } else { "false" }
             ));
             eval_ok(script, _globals)
-        }
+        },
         "headers" => {
             if args.len() < 2 {
                 return Err(shim_error("set headers requires JSON"));
@@ -2099,7 +2104,7 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
                 headers
             ));
             eval_ok(script, _globals)
-        }
+        },
         "credentials" | "auth" => {
             if args.len() < 3 {
                 return Err(shim_error("set credentials requires user and pass"));
@@ -2112,7 +2117,7 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
                 js_string(pass)
             ));
             eval_ok(script, _globals)
-        }
+        },
         "media" => {
             if args.len() < 2 {
                 return Err(shim_error("set media requires a mode"));
@@ -2128,14 +2133,11 @@ fn cmd_set(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Erro
             }
             let script = js_wrap(&format!(
                 "window.__taborAB.setMedia({}, {});\nreturn JSON.stringify({{ ok: true }});",
-                scheme
-                    .as_deref()
-                    .map(js_string)
-                    .unwrap_or_else(|| "null".to_string()),
+                scheme.as_deref().map(js_string).unwrap_or_else(|| "null".to_string()),
                 if reduced { "true" } else { "false" }
             ));
             eval_ok(script, _globals)
-        }
+        },
         _ => Err(shim_error("unknown set option")),
     }
 }
@@ -2150,11 +2152,7 @@ fn cmd_console(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
     if globals.json {
         print_json(value)
     } else {
-        let items = value
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let items = value.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         for item in items {
             let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("log");
             let args = item
@@ -2162,7 +2160,9 @@ fn cmd_console(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
                 .and_then(|v| v.as_array())
                 .map(|vals| {
                     vals.iter()
-                        .map(|v| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| value_to_string(v)))
+                        .map(|v| {
+                            v.as_str().map(|s| s.to_string()).unwrap_or_else(|| value_to_string(v))
+                        })
                         .collect::<Vec<String>>()
                         .join(" ")
                 })
@@ -2183,11 +2183,7 @@ fn cmd_errors(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
     if globals.json {
         print_json(value)
     } else {
-        let items = value
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let items = value.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         for item in items {
             let message = item.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let filename = item.get("filename").and_then(|v| v.as_str()).unwrap_or("");
@@ -2238,13 +2234,13 @@ fn cmd_dialog(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
                 text.as_deref().map(js_string).unwrap_or_else(|| "null".to_string())
             ));
             eval_ok(script, globals)
-        }
+        },
         "dismiss" => {
             let script = js_wrap(
                 "window.__taborAB.setDialogResponse(false, null);\nreturn JSON.stringify({ ok: true });",
             );
             eval_ok(script, globals)
-        }
+        },
         _ => Err(shim_error("dialog requires accept or dismiss")),
     }
 }
@@ -2265,7 +2261,7 @@ fn cmd_trace(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             let state = json!({ "startedAt": started_at });
             fs::write(&state_path, serde_json::to_string(&state)?)?;
             Ok(())
-        }
+        },
         "stop" => {
             let path = args.get(1).ok_or_else(|| shim_error("trace stop requires a path"))?;
             let started_at = fs::read_to_string(&state_path)
@@ -2288,7 +2284,7 @@ fn cmd_trace(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             fs::write(path, serde_json::to_string_pretty(&trace)?)?;
             let _ = fs::remove_file(&state_path);
             Ok(())
-        }
+        },
         _ => Err(shim_error("trace requires start or stop")),
     }
 }
@@ -2302,7 +2298,7 @@ fn cmd_record(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Er
         "restart" => {
             let _ = record_stop(globals);
             record_start(globals, &args[1..])
-        }
+        },
         "stop" => record_stop(globals),
         _ => Err(shim_error("record requires start, stop, or restart")),
     }
@@ -2324,7 +2320,7 @@ fn cmd_record_worker(_globals: &GlobalOptions, args: &[String]) -> Result<(), Bo
                 if let Some(value) = args.get(i) {
                     fps = value.parse::<f64>().unwrap_or(5.0);
                 }
-            }
+            },
             "--full" => full = true,
             _ => (),
         }
@@ -2354,7 +2350,11 @@ fn cmd_record_worker(_globals: &GlobalOptions, args: &[String]) -> Result<(), Bo
     let mut child = ffmpeg.spawn()?;
     let mut stdin = child.stdin.take().ok_or_else(|| shim_error("ffmpeg stdin unavailable"))?;
 
-    let interval = if fps > 0.0 { Duration::from_millis((1000.0 / fps) as u64) } else { Duration::from_millis(200) };
+    let interval = if fps > 0.0 {
+        Duration::from_millis((1000.0 / fps) as u64)
+    } else {
+        Duration::from_millis(200)
+    };
     loop {
         if stop_path.exists() {
             break;
@@ -2406,19 +2406,14 @@ fn record_start(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn 
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.arg("agent-browser")
-        .arg("__record-worker")
-        .arg(&session)
-        .arg(path);
+    cmd.arg("agent-browser").arg("__record-worker").arg(&session).arg(path);
     if globals.full {
         cmd.arg("--full");
     }
     if let Ok(socket) = std::env::var("TABOR_SOCKET") {
         cmd.env("TABOR_SOCKET", socket);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let child = cmd.spawn()?;
 
     let state = json!({ "pid": child.id(), "path": path });
@@ -2447,10 +2442,7 @@ fn record_stop(globals: &GlobalOptions) -> Result<(), Box<dyn Error>> {
 }
 
 fn now_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 fn command_exists(name: &str) -> bool {
@@ -2464,10 +2456,7 @@ fn command_exists(name: &str) -> bool {
 }
 
 fn session_name(globals: &GlobalOptions) -> String {
-    globals
-        .session
-        .clone()
-        .unwrap_or_else(|| String::from("default"))
+    globals.session.clone().unwrap_or_else(|| String::from("default"))
 }
 
 fn record_state_paths(session: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -2502,10 +2491,7 @@ fn network_fallback(
     if clear {
         return Ok(Vec::new());
     }
-    let entries_value = value
-        .get("entries")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let entries_value = value.get("entries").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
     let mut entries: Vec<WebNetworkEntry> = serde_json::from_value(entries_value)?;
     if let Some(filter) = filter {
         entries.retain(|entry| entry.url.contains(&filter));
@@ -2533,12 +2519,13 @@ fn web_eval_json(script: String) -> Result<Value, Box<dyn Error>> {
             let Some(result) = result else {
                 return Err(shim_error("web eval returned no result"));
             };
-            let value: Value = serde_json::from_str(&result).map_err(|_| shim_error("invalid JS result"))?;
+            let value: Value =
+                serde_json::from_str(&result).map_err(|_| shim_error("invalid JS result"))?;
             if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
                 return Err(shim_error(error));
             }
             Ok(value)
-        }
+        },
         Some(SocketReply::Error { error }) => Err(shim_error(error.message)),
         _ => Err(shim_error("unexpected IPC reply")),
     }

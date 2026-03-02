@@ -18,9 +18,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 #[cfg(unix)]
-use base64::engine::general_purpose::STANDARD as BASE64;
-#[cfg(unix)]
 use base64::Engine;
+#[cfg(unix)]
+use base64::engine::general_purpose::STANDARD as BASE64;
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
@@ -29,14 +29,16 @@ use log::info;
 #[cfg(target_os = "macos")]
 use serde::Deserialize;
 use serde_json as json;
-use winit::event::{Event as WinitEvent, Ime, Modifiers, WindowEvent};
 use winit::event::{ElementState, MouseButton};
+use winit::event::{Event as WinitEvent, Ime, Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+#[cfg(target_os = "macos")]
+use winit::keyboard::{
+    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey,
+};
 use winit::raw_window_handle::HasDisplayHandle;
 #[cfg(target_os = "macos")]
 use winit::window::CursorIcon;
-#[cfg(target_os = "macos")]
-use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey};
 use winit::window::WindowId;
 
 use tabor_terminal::event::{Event as TerminalEvent, Notify, OnResize};
@@ -70,13 +72,13 @@ use crate::event::{
     Mouse, SearchState, TouchPurpose, request_web_cursor_update,
 };
 #[cfg(unix)]
+use crate::ipc;
+#[cfg(unix)]
 use crate::ipc::{
     IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession, IpcInspectorTarget,
     IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, SocketReply,
-    TabSelection, WebNetworkAction, WebNetworkEntry, WebMouseAction, WebMouseButton, WebKeyInput,
+    TabSelection, WebKeyInput, WebMouseAction, WebMouseButton, WebNetworkAction, WebNetworkEntry,
 };
-#[cfg(unix)]
-use crate::ipc;
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
@@ -89,19 +91,16 @@ use crate::{input, renderer};
 #[cfg(target_os = "macos")]
 use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
 #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
 use crate::macos::webview::WebView;
 #[cfg(target_os = "macos")]
-use crate::macos::remote_inspector::{
-    InspectorError, InspectorTabInfo, RemoteInspectorClient,
-};
+use crate::tab_panel::TabFavicon;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSEventModifierFlags;
 #[cfg(target_os = "macos")]
 use serde_json::Value as JsonValue;
-#[cfg(target_os = "macos")]
-use crate::tab_panel::TabFavicon;
 
 struct TabState {
     id: TabId,
@@ -136,14 +135,6 @@ struct TabState {
 #[cfg(target_os = "macos")]
 struct ClosedTab {
     kind: WindowKind,
-}
-
-#[cfg(target_os = "macos")]
-struct WebNetworkState {
-    session_id: String,
-    next_id: u64,
-    entries: Vec<WebNetworkEntry>,
-    index: HashMap<String, usize>,
 }
 
 #[cfg(target_os = "macos")]
@@ -189,7 +180,9 @@ impl CefInspectorState {
         let session_ids = self
             .sessions
             .iter()
-            .filter_map(|(session_id, session)| (session.tab_id == tab_id).then(|| session_id.clone()))
+            .filter_map(|(session_id, session)| {
+                (session.tab_id == tab_id).then(|| session_id.clone())
+            })
             .collect::<Vec<_>>();
         for session_id in session_ids {
             self.sessions.remove(&session_id);
@@ -735,11 +728,7 @@ pub struct WindowContext {
     #[cfg(target_os = "macos")]
     next_favicon_char: u32,
     #[cfg(target_os = "macos")]
-    remote_inspector: Option<RemoteInspectorClient>,
-    #[cfg(target_os = "macos")]
     cef_inspector: CefInspectorState,
-    #[cfg(target_os = "macos")]
-    web_network: HashMap<TabId, WebNetworkState>,
     modifiers: Modifiers,
     occluded: bool,
     window_focused: bool,
@@ -894,11 +883,7 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             next_favicon_char: 0xE000,
             #[cfg(target_os = "macos")]
-            remote_inspector: None,
-            #[cfg(target_os = "macos")]
             cef_inspector: CefInspectorState::new(),
-            #[cfg(target_os = "macos")]
-            web_network: HashMap::new(),
             dirty: Default::default(),
         };
 
@@ -959,7 +944,7 @@ impl WindowContext {
         let web_view = match &window_kind {
             WindowKind::Web { url } => {
                 Some(WebView::new(&display.window, &display.size_info, tab_id, url, proxy)?)
-            }
+            },
             WindowKind::Terminal => None,
         };
 
@@ -1150,6 +1135,8 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         {
             let active_id = self.tabs.active_id();
+            let mut active_web = false;
+
             for tab in self.tabs.iter_mut() {
                 let Some(web_view) = tab.web_view.as_mut() else {
                     continue;
@@ -1159,8 +1146,13 @@ impl WindowContext {
                 web_view.set_visible(visible);
                 web_view.set_focus(visible);
                 if visible {
+                    active_web = true;
+
                     web_view.update_frame(&self.display.window, &self.display.size_info);
                 }
+            }
+            if active_web {
+                self.display.window.focus_content_view();
             }
         }
     }
@@ -1205,6 +1197,10 @@ impl WindowContext {
 
             if let Some(url) = url_update.clone() {
                 self.command_history.record_url(url);
+            }
+
+            if url_update.is_some() {
+                self.dirty = true;
             }
 
             if let Some((scroll_x, scroll_y)) = pending_scroll {
@@ -1497,6 +1493,14 @@ impl WindowContext {
         if let Some(input) = command_input.as_deref() {
             if let Some(active_tab) = self.tabs.active_mut() {
                 active_tab.command_state.start_with_input(':', input);
+                #[cfg(target_os = "macos")]
+                if active_tab.kind.is_web() {
+                    if let Some(web_view) = active_tab.web_view.as_mut() {
+                        web_view.set_focus(false);
+                    }
+                    self.display.window.focus_content_view();
+                }
+
                 self.display.pending_update.dirty = true;
                 self.display.damage_tracker.frame().mark_fully_damaged();
                 self.dirty = true;
@@ -1552,7 +1556,6 @@ impl WindowContext {
             if self.closed_tabs.len() > MAX_CLOSED_TABS {
                 self.closed_tabs.remove(0);
             }
-            self.web_network.remove(&tab_id);
             self.cef_inspector.remove_sessions_for_tab(tab_id);
         }
 
@@ -2007,19 +2010,22 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         {
             let targets = self
-                .inspector_tabs()
-                .into_iter()
-                .map(|tab| {
-                    let target_id = Self::cef_target_id(tab.tab_id);
-                    IpcInspectorTarget {
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let WindowKind::Web { url } = &tab.kind else {
+                        return None;
+                    };
+                    let target_id = Self::cef_target_id(tab.id);
+                    Some(IpcInspectorTarget {
                         target_id,
                         target_type: Some(String::from("page")),
-                        url: tab.url,
-                        title: tab.title,
-                        override_name: tab.override_name,
+                        url: if url.is_empty() { None } else { Some(url.clone()) },
+                        title: if tab.title.is_empty() { None } else { Some(tab.title.clone()) },
+                        override_name: tab.custom_title.clone(),
                         host_app_identifier: Some(String::from("tabor")),
-                        tab_id: Some(IpcTabId::from(tab.tab_id)),
-                    }
+                        tab_id: Some(IpcTabId::from(tab.id)),
+                    })
                 })
                 .collect();
             Ok(targets)
@@ -2054,12 +2060,14 @@ impl WindowContext {
                 ));
             };
 
-            let info = self.inspector_tab_info(resolved_tab_id)?;
-            let target_id = Self::cef_target_id(info.tab_id);
+            let target_id = Self::cef_target_id(resolved_tab_id);
 
-            let Some(tab) = self.tabs.get_mut(info.tab_id) else {
+            let Some(tab) = self.tabs.get_mut(resolved_tab_id) else {
                 return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
             };
+            if !tab.kind.is_web() {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
+            }
             let Some(web_view) = tab.web_view.as_mut() else {
                 return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
             };
@@ -2068,14 +2076,14 @@ impl WindowContext {
             let session_id = self.cef_inspector.next_session_id(target_id);
             self.cef_inspector.sessions.insert(
                 session_id.clone(),
-                CefInspectorSession { tab_id: info.tab_id, last_event_id },
+                CefInspectorSession { tab_id: resolved_tab_id, last_event_id },
             );
             self.cef_inspector.register_session(&session_id);
 
             Ok(IpcInspectorSession {
                 session_id,
                 target_id,
-                tab_id: IpcTabId::from(info.tab_id),
+                tab_id: IpcTabId::from(resolved_tab_id),
             })
         }
     }
@@ -2124,7 +2132,9 @@ impl WindowContext {
                 .sessions
                 .get(&session_id)
                 .map(|session| session.tab_id)
-                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"))?;
+                .ok_or_else(|| {
+                    IpcError::new(IpcErrorCode::NotFound, "Inspector session not found")
+                })?;
 
             let value: JsonValue = json::from_str(&message).map_err(|err| {
                 IpcError::new(
@@ -2138,14 +2148,9 @@ impl WindowContext {
                     "Inspector message must be a JSON object",
                 ));
             };
-            let method = object
-                .get("method")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    IpcError::new(
-                        IpcErrorCode::InvalidRequest,
-                        "Inspector message missing method",
-                    )
+            let method =
+                object.get("method").and_then(|value| value.as_str()).ok_or_else(|| {
+                    IpcError::new(IpcErrorCode::InvalidRequest, "Inspector message missing method")
                 })?;
             let id = object.get("id").and_then(|value| value.as_i64()).ok_or_else(|| {
                 IpcError::new(IpcErrorCode::InvalidRequest, "Inspector message missing id")
@@ -2206,7 +2211,9 @@ impl WindowContext {
                 .sessions
                 .get(&session_id)
                 .map(|session| (session.tab_id, session.last_event_id))
-                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"))?;
+                .ok_or_else(|| {
+                    IpcError::new(IpcErrorCode::NotFound, "Inspector session not found")
+                })?;
 
             let mut payloads = self.cef_inspector.drain_messages(&session_id, max);
 
@@ -2215,11 +2222,13 @@ impl WindowContext {
                     return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
                 };
                 let Some(web_view) = tab.web_view.as_mut() else {
-                    return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+                    return Err(IpcError::new(
+                        IpcErrorCode::Unsupported,
+                        "Web view is unavailable",
+                    ));
                 };
                 let remaining = max - payloads.len();
-                let (events, newest_id) =
-                    web_view.devtools_events_since(last_event_id, remaining);
+                let (events, newest_id) = web_view.devtools_events_since(last_event_id, remaining);
                 if newest_id != last_event_id {
                     if let Some(session) = self.cef_inspector.sessions.get_mut(&session_id) {
                         session.last_event_id = newest_id;
@@ -2286,11 +2295,7 @@ impl WindowContext {
             }
 
             let Some(web_view) = tab.web_view.as_mut() else {
-                send_stream_error(
-                    &stream,
-                    IpcErrorCode::Unsupported,
-                    "Web view is unavailable",
-                );
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
                 return;
             };
 
@@ -2340,11 +2345,7 @@ impl WindowContext {
             }
 
             let Some(web_view) = tab.web_view.as_mut() else {
-                send_stream_error(
-                    &stream,
-                    IpcErrorCode::Unsupported,
-                    "Web view is unavailable",
-                );
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
                 return;
             };
 
@@ -2397,11 +2398,7 @@ impl WindowContext {
             }
 
             let Some(web_view) = tab.web_view.as_mut() else {
-                send_stream_error(
-                    &stream,
-                    IpcErrorCode::Unsupported,
-                    "Web view is unavailable",
-                );
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
                 return;
             };
 
@@ -2435,49 +2432,18 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            {
-                let Some(tab) = self.tabs.get_mut(tab_id) else {
-                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-                };
-                if !tab.kind.is_web() {
-                    return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
-                }
-
-                if let Some(web_view) = tab.web_view.as_mut() {
-                    if let Some(entries) = web_view.network_entries(action.clone()) {
-                        return Ok(entries);
-                    }
-                }
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+            if !tab.kind.is_web() {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
             }
 
-            self.ensure_web_network_state(tab_id)?;
-            self.drain_network_messages_for_tab(tab_id)?;
+            let Some(web_view) = tab.web_view.as_mut() else {
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
+            };
 
-            match action {
-                WebNetworkAction::Clear => {
-                    if let Some(state) = self.web_network.get_mut(&tab_id) {
-                        state.entries.clear();
-                        state.index.clear();
-                    }
-                    Ok(Vec::new())
-                },
-                WebNetworkAction::List { filter } => {
-                    let Some(state) = self.web_network.get(&tab_id) else {
-                        return Ok(Vec::new());
-                    };
-                    let entries = if let Some(filter) = filter {
-                        state
-                            .entries
-                            .iter()
-                            .filter(|entry| entry.url.contains(&filter))
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    } else {
-                        state.entries.clone()
-                    };
-                    Ok(entries)
-                },
-            }
+            Ok(web_view.network_entries(action))
         }
     }
 
@@ -2642,10 +2608,7 @@ impl WindowContext {
                 parsed.physical_key,
             );
             if !dispatched {
-                return Err(IpcError::new(
-                    IpcErrorCode::Unsupported,
-                    "DevTools host unavailable",
-                ));
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "DevTools host unavailable"));
             }
 
             Ok(())
@@ -2759,241 +2722,6 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
-    fn ensure_remote_inspector(&mut self) -> Result<(), IpcError> {
-        if self.remote_inspector.is_none() {
-            let inspector = RemoteInspectorClient::connect().map_err(map_inspector_error)?;
-            self.remote_inspector = Some(inspector);
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn ensure_web_network_state(&mut self, tab_id: TabId) -> Result<(), IpcError> {
-        if self.web_network.contains_key(&tab_id) {
-            return Ok(());
-        }
-
-        let session = self.ipc_attach_inspector(Some(tab_id), None)?;
-        let state = WebNetworkState {
-            session_id: session.session_id,
-            next_id: 1,
-            entries: Vec::new(),
-            index: HashMap::new(),
-        };
-        self.web_network.insert(tab_id, state);
-
-        self.send_network_command(tab_id, "Network.enable", json::json!({}))?;
-        self.send_network_command(tab_id, "Page.enable", json::json!({}))?;
-
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn send_network_command(
-        &mut self,
-        tab_id: TabId,
-        method: &str,
-        params: JsonValue,
-    ) -> Result<(), IpcError> {
-        self.ensure_remote_inspector()?;
-
-        let (session_id, id) = {
-            let state = self.web_network.get_mut(&tab_id).ok_or_else(|| {
-                IpcError::new(IpcErrorCode::NotFound, "Network session not initialized")
-            })?;
-            let id = state.next_id;
-            state.next_id += 1;
-            (state.session_id.clone(), id)
-        };
-
-        let Some(inspector) = self.remote_inspector.as_ref() else {
-            return Err(IpcError::new(IpcErrorCode::Internal, "Inspector unavailable"));
-        };
-
-        let message = json::json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        inspector
-            .send_message(&session_id, &message.to_string())
-            .map_err(map_inspector_error)?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn drain_network_messages_for_tab(&mut self, tab_id: TabId) -> Result<(), IpcError> {
-        self.ensure_remote_inspector()?;
-
-        let session_id = match self.web_network.get(&tab_id) {
-            Some(state) => state.session_id.clone(),
-            None => return Ok(()),
-        };
-
-        let messages = {
-            let Some(inspector) = self.remote_inspector.as_ref() else {
-                return Err(IpcError::new(IpcErrorCode::Internal, "Inspector unavailable"));
-            };
-            inspector
-                .poll_messages(&session_id, None)
-                .map_err(map_inspector_error)?
-        };
-
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(state) = self.web_network.get_mut(&tab_id) {
-            for message in messages {
-                Self::update_network_state(state, &message.payload);
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn update_network_state(state: &mut WebNetworkState, payload: &str) {
-        let Ok(value) = serde_json::from_str::<JsonValue>(payload) else {
-            return;
-        };
-        let Some(method) = value.get("method").and_then(|v| v.as_str()) else {
-            return;
-        };
-
-        match method {
-            "Network.requestWillBeSent" => {
-                let params = value.get("params");
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let url = params
-                    .and_then(|p| p.get("request"))
-                    .and_then(|r| r.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if url.is_empty() {
-                    return;
-                }
-                let method_name = params
-                    .and_then(|p| p.get("request"))
-                    .and_then(|r| r.get("method"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let resource_type = params
-                    .and_then(|p| p.get("type"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-
-                let request_id = request_id.unwrap_or_else(|| url.clone());
-                if state.index.contains_key(&request_id) {
-                    return;
-                }
-                let entry = WebNetworkEntry {
-                    request_id: request_id.clone(),
-                    url,
-                    method: method_name,
-                    status: None,
-                    resource_type,
-                    start_time: timestamp,
-                    end_time: None,
-                    error_text: None,
-                };
-                state.entries.push(entry);
-                state.index.insert(request_id, state.entries.len() - 1);
-            }
-            "Network.responseReceived" => {
-                let params = value.get("params");
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let Some(request_id) = request_id else {
-                    return;
-                };
-                let status = params
-                    .and_then(|p| p.get("response"))
-                    .and_then(|r| r.get("status"))
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as u16);
-                let resource_type = params
-                    .and_then(|p| p.get("type"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-                let url = params
-                    .and_then(|p| p.get("response"))
-                    .and_then(|r| r.get("url"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-
-                let index = match state.index.get(&request_id) {
-                    Some(index) => *index,
-                    None => {
-                        let entry = WebNetworkEntry {
-                            request_id: request_id.clone(),
-                            url: url.unwrap_or_default(),
-                            method: None,
-                            status,
-                            resource_type,
-                            start_time: None,
-                            end_time: timestamp,
-                            error_text: None,
-                        };
-                        state.entries.push(entry);
-                        state.index.insert(request_id, state.entries.len() - 1);
-                        return;
-                    }
-                };
-
-                let entry = &mut state.entries[index];
-                entry.status = status.or(entry.status);
-                entry.resource_type = resource_type.or_else(|| entry.resource_type.clone());
-                entry.end_time = timestamp.or(entry.end_time);
-                if let Some(url) = url {
-                    entry.url = url;
-                }
-            }
-            "Network.loadingFinished" => {
-                let params = value.get("params");
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let Some(request_id) = request_id else {
-                    return;
-                };
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-                if let Some(index) = state.index.get(&request_id).copied() {
-                    state.entries[index].end_time = timestamp.or(state.entries[index].end_time);
-                }
-            }
-            "Network.loadingFailed" => {
-                let params = value.get("params");
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let Some(request_id) = request_id else {
-                    return;
-                };
-                let error_text = params
-                    .and_then(|p| p.get("errorText"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-                if let Some(index) = state.index.get(&request_id).copied() {
-                    state.entries[index].error_text = error_text;
-                    state.entries[index].end_time = timestamp.or(state.entries[index].end_time);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    #[cfg(target_os = "macos")]
     fn cef_target_id(tab_id: TabId) -> u64 {
         (u64::from(tab_id.generation) << 32) | u64::from(tab_id.index)
     }
@@ -3003,41 +2731,6 @@ impl WindowContext {
         let index = (target_id & 0xFFFF_FFFF) as u32;
         let generation = (target_id >> 32) as u32;
         TabId::new(index, generation)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn inspector_tabs(&self) -> Vec<InspectorTabInfo> {
-        self.tabs
-            .iter()
-            .filter_map(|tab| {
-                let WindowKind::Web { url } = &tab.kind else {
-                    return None;
-                };
-                Some(InspectorTabInfo {
-                    tab_id: tab.id,
-                    url: if url.is_empty() { None } else { Some(url.clone()) },
-                    title: if tab.title.is_empty() { None } else { Some(tab.title.clone()) },
-                    override_name: tab.custom_title.clone(),
-                })
-            })
-            .collect()
-    }
-
-    #[cfg(target_os = "macos")]
-    fn inspector_tab_info(&self, tab_id: TabId) -> Result<InspectorTabInfo, IpcError> {
-        let tab = self
-            .tabs
-            .get(tab_id)
-            .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
-        let WindowKind::Web { url } = &tab.kind else {
-            return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
-        };
-        Ok(InspectorTabInfo {
-            tab_id: tab.id,
-            url: if url.is_empty() { None } else { Some(url.clone()) },
-            title: if tab.title.is_empty() { None } else { Some(tab.title.clone()) },
-            override_name: tab.custom_title.clone(),
-        })
     }
 
     #[cfg(unix)]
@@ -3307,10 +3000,15 @@ impl WindowContext {
 
         match draw_mode(&tab.kind) {
             DrawMode::Web => {
+                let url = match &tab.kind {
+                    WindowKind::Web { url } => url.as_str(),
+                    WindowKind::Terminal => "",
+                };
                 self.display.draw_web(
                     scheduler,
                     &self.message_buffer,
                     &self.config,
+                    url,
                     &tab.command_state,
                 );
             },
@@ -3346,7 +3044,7 @@ impl WindowContext {
             WinitEvent::AboutToWait
             | WinitEvent::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
                 // Skip further event handling with no staged updates.
-                if self.event_queue.is_empty() {
+                if self.event_queue.is_empty() && !self.display.pending_update.dirty {
                     return;
                 }
 
@@ -3894,24 +3592,6 @@ impl WindowContext {
 }
 
 #[cfg(target_os = "macos")]
-fn map_inspector_error(error: InspectorError) -> IpcError {
-    match error {
-        InspectorError::PermissionDenied => {
-            IpcError::new(IpcErrorCode::PermissionDenied, "Inspector permission denied")
-        },
-        InspectorError::ConnectionFailed(message) => IpcError::new(IpcErrorCode::Internal, message),
-        InspectorError::Timeout => {
-            IpcError::new(IpcErrorCode::Timeout, "Inspector request timed out")
-        },
-        InspectorError::NotFound(message) => IpcError::new(IpcErrorCode::NotFound, message),
-        InspectorError::Ambiguous(message) => IpcError::new(IpcErrorCode::Ambiguous, message),
-        InspectorError::InvalidMessage(message) => {
-            IpcError::new(IpcErrorCode::InvalidRequest, message)
-        },
-    }
-}
-
-#[cfg(target_os = "macos")]
 struct ParsedWebKeyInput {
     key: Key,
     text: String,
@@ -3949,7 +3629,7 @@ fn parse_ipc_key(value: &str) -> Result<Key, IpcError> {
                 ));
             }
             Key::Character(ch.to_string().into())
-        }
+        },
     };
 
     Ok(key)
@@ -3997,8 +3677,8 @@ fn parse_ipc_key_code(value: &str) -> Result<Option<KeyCode>, IpcError> {
                         return Err(IpcError::new(
                             IpcErrorCode::InvalidRequest,
                             "invalid key_code",
-                        ))
-                    }
+                        ));
+                    },
                 };
                 return Ok(Some(code));
             }
@@ -4019,12 +3699,7 @@ fn parse_ipc_key_code(value: &str) -> Result<Option<KeyCode>, IpcError> {
                 '7' => KeyCode::Digit7,
                 '8' => KeyCode::Digit8,
                 '9' => KeyCode::Digit9,
-                _ => {
-                    return Err(IpcError::new(
-                        IpcErrorCode::InvalidRequest,
-                        "invalid key_code",
-                    ))
-                }
+                _ => return Err(IpcError::new(IpcErrorCode::InvalidRequest, "invalid key_code")),
             };
             return Ok(Some(code));
         }
@@ -4048,10 +3723,7 @@ fn parse_ipc_key_code(value: &str) -> Result<Option<KeyCode>, IpcError> {
         return Ok(code);
     }
 
-    Err(IpcError::new(
-        IpcErrorCode::InvalidRequest,
-        "unsupported key_code",
-    ))
+    Err(IpcError::new(IpcErrorCode::InvalidRequest, "unsupported key_code"))
 }
 
 #[cfg(target_os = "macos")]
@@ -4139,7 +3811,7 @@ fn derive_key_code_from_key(key: &Key) -> Option<KeyCode> {
                 '/' => Some(KeyCode::Slash),
                 _ => None,
             }
-        }
+        },
         _ => None,
     }
 }

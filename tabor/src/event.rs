@@ -69,9 +69,9 @@ use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::ipc::{self, IpcRequest, SocketReply};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 #[cfg(target_os = "macos")]
-use crate::macos::favicon::FaviconImage;
-#[cfg(target_os = "macos")]
 use crate::macos::cef;
+#[cfg(target_os = "macos")]
+use crate::macos::favicon::FaviconImage;
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::{
     self, WebActions, WebCommandState, WebHintAction, WebKey, WebMode,
@@ -456,11 +456,7 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_web_mouse(tab_id, action, x, y, button, self.event_loop)
     }
 
-    fn web_key(
-        &mut self,
-        tab_id: TabId,
-        input: ipc::WebKeyInput,
-    ) -> Result<(), ipc::IpcError> {
+    fn web_key(&mut self, tab_id: TabId, input: ipc::WebKeyInput) -> Result<(), ipc::IpcError> {
         self.window.ipc_web_key(tab_id, input)
     }
 }
@@ -496,12 +492,14 @@ impl Processor {
         #[cfg(target_os = "macos")]
         {
             let proxy = proxy.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(16));
-                if !cef::is_initialized_global() {
-                    continue;
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(16));
+                    if !cef::is_initialized_global() {
+                        continue;
+                    }
+                    let _ = proxy.send_event(Event::new(EventType::CefTick, None));
                 }
-                let _ = proxy.send_event(Event::new(EventType::CefTick, None));
             });
         }
 
@@ -979,7 +977,8 @@ impl ApplicationHandler<Event> for Processor {
 
                 if let Some(window_context) = self.windows.get_mut(&window_id) {
                     match window_context.create_tab(options, &self.proxy) {
-                        Ok(_) => {
+                        Ok(_) =>
+                        {
                             #[cfg(target_os = "macos")]
                             if let Some(tab_id) = close_tab_on_success {
                                 let should_close_window = window_context.close_tab(tab_id);
@@ -1260,7 +1259,9 @@ impl ApplicationHandler<Event> for Processor {
             let cef_deadline = Instant::now() + Duration::from_millis(10);
             control_flow = match control_flow {
                 ControlFlow::Wait => ControlFlow::WaitUntil(cef_deadline),
-                ControlFlow::WaitUntil(deadline) => ControlFlow::WaitUntil(min(deadline, cef_deadline)),
+                ControlFlow::WaitUntil(deadline) => {
+                    ControlFlow::WaitUntil(min(deadline, cef_deadline))
+                },
                 other => other,
             };
         }
@@ -2293,6 +2294,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn toggle_command_bar(&mut self) {
         if self.command_state.is_active() {
             self.command_state.cancel();
+            #[cfg(target_os = "macos")]
+            if self.tab_kind.is_web() {
+                if let Some(web_view) = self.web_view.as_mut() {
+                    web_view.set_focus(true);
+                }
+                self.display.window.focus_content_view();
+            }
         } else {
             if self.search_active() {
                 self.cancel_search();
@@ -2313,6 +2321,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 return;
             }
             self.command_state.start();
+            #[cfg(target_os = "macos")]
+            if self.tab_kind.is_web() {
+                if let Some(web_view) = self.web_view.as_mut() {
+                    web_view.set_focus(false);
+                }
+                self.display.window.focus_content_view();
+            }
         }
 
         self.display.pending_update.dirty = true;
@@ -2326,6 +2341,13 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         self.display.damage_tracker.frame().mark_fully_damaged();
         *self.dirty = true;
         self.run_command(input);
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_web() {
+            if let Some(web_view) = self.web_view.as_mut() {
+                web_view.set_focus(true);
+            }
+            self.display.window.focus_content_view();
+        }
     }
 
     fn cancel_command(&mut self) {
@@ -2334,6 +2356,14 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
 
         self.command_state.cancel();
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_web() {
+            if let Some(web_view) = self.web_view.as_mut() {
+                web_view.set_focus(true);
+            }
+            self.display.window.focus_content_view();
+        }
+
         self.display.pending_update.dirty = true;
         self.display.damage_tracker.frame().mark_fully_damaged();
         *self.dirty = true;
@@ -2763,12 +2793,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             let Some(web_view) = self.web_view.as_mut() else {
                 return false;
             };
-            return web_view.handle_key_input(
-                &self.display.window,
-                key,
-                text,
-                modifiers,
-            );
+            return web_view.handle_key_input(&self.display.window, key, text, modifiers);
         }
 
         let web_key = web_key_from_event(key);
@@ -2776,12 +2801,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             if state.mode() == WebMode::Insert && !matches!(web_key, WebKey::Escape) {
                 let modifiers = ctx.modifiers().state();
                 if let Some(web_view) = ctx.web_view.as_mut() {
-                    let forwarded = web_view.handle_key_input(
-                        &ctx.display.window,
-                        key,
-                        text,
-                        modifiers,
-                    );
+                    let forwarded =
+                        web_view.handle_key_input(&ctx.display.window, key, text, modifiers);
                     if forwarded {
                         return true;
                     }
@@ -3444,6 +3465,11 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
 
         self.command_state.start_with_input(prompt, input);
+        if let Some(web_view) = self.web_view.as_mut() {
+            web_view.set_focus(false);
+        }
+        self.display.window.focus_content_view();
+
         self.display.pending_update.dirty = true;
         self.display.damage_tracker.frame().mark_fully_damaged();
         *self.dirty = true;
@@ -4169,9 +4195,7 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
-    use super::{
-        CommandHistory, CommandTarget, command_url_prefix, parse_command_target,
-    };
+    use super::{CommandHistory, CommandTarget, command_url_prefix, parse_command_target};
 
     #[test]
     fn command_url_prefix_parses_basic() {

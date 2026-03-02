@@ -27,14 +27,14 @@ use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 
 use tabor_terminal::tty;
 
+#[cfg(unix)]
+mod agent_browser;
 mod cli;
 mod clipboard;
 mod config;
 mod daemon;
 mod display;
 mod event;
-#[cfg(unix)]
-mod agent_browser;
 mod input;
 #[cfg(unix)]
 mod ipc;

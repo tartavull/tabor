@@ -17,9 +17,7 @@ impl WebView {
         url: &str,
         proxy: &winit::event_loop::EventLoopProxy<crate::event::Event>,
     ) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            inner: webview_cef::WebView::new(window, size_info, tab_id, url, proxy)?,
-        })
+        Ok(Self { inner: webview_cef::WebView::new(window, size_info, tab_id, url, proxy)? })
     }
 
     pub fn set_visible(&mut self, visible: bool) {
@@ -62,19 +60,6 @@ impl WebView {
         modifiers: winit::keyboard::ModifiersState,
     ) -> bool {
         self.inner.handle_key_input(window, key, text, modifiers)
-    }
-
-    pub fn handle_key_input_raw(
-        &mut self,
-        key: &winit::keyboard::Key,
-        text: &str,
-        state: winit::event::ElementState,
-        modifiers: winit::keyboard::ModifiersState,
-        repeat: bool,
-        location: winit::keyboard::KeyLocation,
-        physical_key: winit::keyboard::PhysicalKey,
-    ) -> bool {
-        self.inner.handle_key_input_raw(key, text, state, modifiers, repeat, location, physical_key)
     }
 
     pub fn dispatch_key_event(
@@ -175,7 +160,7 @@ impl WebView {
         self.inner.show_inspector()
     }
 
-    pub fn network_entries(&mut self, action: WebNetworkAction) -> Option<Vec<WebNetworkEntry>> {
+    pub fn network_entries(&mut self, action: WebNetworkAction) -> Vec<WebNetworkEntry> {
         self.inner.network_entries(action)
     }
 }

@@ -9,20 +9,19 @@ use objc2::runtime::{AnyClass, AnyObject, Bool, ProtocolObject};
 use objc2::{MainThreadMarker, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::{
-    NSDictionary, NSActivityOptions, NSProcessInfo, NSObjectProtocol, NSString, NSUserDefaults,
+    NSActivityOptions, NSDictionary, NSObjectProtocol, NSProcessInfo, NSString, NSUserDefaults,
     ns_string,
 };
 
 #[link(name = "AuthenticationServices", kind = "framework")]
 unsafe extern "C" {}
 
-pub mod favicon;
 pub mod cef;
+pub mod favicon;
 pub(crate) mod keycodes;
 pub mod locale;
 pub mod open_documents;
 pub mod proc;
-pub mod remote_inspector;
 pub mod web_commands;
 pub mod web_cursor;
 pub mod webview;

@@ -183,33 +183,99 @@ pub enum IpcRequest {
     Ping,
     GetCapabilities,
     ListTabs,
-    GetTabState { tab_id: IpcTabId },
-    CreateTab { options: WindowOptions, group_id: Option<usize>, group_name: Option<String> },
-    CreateGroup { name: Option<String> },
-    CloseTab { tab_id: Option<IpcTabId> },
-    SelectTab { selection: TabSelection },
-    MoveTab { tab_id: IpcTabId, target_group_id: Option<usize>, target_index: Option<usize> },
-    SetTabTitle { tab_id: Option<IpcTabId>, title: Option<String> },
-    SetGroupName { group_id: usize, name: Option<String> },
+    GetTabState {
+        tab_id: IpcTabId,
+    },
+    CreateTab {
+        options: WindowOptions,
+        group_id: Option<usize>,
+        group_name: Option<String>,
+    },
+    CreateGroup {
+        name: Option<String>,
+    },
+    CloseTab {
+        tab_id: Option<IpcTabId>,
+    },
+    SelectTab {
+        selection: TabSelection,
+    },
+    MoveTab {
+        tab_id: IpcTabId,
+        target_group_id: Option<usize>,
+        target_index: Option<usize>,
+    },
+    SetTabTitle {
+        tab_id: Option<IpcTabId>,
+        title: Option<String>,
+    },
+    SetGroupName {
+        group_id: usize,
+        name: Option<String>,
+    },
     RestoreClosedTab,
-    OpenUrl { url: String, target: UrlTarget },
-    SetWebUrl { tab_id: Option<IpcTabId>, url: String },
-    ReloadWeb { tab_id: Option<IpcTabId> },
-    OpenInspector { tab_id: Option<IpcTabId> },
+    OpenUrl {
+        url: String,
+        target: UrlTarget,
+    },
+    SetWebUrl {
+        tab_id: Option<IpcTabId>,
+        url: String,
+    },
+    ReloadWeb {
+        tab_id: Option<IpcTabId>,
+    },
+    OpenInspector {
+        tab_id: Option<IpcTabId>,
+    },
     GetTabPanel,
-    SetTabPanel { enabled: Option<bool>, width: Option<usize> },
-    DispatchAction { tab_id: Option<IpcTabId>, action: IpcAction },
-    SendInput { tab_id: Option<IpcTabId>, text: String },
-    RunCommandBar { tab_id: Option<IpcTabId>, input: String },
+    SetTabPanel {
+        enabled: Option<bool>,
+        width: Option<usize>,
+    },
+    DispatchAction {
+        tab_id: Option<IpcTabId>,
+        action: IpcAction,
+    },
+    SendInput {
+        tab_id: Option<IpcTabId>,
+        text: String,
+    },
+    RunCommandBar {
+        tab_id: Option<IpcTabId>,
+        input: String,
+    },
     ListInspectorTargets,
-    AttachInspector { tab_id: Option<IpcTabId>, target_id: Option<u64> },
-    DetachInspector { session_id: String },
-    SendInspectorMessage { session_id: String, message: String },
-    PollInspectorMessages { session_id: String, max: Option<usize> },
-    WebEval { tab_id: Option<IpcTabId>, script: String },
-    WebSnapshot { tab_id: Option<IpcTabId>, full: bool },
-    WebPdf { tab_id: Option<IpcTabId> },
-    WebNetwork { tab_id: Option<IpcTabId>, action: WebNetworkAction },
+    AttachInspector {
+        tab_id: Option<IpcTabId>,
+        target_id: Option<u64>,
+    },
+    DetachInspector {
+        session_id: String,
+    },
+    SendInspectorMessage {
+        session_id: String,
+        message: String,
+    },
+    PollInspectorMessages {
+        session_id: String,
+        max: Option<usize>,
+    },
+    WebEval {
+        tab_id: Option<IpcTabId>,
+        script: String,
+    },
+    WebSnapshot {
+        tab_id: Option<IpcTabId>,
+        full: bool,
+    },
+    WebPdf {
+        tab_id: Option<IpcTabId>,
+    },
+    WebNetwork {
+        tab_id: Option<IpcTabId>,
+        action: WebNetworkAction,
+    },
     WebMouse {
         tab_id: Option<IpcTabId>,
         action: WebMouseAction,
@@ -899,14 +965,14 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
-        IpcRequest::WebEval { .. }
-        | IpcRequest::WebSnapshot { .. }
-        | IpcRequest::WebPdf { .. } => IpcResponse {
-            reply: reply_error(
-                IpcErrorCode::Unsupported,
-                "Web automation requests must be handled at the IPC router",
-            ),
-            close_window: false,
+        IpcRequest::WebEval { .. } | IpcRequest::WebSnapshot { .. } | IpcRequest::WebPdf { .. } => {
+            IpcResponse {
+                reply: reply_error(
+                    IpcErrorCode::Unsupported,
+                    "Web automation requests must be handled at the IPC router",
+                ),
+                close_window: false,
+            }
         },
         IpcRequest::SetConfig(..) | IpcRequest::GetConfig(..) => IpcResponse {
             reply: reply_error(
@@ -1580,10 +1646,7 @@ mod tests {
                 return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
             }
             if !self.web_supported {
-                return Err(IpcError::new(
-                    IpcErrorCode::Unsupported,
-                    "Web tabs are not supported",
-                ));
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
             }
             Ok(Vec::new())
         }
@@ -1600,10 +1663,7 @@ mod tests {
                 return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
             }
             if !self.web_supported {
-                return Err(IpcError::new(
-                    IpcErrorCode::Unsupported,
-                    "Web tabs are not supported",
-                ));
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
             }
             Ok(())
         }
@@ -1613,10 +1673,7 @@ mod tests {
                 return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
             }
             if !self.web_supported {
-                return Err(IpcError::new(
-                    IpcErrorCode::Unsupported,
-                    "Web tabs are not supported",
-                ));
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
             }
             Ok(())
         }

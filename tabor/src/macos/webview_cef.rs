@@ -1,21 +1,24 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::ffi::CString;
+use std::fmt::Write;
+use std::mem;
 use std::rc::Rc as StdRc;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use cef::{
-    rc::Rc,
     CefString, Client, DevToolsMessageObserver, DisplayHandler, ImplBrowser, ImplBrowserHost,
     ImplClient, ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplFrame,
     ImplListValue, ImplTask, Task, WrapClient, WrapDevToolsMessageObserver, WrapDisplayHandler,
-    WrapTask,
+    WrapTask, rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
-use objc2::runtime::AnyObject;
-use objc2::{msg_send, MainThreadMarker};
+use objc2::ffi;
+use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+use objc2::{MainThreadMarker, msg_send, sel};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, MouseButton};
@@ -23,8 +26,8 @@ use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::raw_window_handle::RawWindowHandle;
 
-use crate::display::window::Window;
 use crate::display::SizeInfo;
+use crate::display::window::Window;
 use crate::event::Event;
 use crate::ipc::{WebNetworkAction, WebNetworkEntry};
 use crate::tabs::TabId;
@@ -187,7 +190,7 @@ impl DevToolsState {
                 };
                 self.entries.push(entry);
                 self.index.insert(request_id, self.entries.len() - 1);
-            }
+            },
             "Network.responseReceived" => {
                 let request_id = params
                     .and_then(|p| p.get("requestId"))
@@ -228,7 +231,7 @@ impl DevToolsState {
                         self.entries.push(entry);
                         self.index.insert(request_id, self.entries.len() - 1);
                         return;
-                    }
+                    },
                 };
 
                 let entry = &mut self.entries[index];
@@ -238,7 +241,7 @@ impl DevToolsState {
                 if let Some(url) = url {
                     entry.url = url;
                 }
-            }
+            },
             "Network.loadingFinished" => {
                 let request_id = params
                     .and_then(|p| p.get("requestId"))
@@ -251,7 +254,7 @@ impl DevToolsState {
                 if let Some(index) = self.index.get(&request_id).copied() {
                     self.entries[index].end_time = timestamp.or(self.entries[index].end_time);
                 }
-            }
+            },
             "Network.loadingFailed" => {
                 let request_id = params
                     .and_then(|p| p.get("requestId"))
@@ -269,8 +272,8 @@ impl DevToolsState {
                     self.entries[index].error_text = error_text;
                     self.entries[index].end_time = timestamp.or(self.entries[index].end_time);
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 }
@@ -426,6 +429,11 @@ impl WebView {
             if let Some(view) = browser_view(&browser) {
                 unsafe {
                     let _: () = msg_send![view, setFrame: frame];
+                    disable_cef_view_first_responder(view);
+                    let _: () = msg_send![parent, addSubview: view];
+                    let panel_width_px = size_info.padding_x() - size_info.padding_right();
+                    let _ =
+                        window.layout_macos_window_controls(panel_width_px, size_info.padding_y());
                 }
             }
             if let Some(host) = browser.host() {
@@ -539,11 +547,7 @@ impl WebView {
             return false;
         }
 
-        let event = cef::MouseEvent {
-            x: local_x as i32,
-            y: local_y as i32,
-            modifiers: 0,
-        };
+        let event = cef::MouseEvent { x: local_x as i32, y: local_y as i32, modifiers: 0 };
 
         let button_type = match button {
             MouseButton::Left => cef::MouseButtonType::LEFT,
@@ -551,7 +555,7 @@ impl WebView {
             MouseButton::Middle => cef::MouseButtonType::MIDDLE,
             MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => {
                 cef::MouseButtonType::MIDDLE
-            }
+            },
         };
 
         let Some(host) = self.browser.host() else {
@@ -561,10 +565,10 @@ impl WebView {
         match state {
             ElementState::Pressed => {
                 host.send_mouse_click_event(Some(&event), button_type, 0, 1);
-            }
+            },
             ElementState::Released => {
                 host.send_mouse_click_event(Some(&event), button_type, 1, 1);
-            }
+            },
         }
 
         true
@@ -587,19 +591,6 @@ impl WebView {
             key.location,
             key.physical_key,
         )
-    }
-
-    pub fn handle_key_input_raw(
-        &mut self,
-        key: &Key,
-        text: &str,
-        state: ElementState,
-        modifiers: ModifiersState,
-        repeat: bool,
-        location: KeyLocation,
-        physical_key: winit::keyboard::PhysicalKey,
-    ) -> bool {
-        self.handle_key_input_inner(key, text, state, modifiers, repeat, location, physical_key)
     }
 
     pub fn dispatch_key_event(
@@ -674,10 +665,10 @@ impl WebView {
                 if should_send_char {
                     fire_event("char", Some(text), Some(unmodified_text));
                 }
-            }
+            },
             ElementState::Released => {
                 fire_event("keyUp", None, None);
-            }
+            },
         }
 
         true
@@ -701,8 +692,7 @@ impl WebView {
         let native_key_code = cef_native_key_code(scancode, modifiers);
         let (character, unmodified_character) =
             cef_characters_from_key_text(key, if text.is_empty() { "" } else { text });
-        let should_send_char =
-            character != 0 && !modifiers.super_key() && !modifiers.control_key();
+        let should_send_char = character != 0 && !modifiers.super_key() && !modifiers.control_key();
 
         let focus_on_editable_field = 1;
         let mut events = Vec::new();
@@ -734,7 +724,7 @@ impl WebView {
                     ch.focus_on_editable_field = focus_on_editable_field;
                     events.push(ch);
                 }
-            }
+            },
             ElementState::Released => {
                 if windows_key_code != 0 {
                     let mut up = cef::KeyEvent::default();
@@ -748,7 +738,7 @@ impl WebView {
                     up.focus_on_editable_field = focus_on_editable_field;
                     events.push(up);
                 }
-            }
+            },
         }
 
         if events.is_empty() {
@@ -782,7 +772,7 @@ impl WebView {
             None => {
                 callback(None);
                 return;
-            }
+            },
         };
         dict_set_string(&mut params, "expression", script);
         dict_set_bool(&mut params, "returnByValue", true);
@@ -794,7 +784,7 @@ impl WebView {
                 Err(err) => {
                     debug!("Runtime.evaluate failed: {err}");
                     None
-                }
+                },
             };
             callback(output);
         });
@@ -809,27 +799,25 @@ impl WebView {
             None => {
                 callback(Err(String::from("Failed to build screenshot params")));
                 return;
-            }
+            },
         };
         dict_set_string(&mut params, "format", "png");
         if full {
             dict_set_bool(&mut params, "captureBeyondViewport", true);
         }
 
-        self.devtools_execute("Page.captureScreenshot", Some(params), move |result| {
-            match result {
-                Ok(payload) => {
-                    let Some(data) = payload.get("data").and_then(|v| v.as_str()) else {
-                        callback(Err(String::from("Screenshot data missing")));
-                        return;
-                    };
-                    match BASE64.decode(data) {
-                        Ok(bytes) => callback(Ok(bytes)),
-                        Err(err) => callback(Err(err.to_string())),
-                    }
+        self.devtools_execute("Page.captureScreenshot", Some(params), move |result| match result {
+            Ok(payload) => {
+                let Some(data) = payload.get("data").and_then(|v| v.as_str()) else {
+                    callback(Err(String::from("Screenshot data missing")));
+                    return;
+                };
+                match BASE64.decode(data) {
+                    Ok(bytes) => callback(Ok(bytes)),
+                    Err(err) => callback(Err(err.to_string())),
                 }
-                Err(err) => callback(Err(err)),
-            }
+            },
+            Err(err) => callback(Err(err)),
         });
     }
 
@@ -842,24 +830,22 @@ impl WebView {
             None => {
                 callback(Err(String::from("Failed to build PDF params")));
                 return;
-            }
+            },
         };
         dict_set_bool(&mut params, "printBackground", true);
 
-        self.devtools_execute("Page.printToPDF", Some(params), move |result| {
-            match result {
-                Ok(payload) => {
-                    let Some(data) = payload.get("data").and_then(|v| v.as_str()) else {
-                        callback(Err(String::from("PDF data missing")));
-                        return;
-                    };
-                    match BASE64.decode(data) {
-                        Ok(bytes) => callback(Ok(bytes)),
-                        Err(err) => callback(Err(err.to_string())),
-                    }
+        self.devtools_execute("Page.printToPDF", Some(params), move |result| match result {
+            Ok(payload) => {
+                let Some(data) = payload.get("data").and_then(|v| v.as_str()) else {
+                    callback(Err(String::from("PDF data missing")));
+                    return;
+                };
+                match BASE64.decode(data) {
+                    Ok(bytes) => callback(Ok(bytes)),
+                    Err(err) => callback(Err(err.to_string())),
                 }
-                Err(err) => callback(Err(err)),
-            }
+            },
+            Err(err) => callback(Err(err)),
         });
     }
 
@@ -919,11 +905,7 @@ impl WebView {
         let url = frame.url();
         let url = CefString::from(&url);
         let url = url.to_string();
-        if url.is_empty() {
-            None
-        } else {
-            Some(url)
-        }
+        if url.is_empty() { None } else { Some(url) }
     }
 
     pub fn show_inspector(&mut self) -> bool {
@@ -934,16 +916,16 @@ impl WebView {
         true
     }
 
-    pub fn network_entries(&mut self, action: WebNetworkAction) -> Option<Vec<WebNetworkEntry>> {
+    pub fn network_entries(&mut self, action: WebNetworkAction) -> Vec<WebNetworkEntry> {
         let mut state = self.devtools_state.borrow_mut();
         match action {
             WebNetworkAction::Clear => {
                 state.entries.clear();
                 state.index.clear();
-                Some(Vec::new())
-            }
+                Vec::new()
+            },
             WebNetworkAction::List { filter } => {
-                let entries = if let Some(filter) = filter {
+                if let Some(filter) = filter {
                     state
                         .entries
                         .iter()
@@ -952,9 +934,8 @@ impl WebView {
                         .collect::<Vec<_>>()
                 } else {
                     state.entries.clone()
-                };
-                Some(entries)
-            }
+                }
+            },
         }
     }
 
@@ -1126,7 +1107,7 @@ fn cef_windows_key_code_from_key(key: &Key) -> i32 {
                 '\'' => 0xDE,
                 _ => 0,
             }
-        }
+        },
         Key::Named(named) => match named {
             NamedKey::Backspace => 0x08,
             NamedKey::Tab => 0x09,
@@ -1187,10 +1168,7 @@ fn runtime_result_to_string(payload: &JsonValue) -> Option<String> {
         return Some(value.to_string());
     }
 
-    result
-        .get("description")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
+    result.get("description").and_then(|value| value.as_str()).map(|value| value.to_string())
 }
 
 fn dict_set_string(dict: &mut cef::DictionaryValue, key: &str, value: &str) {
@@ -1239,10 +1217,10 @@ fn set_dict_value(
     match value {
         JsonValue::Null => {
             dict_set_null(dict, key);
-        }
+        },
         JsonValue::Bool(value) => {
             dict_set_bool(dict, key, *value);
-        }
+        },
         JsonValue::Number(value) => {
             if let Some(int) = value.as_i64() {
                 if int >= i64::from(i32::MIN) && int <= i64::from(i32::MAX) {
@@ -1261,27 +1239,27 @@ fn set_dict_value(
             } else {
                 return Err(String::from("Invalid numeric parameter"));
             }
-        }
+        },
         JsonValue::String(value) => {
             dict_set_string(dict, key, value);
-        }
+        },
         JsonValue::Array(values) => {
             let mut list = json_to_cef_list(values)?;
             let key = CefString::from(key);
             dict.set_list(Some(&key), Some(&mut list));
-        }
+        },
         JsonValue::Object(_) => {
             let mut nested = json_to_cef_dictionary(value)?;
             let key = CefString::from(key);
             dict.set_dictionary(Some(&key), Some(&mut nested));
-        }
+        },
     }
     Ok(())
 }
 
 fn json_to_cef_list(values: &[JsonValue]) -> Result<cef::ListValue, String> {
-    let mut list = cef::list_value_create()
-        .ok_or_else(|| String::from("Failed to create list value"))?;
+    let mut list =
+        cef::list_value_create().ok_or_else(|| String::from("Failed to create list value"))?;
     list.set_size(values.len());
     for (index, value) in values.iter().enumerate() {
         set_list_value(&mut list, index, value)?;
@@ -1297,10 +1275,10 @@ fn set_list_value(
     match value {
         JsonValue::Null => {
             list.set_null(index);
-        }
+        },
         JsonValue::Bool(value) => {
             list.set_bool(index, if *value { 1 } else { 0 });
-        }
+        },
         JsonValue::Number(value) => {
             if let Some(int) = value.as_i64() {
                 if int >= i64::from(i32::MIN) && int <= i64::from(i32::MAX) {
@@ -1319,19 +1297,19 @@ fn set_list_value(
             } else {
                 return Err(String::from("Invalid numeric parameter"));
             }
-        }
+        },
         JsonValue::String(value) => {
             let value = CefString::from(value.as_str());
             list.set_string(index, Some(&value));
-        }
+        },
         JsonValue::Array(values) => {
             let mut nested = json_to_cef_list(values)?;
             list.set_list(index, Some(&mut nested));
-        }
+        },
         JsonValue::Object(_) => {
             let mut nested = json_to_cef_dictionary(value)?;
             list.set_dictionary(index, Some(&mut nested));
-        }
+        },
     }
     Ok(())
 }
@@ -1344,7 +1322,7 @@ fn dom_key_string(key: &Key, text: &str) -> String {
             } else {
                 text.to_string()
             }
-        }
+        },
         Key::Named(named) => match named {
             NamedKey::Space => " ".to_string(),
             NamedKey::Enter => "Enter".to_string(),
@@ -1403,11 +1381,10 @@ fn devtools_location_value(location: KeyLocation) -> i32 {
 fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
     match window.raw_window_handle() {
         RawWindowHandle::AppKit(handle) => Ok(handle.ns_view.as_ptr() as *mut AnyObject),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "WebView requires an AppKit window",
-        )
-        .into()),
+        _ => {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "WebView requires an AppKit window")
+                .into())
+        },
     }
 }
 
@@ -1427,11 +1404,10 @@ fn cef_rect(window: &Window, size_info: &SizeInfo) -> cef::Rect {
     let scale_factor = window.scale_factor as f64;
     let x = (f64::from(size_info.padding_x()) / scale_factor) as i32;
     let y = (f64::from(size_info.padding_y()) / scale_factor) as i32;
-    let width =
-        (f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
-            / scale_factor) as i32;
-    let height =
-        (f64::from(size_info.cell_height() * size_info.screen_lines() as f32) / scale_factor) as i32;
+    let width = (f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
+        / scale_factor) as i32;
+    let height = (f64::from(size_info.cell_height() * size_info.screen_lines() as f32)
+        / scale_factor) as i32;
     cef::Rect { x, y, width, height }
 }
 
@@ -1439,4 +1415,93 @@ fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
     let host = browser.host()?;
     let view = host.window_handle() as *mut AnyObject;
     if view.is_null() { None } else { Some(view) }
+}
+
+// Keep the embedded CEF view from stealing keyboard focus.
+//
+// Tabor routes keyboard events through winit even for web tabs (command bar, vi-like bindings,
+// web automation), so the CEF view must not become the NSWindow first responder.
+unsafe extern "C-unwind" fn cef_view_accepts_first_responder(_this: &AnyObject, _sel: Sel) -> Bool {
+    Bool::NO
+}
+
+unsafe extern "C-unwind" fn cef_view_become_first_responder(_this: &AnyObject, _sel: Sel) -> Bool {
+    Bool::NO
+}
+
+fn no_first_responder_subclass(superclass: &AnyClass) -> &'static AnyClass {
+    let super_name = superclass.name().to_str().unwrap_or("Unknown");
+    let name = CString::new(format!("TaborNoFirstResponder_{super_name}"))
+        .expect("no-first-responder subclass name");
+
+    if let Some(existing) = AnyClass::get(name.as_c_str()) {
+        return existing;
+    }
+
+    let super_ptr = superclass as *const AnyClass;
+    let cls = unsafe { ffi::objc_allocateClassPair(super_ptr, name.as_ptr(), 0) };
+    let cls =
+        std::ptr::NonNull::new(cls).expect("failed to allocate no-first-responder override class");
+
+    unsafe {
+        add_method_raw(
+            cls.as_ptr(),
+            sel!(acceptsFirstResponder),
+            mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
+                cef_view_accepts_first_responder,
+            ),
+            Bool::ENCODING,
+            &[],
+        );
+        add_method_raw(
+            cls.as_ptr(),
+            sel!(becomeFirstResponder),
+            mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
+                cef_view_become_first_responder,
+            ),
+            Bool::ENCODING,
+            &[],
+        );
+
+        ffi::objc_registerClassPair(cls.as_ptr());
+        cls.as_ref()
+    }
+}
+
+fn disable_cef_view_first_responder(view: *mut AnyObject) {
+    if view.is_null() {
+        return;
+    }
+
+    let obj = unsafe { &*view };
+    let current_class = obj.class();
+    if current_class.name().to_bytes().starts_with(b"TaborNoFirstResponder_") {
+        return;
+    }
+
+    let subclass = no_first_responder_subclass(current_class);
+    unsafe {
+        let old_class = AnyObject::set_class(obj, subclass);
+        debug_assert_eq!(old_class, current_class);
+    }
+}
+
+unsafe fn add_method_raw(
+    cls: *mut AnyClass,
+    selector: Sel,
+    imp: Imp,
+    ret: Encoding,
+    args: &[Encoding],
+) {
+    let encoding = method_type_encoding(ret, args);
+    let success = unsafe { ffi::class_addMethod(cls, selector, imp, encoding.as_ptr()) };
+    assert!(success.as_bool(), "failed to add no-first-responder override method");
+}
+
+fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
+    let mut types = format!("{ret}{}{}", Encoding::Object, Encoding::Sel);
+    for enc in args {
+        let _ = write!(&mut types, "{enc}");
+    }
+    CString::new(types).expect("method type encoding")
 }

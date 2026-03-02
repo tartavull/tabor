@@ -4,16 +4,16 @@ use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::debug;
 
 use cef::{
-    self, args::Args, rc::Rc, App, CefString, ImplApp, ImplCommandLine, LogSeverity, Settings,
-    WrapApp,
+    self, App, CefString, ImplApp, ImplCommandLine, LogSeverity, Settings, WrapApp, args::Args,
+    rc::Rc,
 };
 
 cef::wrap_app! {
@@ -76,11 +76,8 @@ pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
 
     let args = Args::new();
     let mut app = TaborCefApp::new();
-    let exit_code = cef::execute_process(
-        Some(args.as_main_args()),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    );
+    let exit_code =
+        cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
 
     if exit_code >= 0 {
         return Ok(Some(exit_code));
@@ -151,15 +148,14 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     );
 
     if ok != 1 {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "CEF initialization failed").into());
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::Other, "CEF initialization failed").into()
+        );
     }
 
     CEF_RUNTIME.with(|cell| {
-        *cell.borrow_mut() = Some(CefRuntime {
-            _args: args,
-            _framework_dir: framework_dir,
-            _app: app,
-        });
+        *cell.borrow_mut() =
+            Some(CefRuntime { _args: args, _framework_dir: framework_dir, _app: app });
     });
     CEF_INITIALIZED.store(true, Ordering::Relaxed);
 
@@ -208,16 +204,10 @@ pub(crate) fn framework_dir() -> Option<PathBuf> {
         }
     }
 
-    let arch_tag = if env::consts::ARCH == "aarch64" {
-        "macosarm64"
-    } else {
-        "macosx64"
-    };
+    let arch_tag = if env::consts::ARCH == "aarch64" { "macosarm64" } else { "macosx64" };
 
-    let vendor_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("vendor")
-        .join("cef");
+    let vendor_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("vendor").join("cef");
     if !vendor_root.exists() {
         return None;
     }
@@ -255,16 +245,12 @@ fn resolve_framework_dir(path: &Path) -> Option<PathBuf> {
         return path.canonicalize().ok();
     }
 
-    let release = path
-        .join("Release")
-        .join("Chromium Embedded Framework.framework");
+    let release = path.join("Release").join("Chromium Embedded Framework.framework");
     if release.exists() {
         return release.canonicalize().ok();
     }
 
-    let debug = path
-        .join("Debug")
-        .join("Chromium Embedded Framework.framework");
+    let debug = path.join("Debug").join("Chromium Embedded Framework.framework");
     if debug.exists() {
         return debug.canonicalize().ok();
     }
@@ -303,11 +289,9 @@ fn load_library(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
     });
 
     if !loaded {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to load CEF framework",
-        )
-        .into());
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::Other, "Failed to load CEF framework").into()
+        );
     }
 
     let api_hash = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
@@ -329,12 +313,12 @@ fn load_library(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
-    let exe_path = env::current_exe()
-        .ok()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path"))?;
-    let exe_dir = exe_path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path"))?;
+    let exe_path = env::current_exe().ok().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path")
+    })?;
+    let exe_dir = exe_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path")
+    })?;
 
     let bundle_root = main_bundle_path();
     let (dest_dir, link_dir, link_prefix) = if let Some(bundle_root) = bundle_root {
@@ -366,11 +350,7 @@ fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
             if !src.exists() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!(
-                        "Missing CEF sidecar library {} in {}",
-                        lib,
-                        src_dir.display()
-                    ),
+                    format!("Missing CEF sidecar library {} in {}", lib, src_dir.display()),
                 )
                 .into());
             }
@@ -393,10 +373,7 @@ fn find_cef_sidecar_dir(framework_dir: &Path, libs: &[&str]) -> Option<PathBuf> 
     let candidates = [
         framework_dir.parent().map(|path| path.to_path_buf()),
         Some(framework_dir.join("Libraries")),
-        framework_dir
-            .parent()
-            .and_then(|path| path.parent())
-            .map(|path| path.to_path_buf()),
+        framework_dir.parent().and_then(|path| path.parent()).map(|path| path.to_path_buf()),
         Some(framework_dir.to_path_buf()),
     ];
 
@@ -416,11 +393,7 @@ pub fn is_initialized() -> bool {
 fn main_bundle_path() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     let bundle = exe.parent()?.parent()?.parent()?.to_path_buf();
-    if bundle.extension().and_then(|ext| ext.to_str()) == Some("app") {
-        Some(bundle)
-    } else {
-        None
-    }
+    if bundle.extension().and_then(|ext| ext.to_str()) == Some("app") { Some(bundle) } else { None }
 }
 
 fn remote_debugging_port() -> i32 {

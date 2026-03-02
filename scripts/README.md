@@ -27,17 +27,26 @@ all the colors of a standard terminal. The third enumerates the 24-bit colors.
 
 ## Web popup smoke test (macOS)
 
-Runs a popup smoke test using IPC to verify `window.open` creates a new web tab
-and `window.opener.postMessage` reaches the opener. The popup is created from
-`about:blank` with a `link[rel="icon"]` so the script also checks that a favicon
-request hits the local HTTP server. Requires macOS and `python3`. If
-`./scripts/run.sh` is available it is used automatically. Set `TABOR_BIN` to
-override.
+Runs the Rust integration test `web_popup_smoke` from `tabor/tests/web_e2e.rs`.
 
 ```sh
 ./web-popup-smoke.sh
 ```
 
-Environment overrides:
-- `TABOR_BIN` to point at a custom Tabor binary.
-- `PYTHON_BIN` to use a different Python executable.
+## Agent-browser verification
+
+Runs the Rust integration test `agent_browser_fixture_smoke` from
+`tabor/tests/web_e2e.rs`.
+
+```sh
+./verify-agent-browser.sh
+```
+
+## Browser Clipboard Shortcut Test (macOS)
+
+Runs the Rust integration test `browser_clipboard_shortcut_smoke` from
+`tabor/tests/web_e2e.rs` for `Meta+C` / `Meta+V` behavior in web tabs.
+
+```sh
+./verify-browser-clipboard-red.sh
+```
