@@ -183,6 +183,18 @@ impl ApplicationDelegate {
         }
     }
 
+    pub fn get_if_configured(mtm: MainThreadMarker) -> Option<Retained<Self>> {
+        let app = NSApplication::sharedApplication(mtm);
+        let delegate = unsafe { app.delegate() }?;
+
+        if delegate.is_kind_of::<Self>() {
+            // SAFETY: Just checked that the delegate is an instance of `ApplicationDelegate`
+            Some(unsafe { Retained::cast(delegate) })
+        } else {
+            None
+        }
+    }
+
     /// Place the event handler in the application delegate for the duration
     /// of the given closure.
     pub fn set_event_handler<R>(

@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::debug;
 
+use objc2::runtime::Bool;
+use objc2::{MainThreadMarker, msg_send, sel};
+use objc2_app_kit::NSApplication;
+
 use cef::{
     self, App, CefString, ImplApp, ImplCommandLine, LogSeverity, Settings, WrapApp, args::Args,
     rc::Rc,
@@ -79,10 +83,33 @@ struct BundlePaths {
     main_bundle: PathBuf,
 }
 
+fn ensure_application_selector_contract() -> Result<(), Box<dyn Error>> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        io::Error::other("CEF application contract check must run on the main thread")
+    })?;
+
+    let app = NSApplication::sharedApplication(mtm);
+    let responds_is: Bool =
+        unsafe { msg_send![&*app, respondsToSelector: sel!(isHandlingSendEvent)] };
+    let responds_set: Bool =
+        unsafe { msg_send![&*app, respondsToSelector: sel!(setHandlingSendEvent:)] };
+
+    if responds_is.as_bool() && responds_set.as_bool() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "CEF macOS app contract violated: NSApplication must implement isHandlingSendEvent/setHandlingSendEvent:",
+        )
+        .into())
+    }
+}
+
 pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
     let Some(framework_dir) = framework_dir() else {
         return Ok(None);
     };
+
+    ensure_application_selector_contract()?;
 
     load_library(&framework_dir)?;
     ensure_cef_sidecar_libs(&framework_dir)?;
@@ -108,6 +135,7 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
         std::io::Error::new(std::io::ErrorKind::NotFound, "CEF framework not found")
     })?;
 
+    ensure_application_selector_contract()?;
     load_library(&framework_dir)?;
     ensure_cef_sidecar_libs(&framework_dir)?;
 

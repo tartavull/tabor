@@ -92,6 +92,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     #[cfg(target_os = "macos")]
+    macos::ensure_cef_application();
+
+    #[cfg(target_os = "macos")]
     if let Some(exit_code) = macos::cef::maybe_execute_subprocess()? {
         std::process::exit(exit_code);
     }
@@ -517,8 +520,6 @@ fn tabor(mut options: Options) -> Result<(), Box<dyn Error>> {
     // Drop processor before shutting down platform services.
     drop(processor);
 
-    #[cfg(target_os = "macos")]
-    macos::cef::shutdown();
 
     // Without explicitly detaching the console cmd won't redraw it's prompt.
     #[cfg(windows)]

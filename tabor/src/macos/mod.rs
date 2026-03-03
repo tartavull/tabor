@@ -1,20 +1,19 @@
 use std::cell::RefCell;
-#[cfg(feature = "passkey-webauthn")]
-use std::ffi::CStr;
-#[cfg(feature = "passkey-webauthn")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ffi::{CStr, CString};
+use std::fmt::Write;
+use std::mem;
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "passkey-webauthn")]
 use block2::RcBlock;
 use objc2::MainThreadMarker;
+use objc2::encode::{Encode, Encoding};
+use objc2::ffi;
 #[cfg(feature = "passkey-webauthn")]
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
-#[cfg(feature = "passkey-webauthn")]
-use objc2::runtime::{AnyClass, Bool};
-use objc2::runtime::{AnyObject, ProtocolObject};
-#[cfg(feature = "passkey-webauthn")]
+use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, ProtocolObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::{
@@ -49,6 +48,114 @@ thread_local! {
         RefCell::new(None);
 }
 
+static CEF_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
+const CEF_APPLICATION_CLASS_NAME: &[u8] = b"TaborCefApplication\0";
+
+pub fn ensure_cef_application() {
+    let mtm = MainThreadMarker::new().expect("CEF application setup must run on main thread");
+    let class = cef_application_class();
+
+    let app: *mut AnyObject = unsafe { msg_send![class, sharedApplication] };
+    let Some(app) = (unsafe { Retained::from_raw(app) }) else {
+        panic!("failed to initialize NSApplication singleton for CEF");
+    };
+
+    let responds_is: Bool =
+        unsafe { msg_send![&*app, respondsToSelector: sel!(isHandlingSendEvent)] };
+    let responds_set: Bool =
+        unsafe { msg_send![&*app, respondsToSelector: sel!(setHandlingSendEvent:)] };
+
+    assert!(
+        responds_is.as_bool() && responds_set.as_bool(),
+        "CEF application contract not satisfied: NSApplication missing isHandlingSendEvent/setHandlingSendEvent:"
+    );
+
+    let _ = mtm;
+}
+
+unsafe extern "C-unwind" fn cef_app_is_handling_send_event(_this: &AnyObject, _sel: Sel) -> Bool {
+    if CEF_HANDLING_SEND_EVENT.load(Ordering::Relaxed) { Bool::YES } else { Bool::NO }
+}
+
+unsafe extern "C-unwind" fn cef_app_set_handling_send_event(
+    _this: &AnyObject,
+    _sel: Sel,
+    handling_send_event: Bool,
+) {
+    CEF_HANDLING_SEND_EVENT.store(handling_send_event.as_bool(), Ordering::Relaxed);
+}
+
+fn cef_application_class() -> &'static AnyClass {
+    static REGISTER: Once = Once::new();
+    static mut CLASS: *const AnyClass = std::ptr::null();
+
+    REGISTER.call_once(|| {
+        let name = CStr::from_bytes_with_nul(CEF_APPLICATION_CLASS_NAME)
+            .expect("static CEF application class name");
+        let cls = if let Some(existing) = AnyClass::get(name) {
+            existing
+        } else {
+            let superclass_name =
+                CStr::from_bytes_with_nul(b"NSApplication\0").expect("static NSApplication class");
+            let superclass =
+                AnyClass::get(superclass_name).expect("NSApplication class unavailable");
+
+            let super_ptr = superclass as *const AnyClass;
+            let cls = unsafe { ffi::objc_allocateClassPair(super_ptr, name.as_ptr(), 0) };
+            let cls = std::ptr::NonNull::new(cls).expect("failed to allocate CEF app class");
+
+            unsafe {
+                add_cef_method_raw(
+                    cls.as_ptr(),
+                    sel!(isHandlingSendEvent),
+                    mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
+                        cef_app_is_handling_send_event,
+                    ),
+                    Bool::ENCODING,
+                    &[],
+                );
+                add_cef_method_raw(
+                    cls.as_ptr(),
+                    sel!(setHandlingSendEvent:),
+                    mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel, Bool), Imp>(
+                        cef_app_set_handling_send_event,
+                    ),
+                    Encoding::Void,
+                    &[Bool::ENCODING],
+                );
+
+                ffi::objc_registerClassPair(cls.as_ptr());
+                cls.as_ref()
+            }
+        };
+
+        unsafe {
+            CLASS = cls as *const AnyClass;
+        }
+    });
+
+    unsafe { &*CLASS }
+}
+
+unsafe fn add_cef_method_raw(
+    cls: *mut AnyClass,
+    selector: Sel,
+    imp: Imp,
+    ret: Encoding,
+    args: &[Encoding],
+) {
+    let encoding = method_type_encoding(ret, args);
+    let success = unsafe { ffi::class_addMethod(cls, selector, imp, encoding.as_ptr()) };
+    assert!(success.as_bool(), "failed to add CEF application method");
+}
+
+fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
+    let mut types = format!("{ret}{}{}", Encoding::Object, Encoding::Sel);
+    for enc in args {
+        let _ = write!(&mut types, "{enc}");
+    }
+    CString::new(types).expect("method type encoding")
+}
 pub fn disable_autofill() {
     unsafe {
         NSUserDefaults::standardUserDefaults().registerDefaults(

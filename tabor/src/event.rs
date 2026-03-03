@@ -1287,6 +1287,9 @@ impl ApplicationHandler<Event> for Processor {
             info!("Exiting the event loop");
         }
 
+        #[cfg(target_os = "macos")]
+        cef::shutdown();
+
         match self.gl_config.take().map(|config| config.display()) {
             #[cfg(not(target_os = "macos"))]
             Some(glutin::display::Display::Egl(display)) => {

@@ -42,9 +42,9 @@ extern "C" fn send_event(app: &NSApplication, sel: Sel, event: &NSEvent) {
 
     // Events are generally scoped to the window level, so the best way
     // to get device events is to listen for them on NSApplication.
-    let delegate = ApplicationDelegate::get(mtm);
-    maybe_dispatch_device_event(&delegate, event);
-
+    if let Some(delegate) = ApplicationDelegate::get_if_configured(mtm) {
+        maybe_dispatch_device_event(&delegate, event);
+    }
     let _ = mtm;
     let original = unsafe { ORIGINAL.get().expect("no existing sendEvent: handler set") };
     original(app, sel, event)
