@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -66,6 +66,19 @@ thread_local! {
 
 static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+const CEF_HELPER_NAMES: [&str; 5] = [
+    "Tabor Helper",
+    "Tabor Helper (Renderer)",
+    "Tabor Helper (GPU)",
+    "Tabor Helper (Plugin)",
+    "Tabor Helper (Alerts)",
+];
+
+struct BundlePaths {
+    current_bundle: PathBuf,
+    main_bundle: PathBuf,
+}
+
 pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
     let Some(framework_dir) = framework_dir() else {
         return Ok(None);
@@ -128,15 +141,19 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
         settings.resources_dir_path = CefString::from(resources_dir.to_string_lossy().as_ref());
     }
 
+    let bundle_paths = bundle_paths();
     let subprocess_path = env::var("TABOR_CEF_SUBPROCESS_PATH")
         .ok()
         .map(PathBuf::from)
+        .or_else(|| {
+            bundle_paths.as_ref().and_then(|paths| helper_subprocess_path(&paths.main_bundle))
+        })
         .or_else(|| env::current_exe().ok());
     if let Some(subprocess_path) = subprocess_path {
         settings.browser_subprocess_path =
             CefString::from(subprocess_path.to_string_lossy().as_ref());
     }
-    if let Some(bundle_path) = main_bundle_path() {
+    if let Some(bundle_path) = bundle_paths.as_ref().map(|paths| &paths.main_bundle) {
         settings.main_bundle_path = CefString::from(bundle_path.to_string_lossy().as_ref());
     }
 
@@ -320,9 +337,9 @@ fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
         io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path")
     })?;
 
-    let bundle_root = main_bundle_path();
-    let (dest_dir, link_dir, link_prefix) = if let Some(bundle_root) = bundle_root {
-        let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
+    let bundle_paths = bundle_paths();
+    let (dest_dir, link_dir, link_prefix) = if let Some(paths) = bundle_paths.as_ref() {
+        let frameworks_dir = paths.current_bundle.join("Contents").join("Frameworks");
         let link_prefix = PathBuf::from("..").join("Frameworks");
         (frameworks_dir, Some(exe_dir.to_path_buf()), link_prefix)
     } else {
@@ -390,10 +407,59 @@ pub fn is_initialized() -> bool {
     CEF_RUNTIME.with(|cell| cell.borrow().is_some())
 }
 
-fn main_bundle_path() -> Option<PathBuf> {
+fn bundle_paths() -> Option<BundlePaths> {
     let exe = env::current_exe().ok()?;
-    let bundle = exe.parent()?.parent()?.parent()?.to_path_buf();
-    if bundle.extension().and_then(|ext| ext.to_str()) == Some("app") { Some(bundle) } else { None }
+    bundle_paths_for_exe(&exe)
+}
+
+fn bundle_paths_for_exe(exe: &Path) -> Option<BundlePaths> {
+    let contents_dir = exe.parent()?.parent()?;
+    if contents_dir.file_name() != Some(OsStr::new("Contents")) {
+        return None;
+    }
+
+    let current_bundle = contents_dir.parent()?.to_path_buf();
+    if current_bundle.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        return None;
+    }
+
+    let main_bundle =
+        helper_parent_main_bundle(&current_bundle).unwrap_or_else(|| current_bundle.clone());
+
+    Some(BundlePaths { current_bundle, main_bundle })
+}
+
+fn helper_parent_main_bundle(current_bundle: &Path) -> Option<PathBuf> {
+    let frameworks_dir = current_bundle.parent()?;
+    if frameworks_dir.file_name() != Some(OsStr::new("Frameworks")) {
+        return None;
+    }
+
+    let contents_dir = frameworks_dir.parent()?;
+    if contents_dir.file_name() != Some(OsStr::new("Contents")) {
+        return None;
+    }
+
+    let main_bundle = contents_dir.parent()?;
+    if main_bundle.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        return None;
+    }
+
+    Some(main_bundle.to_path_buf())
+}
+
+fn main_bundle_path() -> Option<PathBuf> {
+    bundle_paths().map(|paths| paths.main_bundle)
+}
+
+fn helper_subprocess_path(main_bundle: &Path) -> Option<PathBuf> {
+    let frameworks_dir = main_bundle.join("Contents").join("Frameworks");
+    CEF_HELPER_NAMES
+        .iter()
+        .map(|name| {
+            frameworks_dir.join(format!("{name}.app")).join("Contents").join("MacOS").join(name)
+        })
+        .find(|path| path.exists())
 }
 
 fn remote_debugging_port() -> i32 {

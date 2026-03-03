@@ -269,18 +269,25 @@ If all goes well, this should place a binary at `target/release/tabor`.
 ### macOS
 
 ```sh
-make app
-cp -r target/release/osx/Tabor.app /Applications/
+cargo xtask install --release --launch
+```
+
+This installs `Tabor.app` into `/Applications` when writable, otherwise `~/Applications`, so it can be launched from Spotlight or Dock.
+
+To build the app bundle without installing it:
+
+```sh
+cargo xtask app --release
+open target/release/osx/Tabor.app
 ```
 
 #### Universal Binary
 
-The following will build an executable that runs on both x86 and ARM macos
-architectures:
+The following builds a universal app (x86_64 + arm64) and installs it:
 
 ```sh
 rustup target add x86_64-apple-darwin aarch64-apple-darwin
-make app-universal
+cargo xtask install --universal --launch
 ```
 
 ## Post Build

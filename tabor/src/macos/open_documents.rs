@@ -8,7 +8,7 @@ use objc2::encode::{Encode, Encoding};
 use objc2::ffi;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
-use objc2::{MainThreadMarker, sel};
+use objc2::{MainThreadMarker, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSApplicationDelegateReply};
 use objc2_foundation::{NSArray, NSString, NSURL};
 use winit::event_loop::EventLoopProxy;
@@ -18,6 +18,10 @@ use crate::event::{Event, EventType};
 thread_local! {
     static OPEN_DOCUMENTS_PROXY: RefCell<Option<EventLoopProxy<Event>>> = RefCell::new(None);
 }
+
+const AE_INTERNET_EVENT_CLASS: u32 = u32::from_be_bytes(*b"GURL");
+const AE_GET_URL_EVENT_ID: u32 = u32::from_be_bytes(*b"GURL");
+const AE_KEY_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
 
 fn dispatch_open_urls(urls: Vec<String>) {
     if urls.is_empty() {
@@ -29,6 +33,50 @@ fn dispatch_open_urls(urls: Vec<String>) {
             let _ = proxy.send_event(Event::new(EventType::OpenUrls(urls), None));
         }
     });
+}
+
+unsafe extern "C-unwind" fn handle_get_url_event(
+    _this: &AnyObject,
+    _sel: Sel,
+    event: &AnyObject,
+    _reply: &AnyObject,
+) {
+    let descriptor: Option<Retained<AnyObject>> =
+        unsafe { msg_send![event, paramDescriptorForKeyword: AE_KEY_DIRECT_OBJECT] };
+    let Some(descriptor) = descriptor else {
+        return;
+    };
+
+    let url: Option<Retained<NSString>> = unsafe { msg_send![&*descriptor, stringValue] };
+    let Some(url) = url else {
+        return;
+    };
+
+    dispatch_open_urls(vec![url.to_string()]);
+}
+
+fn register_get_url_handler(delegate_obj: &AnyObject) {
+    let class_name =
+        CStr::from_bytes_with_nul(b"NSAppleEventManager\0").expect("static class name");
+    let Some(manager_class) = AnyClass::get(class_name) else {
+        return;
+    };
+
+    let manager: Option<Retained<AnyObject>> =
+        unsafe { msg_send![manager_class, sharedAppleEventManager] };
+    let Some(manager) = manager else {
+        return;
+    };
+
+    unsafe {
+        let _: () = msg_send![
+            &*manager,
+            setEventHandler: delegate_obj,
+            andSelector: sel!(handleGetURLEvent:withReplyEvent:),
+            forEventClass: AE_INTERNET_EVENT_CLASS,
+            andEventID: AE_GET_URL_EVENT_ID,
+        ];
+    }
 }
 
 unsafe extern "C-unwind" fn application_open_urls(
@@ -127,6 +175,16 @@ fn open_documents_delegate_class(superclass: &AnyClass) -> &'static AnyClass {
                     Encoding::Void,
                     &[Encoding::Object, Encoding::Object],
                 );
+                add_method_raw(
+                    cls.as_ptr(),
+                    sel!(handleGetURLEvent:withReplyEvent:),
+                    mem::transmute::<
+                        unsafe extern "C-unwind" fn(&AnyObject, Sel, &AnyObject, &AnyObject),
+                        Imp,
+                    >(handle_get_url_event),
+                    Encoding::Void,
+                    &[Encoding::Object, Encoding::Object],
+                );
 
                 ffi::objc_registerClassPair(cls.as_ptr());
             }
@@ -207,6 +265,7 @@ pub(crate) fn register_open_documents_handler(proxy: EventLoopProxy<Event>) {
 
     let current_class = delegate_obj.class();
     if current_class.name() == delegate_class_name() {
+        register_get_url_handler(delegate_obj);
         return;
     }
 
@@ -216,4 +275,5 @@ pub(crate) fn register_open_documents_handler(proxy: EventLoopProxy<Event>) {
         debug_assert_eq!(old_class, current_class);
     }
     app.setDelegate(Some(&*delegate));
+    register_get_url_handler(delegate_obj);
 }

@@ -25,28 +25,47 @@ all the colors of a standard terminal. The third enumerates the 24-bit colors.
 ./24-bit-colors.sh
 ```
 
-## Web popup smoke test (macOS)
+## Web E2E tests (macOS)
 
-Runs the Rust integration test `web_popup_smoke` from `tabor/tests/web_e2e.rs`.
-
-```sh
-./web-popup-smoke.sh
-```
-
-## Agent-browser verification
-
-Runs the Rust integration test `agent_browser_fixture_smoke` from
-`tabor/tests/web_e2e.rs`.
+Run the integration test suite in `tabor/tests/web_e2e.rs` directly with Cargo:
 
 ```sh
-./verify-agent-browser.sh
+cargo test -p tabor --test web_e2e -- --nocapture
 ```
 
-## Browser Clipboard Shortcut Test (macOS)
-
-Runs the Rust integration test `browser_clipboard_shortcut_smoke` from
-`tabor/tests/web_e2e.rs` for `Meta+C` / `Meta+V` behavior in web tabs.
+Run a single smoke test:
 
 ```sh
-./verify-browser-clipboard-red.sh
+cargo test -p tabor --test web_e2e web_popup_smoke -- --exact --nocapture
+cargo test -p tabor --test web_e2e agent_browser_fixture_smoke -- --exact --nocapture
+cargo test -p tabor --test web_e2e browser_clipboard_shortcut_smoke -- --exact --nocapture
 ```
+
+Use `cargo xtask` as the primary macOS entrypoint; these scripts are internal build helpers.
+
+Primary commands:
+
+```sh
+cargo xtask run
+cargo xtask install --release --launch
+```
+
+Use `cargo xtask run-raw -- ...` only for explicit raw-binary debugging.
+
+## Passkey-Enabled macOS Build Mode
+
+Default macOS runs/builds intentionally skip the restricted passkey entitlement so web tabs load reliably without an Apple-approved provisioning profile.
+
+Enable passkey mode explicitly:
+
+```sh
+cargo xtask run --passkey
+```
+
+For app signing with passkey entitlement, provide a provisioning profile:
+
+```sh
+TABOR_CODESIGN_PROVISIONING_PROFILE=/path/to/profile.mobileprovision cargo xtask app --passkey --release
+```
+
+Without `TABOR_CODESIGN_PROVISIONING_PROFILE`, passkey signing fails fast by design.

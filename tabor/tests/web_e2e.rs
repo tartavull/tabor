@@ -6,15 +6,15 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use serde_json::{json, Value};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use url::Url;
 
@@ -134,19 +134,21 @@ impl PopupServer {
         let opener = opener_html().to_string();
         let icon = popup_icon();
 
-        let handle = thread::spawn(move || loop {
-            if thread_stop.load(Ordering::Relaxed) {
-                break;
-            }
+        let handle = thread::spawn(move || {
+            loop {
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
+                }
 
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    handle_popup_connection(&mut stream, &thread_hits, &opener, &icon);
-                },
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
-                },
-                Err(_) => break,
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        handle_popup_connection(&mut stream, &thread_hits, &opener, &icon);
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    },
+                    Err(_) => break,
+                }
             }
         });
 

@@ -117,3 +117,4 @@ wayland = [
     "winit/wayland-csd-adwaita-crossfont",
 ]
 nightly = []
+passkey-webauthn = []

@@ -18,6 +18,12 @@ APP_DIR = $(RELEASE_DIR)/osx
 APP_BINARY = $(RELEASE_DIR)/$(TARGET)
 APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
 APP_EXTRAS_DIR = $(APP_DIR)/$(APP_NAME)/Contents/Resources
+APP_DEFAULT_ENTITLEMENTS = $(ASSETS_DIR)/osx/Tabor.entitlements
+APP_PASSKEY_ENTITLEMENTS = $(ASSETS_DIR)/osx/Tabor.passkey.entitlements
+APP_RESOURCE_ENTITLEMENTS ?= $(APP_DEFAULT_ENTITLEMENTS)
+TABOR_CARGO_FEATURES ?=
+TABOR_CODESIGN_ENTITLEMENTS ?=
+TABOR_CODESIGN_PROVISIONING_PROFILE ?=
 APP_COMPLETIONS_DIR = $(APP_EXTRAS_DIR)/completions
 
 DMG_NAME = Tabor.dmg
@@ -36,11 +42,20 @@ binary: $(TARGET)-native ## Build a release binary
 binary-universal: $(TARGET)-universal ## Build a universal release binary
 app: $(APP_NAME)-native ## Create an Tabor.app
 app-universal: $(APP_NAME)-universal ## Create a universal Tabor.app
+app-passkey: TABOR_CARGO_FEATURES = --features passkey-webauthn
+app-passkey: TABOR_CODESIGN_ENTITLEMENTS = $(APP_PASSKEY_ENTITLEMENTS)
+app-passkey: APP_RESOURCE_ENTITLEMENTS = $(APP_PASSKEY_ENTITLEMENTS)
+app-passkey: $(APP_NAME)-native ## Create a passkey-enabled Tabor.app (requires TABOR_CODESIGN_PROVISIONING_PROFILE)
+
+app-passkey-universal: TABOR_CARGO_FEATURES = --features passkey-webauthn
+app-passkey-universal: TABOR_CODESIGN_ENTITLEMENTS = $(APP_PASSKEY_ENTITLEMENTS)
+app-passkey-universal: APP_RESOURCE_ENTITLEMENTS = $(APP_PASSKEY_ENTITLEMENTS)
+app-passkey-universal: $(APP_NAME)-universal ## Create a universal passkey-enabled Tabor.app (requires TABOR_CODESIGN_PROVISIONING_PROFILE)
 $(TARGET)-native:
-	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release
+	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release $(TABOR_CARGO_FEATURES)
 $(TARGET)-universal:
-	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release --target=x86_64-apple-darwin
-	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release --target=aarch64-apple-darwin
+	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release --target=x86_64-apple-darwin $(TABOR_CARGO_FEATURES)
+	MACOSX_DEPLOYMENT_TARGET="10.12" cargo build --release --target=aarch64-apple-darwin $(TABOR_CARGO_FEATURES)
 	@lipo target/{x86_64,aarch64}-apple-darwin/release/$(TARGET) -create -output $(APP_BINARY)
 
 $(APP_NAME)-%: $(TARGET)-%
@@ -54,7 +69,11 @@ $(APP_NAME)-%: $(TARGET)-%
 	@tic -xe tabor,tabor-direct -o $(APP_EXTRAS_DIR) $(TERMINFO)
 	@cp -fRp $(APP_TEMPLATE) $(APP_DIR)
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
+	@cp -fp $(APP_RESOURCE_ENTITLEMENTS) $(APP_EXTRAS_DIR)/Tabor.entitlements
+	@scripts/bundle-macos-deps.sh $(APP_DIR)/$(APP_NAME)
+	@scripts/create-macos-cef-helpers.sh $(APP_DIR)/$(APP_NAME)
 	@cp -fp $(COMPLETIONS) $(APP_COMPLETIONS_DIR)
+	@TABOR_CODESIGN_ENTITLEMENTS="$(TABOR_CODESIGN_ENTITLEMENTS)" TABOR_CODESIGN_PROVISIONING_PROFILE="$(TABOR_CODESIGN_PROVISIONING_PROFILE)" scripts/sign-macos-app.sh $(APP_DIR)/$(APP_NAME)
 	@touch -r "$(APP_BINARY)" "$(APP_DIR)/$(APP_NAME)"
 	@echo "Created '$(APP_NAME)' in '$(APP_DIR)'"
 
@@ -75,7 +94,7 @@ install-universal: $(INSTALL)-native ## Mount universal disk image
 $(INSTALL)-%: $(DMG_NAME)-%
 	@open $(DMG_DIR)/$(DMG_NAME)
 
-.PHONY: app app-universal binary clean dmg install $(TARGET) $(TARGET)-universal
+.PHONY: app app-passkey app-passkey-universal app-universal binary clean dmg install $(TARGET) $(TARGET)-universal
 
 clean: ## Remove all build artifacts
 	@cargo clean

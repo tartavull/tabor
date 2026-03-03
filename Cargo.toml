@@ -4,6 +4,7 @@ members = [
     "tabor_terminal",
     "tabor_config",
     "tabor_config_derive",
+    "xtask",
 ]
 resolver = "2"
 

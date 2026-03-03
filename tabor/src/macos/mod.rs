@@ -1,18 +1,28 @@
 use std::cell::RefCell;
+#[cfg(feature = "passkey-webauthn")]
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "passkey-webauthn")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(feature = "passkey-webauthn")]
 use block2::RcBlock;
+use objc2::MainThreadMarker;
+#[cfg(feature = "passkey-webauthn")]
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool, ProtocolObject};
-use objc2::{MainThreadMarker, msg_send, sel};
+#[cfg(feature = "passkey-webauthn")]
+use objc2::runtime::{AnyClass, Bool};
+use objc2::runtime::{AnyObject, ProtocolObject};
+#[cfg(feature = "passkey-webauthn")]
+use objc2::{msg_send, sel};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::{
     NSActivityOptions, NSDictionary, NSObjectProtocol, NSProcessInfo, NSString, NSUserDefaults,
     ns_string,
 };
 
+#[cfg(feature = "passkey-webauthn")]
 #[link(name = "AuthenticationServices", kind = "framework")]
 unsafe extern "C" {}
 
@@ -30,8 +40,10 @@ mod webview_cef;
 pub(crate) use open_documents::register_open_documents_handler;
 
 static WEBVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "passkey-webauthn")]
 static PASSKEY_AUTH_REQUESTED: AtomicBool = AtomicBool::new(false);
 thread_local! {
+    #[cfg(feature = "passkey-webauthn")]
     static PASSKEY_AUTH_BLOCK: RefCell<Option<RcBlock<dyn Fn(NSInteger)>>> = RefCell::new(None);
     static APP_NAP_ACTIVITY: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>> =
         RefCell::new(None);
@@ -88,6 +100,7 @@ pub(crate) fn register_webview() {
     let prev = WEBVIEW_COUNT.fetch_add(1, Ordering::SeqCst);
     if prev == 0 {
         set_autofill_override(true);
+        #[cfg(feature = "passkey-webauthn")]
         request_passkey_authorization();
     }
 }
@@ -113,6 +126,7 @@ fn set_autofill_override(enabled: bool) {
     }
 }
 
+#[cfg(feature = "passkey-webauthn")]
 fn request_passkey_authorization() {
     if PASSKEY_AUTH_REQUESTED.swap(true, Ordering::SeqCst) {
         return;
