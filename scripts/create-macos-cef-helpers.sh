@@ -31,7 +31,8 @@ fi
 
 main_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null || true)"
 if [[ -z "$main_identifier" ]]; then
-  main_identifier="com.pinkbot.tabor"
+  echo "Unable to read CFBundleIdentifier from '$info_plist'" >&2
+  exit 1
 fi
 
 helper_prefix="${TABOR_CEF_HELPER_PREFIX:-Tabor}"
@@ -65,6 +66,8 @@ for helper_name in "${helpers[@]}"; do
   mkdir -p "$helper_macos"
   cp -f "$main_binary" "$helper_binary"
   chmod +x "$helper_binary"
+  rm -rf "$helper_contents/Frameworks"
+  ln -sfn ../.. "$helper_contents/Frameworks"
 
   cat > "$helper_info" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -41,16 +41,17 @@ cargo test -p tabor --test web_e2e agent_browser_fixture_smoke -- --exact --noca
 cargo test -p tabor --test web_e2e browser_clipboard_shortcut_smoke -- --exact --nocapture
 ```
 
-Use `cargo xtask` as the primary macOS entrypoint; these scripts are internal build helpers.
+Use `cargo xtask` as the primary macOS entrypoint; commands always replace the canonical app bundle at `/Applications/Tabor.app`.
 
 Primary commands:
 
 ```sh
+cargo xtask app
 cargo xtask run
 cargo xtask install --release --launch
 ```
 
-Use `cargo xtask run-raw -- ...` only for explicit raw-binary debugging.
+`cargo xtask run-raw -- ...` is only for explicit raw-binary debugging and does not touch `/Applications/Tabor.app`.
 
 ## Passkey-Enabled macOS Build Mode
 

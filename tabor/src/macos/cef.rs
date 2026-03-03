@@ -378,7 +378,11 @@ fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
             let link_path = link_dir.join(lib);
             if !link_path.exists() {
                 let target = link_prefix.join(lib);
-                symlink(&target, &link_path)?;
+                if let Err(err) = symlink(&target, &link_path) {
+                    if err.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(err.into());
+                    }
+                }
             }
         }
     }

@@ -14,6 +14,8 @@
   <string>Tabor</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
   <key>CFBundleShortVersionString</key>
   <string>0.17.0-dev</string>
   <key>CFBundleSupportedPlatforms</key>
@@ -32,6 +34,22 @@
   <true/>
   <key>CFBundleDisplayName</key>
   <string>Tabor</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>com.pinkbot.tabor.web</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Owner</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>http</string>
+        <string>https</string>
+      </array>
+    </dict>
+  </array>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>

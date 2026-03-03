@@ -4,6 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -34,12 +35,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match command {
         CliCommand::App { options } => {
-            let app_dir = build_app_bundle(&root, options)?;
-            println!("Built {}", app_dir.display());
+            let install_path = install_app_bundle(&root, options)?;
+            println!("Installed {}", install_path.display());
         },
         CliCommand::Run { options, args } => {
-            let app_dir = build_app_bundle(&root, options)?;
-            launch_app_bundle(&app_dir, &args)?;
+            let install_path = install_app_bundle(&root, options)?;
+            launch_app_bundle(&install_path, &args)?;
         },
         CliCommand::Install { options, launch } => {
             let install_path = install_app_bundle(&root, options)?;
@@ -194,9 +195,9 @@ Usage:
   cargo xtask run-raw [--release] [--passkey] [-- <tabor args>]
 
 Commands:
-  app      Build and package Tabor.app (bundle deps, helper apps, codesign)
-  run      Build/package Tabor.app, then launch via `open -n ... --args`
-  install  Build/package and install Tabor.app to /Applications or ~/Applications
+  app      Build/package and install Tabor.app to /Applications
+  run      Build/package/install Tabor.app to /Applications, then launch
+  install  Build/package and install Tabor.app to /Applications
   run-raw  Debug-only: build and run the raw tabor binary directly
 
 Flags:
@@ -247,10 +248,14 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
     build_tabor_binary(root, options)?;
 
     let app_template = root.join("extra").join("osx").join("Tabor.app");
-    let app_dir = app_bundle_path(root, options.profile_release());
+    let app_dir = staging_app_bundle_path()?;
     let app_binary = app_dir.join("Contents").join("MacOS").join("tabor");
     let app_resources = app_dir.join("Contents").join("Resources");
     let app_entitlements = app_resources.join("Tabor.entitlements");
+
+    if let Some(staging_root) = app_dir.parent() {
+        fs::create_dir_all(staging_root)?;
+    }
 
     if app_dir.exists() {
         make_tree_user_writable(&app_dir)?;
@@ -271,7 +276,11 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
     let passkey_entitlements = root.join("extra").join("osx").join("Tabor.passkey.entitlements");
 
     let app_resource_entitlements = explicit_codesign_entitlements.clone().unwrap_or_else(|| {
-        if options.passkey { passkey_entitlements.clone() } else { default_entitlements }
+        if options.passkey {
+            passkey_entitlements.clone()
+        } else {
+            default_entitlements
+        }
     });
     fs::copy(&app_resource_entitlements, &app_entitlements)?;
 
@@ -283,9 +292,13 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
     let mut sign = Command::new(root.join("scripts").join("sign-macos-app.sh"));
     sign.current_dir(root).arg(&app_dir);
 
-    if let Some(path) = explicit_codesign_entitlements
-        .or_else(|| if options.passkey { Some(passkey_entitlements) } else { None })
-    {
+    if let Some(path) = explicit_codesign_entitlements.or_else(|| {
+        if options.passkey {
+            Some(passkey_entitlements)
+        } else {
+            None
+        }
+    }) {
         sign.env("TABOR_CODESIGN_ENTITLEMENTS", path);
     }
 
@@ -300,11 +313,8 @@ fn install_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box
     }
 
     let app_dir = build_app_bundle(root, options)?;
-    let install_path = preferred_install_path()?;
-
-    if let Some(parent) = install_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let staging_root = app_dir.parent().ok_or("invalid staging path for Tabor.app")?.to_path_buf();
+    let install_path = canonical_install_path()?;
 
     if install_path.exists() {
         make_tree_user_writable(&install_path)?;
@@ -313,18 +323,36 @@ fn install_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box
 
     copy_with_ditto(&app_dir, &install_path)?;
 
+    if staging_root.exists() {
+        make_tree_user_writable(&staging_root)?;
+        fs::remove_dir_all(&staging_root)?;
+    }
+
+    remove_legacy_target_app_bundles(root)?;
+
     Ok(install_path)
 }
 
-fn preferred_install_path() -> Result<PathBuf, Box<dyn Error>> {
+fn canonical_install_path() -> Result<PathBuf, Box<dyn Error>> {
     let system_apps = PathBuf::from("/Applications");
-    if dir_is_writable(&system_apps) {
-        return Ok(system_apps.join("Tabor.app"));
+    if !dir_is_writable(&system_apps) {
+        return Err("/Applications is not writable; rerun with permissions that can replace /Applications/Tabor.app"
+            .into());
     }
 
-    let home = env::var_os("HOME").ok_or("HOME is not set")?;
-    let user_apps = PathBuf::from(home).join("Applications");
-    Ok(user_apps.join("Tabor.app"))
+    Ok(system_apps.join("Tabor.app"))
+}
+
+fn remove_legacy_target_app_bundles(root: &Path) -> Result<(), Box<dyn Error>> {
+    for profile in ["debug", "release"] {
+        let legacy_app = root.join("target").join(profile).join("osx").join("Tabor.app");
+        if legacy_app.exists() {
+            make_tree_user_writable(&legacy_app)?;
+            fs::remove_dir_all(&legacy_app)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn dir_is_writable(path: &Path) -> bool {
@@ -423,8 +451,11 @@ fn copy_with_ditto(source: &Path, destination: &Path) -> Result<(), Box<dyn Erro
     run_checked(&mut command, "ditto copy")
 }
 
-fn app_bundle_path(root: &Path, release: bool) -> PathBuf {
-    root.join("target").join(profile_dir(release)).join("osx").join("Tabor.app")
+fn staging_app_bundle_path() -> Result<PathBuf, Box<dyn Error>> {
+    let epoch_nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(env::temp_dir()
+        .join(format!("tabor-xtask-{}-{epoch_nanos}", std::process::id()))
+        .join("Tabor.app"))
 }
 
 fn tabor_binary_path(root: &Path, release: bool) -> PathBuf {
@@ -432,7 +463,11 @@ fn tabor_binary_path(root: &Path, release: bool) -> PathBuf {
 }
 
 fn profile_dir(release: bool) -> &'static str {
-    if release { "release" } else { "debug" }
+    if release {
+        "release"
+    } else {
+        "debug"
+    }
 }
 
 fn make_tree_user_writable(path: &Path) -> Result<(), Box<dyn Error>> {

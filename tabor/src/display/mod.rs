@@ -534,6 +534,30 @@ impl Display {
             window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
+        let hint_state = HintState::new(config.hints.alphabet());
+
+        let mut damage_tracker = DamageTracker::new(size_info.screen_lines(), size_info.columns());
+        damage_tracker.debug = config.debug.highlight_damage;
+
+        #[cfg(target_os = "macos")]
+        let mut tab_panel = TabPanel::new();
+        #[cfg(target_os = "macos")]
+        {
+            tab_panel.set_enabled(config.window.tab_panel.enabled);
+            tab_panel.set_dimensions(panel_dimensions);
+            let has_controls =
+                matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
+            let top_inset = if tab_panel.is_enabled() && has_controls {
+                window
+                    .layout_macos_window_controls(panel_dimensions.width, padding.1)
+                    .unwrap_or(0.0)
+            } else {
+                window.set_macos_background_color(config.colors.primary.background);
+                0.0
+            };
+            tab_panel.set_top_inset_px(top_inset);
+        }
+        // Show only after startup layout is complete, so macOS controls do not visibly jump.
         window.set_visible(true);
 
         // Always focus new windows, even if no Tabor window is currently focused.
@@ -549,32 +573,6 @@ impl Display {
                 StartupMode::Maximized if !is_wayland => window.set_maximized(true),
                 _ => (),
             }
-        }
-
-        let hint_state = HintState::new(config.hints.alphabet());
-
-        let mut damage_tracker = DamageTracker::new(size_info.screen_lines(), size_info.columns());
-        damage_tracker.debug = config.debug.highlight_damage;
-
-        #[cfg(target_os = "macos")]
-        let mut tab_panel = TabPanel::new();
-        #[cfg(target_os = "macos")]
-        {
-            tab_panel.set_enabled(config.window.tab_panel.enabled);
-            tab_panel.set_dimensions(panel_dimensions);
-            let has_controls =
-                matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
-            let top_inset = if tab_panel.is_enabled() && has_controls {
-                let panel_bg = TabPanel::background_color(config);
-                window.set_macos_background_color(panel_bg);
-                window
-                    .layout_macos_window_controls(panel_dimensions.width, padding.1)
-                    .unwrap_or(0.0)
-            } else {
-                window.set_macos_background_color(config.colors.primary.background);
-                0.0
-            };
-            tab_panel.set_top_inset_px(top_inset);
         }
 
         // Disable vsync.
@@ -791,11 +789,7 @@ impl Display {
             let has_controls =
                 matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
             let top_inset = if self.tab_panel.is_enabled() && has_controls {
-                let panel_bg = TabPanel::background_color(config);
-                self.window.set_macos_background_color(panel_bg);
-                self.window
-                    .layout_macos_window_controls(panel_dimensions.width, padding.1)
-                    .unwrap_or(0.0)
+                self.tab_panel.top_inset_px()
             } else {
                 self.window.set_macos_background_color(config.colors.primary.background);
                 0.0

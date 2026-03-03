@@ -592,7 +592,15 @@ impl Processor {
             .or_else(|| self.windows.keys().next().copied());
 
         let Some(window_id) = window_id else {
+            let queue_was_empty = self.pending_open_urls.is_empty();
             self.pending_open_urls.append(&mut urls);
+
+            if queue_was_empty && (self.cli_options.daemon || self.gl_config.is_some()) {
+                let _ = self.proxy.send_event(Event::new(
+                    EventType::CreateWindow(WindowOptions::default()),
+                    None,
+                ));
+            }
             return;
         };
 
@@ -1072,9 +1080,15 @@ impl ApplicationHandler<Event> for Processor {
                     if let Err(err) = self.create_initial_window(event_loop, options) {
                         self.initial_window_error = Some(err);
                         event_loop.exit();
+                    } else {
+                        #[cfg(target_os = "macos")]
+                        self.open_pending_urls();
                     }
                 } else if let Err(err) = self.create_window(event_loop, options) {
                     error!("Could not open window: {err:?}");
+                } else {
+                    #[cfg(target_os = "macos")]
+                    self.open_pending_urls();
                 }
             },
             // Process events affecting all windows.

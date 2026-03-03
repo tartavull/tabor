@@ -431,9 +431,6 @@ impl WebView {
                     let _: () = msg_send![view, setFrame: frame];
                     disable_cef_view_first_responder(view);
                     let _: () = msg_send![parent, addSubview: view];
-                    let panel_width_px = size_info.padding_x() - size_info.padding_right();
-                    let _ =
-                        window.layout_macos_window_controls(panel_width_px, size_info.padding_y());
                 }
             }
             if let Some(host) = browser.host() {
