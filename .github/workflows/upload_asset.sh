@@ -6,7 +6,7 @@ if [ $# -lt 2 ]; then
     exit 1
 fi
 
-repo="tabor/tabor"
+repo="${GITHUB_REPOSITORY:-tabor/tabor}"
 file_path=$1
 bearer=$2
 
