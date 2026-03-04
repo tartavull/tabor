@@ -520,7 +520,6 @@ fn tabor(mut options: Options) -> Result<(), Box<dyn Error>> {
     // Drop processor before shutting down platform services.
     drop(processor);
 
-
     // Without explicitly detaching the console cmd won't redraw it's prompt.
     #[cfg(windows)]
     unsafe {

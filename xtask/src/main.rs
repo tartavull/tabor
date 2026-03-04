@@ -213,6 +213,8 @@ Environment:
   TABOR_CODESIGN_ENTITLEMENTS
   TABOR_CODESIGN_PROVISIONING_PROFILE
   TABOR_CODESIGN_IDENTITY
+  TABOR_CODESIGN_TEAM_ID / TABOR_CODESIGN_TEAM_NAME
+  TABOR_REQUIRE_TEAM_CODESIGN (default: 1)
   TABOR_CEF_PATH / CEF_PATH
 "
     );
@@ -276,11 +278,7 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
     let passkey_entitlements = root.join("extra").join("osx").join("Tabor.passkey.entitlements");
 
     let app_resource_entitlements = explicit_codesign_entitlements.clone().unwrap_or_else(|| {
-        if options.passkey {
-            passkey_entitlements.clone()
-        } else {
-            default_entitlements
-        }
+        if options.passkey { passkey_entitlements.clone() } else { default_entitlements }
     });
     fs::copy(&app_resource_entitlements, &app_entitlements)?;
 
@@ -292,12 +290,10 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
     let mut sign = Command::new(root.join("scripts").join("sign-macos-app.sh"));
     sign.current_dir(root).arg(&app_dir);
 
-    if let Some(path) = explicit_codesign_entitlements.or_else(|| {
-        if options.passkey {
-            Some(passkey_entitlements)
-        } else {
-            None
-        }
+    if let Some(path) = explicit_codesign_entitlements.or(if options.passkey {
+        Some(passkey_entitlements)
+    } else {
+        None
     }) {
         sign.env("TABOR_CODESIGN_ENTITLEMENTS", path);
     }
@@ -463,11 +459,7 @@ fn tabor_binary_path(root: &Path, release: bool) -> PathBuf {
 }
 
 fn profile_dir(release: bool) -> &'static str {
-    if release {
-        "release"
-    } else {
-        "debug"
-    }
+    if release { "release" } else { "debug" }
 }
 
 fn make_tree_user_writable(path: &Path) -> Result<(), Box<dyn Error>> {

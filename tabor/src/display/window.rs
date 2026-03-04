@@ -23,7 +23,7 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::MainThreadMarker,
-    objc2_app_kit::{NSColor, NSColorSpace, NSView, NSWindowButton},
+    objc2_app_kit::{NSColor, NSColorSpace, NSView, NSWindowButton, NSWindowStyleMask},
     objc2_foundation::NSPoint,
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
@@ -457,6 +457,22 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn set_simple_fullscreen(&self, simple_fullscreen: bool) {
         self.window.set_simple_fullscreen(simple_fullscreen);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_fullscreen_flags(&self) -> (bool, bool, bool) {
+        let _mtm = MainThreadMarker::new().expect("macOS fullscreen check must run on main thread");
+        let view = match self.raw_window_handle() {
+            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
+            _ => panic!("macOS window should always use an AppKit handle"),
+        };
+        let window = view.window().expect("NSView should always be attached to NSWindow");
+
+        let native_fullscreen = window.styleMask().contains(NSWindowStyleMask::FullScreen);
+        let simple_fullscreen = self.window.simple_fullscreen();
+        let winit_fullscreen = self.window.fullscreen().is_some();
+
+        (native_fullscreen, simple_fullscreen, winit_fullscreen)
     }
 
     /// Set IME inhibitor state and disable IME while any are present.

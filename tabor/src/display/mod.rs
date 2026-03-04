@@ -52,7 +52,7 @@ use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 #[cfg(target_os = "macos")]
-use crate::display::tab_panel::{TabPanel, compute_panel_dimensions};
+use crate::display::tab_panel::{PanelDimensions, TabPanel, compute_panel_dimensions};
 use crate::display::window::Window;
 use crate::event::{CommandState, Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
@@ -431,6 +431,66 @@ pub struct Display {
 }
 
 impl Display {
+    #[cfg(target_os = "macos")]
+    fn macos_show_semaphore_controls(
+        tab_panel_enabled: bool,
+        decorations: Decorations,
+        is_fullscreen_or_simple_fullscreen: bool,
+    ) -> bool {
+        tab_panel_enabled
+            && matches!(decorations, Decorations::Full | Decorations::Transparent)
+            && !is_fullscreen_or_simple_fullscreen
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_macos_tab_panel_semaphore_inset(
+        window: &Window,
+        tab_panel: &mut TabPanel,
+        panel_dimensions: PanelDimensions,
+        padding_y_px: f32,
+        config: &UiConfig,
+    ) {
+        tab_panel.set_enabled(config.window.tab_panel.enabled);
+        tab_panel.set_dimensions(panel_dimensions);
+
+        let (native_fullscreen, simple_fullscreen, _) = window.macos_fullscreen_flags();
+        let is_fullscreen_or_simple_fullscreen = native_fullscreen || simple_fullscreen;
+        let show_controls = Self::macos_show_semaphore_controls(
+            tab_panel.is_enabled(),
+            config.window.decorations,
+            is_fullscreen_or_simple_fullscreen,
+        );
+
+        let top_inset = if show_controls {
+            window.layout_macos_window_controls(panel_dimensions.width, padding_y_px).unwrap_or(0.0)
+        } else {
+            window.set_macos_background_color(config.colors.primary.background);
+            0.0
+        };
+
+        tab_panel.set_top_inset_px(top_inset);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_macos_tab_panel_semaphore_inset_for_draw(&mut self, config: &UiConfig) {
+        let scale_factor = self.window.scale_factor as f32;
+        let padding = config.window.padding(scale_factor);
+        let panel_dimensions = compute_panel_dimensions(
+            config,
+            self.size_info.cell_width(),
+            self.size_info.width(),
+            padding.0,
+            scale_factor,
+        );
+
+        Self::sync_macos_tab_panel_semaphore_inset(
+            &self.window,
+            &mut self.tab_panel,
+            panel_dimensions,
+            padding.1,
+            config,
+        );
+    }
     pub fn new(
         window: Window,
         gl_context: NotCurrentContext,
@@ -543,19 +603,13 @@ impl Display {
         let mut tab_panel = TabPanel::new();
         #[cfg(target_os = "macos")]
         {
-            tab_panel.set_enabled(config.window.tab_panel.enabled);
-            tab_panel.set_dimensions(panel_dimensions);
-            let has_controls =
-                matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
-            let top_inset = if tab_panel.is_enabled() && has_controls {
-                window
-                    .layout_macos_window_controls(panel_dimensions.width, padding.1)
-                    .unwrap_or(0.0)
-            } else {
-                window.set_macos_background_color(config.colors.primary.background);
-                0.0
-            };
-            tab_panel.set_top_inset_px(top_inset);
+            Self::sync_macos_tab_panel_semaphore_inset(
+                &window,
+                &mut tab_panel,
+                panel_dimensions,
+                padding.1,
+                config,
+            );
         }
         // Show only after startup layout is complete, so macOS controls do not visibly jump.
         window.set_visible(true);
@@ -784,17 +838,13 @@ impl Display {
 
         #[cfg(target_os = "macos")]
         {
-            self.tab_panel.set_enabled(config.window.tab_panel.enabled);
-            self.tab_panel.set_dimensions(panel_dimensions);
-            let has_controls =
-                matches!(config.window.decorations, Decorations::Full | Decorations::Transparent);
-            let top_inset = if self.tab_panel.is_enabled() && has_controls {
-                self.tab_panel.top_inset_px()
-            } else {
-                self.window.set_macos_background_color(config.colors.primary.background);
-                0.0
-            };
-            self.tab_panel.set_top_inset_px(top_inset);
+            Self::sync_macos_tab_panel_semaphore_inset(
+                &self.window,
+                &mut self.tab_panel,
+                panel_dimensions,
+                padding.1,
+                config,
+            );
         }
 
         // Update number of column/lines in the viewport.
@@ -879,6 +929,9 @@ impl Display {
         search_state: &mut SearchState,
         command_state: &CommandState,
     ) {
+        #[cfg(target_os = "macos")]
+        self.sync_macos_tab_panel_semaphore_inset_for_draw(config);
+
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
@@ -1193,6 +1246,9 @@ impl Display {
         url: &str,
         command_state: &CommandState,
     ) {
+        #[cfg(target_os = "macos")]
+        self.sync_macos_tab_panel_semaphore_inset_for_draw(config);
+
         let size_info = self.size_info;
         let metrics = self.glyph_cache.font_metrics();
         let background_color = config.colors.primary.background;
@@ -2027,4 +2083,34 @@ fn window_size(
     let height = (padding.1).mul_add(2., grid_height).floor();
 
     PhysicalSize::new(width as u32, height as u32)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_window_controls_visibility_policy() {
+        assert!(Display::macos_show_semaphore_controls(true, Decorations::Full, false));
+        assert!(Display::macos_show_semaphore_controls(true, Decorations::Transparent, false));
+
+        assert!(!Display::macos_show_semaphore_controls(true, Decorations::Full, true));
+        assert!(!Display::macos_show_semaphore_controls(true, Decorations::Transparent, true));
+        assert!(!Display::macos_show_semaphore_controls(false, Decorations::Full, false));
+        assert!(!Display::macos_show_semaphore_controls(true, Decorations::Buttonless, false));
+        assert!(!Display::macos_show_semaphore_controls(true, Decorations::None, false));
+    }
+
+    #[test]
+    fn macos_fullscreen_roundtrip_uses_measured_inset() {
+        let measured_inset = 26.0_f32;
+
+        let show_controls = Display::macos_show_semaphore_controls(true, Decorations::Full, true);
+        let top_inset = if show_controls { measured_inset } else { 0.0 };
+        assert_eq!(top_inset, 0.0);
+
+        let show_controls = Display::macos_show_semaphore_controls(true, Decorations::Full, false);
+        let top_inset = if show_controls { measured_inset } else { 0.0 };
+        assert_eq!(top_inset, measured_inset);
+    }
 }

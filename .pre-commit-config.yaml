@@ -1,0 +1,25 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+        exclude: ^(vendor/|tabor_terminal/tests/ref/|tabor/windows/|agent-browser-trace\.json$)
+      - id: trailing-whitespace
+        exclude: ^(vendor/|tabor_terminal/tests/ref/|tabor/windows/|agent-browser-trace\.json$)
+      - id: check-yaml
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt-check
+        name: cargo fmt --all -- --check
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: cargo-clippy
+        name: cargo clippy --all-targets
+        entry: cargo clippy --all-targets
+        language: system
+        pass_filenames: false
+        always_run: true

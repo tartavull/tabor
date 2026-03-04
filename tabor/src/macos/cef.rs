@@ -5,7 +5,6 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,8 +50,18 @@ cef::wrap_app! {
             command_line.append_switch(Some(&disable_occluded));
 
             let disable_features = cef::CefString::from("disable-features");
+            #[cfg(feature = "passkey-webauthn")]
             let disable_features_value = cef::CefString::from("CalculateNativeWinOcclusion");
+            #[cfg(not(feature = "passkey-webauthn"))]
+            let disable_features_value =
+                cef::CefString::from("CalculateNativeWinOcclusion,WebAuthentication");
             command_line.append_switch_with_value(Some(&disable_features), Some(&disable_features_value));
+
+            #[cfg(not(feature = "passkey-webauthn"))]
+            {
+                let disable_webauthn = cef::CefString::from("disable-webauthn");
+                command_line.append_switch(Some(&disable_webauthn));
+            }
         }
     }
 }
@@ -365,18 +374,70 @@ fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
         io::Error::new(io::ErrorKind::NotFound, "Failed to resolve executable path")
     })?;
 
-    let bundle_paths = bundle_paths();
-    let (dest_dir, link_dir, link_prefix) = if let Some(paths) = bundle_paths.as_ref() {
-        let frameworks_dir = paths.current_bundle.join("Contents").join("Frameworks");
-        let link_prefix = PathBuf::from("..").join("Frameworks");
-        (frameworks_dir, Some(exe_dir.to_path_buf()), link_prefix)
-    } else {
-        (exe_dir.to_path_buf(), None, PathBuf::new())
-    };
-
-    fs::create_dir_all(&dest_dir)?;
-
     let libs = ["libGLESv2.dylib", "libEGL.dylib"];
+    let bundle_paths = bundle_paths();
+
+    if let Some(paths) = bundle_paths.as_ref() {
+        let frameworks_dir = paths.current_bundle.join("Contents").join("Frameworks");
+
+        for lib in libs {
+            let bundled = frameworks_dir.join(lib);
+            if !bundled.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Missing bundled CEF sidecar library {} in {}",
+                        lib,
+                        frameworks_dir.display()
+                    ),
+                )
+                .into());
+            }
+
+            let link_path = exe_dir.join(lib);
+            let metadata = fs::symlink_metadata(&link_path).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Missing bundled sidecar link {} -> ../Frameworks/{}",
+                        link_path.display(),
+                        lib
+                    ),
+                )
+            })?;
+            if !metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid bundled sidecar link {}: expected symlink to ../Frameworks/{}",
+                        link_path.display(),
+                        lib
+                    ),
+                )
+                .into());
+            }
+
+            let expected = PathBuf::from("..").join("Frameworks").join(lib);
+            let target = fs::read_link(&link_path)?;
+            if target != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid bundled sidecar link {} -> {} (expected {})",
+                        link_path.display(),
+                        target.display(),
+                        expected.display()
+                    ),
+                )
+                .into());
+            }
+        }
+
+        return Ok(());
+    }
+
+    fs::create_dir_all(exe_dir)?;
+
     let src_dir = find_cef_sidecar_dir(framework_dir, &libs).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -389,30 +450,21 @@ fn ensure_cef_sidecar_libs(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
     })?;
 
     for lib in libs {
-        let dst = dest_dir.join(lib);
-        if !dst.exists() {
-            let src = src_dir.join(lib);
-            if !src.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Missing CEF sidecar library {} in {}", lib, src_dir.display()),
-                )
-                .into());
-            }
-            fs::copy(&src, &dst)?;
+        let dst = exe_dir.join(lib);
+        if dst.exists() {
+            continue;
         }
 
-        if let Some(link_dir) = &link_dir {
-            let link_path = link_dir.join(lib);
-            if !link_path.exists() {
-                let target = link_prefix.join(lib);
-                if let Err(err) = symlink(&target, &link_path) {
-                    if err.kind() != io::ErrorKind::AlreadyExists {
-                        return Err(err.into());
-                    }
-                }
-            }
+        let src = src_dir.join(lib);
+        if !src.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Missing CEF sidecar library {} in {}", lib, src_dir.display()),
+            )
+            .into());
         }
+
+        fs::copy(&src, &dst)?;
     }
 
     Ok(())

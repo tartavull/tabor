@@ -291,6 +291,119 @@ fn browser_clipboard_shortcut_smoke() {
     assert_eq!(destination, expected, "browser-tab clipboard shortcut path failed");
 }
 
+#[test]
+fn close_active_web_tab_refreshes_terminal_program_name() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let initial_tabs = harness.run_json(["msg", "list-tabs"]);
+    let terminal_id =
+        first_terminal_tab_id(&initial_tabs).expect("missing initial terminal tab in list-tabs");
+    let initial_program = wait_for_active_terminal_program_name(&harness, Duration::from_secs(6))
+        .expect("active terminal never reported a program name");
+
+    harness.run_ok(["msg", "send-input", "sleep 0.5; sleep 10\n"]);
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    thread::sleep(Duration::from_millis(900));
+
+    harness.run_ok(["msg", "close-tab"]);
+
+    let final_state = harness.run_json(["msg", "list-tabs"]);
+    let tabs = flatten_tabs(&final_state);
+    assert_eq!(tabs.len(), 1, "expected one tab after closing active web tab: {final_state}");
+
+    let remaining = tabs[0];
+    assert_eq!(
+        tab_id_pair(remaining),
+        Some(terminal_id),
+        "expected original terminal tab to remain active: {final_state}"
+    );
+    assert_eq!(
+        remaining.get("kind").and_then(Value::as_str),
+        Some("terminal"),
+        "expected remaining tab to be terminal: {final_state}"
+    );
+    assert_eq!(
+        remaining.get("is_active").and_then(Value::as_bool),
+        Some(true),
+        "expected remaining terminal tab to be active: {final_state}"
+    );
+
+    let program_name = remaining.get("program_name").and_then(Value::as_str);
+    assert_eq!(
+        program_name,
+        Some("sleep"),
+        "expected close-tab handoff to refresh terminal program name (initial: {initial_program}): {final_state}"
+    );
+}
+
+fn flatten_tabs(response: &Value) -> Vec<&Value> {
+    let mut tabs = Vec::new();
+
+    if let Some(groups) = response.get("groups").and_then(Value::as_array) {
+        for group in groups {
+            if let Some(group_tabs) = group.get("tabs").and_then(Value::as_array) {
+                tabs.extend(group_tabs.iter());
+            }
+        }
+    }
+
+    tabs
+}
+
+fn tab_id_pair(tab: &Value) -> Option<(u64, u64)> {
+    let tab_id = tab.get("tab_id")?;
+    let index = tab_id.get("index")?.as_u64()?;
+    let generation = tab_id.get("generation")?.as_u64()?;
+    Some((index, generation))
+}
+
+fn first_terminal_tab_id(response: &Value) -> Option<(u64, u64)> {
+    flatten_tabs(response).into_iter().find_map(|tab| {
+        if tab.get("kind").and_then(Value::as_str) == Some("terminal") {
+            tab_id_pair(tab)
+        } else {
+            None
+        }
+    })
+}
+
+fn wait_for_active_terminal_program_name(
+    harness: &TaborHarness,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        let Some(active) = active_tab(&tabs) else {
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        };
+
+        if active.get("kind").and_then(Value::as_str) == Some("terminal") {
+            if let Some(name) = active.get("program_name").and_then(Value::as_str) {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn active_tab(response: &Value) -> Option<&Value> {
+    flatten_tabs(response)
+        .into_iter()
+        .find(|tab| tab.get("is_active").and_then(Value::as_bool) == Some(true))
+}
+
 fn fixture_url() -> String {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-browser.html");

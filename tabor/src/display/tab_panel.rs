@@ -133,9 +133,6 @@ impl TabPanel {
     pub fn set_top_inset_px(&mut self, inset: f32) {
         self.top_inset_px = inset.max(0.0);
     }
-    pub fn top_inset_px(&self) -> f32 {
-        self.top_inset_px
-    }
 
     pub fn width(&self) -> f32 {
         self.width_px

@@ -68,6 +68,9 @@ for helper_name in "${helpers[@]}"; do
   chmod +x "$helper_binary"
   rm -rf "$helper_contents/Frameworks"
   ln -sfn ../.. "$helper_contents/Frameworks"
+  for lib in libGLESv2.dylib libEGL.dylib; do
+    ln -sfn "../Frameworks/$lib" "$helper_macos/$lib"
+  done
 
   cat > "$helper_info" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

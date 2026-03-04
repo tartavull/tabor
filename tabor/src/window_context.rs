@@ -729,6 +729,8 @@ pub struct WindowContext {
     next_favicon_char: u32,
     #[cfg(target_os = "macos")]
     cef_inspector: CefInspectorState,
+    #[cfg(target_os = "macos")]
+    macos_fullscreen_or_simple_fullscreen: bool,
     modifiers: Modifiers,
     occluded: bool,
     window_focused: bool,
@@ -863,6 +865,12 @@ impl WindowContext {
             None,
         )?;
 
+        #[cfg(target_os = "macos")]
+        let macos_fullscreen_or_simple_fullscreen = {
+            let (native_fullscreen, simple_fullscreen, _) = display.window.macos_fullscreen_flags();
+            native_fullscreen || simple_fullscreen
+        };
+
         // Create context for the Tabor window.
         let mut context = WindowContext {
             preserve_title,
@@ -884,6 +892,8 @@ impl WindowContext {
             next_favicon_char: 0xE000,
             #[cfg(target_os = "macos")]
             cef_inspector: CefInspectorState::new(),
+            #[cfg(target_os = "macos")]
+            macos_fullscreen_or_simple_fullscreen,
             dirty: Default::default(),
         };
 
@@ -1038,6 +1048,25 @@ impl WindowContext {
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn tab_panel_enabled(&self) -> bool {
         false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_macos_fullscreen_transition(&mut self) {
+        let (native_fullscreen, simple_fullscreen, _) =
+            self.display.window.macos_fullscreen_flags();
+        let fullscreen_or_simple_fullscreen = native_fullscreen || simple_fullscreen;
+
+        if fullscreen_or_simple_fullscreen == self.macos_fullscreen_or_simple_fullscreen {
+            return;
+        }
+
+        self.macos_fullscreen_or_simple_fullscreen = fullscreen_or_simple_fullscreen;
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.dirty = true;
+        if self.display.window.has_frame {
+            self.display.window.request_redraw();
+        }
     }
 
     fn begin_tab_rename(&mut self, tab_id: TabId) {
@@ -1545,6 +1574,16 @@ impl WindowContext {
 
     pub(crate) fn close_tab(&mut self, tab_id: TabId) -> bool {
         let was_active = self.tabs.active_id() == Some(tab_id);
+        #[cfg(target_os = "macos")]
+        if was_active {
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                if let Some(web_view) = tab.web_view.as_mut() {
+                    web_view.set_focus(false);
+                    web_view.set_visible(false);
+                }
+            }
+        }
+
         let Some(tab) = self.tabs.remove(tab_id) else {
             return false;
         };
@@ -1563,6 +1602,9 @@ impl WindowContext {
 
         if was_active {
             if let Some(active_id) = self.tabs.active_id() {
+                // close_tab preselects the next active tab inside TabManager::remove.
+                // Reset the marker so set_active_tab runs full focus/visibility updates.
+                self.tabs.active = None;
                 self.set_active_tab(active_id);
             }
         }
@@ -3035,6 +3077,8 @@ impl WindowContext {
         scheduler: &mut Scheduler,
         event: WinitEvent<Event>,
     ) {
+        #[cfg(target_os = "macos")]
+        self.sync_macos_fullscreen_transition();
         #[cfg(target_os = "macos")]
         if self.handle_tab_panel_event(&event, event_proxy) {
             return;
