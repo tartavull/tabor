@@ -82,19 +82,36 @@ jobs:
           make dmg-universal
       - name: Notarize Application
         env:
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_NOTARY_API_ISSUER: ${{ secrets.APPLE_NOTARY_API_ISSUER }}
           APPLE_ID_USERNAME: ${{ secrets.APPLE_ID_USERNAME }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -z "$APPLE_ID_USERNAME" ] || [ -z "$APPLE_ID_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
-            echo "Missing notarization secrets: APPLE_ID_USERNAME, APPLE_ID_PASSWORD, APPLE_TEAM_ID."
+          if [ -z "$APPLE_TEAM_ID" ]; then
+            echo "Missing notarization secret: APPLE_TEAM_ID."
             exit 1
           fi
 
-          TABOR_NOTARY_APPLE_ID="$APPLE_ID_USERNAME" \
-          TABOR_NOTARY_APP_SPECIFIC_PASSWORD="$APPLE_ID_PASSWORD" \
-          TABOR_NOTARY_TEAM_ID="$APPLE_TEAM_ID" \
-          scripts/notarize-macos-app.sh ./target/release/osx/Tabor.app ./target/release/osx/Tabor.dmg
+          if [ -n "$APPLE_NOTARY_API_KEY_P8_BASE64" ] && [ -n "$APPLE_NOTARY_API_KEY_ID" ] && [ -n "$APPLE_NOTARY_API_ISSUER" ]; then
+            NOTARY_KEY_PATH="$RUNNER_TEMP/tabor-notary-api-key.p8"
+            printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+
+            TABOR_NOTARY_API_KEY_PATH="$NOTARY_KEY_PATH" \
+            TABOR_NOTARY_API_KEY_ID="$APPLE_NOTARY_API_KEY_ID" \
+            TABOR_NOTARY_API_ISSUER="$APPLE_NOTARY_API_ISSUER" \
+            scripts/notarize-macos-app.sh ./target/release/osx/Tabor.app ./target/release/osx/Tabor.dmg
+            rm -f "$NOTARY_KEY_PATH"
+          elif [ -n "$APPLE_ID_USERNAME" ] && [ -n "$APPLE_ID_PASSWORD" ]; then
+            TABOR_NOTARY_APPLE_ID="$APPLE_ID_USERNAME" \
+            TABOR_NOTARY_APP_SPECIFIC_PASSWORD="$APPLE_ID_PASSWORD" \
+            TABOR_NOTARY_TEAM_ID="$APPLE_TEAM_ID" \
+            scripts/notarize-macos-app.sh ./target/release/osx/Tabor.app ./target/release/osx/Tabor.dmg
+          else
+            echo "Missing notarization credentials. Provide API key secrets (APPLE_NOTARY_API_KEY_P8_BASE64, APPLE_NOTARY_API_KEY_ID, APPLE_NOTARY_API_ISSUER) or Apple ID secrets (APPLE_ID_USERNAME, APPLE_ID_PASSWORD), plus APPLE_TEAM_ID."
+            exit 1
+          fi
       - name: Upload Application
         run: |
           mv ./target/release/osx/Tabor.dmg ./Tabor-${GITHUB_REF##*/}.dmg
