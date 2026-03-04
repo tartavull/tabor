@@ -9,6 +9,12 @@
        src="https://raw.githubusercontent.com/tartavull/tabor/master/extra/promo/tabor-readme.png">
 </p>
 
+<p align="center">
+  <a href="https://github.com/tartavull/tabor/releases/latest/download/Tabor.dmg">
+    <img alt="Download Tabor.dmg" src="https://img.shields.io/badge/Download-black?style=for-the-badge&logo=apple">
+  </a>
+</p>
+
 ## About
 
 Tabor is a tabbed terminal forked from Alacritty that comes with sensible

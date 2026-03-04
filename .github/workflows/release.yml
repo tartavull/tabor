@@ -95,7 +95,9 @@ jobs:
       - name: Upload Application
         run: |
           mv ./target/release/osx/Tabor.dmg ./Tabor-${GITHUB_REF##*/}.dmg
+          cp ./Tabor-${GITHUB_REF##*/}.dmg ./Tabor.dmg
           ./.github/workflows/upload_asset.sh ./Tabor-${GITHUB_REF##*/}.dmg $GITHUB_TOKEN
+          ./.github/workflows/upload_asset.sh ./Tabor.dmg $GITHUB_TOKEN
       - name: Clean up keychain
         if: always()
         run: |
