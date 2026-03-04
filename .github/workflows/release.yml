@@ -84,6 +84,7 @@ jobs:
           fi
 
           echo "TABOR_CEF_PATH=$CEF_ROOT" >> "$GITHUB_ENV"
+          echo "CEF_PATH=$CEF_ROOT" >> "$GITHUB_ENV"
       - name: Make DMG
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
