@@ -17,7 +17,7 @@ pub fn normalize_web_url(input: &str) -> String {
 }
 
 fn is_local_host(input: &str) -> bool {
-    let end = input.find(|c| matches!(c, '/' | '?' | '#')).unwrap_or(input.len());
+    let end = input.find(['/', '?', '#']).unwrap_or(input.len());
     let mut host = &input[..end];
 
     if let Some((_, tail)) = host.rsplit_once('@') {

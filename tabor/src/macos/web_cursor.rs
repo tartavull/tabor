@@ -61,7 +61,7 @@ pub fn web_cursor_from_css(value: &str) -> Option<CursorIcon> {
         return None;
     }
 
-    let fallback = value.split(',').last().unwrap_or(value).trim();
+    let fallback = value.split(',').next_back().unwrap_or(value).trim();
     let fallback = fallback.trim_matches('"');
     let fallback = if fallback.is_empty() { "default" } else { fallback };
     let fallback = fallback.to_ascii_lowercase();

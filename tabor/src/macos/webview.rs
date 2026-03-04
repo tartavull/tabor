@@ -62,6 +62,7 @@ impl WebView {
         self.inner.handle_key_input(window, key, text, modifiers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_key_event(
         &mut self,
         key: &winit::keyboard::Key,

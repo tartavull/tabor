@@ -361,14 +361,8 @@ impl IpcRequest {
             | IpcRequest::WebNetwork { tab_id, .. }
             | IpcRequest::WebMouse { tab_id, .. }
             | IpcRequest::WebKey { tab_id, .. } => *tab_id,
-            IpcRequest::OpenUrl { target, .. } => match target {
-                UrlTarget::TabId { tab_id } => Some(*tab_id),
-                _ => None,
-            },
-            IpcRequest::SelectTab { selection } => match selection {
-                TabSelection::ById { tab_id } => Some(*tab_id),
-                _ => None,
-            },
+            IpcRequest::OpenUrl { target: UrlTarget::TabId { tab_id }, .. } => Some(*tab_id),
+            IpcRequest::SelectTab { selection: TabSelection::ById { tab_id } } => Some(*tab_id),
             _ => None,
         }
     }
@@ -607,7 +601,7 @@ pub trait IpcContext {
 pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcResponse {
     let now = Instant::now();
 
-    let response = match request {
+    match request {
         IpcRequest::Ping => IpcResponse { reply: SocketReply::Pong, close_window: false },
         IpcRequest::GetCapabilities => IpcResponse {
             reply: SocketReply::Capabilities { capabilities: IpcCapabilities::current() },
@@ -715,7 +709,7 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
         },
         IpcRequest::OpenUrl { url, target } => {
             let result = match target {
-                UrlTarget::NewTab => ctx.open_url_new_tab(url).map(|id| Some(id)),
+                UrlTarget::NewTab => ctx.open_url_new_tab(url).map(Some),
                 UrlTarget::TabId { tab_id } => {
                     ctx.open_url_in_tab(tab_id.into(), url).map(|_| None)
                 },
@@ -981,9 +975,7 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             ),
             close_window: false,
         },
-    };
-
-    response
+    }
 }
 
 /// Create an IPC socket.

@@ -91,7 +91,6 @@ use crate::{input, renderer};
 #[cfg(target_os = "macos")]
 use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
 #[cfg(target_os = "macos")]
-#[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
 use crate::macos::webview::WebView;
@@ -168,7 +167,7 @@ impl CefInspectorState {
 
     fn register_session(&self, session_id: &str) {
         let mut pending = self.pending.lock().unwrap();
-        pending.entry(session_id.to_string()).or_insert_with(VecDeque::new);
+        pending.entry(session_id.to_string()).or_default();
     }
 
     fn remove_session(&self, session_id: &str) {
@@ -180,9 +179,8 @@ impl CefInspectorState {
         let session_ids = self
             .sessions
             .iter()
-            .filter_map(|(session_id, session)| {
-                (session.tab_id == tab_id).then(|| session_id.clone())
-            })
+            .filter(|&(_session_id, session)| session.tab_id == tab_id)
+            .map(|(session_id, _session)| session_id.clone())
             .collect::<Vec<_>>();
         for session_id in session_ids {
             self.sessions.remove(&session_id);
@@ -387,13 +385,13 @@ impl TabManager {
 
     fn get(&self, tab_id: TabId) -> Option<&TabState> {
         self.slots.get(tab_id.slot_index()).and_then(|slot| {
-            (slot.generation == tab_id.generation).then_some(()).and_then(|_| slot.tab.as_ref())
+            (slot.generation == tab_id.generation).then_some(()).and(slot.tab.as_ref())
         })
     }
 
     fn get_mut(&mut self, tab_id: TabId) -> Option<&mut TabState> {
         self.slots.get_mut(tab_id.slot_index()).and_then(|slot| {
-            (slot.generation == tab_id.generation).then_some(()).and_then(|_| slot.tab.as_mut())
+            (slot.generation == tab_id.generation).then_some(()).and(slot.tab.as_mut())
         })
     }
 
@@ -903,6 +901,7 @@ impl WindowContext {
         Ok(context)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_tab(
         tabs: &mut TabManager,
         display: &Display,
@@ -999,8 +998,7 @@ impl WindowContext {
             shell_pid,
         };
 
-        tabs.insert(tab_id, tab, group_id, group_name)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        tabs.insert(tab_id, tab, group_id, group_name).map_err(std::io::Error::other)?;
         Ok(tab_id)
     }
 
@@ -1434,16 +1432,16 @@ impl WindowContext {
         }
 
         if let Some(active_tab) = self.tabs.get_mut(tab_id) {
-            if !active_tab.kind.is_web() {
-                active_tab.terminal.lock().is_focused = self.window_focused;
-                active_tab.activity.mark_seen();
-            } else {
+            if active_tab.kind.is_web() {
                 #[cfg(target_os = "macos")]
                 {
                     self.display.window.set_mouse_cursor(CursorIcon::Default);
                     active_tab.web_command_state.set_last_cursor(CursorIcon::Default);
                     active_tab.web_command_state.set_cursor_pending(false);
                 }
+            } else {
+                active_tab.terminal.lock().is_focused = self.window_focused;
+                active_tab.activity.mark_seen();
             }
             if !self.preserve_title && self.config.window.dynamic_title {
                 let title =
@@ -1837,9 +1835,8 @@ impl WindowContext {
     ) -> Result<(), IpcError> {
         #[cfg(target_os = "macos")]
         {
-            return self
-                .restore_closed_tab(proxy)
-                .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()));
+            self.restore_closed_tab(proxy)
+                .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()))
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1862,9 +1859,8 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         {
             let _ = proxy;
-            return self
-                .open_web_url_in_tab(tab_id, url)
-                .map_err(|err| IpcError::new(IpcErrorCode::InvalidRequest, err));
+            self.open_web_url_in_tab(tab_id, url)
+                .map_err(|err| IpcError::new(IpcErrorCode::InvalidRequest, err))
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1888,7 +1884,7 @@ impl WindowContext {
                 .create_tab(options, proxy)
                 .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()))?;
             self.command_history.record_url(url);
-            return Ok(tab_id);
+            Ok(tab_id)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1909,16 +1905,9 @@ impl WindowContext {
     ) -> Result<(), IpcError> {
         #[cfg(target_os = "macos")]
         {
-            return self.with_action_context(
-                tab_id,
-                event_loop,
-                event_proxy,
-                clipboard,
-                scheduler,
-                |ctx| {
-                    ctx.reload_web();
-                },
-            );
+            self.with_action_context(tab_id, event_loop, event_proxy, clipboard, scheduler, |ctx| {
+                ctx.reload_web();
+            })
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1939,16 +1928,9 @@ impl WindowContext {
     ) -> Result<(), IpcError> {
         #[cfg(target_os = "macos")]
         {
-            return self.with_action_context(
-                tab_id,
-                event_loop,
-                event_proxy,
-                clipboard,
-                scheduler,
-                |ctx| {
-                    ctx.open_web_inspector();
-                },
-            );
+            self.with_action_context(tab_id, event_loop, event_proxy, clipboard, scheduler, |ctx| {
+                ctx.open_web_inspector();
+            })
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -3788,9 +3770,7 @@ fn derive_key_code_from_key(key: &Key) -> Option<KeyCode> {
         },
         Key::Character(ch) => {
             let mut chars = ch.chars();
-            let Some(c) = chars.next() else {
-                return None;
-            };
+            let c = chars.next()?;
             if chars.next().is_some() {
                 return None;
             }

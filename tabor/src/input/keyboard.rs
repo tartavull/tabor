@@ -37,8 +37,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         let mut text = key.text_with_all_modifiers().unwrap_or_default();
-        if matches!(text.as_ref(), "\n" | "\r") {
-            text = "\r".into();
+        if matches!(text, "\n" | "\r") {
+            text = "\r";
         }
 
         // All key bindings are disabled while a hint is being selected.
@@ -57,7 +57,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         if self.ctx.command_active() {
-            self.handle_command_key(&key, &text);
+            self.handle_command_key(&key, text);
             return;
         }
 
@@ -71,7 +71,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         if self.ctx.window_kind().is_web() {
             #[cfg(target_os = "macos")]
-            if self.ctx.web_handle_key(&key, &text) {
+            if self.ctx.web_handle_key(&key, text) {
                 return;
             }
             return;
@@ -339,10 +339,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             #[cfg(target_os = "macos")]
             {
                 let mut text = key.text_with_all_modifiers().unwrap_or_default();
-                if matches!(text.as_ref(), "\n" | "\r") {
-                    text = "\r".into();
+                if matches!(text, "\n" | "\r") {
+                    text = "\r";
                 }
-                let _ = self.ctx.web_handle_key_release(&key, &text);
+                let _ = self.ctx.web_handle_key_release(&key, text);
             }
             return;
         }

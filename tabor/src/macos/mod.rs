@@ -95,8 +95,7 @@ fn cef_application_class() -> &'static AnyClass {
         let cls = if let Some(existing) = AnyClass::get(name) {
             existing
         } else {
-            let superclass_name =
-                CStr::from_bytes_with_nul(b"NSApplication\0").expect("static NSApplication class");
+            let superclass_name = c"NSApplication";
             let superclass =
                 AnyClass::get(superclass_name).expect("NSApplication class unavailable");
 

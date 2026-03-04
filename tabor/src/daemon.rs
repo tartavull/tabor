@@ -178,12 +178,12 @@ pub fn foreground_process_name(master_fd: RawFd, shell_pid: u32) -> Result<Strin
         let path = macos::proc::executable_path(pid)?;
         let name = path
             .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "foreground process has no name"))?
+            .ok_or_else(|| io::Error::other("foreground process has no name"))?
             .to_str()
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "foreground process name is not utf-8")
             })?;
-        return Ok(name.to_string());
+        Ok(name.to_string())
     }
 
     #[cfg(not(target_os = "macos"))]

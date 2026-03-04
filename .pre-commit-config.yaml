@@ -18,8 +18,8 @@ repos:
         always_run: true
 
       - id: cargo-clippy
-        name: cargo clippy --all-targets
-        entry: cargo clippy --all-targets
+        name: cargo clippy --all-targets -- -D warnings
+        entry: cargo clippy --all-targets -- -D warnings
         language: system
         pass_filenames: false
         always_run: true

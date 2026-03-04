@@ -1052,8 +1052,6 @@ mod tests {
             assert_eq!(generated, completion);
         }
 
-        if std::env::var("TABOR_GEN_COMPLETIONS").is_ok() {
-            return;
-        }
+        if std::env::var("TABOR_GEN_COMPLETIONS").is_ok() {}
     }
 }

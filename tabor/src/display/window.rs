@@ -546,7 +546,7 @@ impl Window {
             return None;
         }
 
-        let scale_factor = self.scale_factor as f64;
+        let scale_factor = self.scale_factor;
 
         let close_frame = close.frame();
         let mini_frame = mini.frame();

@@ -15,8 +15,8 @@ use winit::event_loop::EventLoopProxy;
 use crate::event::{Event, EventType};
 
 thread_local! {
-    static OPEN_DOCUMENTS_PROXY: RefCell<Option<EventLoopProxy<Event>>> = RefCell::new(None);
-    static OPEN_URL_EVENT_HANDLER: RefCell<Option<Retained<AnyObject>>> = RefCell::new(None);
+    static OPEN_DOCUMENTS_PROXY: RefCell<Option<EventLoopProxy<Event>>> = const { RefCell::new(None) };
+    static OPEN_URL_EVENT_HANDLER: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
 
 const AE_INTERNET_EVENT_CLASS: u32 = u32::from_be_bytes(*b"GURL");
@@ -56,8 +56,7 @@ unsafe extern "C-unwind" fn handle_get_url_event(
 }
 
 fn register_get_url_handler() {
-    let class_name =
-        CStr::from_bytes_with_nul(b"NSAppleEventManager\0").expect("static class name");
+    let class_name = c"NSAppleEventManager";
     let Some(manager_class) = AnyClass::get(class_name) else {
         return;
     };
@@ -105,8 +104,7 @@ fn open_url_event_handler_class() -> &'static AnyClass {
         let cls = if let Some(existing) = AnyClass::get(name) {
             existing
         } else {
-            let superclass_name =
-                CStr::from_bytes_with_nul(b"NSObject\0").expect("static NSObject class name");
+            let superclass_name = c"NSObject";
             let superclass = AnyClass::get(superclass_name).expect("NSObject class unavailable");
 
             let super_ptr = superclass as *const AnyClass;
@@ -140,7 +138,7 @@ fn open_url_event_handler_class() -> &'static AnyClass {
 }
 
 fn open_url_handler_class_name() -> &'static CStr {
-    CStr::from_bytes_with_nul(b"TaborOpenUrlEventHandler\0").expect("static class name")
+    c"TaborOpenUrlEventHandler"
 }
 
 unsafe fn add_method_raw(

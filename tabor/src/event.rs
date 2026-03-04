@@ -792,6 +792,7 @@ impl Processor {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
     fn window_for_ipc_request(&self, request: &IpcRequest) -> Result<WindowId, SocketReply> {
         if let Some(tab_id) = request.target_tab_id() {
             let tab_id: TabId = tab_id.into();
@@ -1556,6 +1557,7 @@ impl Default for CommandState {
 }
 
 /// URL history for command bar completions.
+#[derive(Default)]
 pub struct CommandHistory {
     urls: Vec<String>,
 }
@@ -1603,12 +1605,6 @@ impl CommandHistory {
         }
 
         None
-    }
-}
-
-impl Default for CommandHistory {
-    fn default() -> Self {
-        Self { urls: Vec::new() }
     }
 }
 
@@ -1669,6 +1665,7 @@ pub struct ActionContext<'a, N, T> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn request_web_cursor_update(
     web_view: &mut WebView,
     web_command_state: &mut WebCommandState,
@@ -1681,7 +1678,7 @@ pub(crate) fn request_web_cursor_update(
 ) {
     web_command_state.set_last_cursor_pos(position);
 
-    let scale_factor = display.window.scale_factor as f64;
+    let scale_factor = display.window.scale_factor;
     let size_info = display.size_info;
     let origin_x = f64::from(size_info.padding_x()) / scale_factor;
     let origin_y = f64::from(size_info.padding_y()) / scale_factor;
@@ -1919,7 +1916,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         request_web_cursor_update(
             web_view,
             self.web_command_state,
-            &self.display,
+            self.display,
             position,
             self.event_proxy,
             self.scheduler,
@@ -2962,7 +2959,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             Key::Named(NamedKey::Copy) => "c",
             Key::Named(NamedKey::Paste) => "v",
             Key::Named(NamedKey::Cut) => "x",
-            Key::Character(ch) => ch.as_ref(),
+            Key::Character(ch) => ch,
             _ => return false,
         };
 

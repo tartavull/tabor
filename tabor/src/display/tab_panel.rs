@@ -230,7 +230,7 @@ impl TabPanel {
         }
 
         let text = key.text_with_all_modifiers().unwrap_or_default();
-        if edit.insert_text(&text) {
+        if edit.insert_text(text) {
             TabPanelEditOutcome::Changed
         } else {
             TabPanelEditOutcome::None
@@ -293,7 +293,7 @@ impl TabPanel {
 
         let panel_size_info = self.panel_size_info(size_info);
         let resizing = self.resize.is_some();
-        let resize_hit = !self.drag.is_some() && self.is_on_resize_handle(position);
+        let resize_hit = self.drag.is_none() && self.is_on_resize_handle(position);
         let capture = self.should_capture(Some(position)) || resize_hit;
 
         if resizing {
@@ -1264,6 +1264,7 @@ impl TabPanel {
         RenderLayout { items }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_group_render_items(
         &self,
         items: &mut Vec<RenderItem>,

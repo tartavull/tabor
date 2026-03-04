@@ -2,15 +2,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WindowKind {
+    #[default]
     Terminal,
-    Web { url: String },
-}
-
-impl Default for WindowKind {
-    fn default() -> Self {
-        Self::Terminal
-    }
+    Web {
+        url: String,
+    },
 }
 
 impl WindowKind {

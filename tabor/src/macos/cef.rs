@@ -73,8 +73,8 @@ struct CefRuntime {
 }
 
 thread_local! {
-    static CEF_RUNTIME: RefCell<Option<CefRuntime>> = RefCell::new(None);
-    static CEF_LIBRARY_LOADED: Cell<bool> = Cell::new(false);
+    static CEF_RUNTIME: RefCell<Option<CefRuntime>> = const { RefCell::new(None) };
+    static CEF_LIBRARY_LOADED: Cell<bool> = const { Cell::new(false) };
 }
 
 static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -150,10 +150,12 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
 
     let args = Args::new();
     let mut app = TaborCefApp::new();
-    let mut settings = Settings::default();
-    settings.no_sandbox = 1;
-    settings.external_message_pump = 1;
-    settings.remote_debugging_port = remote_debugging_port();
+    let mut settings = Settings {
+        no_sandbox: 1,
+        external_message_pump: 1,
+        remote_debugging_port: remote_debugging_port(),
+        ..Settings::default()
+    };
 
     let cache_root = env::var("TABOR_CEF_CACHE_PATH")
         .map(PathBuf::from)
@@ -202,9 +204,7 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     );
 
     if ok != 1 {
-        return Err(
-            std::io::Error::new(std::io::ErrorKind::Other, "CEF initialization failed").into()
-        );
+        return Err(std::io::Error::other("CEF initialization failed").into());
     }
 
     CEF_RUNTIME.with(|cell| {
@@ -343,9 +343,7 @@ fn load_library(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
     });
 
     if !loaded {
-        return Err(
-            std::io::Error::new(std::io::ErrorKind::Other, "Failed to load CEF framework").into()
-        );
+        return Err(std::io::Error::other("Failed to load CEF framework").into());
     }
 
     let api_hash = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
@@ -355,11 +353,9 @@ fn load_library(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
         unsafe { CStr::from_ptr(api_hash) }.to_str().unwrap_or("")
     };
     if api_hash.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "CEF API hash mismatch; check CEF framework version",
-        )
-        .into());
+        return Err(
+            std::io::Error::other("CEF API hash mismatch; check CEF framework version").into()
+        );
     }
 
     debug!("CEF framework loaded from {}", framework_lib.display());
@@ -478,13 +474,10 @@ fn find_cef_sidecar_dir(framework_dir: &Path, libs: &[&str]) -> Option<PathBuf> 
         Some(framework_dir.to_path_buf()),
     ];
 
-    for candidate in candidates.into_iter().flatten() {
-        if libs.iter().all(|lib| candidate.join(lib).exists()) {
-            return Some(candidate);
-        }
-    }
-
-    None
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| libs.iter().all(|lib| candidate.join(lib).exists()))
 }
 
 pub fn is_initialized() -> bool {

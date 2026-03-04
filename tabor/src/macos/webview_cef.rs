@@ -395,9 +395,8 @@ impl WebView {
         url: &str,
         _proxy: &winit::event_loop::EventLoopProxy<Event>,
     ) -> Result<Self, Box<dyn Error>> {
-        let _mtm = MainThreadMarker::new().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "WebView must be created on main thread")
-        })?;
+        let _mtm = MainThreadMarker::new()
+            .ok_or_else(|| std::io::Error::other("WebView must be created on main thread"))?;
 
         crate::macos::cef::ensure_initialized()?;
         super::register_webview();
@@ -422,9 +421,7 @@ impl WebView {
                 None,
                 None,
             )
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "Failed to create CEF browser")
-            })?;
+            .ok_or_else(|| std::io::Error::other("Failed to create CEF browser"))?;
 
             if let Some(view) = browser_view(&browser) {
                 unsafe {
@@ -529,7 +526,7 @@ impl WebView {
     ) -> bool {
         let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
 
-        let scale_factor = window.scale_factor as f64;
+        let scale_factor = window.scale_factor;
         let origin_x = f64::from(size_info.padding_x()) / scale_factor;
         let origin_y = f64::from(size_info.padding_y()) / scale_factor;
         let width =
@@ -590,6 +587,7 @@ impl WebView {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_key_event(
         &self,
         key: &Key,
@@ -671,6 +669,7 @@ impl WebView {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_key_input_inner(
         &mut self,
         key: &Key,
@@ -697,42 +696,48 @@ impl WebView {
         match state {
             ElementState::Pressed => {
                 if windows_key_code != 0 {
-                    let mut down = cef::KeyEvent::default();
-                    down.type_ = cef::KeyEventType::KEYDOWN;
-                    down.modifiers = base_flags;
-                    down.windows_key_code = windows_key_code;
-                    down.native_key_code = native_key_code;
-                    down.is_system_key = 0;
-                    down.character = character;
-                    down.unmodified_character = unmodified_character;
-                    down.focus_on_editable_field = focus_on_editable_field;
+                    let down = cef::KeyEvent {
+                        type_: cef::KeyEventType::KEYDOWN,
+                        modifiers: base_flags,
+                        windows_key_code,
+                        native_key_code,
+                        is_system_key: 0,
+                        character,
+                        unmodified_character,
+                        focus_on_editable_field,
+                        ..cef::KeyEvent::default()
+                    };
                     events.push(down);
                 }
 
                 if should_send_char {
-                    let mut ch = cef::KeyEvent::default();
-                    ch.type_ = cef::KeyEventType::CHAR;
-                    ch.modifiers = base_flags;
-                    ch.windows_key_code = character as i32;
-                    ch.native_key_code = native_key_code;
-                    ch.is_system_key = 0;
-                    ch.character = character;
-                    ch.unmodified_character = unmodified_character;
-                    ch.focus_on_editable_field = focus_on_editable_field;
+                    let ch = cef::KeyEvent {
+                        type_: cef::KeyEventType::CHAR,
+                        modifiers: base_flags,
+                        windows_key_code: character as i32,
+                        native_key_code,
+                        is_system_key: 0,
+                        character,
+                        unmodified_character,
+                        focus_on_editable_field,
+                        ..cef::KeyEvent::default()
+                    };
                     events.push(ch);
                 }
             },
             ElementState::Released => {
                 if windows_key_code != 0 {
-                    let mut up = cef::KeyEvent::default();
-                    up.type_ = cef::KeyEventType::KEYUP;
-                    up.modifiers = base_flags;
-                    up.windows_key_code = windows_key_code;
-                    up.native_key_code = native_key_code;
-                    up.is_system_key = 0;
-                    up.character = 0;
-                    up.unmodified_character = 0;
-                    up.focus_on_editable_field = focus_on_editable_field;
+                    let up = cef::KeyEvent {
+                        type_: cef::KeyEventType::KEYUP,
+                        modifiers: base_flags,
+                        windows_key_code,
+                        native_key_code,
+                        is_system_key: 0,
+                        character: 0,
+                        unmodified_character: 0,
+                        focus_on_editable_field,
+                        ..cef::KeyEvent::default()
+                    };
                     events.push(up);
                 }
             },
@@ -876,9 +881,7 @@ impl WebView {
 
     pub fn poll_title(&mut self) -> Option<String> {
         let title = self.title_state.borrow().clone();
-        let Some(title) = title else {
-            return None;
-        };
+        let title = title?;
 
         if self.last_title.as_deref() == Some(&title) {
             return None;
@@ -1378,10 +1381,7 @@ fn devtools_location_value(location: KeyLocation) -> i32 {
 fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
     match window.raw_window_handle() {
         RawWindowHandle::AppKit(handle) => Ok(handle.ns_view.as_ptr() as *mut AnyObject),
-        _ => {
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "WebView requires an AppKit window")
-                .into())
-        },
+        _ => Err(std::io::Error::other("WebView requires an AppKit window").into()),
     }
 }
 
@@ -1398,7 +1398,7 @@ fn webview_frame(window: &Window, size_info: &SizeInfo) -> CGRect {
 }
 
 fn cef_rect(window: &Window, size_info: &SizeInfo) -> cef::Rect {
-    let scale_factor = window.scale_factor as f64;
+    let scale_factor = window.scale_factor;
     let x = (f64::from(size_info.padding_x()) / scale_factor) as i32;
     let y = (f64::from(size_info.padding_y()) / scale_factor) as i32;
     let width = (f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())

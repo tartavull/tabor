@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
@@ -965,9 +963,9 @@ pub fn run(options: AgentBrowserOptions) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn parse_args(
-    args: Vec<String>,
-) -> Result<(GlobalOptions, Option<String>, Vec<String>), Box<dyn Error>> {
+type ParsedArgs = (GlobalOptions, Option<String>, Vec<String>);
+
+fn parse_args(args: Vec<String>) -> Result<ParsedArgs, Box<dyn Error>> {
     let mut globals = GlobalOptions::default();
     let mut command: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
@@ -1400,7 +1398,7 @@ fn cmd_screenshot(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dy
         _ => return Err(shim_error("unexpected IPC reply for screenshot")),
     };
 
-    if let Some(path) = args.get(0) {
+    if let Some(path) = args.first() {
         std::fs::write(path, data)?;
     } else {
         let mut stdout = io::stdout();
@@ -1411,7 +1409,7 @@ fn cmd_screenshot(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dy
 }
 
 fn cmd_pdf(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let Some(path) = args.get(0) else {
+    let Some(path) = args.first() else {
         return Err(shim_error("pdf requires a path"));
     };
     let reply = send_request(IpcRequest::WebPdf { tab_id: None })?;
@@ -1633,8 +1631,7 @@ fn cmd_wait(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Err
             let result = web_eval_json(script)?;
             result.get("value").and_then(|v| v.as_bool()).unwrap_or(false)
         } else if let Some(url) = &url {
-            let script =
-                js_wrap(&format!("return JSON.stringify({{ value: window.location.href }});"));
+            let script = js_wrap("return JSON.stringify({ value: window.location.href });");
             let result = web_eval_json(script)?;
             let value = result.get("value").and_then(|v| v.as_str()).unwrap_or("");
             url_matches(url, value)
@@ -1780,7 +1777,7 @@ fn cmd_window(_globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
 }
 
 fn cmd_cookies(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let action = args.get(0).map(|v| v.as_str()).unwrap_or("get");
+    let action = args.first().map(|v| v.as_str()).unwrap_or("get");
     match action {
         "get" => {
             let script = js_wrap("return JSON.stringify({ value: document.cookie || '' });");
@@ -1856,27 +1853,25 @@ fn cmd_storage(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn E
 }
 
 fn cmd_session(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error>> {
-    if args.get(0).map(|v| v.as_str()) == Some("list") {
+    if args.first().map(|v| v.as_str()) == Some("list") {
         if globals.json {
             print_json(json!({ "sessions": ["default"] }))
         } else {
             println!("default");
             Ok(())
         }
+    } else if globals.json {
+        print_json(
+            json!({ "session": globals.session.clone().unwrap_or_else(|| "default".to_string()) }),
+        )
     } else {
-        if globals.json {
-            print_json(
-                json!({ "session": globals.session.clone().unwrap_or_else(|| "default".to_string()) }),
-            )
-        } else {
-            println!("{}", globals.session.clone().unwrap_or_else(|| "default".to_string()));
-            Ok(())
-        }
+        println!("{}", globals.session.clone().unwrap_or_else(|| "default".to_string()));
+        Ok(())
     }
 }
 
 fn cmd_network(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let Some(action) = args.get(0).map(|v| v.as_str()) else {
+    let Some(action) = args.first().map(|v| v.as_str()) else {
         return Err(shim_error("network requires an action"));
     };
 
@@ -2382,7 +2377,7 @@ fn cmd_record_worker(_globals: &GlobalOptions, args: &[String]) -> Result<(), Bo
 }
 
 fn record_start(globals: &GlobalOptions, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let path = args.get(0).ok_or_else(|| shim_error("record start requires a path"))?;
+    let path = args.first().ok_or_else(|| shim_error("record start requires a path"))?;
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -2634,5 +2629,5 @@ fn parse_key(input: &str) -> KeyInfo {
 }
 
 fn shim_error(message: impl Into<String>) -> Box<dyn Error> {
-    Box::new(io::Error::new(io::ErrorKind::Other, message.into()))
+    Box::new(io::Error::other(message.into()))
 }
