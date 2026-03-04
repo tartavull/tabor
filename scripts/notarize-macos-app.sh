@@ -117,6 +117,9 @@ xcrun stapler validate "$app_path"
 /usr/sbin/spctl --assess --type execute --verbose "$app_path"
 
 if [[ -n "$dmg_path" ]]; then
+  echo "Submitting DMG to Apple notary service"
+  xcrun notarytool submit "$dmg_path" "${auth_args[@]}" --wait --timeout 30m
+
   echo "Stapling ticket to DMG"
   xcrun stapler staple "$dmg_path"
 
