@@ -30,6 +30,8 @@ pub enum Topic {
     BlinkTimeout,
     ForegroundProcess,
     TabActivityTick,
+    CefPump,
+    CefWatchdog,
     WebCursor,
     Frame,
 }

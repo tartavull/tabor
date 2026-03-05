@@ -104,6 +104,14 @@ impl TaborHarness {
         serde_json::from_str(&stdout)
             .unwrap_or_else(|_| panic!("invalid json output from tabor: {stdout}"))
     }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn tmp_path(&self, name: &str) -> PathBuf {
+        self._tmp.path().join(name)
+    }
 }
 
 impl Drop for TaborHarness {
@@ -340,6 +348,121 @@ fn close_active_web_tab_refreshes_terminal_program_name() {
     );
 }
 
+#[test]
+fn close_active_web_tab_preserves_terminal_key_input_stream() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let initial_tabs = harness.run_json(["msg", "list-tabs"]);
+    let terminal_id =
+        first_terminal_tab_id(&initial_tabs).expect("missing initial terminal tab in list-tabs");
+    let tab_id_arg = format!("{}:{}", terminal_id.0, terminal_id.1);
+
+    let capture_path = harness.tmp_path("terminal-key-capture.txt");
+    let capture_path_str = capture_path.to_str().expect("capture path is not valid utf-8");
+    let command = format!("IFS= read -r line; printf '%s' \"$line\" > {}\n", capture_path_str);
+    harness.run_ok(["msg", "send-input", command.as_str(), "--tab-id", tab_id_arg.as_str()]);
+    thread::sleep(Duration::from_millis(200));
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    thread::sleep(Duration::from_millis(900));
+    harness.run_ok(["msg", "close-tab"]);
+
+    let sentinel = "alpha123beta456gamma789delta";
+    for ch in sentinel.chars() {
+        let key = ch.to_string();
+        send_terminal_key(&harness, terminal_id, key.as_str(), Some(key.as_str()));
+    }
+    send_terminal_key(&harness, terminal_id, "enter", None);
+
+    let captured =
+        wait_for_file_content(&capture_path, Duration::from_secs(6)).unwrap_or_else(|| {
+            panic!("timed out waiting for capture file: {}", capture_path.display())
+        });
+    assert_eq!(
+        captured, sentinel,
+        "terminal_key stream mismatch after opening and closing a web tab"
+    );
+}
+
+#[test]
+fn repeated_web_tab_close_releases_webview_resources() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+    let harness_pid = harness.pid();
+
+    let baseline = runtime_metrics(&harness);
+    let (baseline_live, baseline_created, baseline_dropped) = webview_counts(&baseline);
+    let baseline_close_count = web_close_count(&baseline);
+
+    let cycles = 8_u64;
+    let mut steady_children = None;
+
+    for iteration in 0..cycles {
+        let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+        assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+        thread::sleep(Duration::from_millis(200));
+        harness.run_ok(["msg", "close-tab"]);
+
+        let expected =
+            (baseline_live, baseline_created + iteration + 1, baseline_dropped + iteration + 1);
+        let settled = wait_for_webview_counts(&harness, expected, Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                panic!("timed out waiting for expected webview counts: {expected:?}")
+            });
+        let actual = webview_counts(&settled);
+        assert_eq!(
+            actual, expected,
+            "unexpected webview metrics after close cycle {iteration}: {settled}"
+        );
+
+        if iteration == 0 {
+            steady_children = Some(child_process_count(harness_pid));
+        }
+    }
+
+    let final_metrics = runtime_metrics(&harness);
+    let (final_live, final_created, final_dropped) = webview_counts(&final_metrics);
+    assert_eq!(
+        final_live, baseline_live,
+        "webview live count changed after close cycles: {final_metrics}"
+    );
+    assert_eq!(
+        final_created,
+        baseline_created + cycles,
+        "webview created count mismatch after close cycles: {final_metrics}"
+    );
+    assert_eq!(
+        final_dropped,
+        baseline_dropped + cycles,
+        "webview dropped count mismatch after close cycles: {final_metrics}"
+    );
+
+    let final_close_count = web_close_count(&final_metrics);
+    assert!(
+        final_close_count >= baseline_close_count + cycles,
+        "web close counter did not advance as expected: {final_metrics}"
+    );
+
+    let steady_children = steady_children.expect("steady child process baseline missing");
+    let child_cap = steady_children + 2;
+    let settled_children =
+        wait_for_child_process_count_max(harness_pid, child_cap, Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                let current = child_process_count(harness_pid);
+                panic!(
+                    "CEF subprocesses kept accumulating (steady={steady_children}, cap={child_cap}, current={current})"
+                )
+            });
+    assert!(
+        settled_children <= child_cap,
+        "child process count exceeded cap after close cycles: {settled_children} > {child_cap}"
+    );
+}
+
 fn flatten_tabs(response: &Value) -> Vec<&Value> {
     let mut tabs = Vec::new();
 
@@ -402,6 +525,130 @@ fn active_tab(response: &Value) -> Option<&Value> {
     flatten_tabs(response)
         .into_iter()
         .find(|tab| tab.get("is_active").and_then(Value::as_bool) == Some(true))
+}
+
+fn send_terminal_key(harness: &TaborHarness, tab_id: (u64, u64), key: &str, text: Option<&str>) {
+    let payload = json!({
+        "type": "terminal_key",
+        "tab_id": {
+            "index": tab_id.0,
+            "generation": tab_id.1
+        },
+        "input": {
+            "key": key,
+            "text": text,
+            "modifiers": {
+                "shift": false,
+                "control": false,
+                "alt": false,
+                "super_key": false
+            },
+            "repeat": false,
+            "state": "down"
+        }
+    });
+    let message = payload.to_string();
+    harness.run_ok(["msg", "send", message.as_str()]);
+}
+
+fn runtime_metrics(harness: &TaborHarness) -> Value {
+    let payload = json!({"type": "runtime_metrics"}).to_string();
+    harness.run_json(["msg", "send", payload.as_str()])
+}
+
+fn webview_counts(metrics_response: &Value) -> (u64, u64, u64) {
+    let metrics = metrics_response
+        .get("metrics")
+        .unwrap_or_else(|| panic!("missing metrics field: {metrics_response}"));
+    let webview = metrics
+        .get("webview")
+        .unwrap_or_else(|| panic!("missing webview field: {metrics_response}"));
+
+    let live = webview
+        .get("live")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing webview.live: {metrics_response}"));
+    let created = webview
+        .get("created")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing webview.created: {metrics_response}"));
+    let dropped = webview
+        .get("dropped")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing webview.dropped: {metrics_response}"));
+
+    (live, created, dropped)
+}
+
+fn web_close_count(metrics_response: &Value) -> u64 {
+    metrics_response
+        .get("metrics")
+        .and_then(|metrics| metrics.get("web_close"))
+        .and_then(|close| close.get("count"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing web_close.count: {metrics_response}"))
+}
+
+fn wait_for_webview_counts(
+    harness: &TaborHarness,
+    expected: (u64, u64, u64),
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let metrics = runtime_metrics(harness);
+        if webview_counts(&metrics) == expected {
+            return Some(metrics);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn child_process_count(parent_pid: u32) -> usize {
+    let output = Command::new("pgrep")
+        .arg("-P")
+        .arg(parent_pid.to_string())
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run pgrep for pid {parent_pid}: {err}"));
+
+    if !output.status.success() {
+        return 0;
+    }
+
+    String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn wait_for_child_process_count_max(
+    parent_pid: u32,
+    max_count: usize,
+    timeout: Duration,
+) -> Option<usize> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let count = child_process_count(parent_pid);
+        if count <= max_count {
+            return Some(count);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_file_content(path: &Path, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return Some(content);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
 }
 
 fn fixture_url() -> String {

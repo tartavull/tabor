@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::fmt::Write;
 use std::mem;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(feature = "passkey-webauthn")]
 use block2::RcBlock;
@@ -39,6 +39,8 @@ mod webview_cef;
 pub(crate) use open_documents::register_open_documents_handler;
 
 static WEBVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WEBVIEW_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WEBVIEW_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "passkey-webauthn")]
 static PASSKEY_AUTH_REQUESTED: AtomicBool = AtomicBool::new(false);
 thread_local! {
@@ -46,6 +48,21 @@ thread_local! {
     static PASSKEY_AUTH_BLOCK: RefCell<Option<RcBlock<dyn Fn(NSInteger)>>> = RefCell::new(None);
     static APP_NAP_ACTIVITY: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>> =
         RefCell::new(None);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WebViewMetrics {
+    pub live: usize,
+    pub created: u64,
+    pub dropped: u64,
+}
+
+pub(crate) fn webview_metrics() -> WebViewMetrics {
+    WebViewMetrics {
+        live: WEBVIEW_COUNT.load(Ordering::SeqCst),
+        created: WEBVIEW_CREATED_TOTAL.load(Ordering::SeqCst),
+        dropped: WEBVIEW_DROPPED_TOTAL.load(Ordering::SeqCst),
+    }
 }
 
 static CEF_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
@@ -204,6 +221,7 @@ pub fn set_background_activation() {
 
 pub(crate) fn register_webview() {
     let prev = WEBVIEW_COUNT.fetch_add(1, Ordering::SeqCst);
+    WEBVIEW_CREATED_TOTAL.fetch_add(1, Ordering::SeqCst);
     if prev == 0 {
         set_autofill_override(true);
         #[cfg(feature = "passkey-webauthn")]
@@ -217,6 +235,7 @@ pub(crate) fn unregister_webview() {
             if count == 0 { None } else { Some(count - 1) }
         })
         .expect("WebView autofill counter underflow");
+    WEBVIEW_DROPPED_TOTAL.fetch_add(1, Ordering::SeqCst);
 
     if prev == 1 {
         set_autofill_override(false);

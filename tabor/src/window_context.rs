@@ -75,9 +75,11 @@ use crate::event::{
 use crate::ipc;
 #[cfg(unix)]
 use crate::ipc::{
-    IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession, IpcInspectorTarget,
-    IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, SocketReply,
-    TabSelection, WebKeyInput, WebMouseAction, WebMouseButton, WebNetworkAction, WebNetworkEntry,
+    IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession,
+    IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind,
+    IpcTabPanelState, IpcTabState, IpcWebCloseMetrics, IpcWebViewMetrics, SocketReply,
+    TabSelection, TerminalKeyInput, WebKeyInput, WebMouseAction, WebMouseButton, WebNetworkAction,
+    WebNetworkEntry,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -134,6 +136,34 @@ struct TabState {
 #[cfg(target_os = "macos")]
 struct ClosedTab {
     kind: WindowKind,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default, Clone, PartialEq)]
+struct WebCloseMetrics {
+    count: u64,
+    last_ms: Option<f64>,
+    max_ms: f64,
+    total_ms: f64,
+}
+
+#[cfg(target_os = "macos")]
+impl WebCloseMetrics {
+    fn record_close(&mut self, elapsed_ms: f64) {
+        self.count = self.count.saturating_add(1);
+        self.last_ms = Some(elapsed_ms);
+        self.max_ms = self.max_ms.max(elapsed_ms);
+        self.total_ms += elapsed_ms;
+    }
+
+    fn to_ipc(&self) -> IpcWebCloseMetrics {
+        IpcWebCloseMetrics {
+            count: self.count,
+            last_ms: self.last_ms,
+            max_ms: self.max_ms,
+            total_ms: self.total_ms,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -728,6 +758,8 @@ pub struct WindowContext {
     #[cfg(target_os = "macos")]
     cef_inspector: CefInspectorState,
     #[cfg(target_os = "macos")]
+    web_close_metrics: WebCloseMetrics,
+    #[cfg(target_os = "macos")]
     macos_fullscreen_or_simple_fullscreen: bool,
     modifiers: Modifiers,
     occluded: bool,
@@ -891,6 +923,8 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             cef_inspector: CefInspectorState::new(),
             #[cfg(target_os = "macos")]
+            web_close_metrics: WebCloseMetrics::default(),
+            #[cfg(target_os = "macos")]
             macos_fullscreen_or_simple_fullscreen,
             dirty: Default::default(),
         };
@@ -1039,6 +1073,16 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
+    pub(crate) fn has_web_tab(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.kind.is_web())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn active_tab_is_web(&self) -> bool {
+        self.tabs.active().is_some_and(|tab| tab.kind.is_web())
+    }
+
+    #[cfg(target_os = "macos")]
     pub(crate) fn tab_panel_enabled(&self) -> bool {
         self.display.tab_panel.is_enabled()
     }
@@ -1162,7 +1206,6 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         {
             let active_id = self.tabs.active_id();
-            let mut active_web = false;
 
             for tab in self.tabs.iter_mut() {
                 let Some(web_view) = tab.web_view.as_mut() else {
@@ -1173,12 +1216,12 @@ impl WindowContext {
                 web_view.set_visible(visible);
                 web_view.set_focus(visible);
                 if visible {
-                    active_web = true;
-
                     web_view.update_frame(&self.display.window, &self.display.size_info);
                 }
             }
-            if active_web {
+
+            if active_id.is_some() {
+                // Keep the winit content view as first responder after web->terminal handoff.
                 self.display.window.focus_content_view();
             }
         }
@@ -1573,6 +1616,10 @@ impl WindowContext {
     pub(crate) fn close_tab(&mut self, tab_id: TabId) -> bool {
         let was_active = self.tabs.active_id() == Some(tab_id);
         #[cfg(target_os = "macos")]
+        let close_started = Instant::now();
+        #[cfg(target_os = "macos")]
+        let mut closed_web = false;
+        #[cfg(target_os = "macos")]
         if was_active {
             if let Some(tab) = self.tabs.get_mut(tab_id) {
                 if let Some(web_view) = tab.web_view.as_mut() {
@@ -1588,6 +1635,7 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         if tab.kind.is_web() {
+            closed_web = true;
             self.closed_tabs.push(ClosedTab { kind: tab.kind.clone() });
             const MAX_CLOSED_TABS: usize = 10;
             if self.closed_tabs.len() > MAX_CLOSED_TABS {
@@ -1597,6 +1645,12 @@ impl WindowContext {
         }
 
         let _ = tab.notifier.0.send(Msg::Shutdown);
+
+        #[cfg(target_os = "macos")]
+        if closed_web {
+            let elapsed_ms = close_started.elapsed().as_secs_f64() * 1_000.0;
+            self.web_close_metrics.record_close(elapsed_ms);
+        }
 
         if was_active {
             if let Some(active_id) = self.tabs.active_id() {
@@ -1975,6 +2029,37 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
+    pub(crate) fn ipc_runtime_metrics(&self) -> Result<IpcRuntimeMetrics, IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let webview = crate::macos::webview_metrics();
+            let cef_pump = crate::macos::cef::cef_pump_metrics();
+            Ok(IpcRuntimeMetrics {
+                webview: Some(IpcWebViewMetrics {
+                    live: webview.live as u64,
+                    created: webview.created,
+                    dropped: webview.dropped,
+                }),
+                web_close: Some(self.web_close_metrics.to_ipc()),
+                cef_pump: Some(IpcCefPumpMetrics {
+                    scheduled: cef_pump.scheduled,
+                    executed: cef_pump.executed,
+                    coalesced: cef_pump.coalesced,
+                    last_requested_delay_ms: cef_pump.last_requested_delay_ms,
+                    last_effective_delay_ms: cef_pump.last_effective_delay_ms,
+                    last_run_ms_ago: cef_pump.last_run_ms_ago,
+                    hidden_throttle_active: cef_pump.hidden_throttle_active,
+                }),
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(IpcRuntimeMetrics::default())
+        }
+    }
+
+    #[cfg(unix)]
     pub(crate) fn ipc_dispatch_action(
         &mut self,
         tab_id: TabId,
@@ -2002,6 +2087,41 @@ impl WindowContext {
         };
         tab.notifier.notify(text.into_bytes());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_terminal_key(
+        &mut self,
+        tab_id: TabId,
+        input: TerminalKeyInput,
+        event_loop: &ActiveEventLoop,
+        event_proxy: &EventLoopProxy<Event>,
+        clipboard: &mut Clipboard,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), IpcError> {
+        let Some(tab) = self.tabs.get(tab_id) else {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+        };
+        if tab.kind.is_web() {
+            return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a terminal tab"));
+        }
+
+        let bytes = terminal_key_bytes(input)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        self.with_action_context(
+            tab_id,
+            event_loop,
+            event_proxy,
+            clipboard,
+            scheduler,
+            move |ctx| {
+                input::ActionContext::on_terminal_input_start(ctx);
+                input::ActionContext::write_to_pty(ctx, bytes);
+            },
+        )
     }
 
     #[cfg(unix)]
@@ -3614,6 +3734,88 @@ impl WindowContext {
                 tab_terminal.resize(new_size);
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_key_bytes(input: TerminalKeyInput) -> Result<Vec<u8>, IpcError> {
+    if input.state != crate::ipc::WebKeyState::Down {
+        return Ok(Vec::new());
+    }
+
+    let text = match input.text {
+        Some(text) => text,
+        None => default_terminal_key_text(&input.key)?,
+    };
+
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    if input.modifiers.alt {
+        bytes.push(0x1b);
+    }
+
+    if input.modifiers.control {
+        if let Some(control) = terminal_control_byte(&text) {
+            bytes.push(control);
+            return Ok(bytes);
+        }
+    }
+
+    bytes.extend_from_slice(text.as_bytes());
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn default_terminal_key_text(key: &str) -> Result<String, IpcError> {
+    let trimmed = key.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let text = match lowered.as_str() {
+        "enter" => "\r".to_string(),
+        "tab" => "\t".to_string(),
+        "backspace" => "\u{7f}".to_string(),
+        "space" => " ".to_string(),
+        _ => {
+            let mut chars = trimmed.chars();
+            let Some(ch) = chars.next() else {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "key is empty"));
+            };
+            if chars.next().is_some() {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "terminal_key requires text for multi-character keys",
+                ));
+            }
+            ch.to_string()
+        },
+    };
+
+    Ok(text)
+}
+
+#[cfg(unix)]
+fn terminal_control_byte(text: &str) -> Option<u8> {
+    let mut chars = text.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+
+    if ch.is_ascii_alphabetic() {
+        return Some((ch.to_ascii_uppercase() as u8) & 0x1f);
+    }
+
+    match ch {
+        '@' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
     }
 }
 

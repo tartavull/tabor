@@ -6,7 +6,9 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use log::debug;
 
@@ -15,9 +17,72 @@ use objc2::{MainThreadMarker, msg_send, sel};
 use objc2_app_kit::NSApplication;
 
 use cef::{
-    self, App, CefString, ImplApp, ImplCommandLine, LogSeverity, Settings, WrapApp, args::Args,
-    rc::Rc,
+    self, App, BrowserProcessHandler, CefString, ImplApp, ImplBrowserProcessHandler,
+    ImplCommandLine, LogSeverity, Settings, WrapApp, WrapBrowserProcessHandler, args::Args, rc::Rc,
 };
+
+#[cfg(feature = "passkey-webauthn")]
+const DISABLE_FEATURES: &str = "CalculateNativeWinOcclusion";
+
+#[cfg(not(feature = "passkey-webauthn"))]
+const DISABLE_FEATURES: &str = "CalculateNativeWinOcclusion,WebAuthentication,WebAuthenticationAPI,ContentWebAuthenticationAPI,WebBluetooth,ContentWebBluetooth,WebBluetoothNewPermissionsBackend";
+
+#[cfg(not(feature = "passkey-webauthn"))]
+const DISABLE_BLINK_FEATURES: &str = "WebAuthentication,WebBluetooth";
+
+type MessagePumpNotifier = Arc<dyn Fn(Duration) + Send + Sync + 'static>;
+
+const METRICS_NONE: u64 = u64::MAX;
+const MAX_MESSAGE_PUMP_DELAY_MS: u64 = 10_000;
+
+static MESSAGE_PUMP_NOTIFIER: OnceLock<MessagePumpNotifier> = OnceLock::new();
+static CEF_PUMP_SCHEDULED: AtomicU64 = AtomicU64::new(0);
+static CEF_PUMP_EXECUTED: AtomicU64 = AtomicU64::new(0);
+static CEF_PUMP_COALESCED: AtomicU64 = AtomicU64::new(0);
+static CEF_PUMP_LAST_REQUESTED_DELAY_MS: AtomicU64 = AtomicU64::new(METRICS_NONE);
+static CEF_PUMP_LAST_EFFECTIVE_DELAY_MS: AtomicU64 = AtomicU64::new(METRICS_NONE);
+static CEF_PUMP_HIDDEN_THROTTLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CEF_PUMP_LAST_RUN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CefPumpMetrics {
+    pub scheduled: u64,
+    pub executed: u64,
+    pub coalesced: u64,
+    pub last_requested_delay_ms: Option<u64>,
+    pub last_effective_delay_ms: Option<u64>,
+    pub last_run_ms_ago: Option<u64>,
+    pub hidden_throttle_active: bool,
+}
+
+fn last_run_lock() -> &'static Mutex<Option<Instant>> {
+    CEF_PUMP_LAST_RUN.get_or_init(|| Mutex::new(None))
+}
+
+fn decode_metric(value: u64) -> Option<u64> {
+    if value == METRICS_NONE { None } else { Some(value) }
+}
+
+fn schedule_message_pump_work(delay_ms: i64) {
+    let normalized_delay_ms = delay_ms.max(0) as u64;
+    let clamped_delay_ms = normalized_delay_ms.min(MAX_MESSAGE_PUMP_DELAY_MS);
+    CEF_PUMP_SCHEDULED.fetch_add(1, Ordering::Relaxed);
+    CEF_PUMP_LAST_REQUESTED_DELAY_MS.store(clamped_delay_ms, Ordering::Relaxed);
+
+    if let Some(notifier) = MESSAGE_PUMP_NOTIFIER.get() {
+        notifier(Duration::from_millis(clamped_delay_ms));
+    }
+}
+
+cef::wrap_browser_process_handler! {
+    struct TaborBrowserProcessHandler {}
+
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            schedule_message_pump_work(delay_ms);
+        }
+    }
+}
 
 cef::wrap_app! {
     struct TaborCefApp {}
@@ -50,18 +115,26 @@ cef::wrap_app! {
             command_line.append_switch(Some(&disable_occluded));
 
             let disable_features = cef::CefString::from("disable-features");
-            #[cfg(feature = "passkey-webauthn")]
-            let disable_features_value = cef::CefString::from("CalculateNativeWinOcclusion");
-            #[cfg(not(feature = "passkey-webauthn"))]
-            let disable_features_value =
-                cef::CefString::from("CalculateNativeWinOcclusion,WebAuthentication");
+            let disable_features_value = cef::CefString::from(DISABLE_FEATURES);
             command_line.append_switch_with_value(Some(&disable_features), Some(&disable_features_value));
 
             #[cfg(not(feature = "passkey-webauthn"))]
             {
+                let disable_blink_features = cef::CefString::from("disable-blink-features");
+                let disable_blink_features_value =
+                    cef::CefString::from(DISABLE_BLINK_FEATURES);
+                command_line.append_switch_with_value(
+                    Some(&disable_blink_features),
+                    Some(&disable_blink_features_value),
+                );
+
                 let disable_webauthn = cef::CefString::from("disable-webauthn");
                 command_line.append_switch(Some(&disable_webauthn));
             }
+        }
+
+        fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
+            Some(TaborBrowserProcessHandler::new())
         }
     }
 }
@@ -218,7 +291,53 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
 
 pub fn do_message_loop_work() {
     if is_initialized() {
+        CEF_PUMP_EXECUTED.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last_run) = last_run_lock().lock() {
+            *last_run = Some(Instant::now());
+        }
         cef::do_message_loop_work();
+    }
+}
+
+pub fn register_message_pump_notifier<F>(notifier: F)
+where
+    F: Fn(Duration) + Send + Sync + 'static,
+{
+    let _ = MESSAGE_PUMP_NOTIFIER.set(Arc::new(notifier));
+}
+
+pub fn record_message_pump_schedule(
+    delay: Duration,
+    coalesced: bool,
+    hidden_throttle_active: bool,
+) {
+    let delay_ms = delay.as_millis().min(MAX_MESSAGE_PUMP_DELAY_MS as u128) as u64;
+    CEF_PUMP_LAST_EFFECTIVE_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+    CEF_PUMP_HIDDEN_THROTTLE_ACTIVE.store(hidden_throttle_active, Ordering::Relaxed);
+    if coalesced {
+        CEF_PUMP_COALESCED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn cef_pump_metrics() -> CefPumpMetrics {
+    let last_run_ms_ago = if let Ok(last_run) = last_run_lock().lock() {
+        last_run.map(|instant| Instant::now().saturating_duration_since(instant).as_millis() as u64)
+    } else {
+        None
+    };
+
+    CefPumpMetrics {
+        scheduled: CEF_PUMP_SCHEDULED.load(Ordering::Relaxed),
+        executed: CEF_PUMP_EXECUTED.load(Ordering::Relaxed),
+        coalesced: CEF_PUMP_COALESCED.load(Ordering::Relaxed),
+        last_requested_delay_ms: decode_metric(
+            CEF_PUMP_LAST_REQUESTED_DELAY_MS.load(Ordering::Relaxed),
+        ),
+        last_effective_delay_ms: decode_metric(
+            CEF_PUMP_LAST_EFFECTIVE_DELAY_MS.load(Ordering::Relaxed),
+        ),
+        last_run_ms_ago,
+        hidden_throttle_active: CEF_PUMP_HIDDEN_THROTTLE_ACTIVE.load(Ordering::Relaxed),
     }
 }
 
@@ -229,6 +348,12 @@ pub fn shutdown() {
             *cell.borrow_mut() = None;
         });
         CEF_INITIALIZED.store(false, Ordering::Relaxed);
+        CEF_PUMP_LAST_REQUESTED_DELAY_MS.store(METRICS_NONE, Ordering::Relaxed);
+        CEF_PUMP_LAST_EFFECTIVE_DELAY_MS.store(METRICS_NONE, Ordering::Relaxed);
+        CEF_PUMP_HIDDEN_THROTTLE_ACTIVE.store(false, Ordering::Relaxed);
+        if let Ok(mut last_run) = last_run_lock().lock() {
+            *last_run = None;
+        }
     }
 }
 
@@ -547,4 +672,39 @@ fn remote_debugging_port() -> i32 {
         .unwrap_or(0);
 
     if port < 0 { 0 } else { port }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn non_passkey_disable_features_cover_webauthn_and_bluetooth() {
+        let parts = DISABLE_FEATURES.split(',').collect::<Vec<_>>();
+        for required in [
+            "WebAuthentication",
+            "WebAuthenticationAPI",
+            "ContentWebAuthenticationAPI",
+            "WebBluetooth",
+            "ContentWebBluetooth",
+            "WebBluetoothNewPermissionsBackend",
+        ] {
+            assert!(parts.contains(&required), "missing disable feature: {required}");
+        }
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn non_passkey_disable_blink_features_cover_webauthn_and_bluetooth() {
+        let parts = DISABLE_BLINK_FEATURES.split(',').collect::<Vec<_>>();
+        assert!(parts.contains(&"WebAuthentication"));
+        assert!(parts.contains(&"WebBluetooth"));
+    }
+
+    #[cfg(feature = "passkey-webauthn")]
+    #[test]
+    fn passkey_build_keeps_only_occlusion_feature_disable() {
+        assert_eq!(DISABLE_FEATURES, "CalculateNativeWinOcclusion");
+    }
 }

@@ -13,7 +13,8 @@ COMPLETIONS = $(COMPLETIONS_DIR)/_tabor \
 	$(COMPLETIONS_DIR)/tabor.fish
 
 APP_NAME = Tabor.app
-APP_TEMPLATE = $(ASSETS_DIR)/osx/$(APP_NAME)
+APP_TEMPLATE_INFO = $(ASSETS_DIR)/osx/Tabor.Info.plist
+APP_TEMPLATE_ICON = $(ASSETS_DIR)/osx/tabor.icns
 APP_DIR = $(RELEASE_DIR)/osx
 APP_BINARY = $(RELEASE_DIR)/$(TARGET)
 APP_BINARY_DIR = $(APP_DIR)/$(APP_NAME)/Contents/MacOS
@@ -89,6 +90,7 @@ $(TARGET)-universal:
 	@lipo target/{x86_64,aarch64}-apple-darwin/release/$(TARGET) -create -output $(APP_BINARY)
 
 $(APP_NAME)-%: $(TARGET)-%
+	@rm -rf $(APP_DIR)/$(APP_NAME)
 	@mkdir -p $(APP_BINARY_DIR)
 	@mkdir -p $(APP_EXTRAS_DIR)
 	@mkdir -p $(APP_COMPLETIONS_DIR)
@@ -97,7 +99,8 @@ $(APP_NAME)-%: $(TARGET)-%
 	@scdoc < $(MANPAGE-CONFIG) | gzip -c > $(APP_EXTRAS_DIR)/tabor.5.gz
 	@scdoc < $(MANPAGE-CONFIG-BINDINGS) | gzip -c > $(APP_EXTRAS_DIR)/tabor-bindings.5.gz
 	@tic -xe tabor,tabor-direct -o $(APP_EXTRAS_DIR) $(TERMINFO)
-	@cp -fRp $(APP_TEMPLATE) $(APP_DIR)
+	@cp -fp $(APP_TEMPLATE_INFO) $(APP_DIR)/$(APP_NAME)/Contents/Info.plist
+	@cp -fp $(APP_TEMPLATE_ICON) $(APP_EXTRAS_DIR)/tabor.icns
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
 	@cp -fp $(APP_RESOURCE_ENTITLEMENTS) $(APP_EXTRAS_DIR)/Tabor.entitlements
 	@scripts/bundle-macos-deps.sh $(APP_DIR)/$(APP_NAME)

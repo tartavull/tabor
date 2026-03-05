@@ -148,6 +148,20 @@ impl TabPanel {
         if self.groups != groups {
             self.groups = groups;
             self.validate_edit_target();
+
+            if self.hover.tab.is_some_and(|tab_id| self.find_tab(tab_id).is_none()) {
+                self.hover = HoverState::default();
+            }
+
+            let drag_invalid = self.drag.as_ref().is_some_and(|drag| match drag.item {
+                DragItem::Tab(tab_id) => self.find_tab(tab_id).is_none(),
+                DragItem::Group { group_id } => self.find_group(group_id).is_none(),
+            });
+            if drag_invalid {
+                self.drag = None;
+                self.drop_target = None;
+            }
+
             changed = true;
         }
 
@@ -1802,3 +1816,101 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 const DRAG_THRESHOLD_PX: f64 = 4.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{ElementState, MouseButton};
+
+    use crate::display::SizeInfo;
+    use crate::window_kind::TabKind;
+
+    fn panel_tab(tab_id: TabId, is_active: bool) -> TabPanelTab {
+        TabPanelTab {
+            tab_id,
+            title: format!("tab-{}", tab_id.index),
+            is_active,
+            kind: TabKind::Web { url: String::from("https://example.com") },
+            activity: None,
+            #[cfg(target_os = "macos")]
+            favicon: None,
+        }
+    }
+
+    fn group_with_tabs(tabs: &[(TabId, bool)]) -> TabPanelGroup {
+        TabPanelGroup {
+            id: 1,
+            label: String::from("group 1"),
+            tabs: tabs.iter().map(|(tab_id, is_active)| panel_tab(*tab_id, *is_active)).collect(),
+        }
+    }
+
+    fn panel_and_size() -> (TabPanel, SizeInfo) {
+        let mut panel = TabPanel::new();
+        panel.set_enabled(true);
+        panel.set_dimensions(PanelDimensions { columns: 20, width: 200.0 });
+
+        let size_info = SizeInfo::new(800.0, 600.0, 10.0, 20.0, 0.0, 0.0, 0.0, false);
+        (panel, size_info)
+    }
+
+    #[test]
+    fn closing_pressed_tab_without_release_drops_stale_drag_item() {
+        let first_tab = TabId::new(1, 0);
+        let second_tab = TabId::new(2, 0);
+
+        let (mut panel, size_info) = panel_and_size();
+        let _ = panel
+            .set_groups(vec![group_with_tabs(&[(first_tab, true), (second_tab, false)])], None);
+
+        let first_tab_pos = PhysicalPosition::new(20.0, 30.0);
+        let first_hover = panel.cursor_moved(first_tab_pos, &size_info);
+        assert!(first_hover.capture);
+
+        let press = panel.mouse_input(ElementState::Pressed, MouseButton::Left, &size_info);
+        assert!(press.capture);
+
+        let _ = panel.set_groups(vec![group_with_tabs(&[(second_tab, true)])], None);
+
+        let second_tab_pos = PhysicalPosition::new(20.0, 40.0);
+        let drag_move = panel.cursor_moved(second_tab_pos, &size_info);
+        assert!(drag_move.capture);
+
+        let release = panel.mouse_input(ElementState::Released, MouseButton::Left, &size_info);
+        assert!(
+            matches!(release.command, Some(TabPanelCommand::Focus(tab_id)) if tab_id == second_tab),
+            "expected focus on surviving tab, got {:?}",
+            release.command
+        );
+    }
+
+    #[test]
+    fn dragging_tab_without_group_refresh_emits_move_command() {
+        let first_tab = TabId::new(1, 0);
+        let second_tab = TabId::new(2, 0);
+
+        let (mut panel, size_info) = panel_and_size();
+        let _ = panel
+            .set_groups(vec![group_with_tabs(&[(first_tab, true), (second_tab, false)])], None);
+
+        let first_tab_pos = PhysicalPosition::new(20.0, 30.0);
+        let first_hover = panel.cursor_moved(first_tab_pos, &size_info);
+        assert!(first_hover.capture);
+
+        let press = panel.mouse_input(ElementState::Pressed, MouseButton::Left, &size_info);
+        assert!(press.capture);
+
+        let target_pos = PhysicalPosition::new(20.0, 52.0);
+        let drag_move = panel.cursor_moved(target_pos, &size_info);
+        assert!(drag_move.capture);
+
+        let release = panel.mouse_input(ElementState::Released, MouseButton::Left, &size_info);
+        assert!(
+            matches!(release.command, Some(TabPanelCommand::Move { tab_id, .. }) if tab_id == first_tab),
+            "expected drag move command, got {:?}",
+            release.command
+        );
+    }
+}

@@ -11,8 +11,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use cef::{
     CefString, Client, DevToolsMessageObserver, DisplayHandler, ImplBrowser, ImplBrowserHost,
     ImplClient, ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplFrame,
-    ImplListValue, ImplTask, Task, WrapClient, WrapDevToolsMessageObserver, WrapDisplayHandler,
-    WrapTask, rc::Rc,
+    ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler, ImplPermissionPromptCallback,
+    ImplTask, PermissionHandler, PermissionRequestResult, Task, WrapClient,
+    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapPermissionHandler, WrapTask, rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
@@ -346,6 +347,158 @@ cef::wrap_display_handler! {
     }
 }
 
+#[cfg(not(feature = "passkey-webauthn"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionDecision {
+    Allow,
+    Deny,
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+fn all_known_permission_mask() -> u32 {
+    use cef::PermissionRequestTypes as Permission;
+
+    Permission::AR_SESSION.get_raw()
+        | Permission::CAMERA_PAN_TILT_ZOOM.get_raw()
+        | Permission::CAMERA_STREAM.get_raw()
+        | Permission::CAPTURED_SURFACE_CONTROL.get_raw()
+        | Permission::CLIPBOARD.get_raw()
+        | Permission::TOP_LEVEL_STORAGE_ACCESS.get_raw()
+        | Permission::DISK_QUOTA.get_raw()
+        | Permission::LOCAL_FONTS.get_raw()
+        | Permission::GEOLOCATION.get_raw()
+        | Permission::HAND_TRACKING.get_raw()
+        | Permission::IDENTITY_PROVIDER.get_raw()
+        | Permission::IDLE_DETECTION.get_raw()
+        | Permission::MIC_STREAM.get_raw()
+        | Permission::MIDI_SYSEX.get_raw()
+        | Permission::MULTIPLE_DOWNLOADS.get_raw()
+        | Permission::NOTIFICATIONS.get_raw()
+        | Permission::KEYBOARD_LOCK.get_raw()
+        | Permission::POINTER_LOCK.get_raw()
+        | Permission::PROTECTED_MEDIA_IDENTIFIER.get_raw()
+        | Permission::REGISTER_PROTOCOL_HANDLER.get_raw()
+        | Permission::STORAGE_ACCESS.get_raw()
+        | Permission::VR_SESSION.get_raw()
+        | Permission::WEB_APP_INSTALLATION.get_raw()
+        | Permission::WINDOW_MANAGEMENT.get_raw()
+        | Permission::FILE_SYSTEM_ACCESS.get_raw()
+        | Permission::LOCAL_NETWORK_ACCESS.get_raw()
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+fn blocked_permission_mask() -> u32 {
+    use cef::PermissionRequestTypes as Permission;
+
+    Permission::AR_SESSION.get_raw()
+        | Permission::VR_SESSION.get_raw()
+        | Permission::HAND_TRACKING.get_raw()
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+fn permission_decision(requested_permissions: u32) -> PermissionDecision {
+    if requested_permissions == 0 {
+        return PermissionDecision::Deny;
+    }
+
+    let unknown_permissions = requested_permissions & !all_known_permission_mask();
+    if unknown_permissions != 0 {
+        return PermissionDecision::Deny;
+    }
+
+    if requested_permissions & blocked_permission_mask() != 0 {
+        return PermissionDecision::Deny;
+    }
+
+    PermissionDecision::Allow
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+fn should_block_permission_request(requested_permissions: u32) -> bool {
+    matches!(permission_decision(requested_permissions), PermissionDecision::Deny)
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+fn log_blocked_permission_request(
+    source: &str,
+    requesting_origin: Option<&cef::CefString>,
+    requested_permissions: u32,
+) {
+    let origin = requesting_origin
+        .map(|origin| origin.to_string())
+        .unwrap_or_else(|| String::from("<unknown>"));
+    debug!(
+        "Denied CEF permission request (source={source}, origin={origin}, mask=0x{requested_permissions:08x})"
+    );
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+cef::wrap_permission_handler! {
+    struct TaborPermissionHandler {}
+
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            requesting_origin: Option<&cef::CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut cef::MediaAccessCallback>,
+        ) -> ::std::os::raw::c_int {
+            if should_block_permission_request(requested_permissions) {
+                if let Some(callback) = callback {
+                    callback.cancel();
+                }
+                log_blocked_permission_request(
+                    "media_access",
+                    requesting_origin,
+                    requested_permissions,
+                );
+                return 1;
+            }
+
+            0
+        }
+
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _prompt_id: u64,
+            requesting_origin: Option<&cef::CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut cef::PermissionPromptCallback>,
+        ) -> ::std::os::raw::c_int {
+            if should_block_permission_request(requested_permissions) {
+                if let Some(callback) = callback {
+                    callback.cont(PermissionRequestResult::DENY);
+                }
+                log_blocked_permission_request("prompt", requesting_origin, requested_permissions);
+                return 1;
+            }
+
+            0
+        }
+    }
+}
+#[cfg(not(feature = "passkey-webauthn"))]
+cef::wrap_client! {
+    struct TaborClient {
+        display_handler: cef::DisplayHandler,
+        permission_handler: cef::PermissionHandler,
+    }
+
+    impl Client {
+        fn display_handler(&self) -> Option<cef::DisplayHandler> {
+            Some(self.display_handler.clone())
+        }
+
+        fn permission_handler(&self) -> Option<cef::PermissionHandler> {
+            Some(self.permission_handler.clone())
+        }
+    }
+}
+
+#[cfg(feature = "passkey-webauthn")]
 cef::wrap_client! {
     struct TaborClient {
         display_handler: cef::DisplayHandler,
@@ -372,6 +525,18 @@ cef::wrap_task! {
             for event in &self.events {
                 host.send_key_event(Some(event));
             }
+        }
+    }
+}
+
+cef::wrap_task! {
+    struct CloseBrowserTask {
+        browser: cef::Browser,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            close_browser_resources(&self.browser);
         }
     }
 }
@@ -409,6 +574,12 @@ impl WebView {
 
             let title_state = StdRc::new(RefCell::new(None));
             let display_handler = TaborDisplayHandler::new(title_state.clone());
+            #[cfg(not(feature = "passkey-webauthn"))]
+            let mut client = {
+                let permission_handler = TaborPermissionHandler::new();
+                TaborClient::new(display_handler, permission_handler)
+            };
+            #[cfg(feature = "passkey-webauthn")]
             let mut client = TaborClient::new(display_handler);
 
             let browser_settings = cef::BrowserSettings::default();
@@ -1024,9 +1195,13 @@ impl WebView {
 
 impl Drop for WebView {
     fn drop(&mut self) {
-        if let Some(host) = self.browser.host() {
-            host.close_browser(1);
+        if cef::currently_on(cef::ThreadId::UI) == 1 {
+            close_browser_resources(&self.browser);
+        } else {
+            let mut task = CloseBrowserTask::new(self.browser.clone());
+            let _ = cef::post_task(cef::ThreadId::UI, Some(&mut task));
         }
+
         super::unregister_webview();
     }
 }
@@ -1414,6 +1589,18 @@ fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
     if view.is_null() { None } else { Some(view) }
 }
 
+fn close_browser_resources(browser: &cef::Browser) {
+    if let Some(view) = browser_view(browser) {
+        unsafe {
+            let _: () = msg_send![view, removeFromSuperview];
+        }
+    }
+
+    if let Some(host) = browser.host() {
+        host.close_browser(1);
+    }
+}
+
 // Keep the embedded CEF view from stealing keyboard focus.
 //
 // Tabor routes keyboard events through winit even for web tabs (command bar, vi-like bindings,
@@ -1501,4 +1688,51 @@ fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
         let _ = write!(&mut types, "{enc}");
     }
     CString::new(types).expect("method type encoding")
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "passkey-webauthn"))]
+    use super::{PermissionDecision, permission_decision, should_block_permission_request};
+    #[cfg(not(feature = "passkey-webauthn"))]
+    use cef::PermissionRequestTypes as Permission;
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn permission_policy_allows_known_safe_permissions() {
+        let permissions = Permission::CAMERA_STREAM.get_raw() | Permission::MIC_STREAM.get_raw();
+        assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
+        assert!(!should_block_permission_request(permissions));
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn permission_policy_denies_blocked_permissions() {
+        let permissions = Permission::AR_SESSION.get_raw();
+        assert_eq!(permission_decision(permissions), PermissionDecision::Deny);
+        assert!(should_block_permission_request(permissions));
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn permission_policy_denies_unknown_permissions() {
+        let unknown_bit = 1_u32 << 30;
+        assert_eq!(permission_decision(unknown_bit), PermissionDecision::Deny);
+        assert!(should_block_permission_request(unknown_bit));
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn permission_policy_denies_empty_permissions() {
+        assert_eq!(permission_decision(0), PermissionDecision::Deny);
+        assert!(should_block_permission_request(0));
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn permission_policy_allows_local_network_permission() {
+        let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
+        assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
+        assert!(!should_block_permission_request(permissions));
+    }
 }

@@ -249,10 +249,14 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
 
     build_tabor_binary(root, options)?;
 
-    let app_template = root.join("extra").join("osx").join("Tabor.app");
+    let app_template_info = root.join("extra").join("osx").join("Tabor.Info.plist");
+    let app_template_icon = root.join("extra").join("osx").join("tabor.icns");
     let app_dir = staging_app_bundle_path()?;
-    let app_binary = app_dir.join("Contents").join("MacOS").join("tabor");
-    let app_resources = app_dir.join("Contents").join("Resources");
+    let app_contents = app_dir.join("Contents");
+    let app_binary = app_contents.join("MacOS").join("tabor");
+    let app_resources = app_contents.join("Resources");
+    let app_info_plist = app_contents.join("Info.plist");
+    let app_icon = app_resources.join("tabor.icns");
     let app_entitlements = app_resources.join("Tabor.entitlements");
 
     if let Some(staging_root) = app_dir.parent() {
@@ -264,9 +268,10 @@ fn build_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box<d
         fs::remove_dir_all(&app_dir)?;
     }
 
-    copy_with_ditto(&app_template, &app_dir)?;
     fs::create_dir_all(app_dir.join("Contents").join("MacOS"))?;
     fs::create_dir_all(&app_resources)?;
+    fs::copy(&app_template_info, &app_info_plist)?;
+    fs::copy(&app_template_icon, &app_icon)?;
 
     let built_binary = tabor_binary_path(root, options.profile_release());
     fs::copy(&built_binary, &app_binary)?;

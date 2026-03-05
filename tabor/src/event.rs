@@ -231,6 +231,14 @@ Misc:
 
 #[cfg(target_os = "macos")]
 const WEB_CURSOR_THROTTLE: Duration = Duration::from_millis(100);
+#[cfg(target_os = "macos")]
+const CEF_WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
+
+#[cfg(target_os = "macos")]
+const CEF_HIDDEN_WEB_MIN_DELAY: Duration = Duration::from_millis(40);
+
+#[cfg(target_os = "macos")]
+const CEF_IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(2);
 
 /// Maximum number of lines for the blocking search while still typing the search regex.
 const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
@@ -257,6 +265,12 @@ pub struct Processor {
     initial_window_error: Option<Box<dyn Error>>,
     #[cfg(target_os = "macos")]
     pending_open_urls: Vec<String>,
+    #[cfg(target_os = "macos")]
+    cef_pump_timer: Option<(WindowId, Instant)>,
+    #[cfg(target_os = "macos")]
+    cef_watchdog_window_id: Option<WindowId>,
+    #[cfg(target_os = "macos")]
+    cef_shutdown_deadline: Option<Instant>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
     proxy: EventLoopProxy<Event>,
     gl_config: Option<GlutinConfig>,
@@ -459,6 +473,25 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
     fn web_key(&mut self, tab_id: TabId, input: ipc::WebKeyInput) -> Result<(), ipc::IpcError> {
         self.window.ipc_web_key(tab_id, input)
     }
+
+    fn terminal_key(
+        &mut self,
+        tab_id: TabId,
+        input: ipc::TerminalKeyInput,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_terminal_key(
+            tab_id,
+            input,
+            self.event_loop,
+            self.event_proxy,
+            self.clipboard,
+            self.scheduler,
+        )
+    }
+
+    fn runtime_metrics(&mut self) -> Result<ipc::IpcRuntimeMetrics, ipc::IpcError> {
+        self.window.ipc_runtime_metrics()
+    }
 }
 
 impl Processor {
@@ -492,14 +525,8 @@ impl Processor {
         #[cfg(target_os = "macos")]
         {
             let proxy = proxy.clone();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_millis(16));
-                    if !cef::is_initialized_global() {
-                        continue;
-                    }
-                    let _ = proxy.send_event(Event::new(EventType::CefTick, None));
-                }
+            cef::register_message_pump_notifier(move |delay| {
+                let _ = proxy.send_event(Event::new(EventType::CefSchedule(delay), None));
             });
         }
 
@@ -508,6 +535,12 @@ impl Processor {
             initial_window_error: None,
             #[cfg(target_os = "macos")]
             pending_open_urls: Vec::new(),
+            #[cfg(target_os = "macos")]
+            cef_pump_timer: None,
+            #[cfg(target_os = "macos")]
+            cef_watchdog_window_id: None,
+            #[cfg(target_os = "macos")]
+            cef_shutdown_deadline: None,
             cli_options,
             proxy,
             scheduler,
@@ -648,6 +681,101 @@ impl Processor {
 
         let event = Event::new(EventType::TabActivityTick, window_id);
         self.scheduler.schedule(event, TAB_ACTIVITY_TICK_INTERVAL, true, timer_id);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_any_web_tabs(&self) -> bool {
+        self.windows.values().any(WindowContext::has_web_tab)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_visible_web_tab(&self) -> bool {
+        self.windows.values().any(WindowContext::active_tab_is_web)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cef_timer_window_id(&self, preferred: Option<WindowId>) -> Option<WindowId> {
+        preferred
+            .filter(|window_id| self.windows.contains_key(window_id))
+            .or_else(|| self.windows.keys().next().copied())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn schedule_cef_pump(&mut self, requested_delay: Duration) {
+        if !cef::is_initialized_global() {
+            return;
+        }
+
+        if let Some((window_id, _)) = self.cef_pump_timer {
+            if !self.windows.contains_key(&window_id) {
+                self.cef_pump_timer = None;
+            }
+        }
+
+        let hidden_throttle_active = self.has_any_web_tabs() && !self.has_visible_web_tab();
+        let effective_delay = if hidden_throttle_active {
+            requested_delay.max(CEF_HIDDEN_WEB_MIN_DELAY)
+        } else {
+            requested_delay
+        };
+        let deadline = Instant::now() + effective_delay;
+
+        let mut coalesced = false;
+        if let Some((_, scheduled_deadline)) = self.cef_pump_timer {
+            if scheduled_deadline <= deadline {
+                coalesced = true;
+            }
+        }
+
+        if !coalesced {
+            if let Some((window_id, _)) = self.cef_pump_timer.take() {
+                self.scheduler.unschedule(TimerId::new(Topic::CefPump, window_id));
+            }
+
+            if let Some(window_id) = self.cef_timer_window_id(None) {
+                let timer_id = TimerId::new(Topic::CefPump, window_id);
+                let event = Event::new(EventType::CefTick, window_id);
+                self.scheduler.schedule(event, effective_delay, false, timer_id);
+                self.cef_pump_timer = Some((window_id, deadline));
+            }
+        }
+
+        cef::record_message_pump_schedule(effective_delay, coalesced, hidden_throttle_active);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn refresh_cef_watchdog(&mut self) {
+        if !cef::is_initialized_global() {
+            if let Some(window_id) = self.cef_watchdog_window_id.take() {
+                self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
+            }
+            self.cef_shutdown_deadline = None;
+            return;
+        }
+
+        let Some(window_id) = self.cef_timer_window_id(self.cef_watchdog_window_id) else {
+            return;
+        };
+
+        if let Some(previous_window_id) = self.cef_watchdog_window_id {
+            if previous_window_id != window_id {
+                self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, previous_window_id));
+            }
+        }
+
+        let timer_id = TimerId::new(Topic::CefWatchdog, window_id);
+        if !self.scheduler.scheduled(timer_id) {
+            let event = Event::new(EventType::CefWatchdog, window_id);
+            self.scheduler.schedule(event, CEF_WATCHDOG_INTERVAL, true, timer_id);
+        }
+
+        self.cef_watchdog_window_id = Some(window_id);
+        if self.has_any_web_tabs() {
+            self.cef_shutdown_deadline = None;
+        } else {
+            self.cef_shutdown_deadline
+                .get_or_insert_with(|| Instant::now() + CEF_IDLE_SHUTDOWN_DELAY);
+        }
     }
 
     /// Run the event loop.
@@ -859,6 +987,21 @@ impl Processor {
 
         self.scheduler.unschedule_window(window_context.id());
 
+        #[cfg(target_os = "macos")]
+        {
+            if self
+                .cef_pump_timer
+                .is_some_and(|(scheduled_window_id, _)| scheduled_window_id == window_id)
+            {
+                self.cef_pump_timer = None;
+            }
+
+            self.cef_shutdown_deadline = None;
+            if self.cef_watchdog_window_id == Some(window_id) {
+                self.cef_watchdog_window_id = None;
+            }
+        }
+
         if self.windows.is_empty() && !self.cli_options.daemon {
             if self.config.debug.ref_test {
                 window_context.write_ref_test_results();
@@ -962,7 +1105,56 @@ impl ApplicationHandler<Event> for Processor {
         // Handle events which don't mandate the WindowId.
         match (payload, window_id) {
             #[cfg(target_os = "macos")]
-            (EventType::CefTick, _) => {
+            (EventType::CefSchedule(delay), _) => {
+                self.schedule_cef_pump(delay);
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::CefTick, window_id) => {
+                if let Some((scheduled_window_id, _)) = self.cef_pump_timer {
+                    if Some(scheduled_window_id) == window_id {
+                        self.cef_pump_timer = None;
+                    }
+                }
+
+                if cef::is_initialized_global() {
+                    cef::do_message_loop_work();
+                }
+            },
+            #[cfg(target_os = "macos")]
+            (EventType::CefWatchdog, Some(window_id)) => {
+                if self.cef_watchdog_window_id != Some(window_id) {
+                    return;
+                }
+
+                if !cef::is_initialized_global() {
+                    self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
+                    self.cef_watchdog_window_id = None;
+                    self.cef_shutdown_deadline = None;
+                    return;
+                }
+
+                if self.has_any_web_tabs() {
+                    self.cef_shutdown_deadline = None;
+                    cef::do_message_loop_work();
+                    return;
+                }
+
+                if let Some(deadline) = self.cef_shutdown_deadline {
+                    if Instant::now() >= deadline {
+                        if let Some((scheduled_window_id, _)) = self.cef_pump_timer.take() {
+                            self.scheduler
+                                .unschedule(TimerId::new(Topic::CefPump, scheduled_window_id));
+                        }
+                        cef::shutdown();
+                        self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
+                        self.cef_watchdog_window_id = None;
+                        self.cef_shutdown_deadline = None;
+                        return;
+                    }
+                } else {
+                    self.cef_shutdown_deadline = Some(Instant::now() + CEF_IDLE_SHUTDOWN_DELAY);
+                }
+
                 cef::do_message_loop_work();
             },
             #[cfg(unix)]
@@ -1260,26 +1452,14 @@ impl ApplicationHandler<Event> for Processor {
         }
 
         #[cfg(target_os = "macos")]
-        crate::macos::cef::do_message_loop_work();
+        self.refresh_cef_watchdog();
 
         // Update the scheduler after event processing to ensure
         // the event loop deadline is as accurate as possible.
-        let mut control_flow = match self.scheduler.update() {
+        let control_flow = match self.scheduler.update() {
             Some(instant) => ControlFlow::WaitUntil(instant),
             None => ControlFlow::Wait,
         };
-
-        #[cfg(target_os = "macos")]
-        if cef::is_initialized_global() {
-            let cef_deadline = Instant::now() + Duration::from_millis(10);
-            control_flow = match control_flow {
-                ControlFlow::Wait => ControlFlow::WaitUntil(cef_deadline),
-                ControlFlow::WaitUntil(deadline) => {
-                    ControlFlow::WaitUntil(min(deadline, cef_deadline))
-                },
-                other => other,
-            };
-        }
         event_loop.set_control_flow(control_flow);
     }
 
@@ -1386,7 +1566,11 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     WebCursorRequest,
     #[cfg(target_os = "macos")]
+    CefSchedule(Duration),
+    #[cfg(target_os = "macos")]
     CefTick,
+    #[cfg(target_os = "macos")]
+    CefWatchdog,
     #[cfg(target_os = "macos")]
     CloseTab(TabId),
     #[cfg(target_os = "macos")]
@@ -4611,7 +4795,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::WebFavicon { .. }
                 | EventType::WebCursor { .. }
                 | EventType::WebCursorRequest
+                | EventType::CefSchedule(_)
                 | EventType::CefTick
+                | EventType::CefWatchdog
                 | EventType::TabSearch(_)
                 | EventType::OpenUrls(_)
                 | EventType::Frame => (),

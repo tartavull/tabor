@@ -128,6 +128,45 @@ pub struct IpcCapabilities {
     pub web_tabs: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct IpcRuntimeMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webview: Option<IpcWebViewMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_close: Option<IpcWebCloseMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cef_pump: Option<IpcCefPumpMetrics>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcWebViewMetrics {
+    pub live: u64,
+    pub created: u64,
+    pub dropped: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct IpcWebCloseMetrics {
+    pub count: u64,
+    pub last_ms: Option<f64>,
+    pub max_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcCefPumpMetrics {
+    pub scheduled: u64,
+    pub executed: u64,
+    pub coalesced: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_requested_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_effective_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_ms_ago: Option<u64>,
+    pub hidden_throttle_active: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcErrorCode {
@@ -287,6 +326,11 @@ pub enum IpcRequest {
         tab_id: Option<IpcTabId>,
         input: WebKeyInput,
     },
+    TerminalKey {
+        tab_id: Option<IpcTabId>,
+        input: TerminalKeyInput,
+    },
+    RuntimeMetrics,
     SetConfig(IpcConfig),
     GetConfig(IpcGetConfig),
 }
@@ -336,6 +380,11 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
         IpcRequestHelp { name: "web_network", summary: "Inspect web network activity." },
         IpcRequestHelp { name: "web_mouse", summary: "Dispatch native web mouse input." },
         IpcRequestHelp { name: "web_key", summary: "Dispatch native web key input." },
+        IpcRequestHelp { name: "terminal_key", summary: "Dispatch terminal key input." },
+        IpcRequestHelp {
+            name: "runtime_metrics",
+            summary: "Read runtime instrumentation metrics.",
+        },
         IpcRequestHelp { name: "set_config", summary: "Apply runtime config overrides." },
         IpcRequestHelp { name: "get_config", summary: "Read runtime config." },
     ]
@@ -360,7 +409,8 @@ impl IpcRequest {
             | IpcRequest::WebPdf { tab_id }
             | IpcRequest::WebNetwork { tab_id, .. }
             | IpcRequest::WebMouse { tab_id, .. }
-            | IpcRequest::WebKey { tab_id, .. } => *tab_id,
+            | IpcRequest::WebKey { tab_id, .. }
+            | IpcRequest::TerminalKey { tab_id, .. } => *tab_id,
             IpcRequest::OpenUrl { target: UrlTarget::TabId { tab_id }, .. } => Some(*tab_id),
             IpcRequest::SelectTab { selection: TabSelection::ById { tab_id } } => Some(*tab_id),
             _ => None,
@@ -396,6 +446,7 @@ pub enum SocketReply {
     WebSnapshot { data: String },
     WebPdf { data: String },
     WebNetwork { entries: Vec<WebNetworkEntry> },
+    RuntimeMetrics { metrics: IpcRuntimeMetrics },
     Error { error: IpcError },
 }
 
@@ -460,6 +511,18 @@ pub struct WebKeyInput {
     pub key: String,
     #[serde(default)]
     pub key_code: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub modifiers: WebKeyModifiers,
+    #[serde(default)]
+    pub repeat: bool,
+    pub state: WebKeyState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TerminalKeyInput {
+    pub key: String,
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
@@ -596,6 +659,8 @@ pub trait IpcContext {
         button: WebMouseButton,
     ) -> Result<(), IpcError>;
     fn web_key(&mut self, tab_id: TabId, input: WebKeyInput) -> Result<(), IpcError>;
+    fn terminal_key(&mut self, tab_id: TabId, input: TerminalKeyInput) -> Result<(), IpcError>;
+    fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError>;
 }
 
 pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcResponse {
@@ -959,6 +1024,32 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::TerminalKey { tab_id, input } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.terminal_key(tab_id, input) {
+                Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::RuntimeMetrics => match ctx.runtime_metrics() {
+            Ok(metrics) => {
+                IpcResponse { reply: SocketReply::RuntimeMetrics { metrics }, close_window: false }
+            },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
+        },
         IpcRequest::WebEval { .. } | IpcRequest::WebSnapshot { .. } | IpcRequest::WebPdf { .. } => {
             IpcResponse {
                 reply: reply_error(
@@ -1192,6 +1283,7 @@ mod tests {
         inspector_targets: Vec<IpcInspectorTarget>,
         inspector_sessions: HashMap<String, IpcInspectorSession>,
         inspector_messages: HashMap<String, VecDeque<String>>,
+        runtime_metrics: IpcRuntimeMetrics,
     }
 
     impl MockContext {
@@ -1210,6 +1302,24 @@ mod tests {
                 inspector_targets: Vec::new(),
                 inspector_sessions: HashMap::new(),
                 inspector_messages: HashMap::new(),
+                runtime_metrics: IpcRuntimeMetrics {
+                    webview: Some(IpcWebViewMetrics { live: 1, created: 1, dropped: 0 }),
+                    web_close: Some(IpcWebCloseMetrics {
+                        count: 0,
+                        last_ms: None,
+                        max_ms: 0.0,
+                        total_ms: 0.0,
+                    }),
+                    cef_pump: Some(IpcCefPumpMetrics {
+                        scheduled: 10,
+                        executed: 9,
+                        coalesced: 1,
+                        last_requested_delay_ms: Some(4),
+                        last_effective_delay_ms: Some(40),
+                        last_run_ms_ago: Some(12),
+                        hidden_throttle_active: true,
+                    }),
+                },
             };
             let _ = context.add_tab(IpcTabKind::Terminal, None, None);
             context
@@ -1669,6 +1779,21 @@ mod tests {
             }
             Ok(())
         }
+
+        fn terminal_key(
+            &mut self,
+            tab_id: TabId,
+            _input: TerminalKeyInput,
+        ) -> Result<(), IpcError> {
+            if !self.tabs.contains_key(&tab_id) {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            }
+            Ok(())
+        }
+
+        fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError> {
+            Ok(self.runtime_metrics.clone())
+        }
     }
 
     #[test]
@@ -1849,6 +1974,27 @@ mod tests {
         );
         assert!(matches!(response.reply, SocketReply::Ok));
         assert_eq!(ctx.last_command.as_deref(), Some(":o https://example.com"));
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::TerminalKey {
+                tab_id: Some(tab_id.into()),
+                input: TerminalKeyInput {
+                    key: String::from("a"),
+                    text: Some(String::from("a")),
+                    modifiers: WebKeyModifiers::default(),
+                    repeat: false,
+                    state: WebKeyState::Down,
+                },
+            },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+
+        let response = handle_request(&mut ctx, IpcRequest::RuntimeMetrics);
+        let SocketReply::RuntimeMetrics { metrics } = response.reply else {
+            panic!("expected runtime_metrics reply");
+        };
+        assert_eq!(metrics, ctx.runtime_metrics);
     }
 
     #[test]
