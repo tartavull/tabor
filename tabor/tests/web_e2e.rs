@@ -25,6 +25,7 @@ struct TaborHarness {
     bin: PathBuf,
     socket: PathBuf,
     _tmp: TempDir,
+    log_path: PathBuf,
     child: Child,
 }
 
@@ -43,12 +44,13 @@ impl TaborHarness {
             .arg(&socket)
             .env("TABOR_BACKGROUND", "1")
             .env("TABOR_WEBVIEW_ENGINE", "cef")
+            .env("RUST_BACKTRACE", "1")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
             .expect("failed to spawn tabor");
 
-        let harness = Self { bin, socket, _tmp: tmp, child };
+        let harness = Self { bin, socket, _tmp: tmp, log_path: log_path.clone(), child };
 
         let start = Instant::now();
         while start.elapsed() < START_TIMEOUT {
@@ -100,9 +102,72 @@ impl TaborHarness {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let stdout = self.run_ok(args);
-        serde_json::from_str(&stdout)
-            .unwrap_or_else(|_| panic!("invalid json output from tabor: {stdout}"))
+        let output = self.run_output(args);
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        if !output.status.success() {
+            panic!(
+                "tabor command failed while expecting json (status={:?}): stderr={stderr}; stdout={stdout}; harness_log_tail:\n{}",
+                output.status.code(),
+                self.log_tail()
+            );
+        }
+
+        if stdout.is_empty() {
+            let child_alive = self.child_alive();
+            let child_sample =
+                if child_alive { self.sample_child() } else { String::from("<child not alive>") };
+
+            panic!(
+                "empty json output from tabor: stderr={stderr}; child_alive={child_alive}; child_sample:\n{child_sample}\nharness_log_tail:\n{}",
+                self.log_tail()
+            );
+        }
+
+        serde_json::from_str(&stdout).unwrap_or_else(|err| {
+        panic!(
+            "invalid json output from tabor: {stdout}; parse_error={err}; stderr={stderr}; harness_log_tail:\n{}",
+            self.log_tail()
+        )
+    })
+    }
+
+    fn log_tail(&self) -> String {
+        const LOG_LINES: usize = 120;
+
+        match std::fs::read_to_string(&self.log_path) {
+            Ok(content) => {
+                let mut lines: Vec<&str> = content.lines().rev().take(LOG_LINES).collect();
+                lines.reverse();
+                if lines.is_empty() { String::from("<empty>") } else { lines.join("\n") }
+            },
+            Err(err) => format!("<unavailable: {err}>"),
+        }
+    }
+
+    fn child_alive(&self) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(self.pid().to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn sample_child(&self) -> String {
+        match Command::new("sample").arg(self.pid().to_string()).arg("1").arg("1").output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.trim().is_empty() {
+                    stdout.lines().take(160).collect::<Vec<_>>().join("\n")
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if stderr.is_empty() { String::from("<empty sample output>") } else { stderr }
+                }
+            },
+            Err(err) => format!("<sample unavailable: {err}>"),
+        }
     }
 
     fn pid(&self) -> u32 {
@@ -463,6 +528,42 @@ fn repeated_web_tab_close_releases_webview_resources() {
     );
 }
 
+#[test]
+fn reopen_web_tab_after_idle_shutdown_window_keeps_instance_alive() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let idle_wait_secs = env_u64("TABOR_REPRO_IDLE_WAIT_SECS", 2);
+    let switch_active = env_u64("TABOR_REPRO_SWITCH_ACTIVE", 1) != 0;
+
+    let first_url = format!("{fixture}#first");
+    let first_reply = harness.run_json(["msg", "create-tab", "--web", first_url.as_str()]);
+    assert_eq!(first_reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    if switch_active {
+        harness.run_ok(["msg", "select-tab", "--previous"]);
+        harness.run_ok(["msg", "select-tab", "--next"]);
+        harness.run_ok(["msg", "select-tab", "--next"]);
+        harness.run_ok(["msg", "select-tab", "--previous"]);
+    }
+
+    ensure_active_web_tab(&harness, 5);
+    harness.run_ok(["msg", "close-tab"]);
+    harness.run_ok(["msg", "ping"]);
+    thread::sleep(Duration::from_millis(120));
+    assert_only_terminal_tab_remains(&harness);
+
+    thread::sleep(Duration::from_secs(idle_wait_secs));
+
+    let second_url = format!("{fixture}#second");
+    let second_reply = harness.run_json(["msg", "create-tab", "--web", second_url.as_str()]);
+    assert_eq!(second_reply.get("type").and_then(Value::as_str), Some("tab_created"));
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
+}
+
 fn flatten_tabs(response: &Value) -> Vec<&Value> {
     let mut tabs = Vec::new();
 
@@ -485,13 +586,9 @@ fn tab_id_pair(tab: &Value) -> Option<(u64, u64)> {
 }
 
 fn first_terminal_tab_id(response: &Value) -> Option<(u64, u64)> {
-    flatten_tabs(response).into_iter().find_map(|tab| {
-        if tab.get("kind").and_then(Value::as_str) == Some("terminal") {
-            tab_id_pair(tab)
-        } else {
-            None
-        }
-    })
+    flatten_tabs(response)
+        .into_iter()
+        .find_map(|tab| if tab_kind_is(tab, "terminal") { tab_id_pair(tab) } else { None })
 }
 
 fn wait_for_active_terminal_program_name(
@@ -507,7 +604,7 @@ fn wait_for_active_terminal_program_name(
             continue;
         };
 
-        if active.get("kind").and_then(Value::as_str) == Some("terminal") {
+        if tab_kind_is(active, "terminal") {
             if let Some(name) = active.get("program_name").and_then(Value::as_str) {
                 if !name.is_empty() {
                     return Some(name.to_string());
@@ -525,6 +622,41 @@ fn active_tab(response: &Value) -> Option<&Value> {
     flatten_tabs(response)
         .into_iter()
         .find(|tab| tab.get("is_active").and_then(Value::as_bool) == Some(true))
+}
+
+fn ensure_active_web_tab(harness: &TaborHarness, max_switches: usize) {
+    for _ in 0..max_switches {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        if let Some(active) = active_tab(&tabs) {
+            if tab_kind_is(active, "web") {
+                return;
+            }
+        }
+
+        harness.run_ok(["msg", "select-tab", "--next"]);
+        thread::sleep(Duration::from_millis(40));
+    }
+
+    let tabs = harness.run_json(["msg", "list-tabs"]);
+    panic!("failed to activate a web tab before close: {tabs}");
+}
+
+fn assert_only_terminal_tab_remains(harness: &TaborHarness) {
+    let tabs = harness.run_json(["msg", "list-tabs"]);
+    let flat_tabs = flatten_tabs(&tabs);
+    assert_eq!(flat_tabs.len(), 1, "expected one tab after closing web batch: {tabs}");
+    assert!(
+        tab_kind_is(flat_tabs[0], "terminal"),
+        "expected remaining tab to be terminal after closing web batch: {tabs}"
+    );
+}
+
+fn tab_kind_is(tab: &Value, kind: &str) -> bool {
+    match tab.get("kind") {
+        Some(Value::String(current_kind)) => current_kind == kind,
+        Some(Value::Object(tab_kind)) => tab_kind.contains_key(kind),
+        _ => false,
+    }
 }
 
 fn send_terminal_key(harness: &TaborHarness, tab_id: (u64, u64), key: &str, text: Option<&str>) {

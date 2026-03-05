@@ -461,10 +461,16 @@ impl Display {
             is_fullscreen_or_simple_fullscreen,
         );
 
+        let background_color = if show_controls {
+            TabPanel::background_color(config)
+        } else {
+            config.colors.primary.background
+        };
+        window.set_macos_background_color(background_color);
+
         let top_inset = if show_controls {
             window.layout_macos_window_controls(panel_dimensions.width, padding_y_px).unwrap_or(0.0)
         } else {
-            window.set_macos_background_color(config.colors.primary.background);
             0.0
         };
 

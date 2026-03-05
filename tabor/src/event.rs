@@ -237,9 +237,6 @@ const CEF_WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const CEF_HIDDEN_WEB_MIN_DELAY: Duration = Duration::from_millis(40);
 
-#[cfg(target_os = "macos")]
-const CEF_IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(2);
-
 /// Maximum number of lines for the blocking search while still typing the search regex.
 const MAX_SEARCH_WHILE_TYPING: Option<usize> = Some(1000);
 
@@ -269,8 +266,6 @@ pub struct Processor {
     cef_pump_timer: Option<(WindowId, Instant)>,
     #[cfg(target_os = "macos")]
     cef_watchdog_window_id: Option<WindowId>,
-    #[cfg(target_os = "macos")]
-    cef_shutdown_deadline: Option<Instant>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
     proxy: EventLoopProxy<Event>,
     gl_config: Option<GlutinConfig>,
@@ -539,8 +534,6 @@ impl Processor {
             cef_pump_timer: None,
             #[cfg(target_os = "macos")]
             cef_watchdog_window_id: None,
-            #[cfg(target_os = "macos")]
-            cef_shutdown_deadline: None,
             cli_options,
             proxy,
             scheduler,
@@ -749,7 +742,13 @@ impl Processor {
             if let Some(window_id) = self.cef_watchdog_window_id.take() {
                 self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
             }
-            self.cef_shutdown_deadline = None;
+            return;
+        }
+
+        if !self.has_any_web_tabs() {
+            if let Some(window_id) = self.cef_watchdog_window_id.take() {
+                self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
+            }
             return;
         }
 
@@ -770,12 +769,6 @@ impl Processor {
         }
 
         self.cef_watchdog_window_id = Some(window_id);
-        if self.has_any_web_tabs() {
-            self.cef_shutdown_deadline = None;
-        } else {
-            self.cef_shutdown_deadline
-                .get_or_insert_with(|| Instant::now() + CEF_IDLE_SHUTDOWN_DELAY);
-        }
     }
 
     /// Run the event loop.
@@ -996,7 +989,6 @@ impl Processor {
                 self.cef_pump_timer = None;
             }
 
-            self.cef_shutdown_deadline = None;
             if self.cef_watchdog_window_id == Some(window_id) {
                 self.cef_watchdog_window_id = None;
             }
@@ -1129,30 +1121,13 @@ impl ApplicationHandler<Event> for Processor {
                 if !cef::is_initialized_global() {
                     self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
                     self.cef_watchdog_window_id = None;
-                    self.cef_shutdown_deadline = None;
                     return;
                 }
 
-                if self.has_any_web_tabs() {
-                    self.cef_shutdown_deadline = None;
-                    cef::do_message_loop_work();
+                if !self.has_any_web_tabs() {
+                    self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
+                    self.cef_watchdog_window_id = None;
                     return;
-                }
-
-                if let Some(deadline) = self.cef_shutdown_deadline {
-                    if Instant::now() >= deadline {
-                        if let Some((scheduled_window_id, _)) = self.cef_pump_timer.take() {
-                            self.scheduler
-                                .unschedule(TimerId::new(Topic::CefPump, scheduled_window_id));
-                        }
-                        cef::shutdown();
-                        self.scheduler.unschedule(TimerId::new(Topic::CefWatchdog, window_id));
-                        self.cef_watchdog_window_id = None;
-                        self.cef_shutdown_deadline = None;
-                        return;
-                    }
-                } else {
-                    self.cef_shutdown_deadline = Some(Instant::now() + CEF_IDLE_SHUTDOWN_DELAY);
                 }
 
                 cef::do_message_loop_work();
