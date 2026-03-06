@@ -3,17 +3,19 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::ffi::CString;
 use std::fmt::Write;
+use std::fs;
 use std::mem;
+use std::path::PathBuf;
 use std::rc::Rc as StdRc;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use cef::{
-    CefString, Client, DevToolsMessageObserver, DisplayHandler, ImplBrowser, ImplBrowserHost,
-    ImplClient, ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplFrame,
-    ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler, ImplPermissionPromptCallback,
-    ImplTask, PermissionHandler, PermissionRequestResult, Task, WrapClient,
-    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapPermissionHandler, WrapTask, rc::Rc,
+    CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler,
+    ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
+    ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplDownloadHandler,
+    ImplDownloadItem, ImplFrame, ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler,
+    ImplPermissionPromptCallback, ImplTask, PermissionHandler, PermissionRequestResult, Task,
+    WrapClient, WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler,
+    WrapPermissionHandler, WrapTask, rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
@@ -30,7 +32,7 @@ use winit::raw_window_handle::RawWindowHandle;
 use crate::display::SizeInfo;
 use crate::display::window::Window;
 use crate::event::Event;
-use crate::ipc::{WebNetworkAction, WebNetworkEntry};
+use crate::ipc::{AgentDownload, WebNetworkEntry};
 use crate::tabs::TabId;
 use tabor_terminal::grid::Dimensions;
 
@@ -91,6 +93,39 @@ struct DevToolsState {
     next_event_id: u64,
 }
 
+struct AutomationState {
+    downloads: HashMap<u32, AgentDownload>,
+    download_order: Vec<u32>,
+    download_dir: PathBuf,
+}
+
+impl AutomationState {
+    fn new() -> Self {
+        let base_dir =
+            home::home_dir().map(|path| path.join("Downloads")).unwrap_or_else(std::env::temp_dir);
+        let download_dir = base_dir.join("Tabor");
+        let _ = fs::create_dir_all(&download_dir);
+        Self { downloads: HashMap::new(), download_order: Vec::new(), download_dir }
+    }
+
+    fn downloads(&self) -> Vec<AgentDownload> {
+        self.download_order.iter().filter_map(|id| self.downloads.get(id).cloned()).collect()
+    }
+
+    fn update_download(&mut self, download: AgentDownload) {
+        if !self.downloads.contains_key(&download.id) {
+            self.download_order.push(download.id);
+        }
+        self.downloads.insert(download.id, download);
+    }
+
+    fn next_download_path(&self, suggested_name: &str) -> PathBuf {
+        let suggested_name =
+            if suggested_name.trim().is_empty() { "download.bin" } else { suggested_name };
+        self.download_dir.join(suggested_name)
+    }
+}
+
 impl DevToolsState {
     fn new() -> Self {
         Self {
@@ -139,7 +174,23 @@ impl DevToolsState {
             if event.id <= last_id {
                 continue;
             }
-            out.push(event.payload.clone());
+            let payload = serde_json::from_str::<JsonValue>(&event.payload)
+                .ok()
+                .and_then(|value| match value {
+                    JsonValue::Object(mut object) => {
+                        object.insert(String::from("id"), JsonValue::from(event.id));
+                        Some(JsonValue::Object(object).to_string())
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "id": event.id,
+                        "payload": event.payload,
+                    })
+                    .to_string()
+                });
+            out.push(payload);
             newest = event.id;
             if out.len() >= max {
                 break;
@@ -347,6 +398,104 @@ cef::wrap_display_handler! {
     }
 }
 
+cef::wrap_download_handler! {
+    struct TaborDownloadHandler {
+        automation_state: StdRc<RefCell<AutomationState>>,
+    }
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _url: Option<&cef::CefString>,
+            _request_method: Option<&cef::CefString>,
+        ) -> ::std::os::raw::c_int {
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            download_item: Option<&mut cef::DownloadItem>,
+            suggested_name: Option<&cef::CefString>,
+            callback: Option<&mut cef::BeforeDownloadCallback>,
+        ) -> ::std::os::raw::c_int {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            let suggested_name = suggested_name
+                .map(|name| name.to_string())
+                .or_else(|| {
+                    download_item.as_ref().map(|item| {
+                        let suggested_name = item.suggested_file_name();
+                        CefString::from(&suggested_name).to_string()
+                    })
+                })
+                .unwrap_or_else(|| String::from("download.bin"));
+            let state = self.automation_state.borrow_mut();
+            let path = state.next_download_path(&suggested_name);
+            let _ = fs::create_dir_all(path.parent().unwrap_or(&state.download_dir));
+            let download_path = CefString::from(path.to_string_lossy().as_ref());
+            callback.cont(Some(&download_path), 0);
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            download_item: Option<&mut cef::DownloadItem>,
+            _callback: Option<&mut cef::DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else {
+                return;
+            };
+            let state = if item.is_complete() != 0 {
+                "complete"
+            } else if item.is_canceled() != 0 {
+                "canceled"
+            } else if item.is_interrupted() != 0 {
+                "interrupted"
+            } else if item.is_paused() != 0 {
+                "paused"
+            } else if item.is_in_progress() != 0 {
+                "in_progress"
+            } else {
+                "unknown"
+            };
+            self.automation_state.borrow_mut().update_download(AgentDownload {
+                id: item.id(),
+                state: state.to_string(),
+                url: {
+                    let url = item.url();
+                    CefString::from(&url).to_string()
+                },
+                suggested_name: {
+                    let suggested_name = item.suggested_file_name();
+                    CefString::from(&suggested_name).to_string()
+                },
+                full_path: {
+                    let path = {
+                        let full_path = item.full_path();
+                        CefString::from(&full_path).to_string()
+                    };
+                    (!path.is_empty()).then_some(path)
+                },
+                mime_type: {
+                    let mime_type = {
+                        let mime_type = item.mime_type();
+                        CefString::from(&mime_type).to_string()
+                    };
+                    (!mime_type.is_empty()).then_some(mime_type)
+                },
+                percent_complete: (item.percent_complete() >= 0)
+                    .then_some(i64::from(item.percent_complete())),
+                total_bytes: (item.total_bytes() > 0).then_some(item.total_bytes()),
+                received_bytes: (item.received_bytes() > 0).then_some(item.received_bytes()),
+            });
+        }
+    }
+}
+
 #[cfg(not(feature = "passkey-webauthn"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionDecision {
@@ -484,12 +633,17 @@ cef::wrap_permission_handler! {
 cef::wrap_client! {
     struct TaborClient {
         display_handler: cef::DisplayHandler,
+        download_handler: cef::DownloadHandler,
         permission_handler: cef::PermissionHandler,
     }
 
     impl Client {
         fn display_handler(&self) -> Option<cef::DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+
+        fn download_handler(&self) -> Option<cef::DownloadHandler> {
+            Some(self.download_handler.clone())
         }
 
         fn permission_handler(&self) -> Option<cef::PermissionHandler> {
@@ -502,11 +656,16 @@ cef::wrap_client! {
 cef::wrap_client! {
     struct TaborClient {
         display_handler: cef::DisplayHandler,
+        download_handler: cef::DownloadHandler,
     }
 
     impl Client {
         fn display_handler(&self) -> Option<cef::DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+
+        fn download_handler(&self) -> Option<cef::DownloadHandler> {
+            Some(self.download_handler.clone())
         }
     }
 }
@@ -547,6 +706,7 @@ pub struct WebView {
     last_url: Option<String>,
     title_state: StdRc<RefCell<Option<String>>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
+    automation_state: StdRc<RefCell<AutomationState>>,
     _devtools_observer: cef::DevToolsMessageObserver,
     _devtools_registration: Option<cef::Registration>,
     _client: cef::Client,
@@ -573,14 +733,16 @@ impl WebView {
             let window_info = cef::WindowInfo::default().set_as_child(parent.cast(), &bounds);
 
             let title_state = StdRc::new(RefCell::new(None));
+            let automation_state = StdRc::new(RefCell::new(AutomationState::new()));
             let display_handler = TaborDisplayHandler::new(title_state.clone());
+            let download_handler = TaborDownloadHandler::new(automation_state.clone());
             #[cfg(not(feature = "passkey-webauthn"))]
             let mut client = {
                 let permission_handler = TaborPermissionHandler::new();
-                TaborClient::new(display_handler, permission_handler)
+                TaborClient::new(display_handler, download_handler, permission_handler)
             };
             #[cfg(feature = "passkey-webauthn")]
-            let mut client = TaborClient::new(display_handler);
+            let mut client = TaborClient::new(display_handler, download_handler);
 
             let browser_settings = cef::BrowserSettings::default();
             let initial_url = if url.is_empty() { "about:blank" } else { url };
@@ -617,6 +779,7 @@ impl WebView {
                 last_url: None,
                 title_state,
                 devtools_state,
+                automation_state,
                 _devtools_observer: observer,
                 _devtools_registration: registration,
                 _client: client,
@@ -759,88 +922,6 @@ impl WebView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_key_event(
-        &self,
-        key: &Key,
-        key_code_override: Option<&str>,
-        text: &str,
-        unmodified_text: &str,
-        state: ElementState,
-        modifiers: ModifiersState,
-        repeat: bool,
-        location: KeyLocation,
-        physical_key: winit::keyboard::PhysicalKey,
-    ) -> bool {
-        let Some(_host) = self.browser.host() else {
-            return false;
-        };
-
-        let key_string = dom_key_string(key, text);
-        let code_string = key_code_override
-            .map(|value| value.to_string())
-            .or_else(|| dom_code_from_physical_key(physical_key));
-        let windows_key_code = cef_windows_key_code_from_key(key);
-        let scancode = macos_scancode_from_physical_key(physical_key).unwrap_or(0) as i32;
-        let modifier_bits = devtools_modifier_bits(modifiers);
-        let is_keypad = matches!(location, KeyLocation::Numpad);
-        let location_value = devtools_location_value(location);
-        let should_send_char =
-            !text.is_empty() && !modifiers.super_key() && !modifiers.control_key();
-
-        let fire_event = |event_type: &str, text_value: Option<&str>, unmodified: Option<&str>| {
-            let mut params = match cef::dictionary_value_create() {
-                Some(params) => params,
-                None => return,
-            };
-            dict_set_string(&mut params, "type", event_type);
-            if !key_string.is_empty() {
-                dict_set_string(&mut params, "key", &key_string);
-            }
-            if let Some(code) = code_string.as_deref() {
-                if !code.is_empty() {
-                    dict_set_string(&mut params, "code", code);
-                }
-            }
-            if let Some(text_value) = text_value {
-                if !text_value.is_empty() {
-                    dict_set_string(&mut params, "text", text_value);
-                }
-            }
-            if let Some(unmodified) = unmodified {
-                if !unmodified.is_empty() {
-                    dict_set_string(&mut params, "unmodifiedText", unmodified);
-                }
-            }
-            dict_set_int(&mut params, "modifiers", modifier_bits);
-            if windows_key_code != 0 {
-                dict_set_int(&mut params, "windowsVirtualKeyCode", windows_key_code);
-            }
-            if scancode != 0 {
-                dict_set_int(&mut params, "nativeVirtualKeyCode", scancode);
-            }
-            dict_set_bool(&mut params, "autoRepeat", repeat);
-            dict_set_bool(&mut params, "isKeypad", is_keypad);
-            dict_set_bool(&mut params, "isSystemKey", false);
-            dict_set_int(&mut params, "location", location_value);
-            self.devtools_fire("Input.dispatchKeyEvent", Some(params));
-        };
-
-        match state {
-            ElementState::Pressed => {
-                fire_event("rawKeyDown", None, None);
-                if should_send_char {
-                    fire_event("char", Some(text), Some(unmodified_text));
-                }
-            },
-            ElementState::Released => {
-                fire_event("keyUp", None, None);
-            },
-        }
-
-        true
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn handle_key_input_inner(
         &mut self,
         key: &Key,
@@ -940,6 +1021,20 @@ impl WebView {
     where
         F: FnOnce(Option<String>) + 'static,
     {
+        self.eval_js_string_impl(script, false, callback);
+    }
+
+    pub fn eval_js_string_with_user_gesture<F>(&mut self, script: &str, callback: F)
+    where
+        F: FnOnce(Option<String>) + 'static,
+    {
+        self.eval_js_string_impl(script, true, callback);
+    }
+
+    fn eval_js_string_impl<F>(&mut self, script: &str, user_gesture: bool, callback: F)
+    where
+        F: FnOnce(Option<String>) + 'static,
+    {
         let mut params = match cef::dictionary_value_create() {
             Some(params) => params,
             None => {
@@ -950,6 +1045,7 @@ impl WebView {
         dict_set_string(&mut params, "expression", script);
         dict_set_bool(&mut params, "returnByValue", true);
         dict_set_bool(&mut params, "awaitPromise", true);
+        dict_set_bool(&mut params, "userGesture", user_gesture);
 
         self.devtools_execute("Runtime.evaluate", Some(params), move |result| {
             let output = match result {
@@ -960,65 +1056,6 @@ impl WebView {
                 },
             };
             callback(output);
-        });
-    }
-
-    pub fn snapshot_png<F>(&mut self, full: bool, callback: F)
-    where
-        F: FnOnce(Result<Vec<u8>, String>) + 'static,
-    {
-        let mut params = match cef::dictionary_value_create() {
-            Some(params) => params,
-            None => {
-                callback(Err(String::from("Failed to build screenshot params")));
-                return;
-            },
-        };
-        dict_set_string(&mut params, "format", "png");
-        if full {
-            dict_set_bool(&mut params, "captureBeyondViewport", true);
-        }
-
-        self.devtools_execute("Page.captureScreenshot", Some(params), move |result| match result {
-            Ok(payload) => {
-                let Some(data) = payload.get("data").and_then(|v| v.as_str()) else {
-                    callback(Err(String::from("Screenshot data missing")));
-                    return;
-                };
-                match BASE64.decode(data) {
-                    Ok(bytes) => callback(Ok(bytes)),
-                    Err(err) => callback(Err(err.to_string())),
-                }
-            },
-            Err(err) => callback(Err(err)),
-        });
-    }
-
-    pub fn pdf<F>(&mut self, callback: F)
-    where
-        F: FnOnce(Result<Vec<u8>, String>) + 'static,
-    {
-        let mut params = match cef::dictionary_value_create() {
-            Some(params) => params,
-            None => {
-                callback(Err(String::from("Failed to build PDF params")));
-                return;
-            },
-        };
-        dict_set_bool(&mut params, "printBackground", true);
-
-        self.devtools_execute("Page.printToPDF", Some(params), move |result| match result {
-            Ok(payload) => {
-                let Some(data) = payload.get("data").and_then(|v| v.as_str()) else {
-                    callback(Err(String::from("PDF data missing")));
-                    return;
-                };
-                match BASE64.decode(data) {
-                    Ok(bytes) => callback(Ok(bytes)),
-                    Err(err) => callback(Err(err.to_string())),
-                }
-            },
-            Err(err) => callback(Err(err)),
         });
     }
 
@@ -1048,6 +1085,152 @@ impl WebView {
     pub fn latest_devtools_event_id(&self) -> u64 {
         let state = self.devtools_state.borrow();
         state.latest_event_id()
+    }
+
+    pub fn set_file_input_files<F>(
+        &self,
+        element_id: &str,
+        paths: Vec<String>,
+        callback: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Result<String, String>) + 'static,
+    {
+        let browser = self.browser.clone();
+        let state = self.devtools_state.clone();
+        let callback: StringResultCallback = StdRc::new(RefCell::new(Some(Box::new(callback))));
+        let selector = format!("[data-tabor-agent-id=\"{element_id}\"]");
+        let inspect_script = format!(
+            "(async () => {{\
+                const id = {id};\
+                const selector = {selector};\
+                const el = document.querySelector(selector);\
+                if (!el) throw new Error(\"element not found\");\
+                el.dispatchEvent(new Event(\"input\", {{ bubbles: true }}));\
+                el.dispatchEvent(new Event(\"change\", {{ bubbles: true }}));\
+                return window.__taborAgent.inspect(id);\
+            }})()",
+            id = serde_json::to_string(element_id).unwrap(),
+            selector = serde_json::to_string(&selector).unwrap(),
+        );
+
+        let callback_for_root = callback.clone();
+        let browser_for_root = browser.clone();
+        let state_for_root = state.clone();
+        devtools_command_json_with(
+            &browser_for_root,
+            &state_for_root,
+            "DOM.getDocument",
+            Some(serde_json::json!({ "depth": 0 })),
+            move |result| {
+                let root_id = match result {
+                    Ok(payload) => payload
+                        .get("root")
+                        .and_then(|root| root.get("nodeId"))
+                        .and_then(JsonValue::as_u64),
+                    Err(err) => {
+                        finish_string_result_callback(&callback_for_root, Err(err));
+                        return;
+                    },
+                };
+                let Some(root_id) = root_id else {
+                    finish_string_result_callback(
+                        &callback_for_root,
+                        Err(String::from("DOM.getDocument returned no root node id")),
+                    );
+                    return;
+                };
+
+                let browser = browser.clone();
+                let state = state.clone();
+                let selector = selector.clone();
+                let inspect_script = inspect_script.clone();
+                let paths = paths.clone();
+                let callback = callback_for_root.clone();
+                let browser_for_query = browser.clone();
+                let state_for_query = state.clone();
+                let query = devtools_command_json_with(
+                    &browser_for_query,
+                    &state_for_query,
+                    "DOM.querySelector",
+                    Some(serde_json::json!({
+                        "nodeId": root_id,
+                        "selector": selector,
+                    })),
+                    move |result| {
+                        let node_id = match result {
+                            Ok(payload) => payload.get("nodeId").and_then(JsonValue::as_u64),
+                            Err(err) => {
+                                finish_string_result_callback(&callback, Err(err));
+                                return;
+                            },
+                        };
+                        let Some(node_id) = node_id.filter(|node_id| *node_id != 0) else {
+                            finish_string_result_callback(
+                                &callback,
+                                Err(String::from("element not found")),
+                            );
+                            return;
+                        };
+
+                        let browser = browser.clone();
+                        let state = state.clone();
+                        let callback_for_set = callback.clone();
+                        let browser_for_set = browser.clone();
+                        let state_for_set = state.clone();
+                        let set_files = devtools_command_json_with(
+                            &browser_for_set,
+                            &state_for_set,
+                            "DOM.setFileInputFiles",
+                            Some(serde_json::json!({
+                                "nodeId": node_id,
+                                "files": paths,
+                            })),
+                            move |result| match result {
+                                Ok(_) => {
+                                    let callback_for_eval = callback_for_set.clone();
+                                    let browser_for_eval = browser.clone();
+                                    let state_for_eval = state.clone();
+                                    if let Err(err) = runtime_evaluate_with(
+                                        &browser_for_eval,
+                                        &state_for_eval,
+                                        &inspect_script,
+                                        false,
+                                        move |result| match result {
+                                            Some(raw) => finish_string_result_callback(
+                                                &callback_for_eval,
+                                                Ok(raw),
+                                            ),
+                                            None => finish_string_result_callback(
+                                                &callback_for_eval,
+                                                Err(String::from(
+                                                    "Runtime.evaluate returned no payload",
+                                                )),
+                                            ),
+                                        },
+                                    ) {
+                                        finish_string_result_callback(&callback_for_set, Err(err));
+                                    }
+                                },
+                                Err(err) => {
+                                    finish_string_result_callback(&callback_for_set, Err(err))
+                                },
+                            },
+                        );
+                        if let Err(err) = set_files {
+                            finish_string_result_callback(&callback, Err(err));
+                        }
+                    },
+                );
+                if let Err(err) = query {
+                    finish_string_result_callback(&callback_for_root, Err(err));
+                }
+            },
+        )
+    }
+
+    pub fn downloads(&self) -> Vec<AgentDownload> {
+        self.automation_state.borrow().downloads()
     }
 
     pub fn poll_title(&mut self) -> Option<String> {
@@ -1087,32 +1270,12 @@ impl WebView {
         true
     }
 
-    pub fn network_entries(&mut self, action: WebNetworkAction) -> Vec<WebNetworkEntry> {
-        let mut state = self.devtools_state.borrow_mut();
-        match action {
-            WebNetworkAction::Clear => {
-                state.entries.clear();
-                state.index.clear();
-                Vec::new()
-            },
-            WebNetworkAction::List { filter } => {
-                if let Some(filter) = filter {
-                    state
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.url.contains(&filter))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                } else {
-                    state.entries.clone()
-                }
-            },
-        }
-    }
-
     fn enable_devtools_domains(&self) {
+        self.devtools_fire("DOM.enable", None);
         self.devtools_fire("Network.enable", None);
         self.devtools_fire("Page.enable", None);
+        self.devtools_fire("Runtime.enable", None);
+        self.devtools_fire("Log.enable", None);
     }
 
     fn devtools_fire(&self, method: &str, params: Option<cef::DictionaryValue>) {
@@ -1203,6 +1366,88 @@ impl Drop for WebView {
         }
 
         super::unregister_webview();
+    }
+}
+
+fn devtools_command_json_with<F>(
+    browser: &cef::Browser,
+    state: &StdRc<RefCell<DevToolsState>>,
+    method: &str,
+    params: Option<JsonValue>,
+    callback: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Result<JsonValue, String>) + 'static,
+{
+    let params = match params {
+        None => None,
+        Some(JsonValue::Null) => None,
+        Some(value) => Some(json_to_cef_dictionary(&value)?),
+    };
+
+    let Some(host) = browser.host() else {
+        return Err(String::from("DevTools host unavailable"));
+    };
+
+    let method = CefString::from(method);
+    let mut params = params;
+    let id = {
+        let mut state = state.borrow_mut();
+        let id = state.next_id();
+        state.pending.insert(id, Box::new(callback));
+        id
+    };
+
+    let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
+    if ok == 0 {
+        let _ = {
+            let mut state = state.borrow_mut();
+            state.pending.remove(&id)
+        };
+        return Err(String::from("DevTools method dispatch failed"));
+    }
+
+    Ok(())
+}
+
+fn runtime_evaluate_with<F>(
+    browser: &cef::Browser,
+    state: &StdRc<RefCell<DevToolsState>>,
+    script: &str,
+    user_gesture: bool,
+    callback: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Option<String>) + 'static,
+{
+    devtools_command_json_with(
+        browser,
+        state,
+        "Runtime.evaluate",
+        Some(serde_json::json!({
+            "expression": script,
+            "returnByValue": true,
+            "awaitPromise": true,
+            "userGesture": user_gesture,
+        })),
+        move |result| {
+            let output = match result {
+                Ok(payload) => runtime_result_to_string(&payload),
+                Err(err) => {
+                    debug!("Runtime.evaluate failed: {err}");
+                    None
+                },
+            };
+            callback(output);
+        },
+    )
+}
+
+type StringResultCallback = StdRc<RefCell<Option<Box<dyn FnOnce(Result<String, String>)>>>>;
+
+fn finish_string_result_callback(callback: &StringResultCallback, result: Result<String, String>) {
+    if let Some(callback) = callback.borrow_mut().take() {
+        callback(result);
     }
 }
 
@@ -1487,70 +1732,6 @@ fn set_list_value(
         },
     }
     Ok(())
-}
-
-fn dom_key_string(key: &Key, text: &str) -> String {
-    match key {
-        Key::Character(ch) => {
-            if text.is_empty() {
-                ch.to_string()
-            } else {
-                text.to_string()
-            }
-        },
-        Key::Named(named) => match named {
-            NamedKey::Space => " ".to_string(),
-            NamedKey::Enter => "Enter".to_string(),
-            NamedKey::Tab => "Tab".to_string(),
-            NamedKey::Escape => "Escape".to_string(),
-            NamedKey::Backspace => "Backspace".to_string(),
-            NamedKey::Delete => "Delete".to_string(),
-            NamedKey::ArrowLeft => "ArrowLeft".to_string(),
-            NamedKey::ArrowRight => "ArrowRight".to_string(),
-            NamedKey::ArrowUp => "ArrowUp".to_string(),
-            NamedKey::ArrowDown => "ArrowDown".to_string(),
-            NamedKey::Home => "Home".to_string(),
-            NamedKey::End => "End".to_string(),
-            NamedKey::PageUp => "PageUp".to_string(),
-            NamedKey::PageDown => "PageDown".to_string(),
-            NamedKey::Insert => "Insert".to_string(),
-            _ => format!("{named:?}"),
-        },
-        _ => String::new(),
-    }
-}
-
-fn dom_code_from_physical_key(physical_key: winit::keyboard::PhysicalKey) -> Option<String> {
-    match physical_key {
-        winit::keyboard::PhysicalKey::Code(code) => Some(format!("{code:?}")),
-        _ => None,
-    }
-}
-
-fn devtools_modifier_bits(modifiers: ModifiersState) -> i32 {
-    let mut bits = 0;
-    if modifiers.alt_key() {
-        bits |= 1;
-    }
-    if modifiers.control_key() {
-        bits |= 2;
-    }
-    if modifiers.super_key() {
-        bits |= 4;
-    }
-    if modifiers.shift_key() {
-        bits |= 8;
-    }
-    bits
-}
-
-fn devtools_location_value(location: KeyLocation) -> i32 {
-    match location {
-        KeyLocation::Standard => 0,
-        KeyLocation::Left => 1,
-        KeyLocation::Right => 2,
-        KeyLocation::Numpad => 3,
-    }
 }
 
 fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {

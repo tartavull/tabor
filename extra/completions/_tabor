@@ -524,10 +524,262 @@ esac
     ;;
 esac
 ;;
-(agent-browser)
+(agent)
 _arguments "${_arguments_options[@]}" : \
-'*::args -- Command and args to pass through:_default' \
+'-s+[IPC socket connection path override]:SOCKET:_files' \
+'--socket=[IPC socket connection path override]:SOCKET:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_tabor__agent_commands" \
+"*::: :->agent" \
 && ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-agent-command-$line[1]:"
+        case $line[1] in
+            (attach)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(app)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+'--tab-id=[Tab id formatted as <index>\:<generation>]:INDEX:GEN:_default' \
+'--active[Select the active tab]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(observe)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':element_id -- Element id returned by `tabor agent observe`:_default' \
+&& ret=0
+;;
+(screenshot)
+_arguments "${_arguments_options[@]}" : \
+'--path=[Write the PNG to this path. A temp file is used by default]:PATH:_files' \
+'--element-id=[Crop the viewport screenshot to the observed element]:ELEMENT_ID:_default' \
+'--full-page[Capture the full page instead of the viewport]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(events)
+_arguments "${_arguments_options[@]}" : \
+'--since=[Return events after this event id]:SINCE:_default' \
+'--max=[Maximum number of events to return]:MAX:_default' \
+'*--kind=[Restrict events to one or more kinds]:KINDS:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(pdf)
+_arguments "${_arguments_options[@]}" : \
+'--path=[Write the PDF to this path. A temp file is used by default]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(upload)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':element_id -- Element id returned by `tabor agent observe`:_default' \
+'*::paths -- One or more local file paths to upload:_files' \
+&& ret=0
+;;
+(downloads)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(act)
+_arguments "${_arguments_options[@]}" : \
+'--observe=[Include a post-action observation in the reply]:OBSERVE:(true false)' \
+'-h[Print help]' \
+'--help[Print help]' \
+':actions_json -- JSON array of agent actions:_default' \
+&& ret=0
+;;
+(clipboard)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_tabor__agent__clipboard_commands" \
+"*::: :->clipboard" \
+&& ret=0
+
+    case $state in
+    (clipboard)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-agent-clipboard-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':text:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_tabor__agent__clipboard__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-agent-clipboard-help-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_tabor__agent__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-agent-help-command-$line[1]:"
+        case $line[1] in
+            (attach)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(app)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screenshot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(events)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(pdf)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(upload)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(downloads)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(act)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(clipboard)
+_arguments "${_arguments_options[@]}" : \
+":: :_tabor__agent__help__clipboard_commands" \
+"*::: :->clipboard" \
+&& ret=0
+
+    case $state in
+    (clipboard)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-agent-help-clipboard-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
 ;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
@@ -708,9 +960,93 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
-(agent-browser)
+(agent)
+_arguments "${_arguments_options[@]}" : \
+":: :_tabor__help__agent_commands" \
+"*::: :->agent" \
+&& ret=0
+
+    case $state in
+    (agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-help-agent-command-$line[1]:"
+        case $line[1] in
+            (attach)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
+;;
+(app)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(use)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(screenshot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(events)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(pdf)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(upload)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(downloads)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(act)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(clipboard)
+_arguments "${_arguments_options[@]}" : \
+":: :_tabor__help__agent__clipboard_commands" \
+"*::: :->clipboard" \
+&& ret=0
+
+    case $state in
+    (clipboard)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tabor-help-agent-clipboard-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (migrate)
 _arguments "${_arguments_options[@]}" : \
@@ -733,31 +1069,344 @@ esac
 _tabor_commands() {
     local commands; commands=(
 'msg:Send a message to the Tabor socket' \
-'agent-browser:Agent-browser CLI compatibility shim' \
+'agent:Stateful agent control for an attached Tabor instance' \
 'migrate:Migrate the configuration file' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor commands' commands "$@"
 }
-(( $+functions[_tabor__agent-browser_commands] )) ||
-_tabor__agent-browser_commands() {
+(( $+functions[_tabor__agent_commands] )) ||
+_tabor__agent_commands() {
+    local commands; commands=(
+'attach:Attach to a running Tabor instance and start the local controller' \
+'app:List tabs and current agent state' \
+'use:Select the active tab or a specific tab for automation' \
+'observe:Observe the selected web tab' \
+'inspect:Inspect one observed element by id' \
+'screenshot:Capture a screenshot from the selected web tab' \
+'events:Read buffered console, network, and page events' \
+'pdf:Render the selected web tab as a PDF' \
+'upload:Upload local files into a selected file input' \
+'downloads:List tracked downloads for the selected web tab' \
+'act:Execute batched actions encoded as JSON' \
+'clipboard:Read or update the system clipboard' \
+'close:Stop the local controller for this Tabor socket' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tabor agent commands' commands "$@"
+}
+(( $+functions[_tabor__agent__act_commands] )) ||
+_tabor__agent__act_commands() {
     local commands; commands=()
-    _describe -t commands 'tabor agent-browser commands' commands "$@"
+    _describe -t commands 'tabor agent act commands' commands "$@"
+}
+(( $+functions[_tabor__agent__app_commands] )) ||
+_tabor__agent__app_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent app commands' commands "$@"
+}
+(( $+functions[_tabor__agent__attach_commands] )) ||
+_tabor__agent__attach_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent attach commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard_commands] )) ||
+_tabor__agent__clipboard_commands() {
+    local commands; commands=(
+'get:Read the system clipboard' \
+'set:Replace the system clipboard contents' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tabor agent clipboard commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard__get_commands] )) ||
+_tabor__agent__clipboard__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent clipboard get commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard__help_commands] )) ||
+_tabor__agent__clipboard__help_commands() {
+    local commands; commands=(
+'get:Read the system clipboard' \
+'set:Replace the system clipboard contents' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tabor agent clipboard help commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard__help__get_commands] )) ||
+_tabor__agent__clipboard__help__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent clipboard help get commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard__help__help_commands] )) ||
+_tabor__agent__clipboard__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent clipboard help help commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard__help__set_commands] )) ||
+_tabor__agent__clipboard__help__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent clipboard help set commands' commands "$@"
+}
+(( $+functions[_tabor__agent__clipboard__set_commands] )) ||
+_tabor__agent__clipboard__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent clipboard set commands' commands "$@"
+}
+(( $+functions[_tabor__agent__close_commands] )) ||
+_tabor__agent__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent close commands' commands "$@"
+}
+(( $+functions[_tabor__agent__downloads_commands] )) ||
+_tabor__agent__downloads_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent downloads commands' commands "$@"
+}
+(( $+functions[_tabor__agent__events_commands] )) ||
+_tabor__agent__events_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent events commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help_commands] )) ||
+_tabor__agent__help_commands() {
+    local commands; commands=(
+'attach:Attach to a running Tabor instance and start the local controller' \
+'app:List tabs and current agent state' \
+'use:Select the active tab or a specific tab for automation' \
+'observe:Observe the selected web tab' \
+'inspect:Inspect one observed element by id' \
+'screenshot:Capture a screenshot from the selected web tab' \
+'events:Read buffered console, network, and page events' \
+'pdf:Render the selected web tab as a PDF' \
+'upload:Upload local files into a selected file input' \
+'downloads:List tracked downloads for the selected web tab' \
+'act:Execute batched actions encoded as JSON' \
+'clipboard:Read or update the system clipboard' \
+'close:Stop the local controller for this Tabor socket' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tabor agent help commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__act_commands] )) ||
+_tabor__agent__help__act_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help act commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__app_commands] )) ||
+_tabor__agent__help__app_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help app commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__attach_commands] )) ||
+_tabor__agent__help__attach_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help attach commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__clipboard_commands] )) ||
+_tabor__agent__help__clipboard_commands() {
+    local commands; commands=(
+'get:Read the system clipboard' \
+'set:Replace the system clipboard contents' \
+    )
+    _describe -t commands 'tabor agent help clipboard commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__clipboard__get_commands] )) ||
+_tabor__agent__help__clipboard__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help clipboard get commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__clipboard__set_commands] )) ||
+_tabor__agent__help__clipboard__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help clipboard set commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__close_commands] )) ||
+_tabor__agent__help__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help close commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__downloads_commands] )) ||
+_tabor__agent__help__downloads_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help downloads commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__events_commands] )) ||
+_tabor__agent__help__events_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help events commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__help_commands] )) ||
+_tabor__agent__help__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help help commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__inspect_commands] )) ||
+_tabor__agent__help__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help inspect commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__observe_commands] )) ||
+_tabor__agent__help__observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help observe commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__pdf_commands] )) ||
+_tabor__agent__help__pdf_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help pdf commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__screenshot_commands] )) ||
+_tabor__agent__help__screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help screenshot commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__upload_commands] )) ||
+_tabor__agent__help__upload_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help upload commands' commands "$@"
+}
+(( $+functions[_tabor__agent__help__use_commands] )) ||
+_tabor__agent__help__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help use commands' commands "$@"
+}
+(( $+functions[_tabor__agent__inspect_commands] )) ||
+_tabor__agent__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent inspect commands' commands "$@"
+}
+(( $+functions[_tabor__agent__observe_commands] )) ||
+_tabor__agent__observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent observe commands' commands "$@"
+}
+(( $+functions[_tabor__agent__pdf_commands] )) ||
+_tabor__agent__pdf_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent pdf commands' commands "$@"
+}
+(( $+functions[_tabor__agent__screenshot_commands] )) ||
+_tabor__agent__screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent screenshot commands' commands "$@"
+}
+(( $+functions[_tabor__agent__upload_commands] )) ||
+_tabor__agent__upload_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent upload commands' commands "$@"
+}
+(( $+functions[_tabor__agent__use_commands] )) ||
+_tabor__agent__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent use commands' commands "$@"
 }
 (( $+functions[_tabor__help_commands] )) ||
 _tabor__help_commands() {
     local commands; commands=(
 'msg:Send a message to the Tabor socket' \
-'agent-browser:Agent-browser CLI compatibility shim' \
+'agent:Stateful agent control for an attached Tabor instance' \
 'migrate:Migrate the configuration file' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor help commands' commands "$@"
 }
-(( $+functions[_tabor__help__agent-browser_commands] )) ||
-_tabor__help__agent-browser_commands() {
+(( $+functions[_tabor__help__agent_commands] )) ||
+_tabor__help__agent_commands() {
+    local commands; commands=(
+'attach:Attach to a running Tabor instance and start the local controller' \
+'app:List tabs and current agent state' \
+'use:Select the active tab or a specific tab for automation' \
+'observe:Observe the selected web tab' \
+'inspect:Inspect one observed element by id' \
+'screenshot:Capture a screenshot from the selected web tab' \
+'events:Read buffered console, network, and page events' \
+'pdf:Render the selected web tab as a PDF' \
+'upload:Upload local files into a selected file input' \
+'downloads:List tracked downloads for the selected web tab' \
+'act:Execute batched actions encoded as JSON' \
+'clipboard:Read or update the system clipboard' \
+'close:Stop the local controller for this Tabor socket' \
+    )
+    _describe -t commands 'tabor help agent commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__act_commands] )) ||
+_tabor__help__agent__act_commands() {
     local commands; commands=()
-    _describe -t commands 'tabor help agent-browser commands' commands "$@"
+    _describe -t commands 'tabor help agent act commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__app_commands] )) ||
+_tabor__help__agent__app_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent app commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__attach_commands] )) ||
+_tabor__help__agent__attach_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent attach commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__clipboard_commands] )) ||
+_tabor__help__agent__clipboard_commands() {
+    local commands; commands=(
+'get:Read the system clipboard' \
+'set:Replace the system clipboard contents' \
+    )
+    _describe -t commands 'tabor help agent clipboard commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__clipboard__get_commands] )) ||
+_tabor__help__agent__clipboard__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent clipboard get commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__clipboard__set_commands] )) ||
+_tabor__help__agent__clipboard__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent clipboard set commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__close_commands] )) ||
+_tabor__help__agent__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent close commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__downloads_commands] )) ||
+_tabor__help__agent__downloads_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent downloads commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__events_commands] )) ||
+_tabor__help__agent__events_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent events commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__inspect_commands] )) ||
+_tabor__help__agent__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent inspect commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__observe_commands] )) ||
+_tabor__help__agent__observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent observe commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__pdf_commands] )) ||
+_tabor__help__agent__pdf_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent pdf commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__screenshot_commands] )) ||
+_tabor__help__agent__screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent screenshot commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__upload_commands] )) ||
+_tabor__help__agent__upload_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent upload commands' commands "$@"
+}
+(( $+functions[_tabor__help__agent__use_commands] )) ||
+_tabor__help__agent__use_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent use commands' commands "$@"
 }
 (( $+functions[_tabor__help__help_commands] )) ||
 _tabor__help__help_commands() {

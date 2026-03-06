@@ -88,6 +88,9 @@ action.
 ## IPC and automation
 
 Tabor exposes a local IPC socket for scripting tab management, actions, and web
-automation. Use `tabor msg` typed subcommands (for example, `tabor msg list-tabs`)
-or `tabor msg send` for raw JSON. The full protocol, including Remote Inspector
-commands, is documented in [`docs/ipc.md`](./ipc.md).
+automation. Use `tabor msg` for one-shot app control such as creating tabs,
+moving tabs, setting URLs, and opening the inspector. Use `tabor agent` as the
+primary automation surface when you need to take over a live web tab, inspect
+its interactive elements, execute batched actions, capture screenshots/PDFs,
+stream console or network events, upload files, and inspect downloads. The full
+protocol is documented in [`docs/ipc.md`](./ipc.md).

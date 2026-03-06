@@ -94,6 +94,11 @@
     </div>
 
     <div class="row">
+      <a id="download-link" href="#" download="agent-download.txt">Download file</a>
+      <div id="download-output">Download ready</div>
+    </div>
+
+    <div class="row">
       <button id="console-btn" data-testid="console-button">Console log</button>
       <button id="error-btn">Throw error</button>
       <img id="logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" alt="Logo">
@@ -126,8 +131,16 @@
       const fileOutput = document.getElementById('file-output');
       const fetchBtn = document.getElementById('fetch-btn');
       const fetchOutput = document.getElementById('fetch-output');
+      const downloadLink = document.getElementById('download-link');
+      const downloadOutput = document.getElementById('download-output');
       const consoleBtn = document.getElementById('console-btn');
       const errorBtn = document.getElementById('error-btn');
+      const downloadBlob = new Blob(['agent download fixture'], { type: 'text/plain' });
+
+      downloadLink.href = URL.createObjectURL(downloadBlob);
+      downloadLink.addEventListener('click', () => {
+        downloadOutput.textContent = 'Download started';
+      });
 
       alertBtn.addEventListener('click', () => {
         alert('Hello from alert');

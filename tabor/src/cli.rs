@@ -1,6 +1,5 @@
 use std::cmp::max;
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -319,7 +318,7 @@ pub enum Subcommands {
     #[cfg(unix)]
     Msg(MessageOptions),
     #[cfg(unix)]
-    AgentBrowser(AgentBrowserOptions),
+    Agent(AgentOptions),
     Migrate(MigrateOptions),
 }
 
@@ -336,14 +335,169 @@ pub struct MessageOptions {
     pub message: MessageCommand,
 }
 
-/// Agent-browser CLI compatibility shim.
+/// Stateful agent control for an attached Tabor instance.
 #[cfg(unix)]
 #[derive(Args, Debug, Clone)]
-#[clap(disable_help_flag = true, disable_version_flag = true)]
-pub struct AgentBrowserOptions {
-    /// Command and args to pass through.
-    #[clap(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
-    pub args: Vec<OsString>,
+pub struct AgentOptions {
+    /// IPC socket connection path override.
+    #[clap(short, long, value_hint = ValueHint::FilePath)]
+    pub socket: Option<PathBuf>,
+
+    /// Agent command.
+    #[clap(subcommand)]
+    pub command: AgentCommand,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum AgentCommand {
+    /// Attach to a running Tabor instance and start the local controller.
+    Attach,
+
+    /// List tabs and current agent state.
+    App,
+
+    /// Select the active tab or a specific tab for automation.
+    Use(AgentUse),
+
+    /// Observe the selected web tab.
+    Observe,
+
+    /// Inspect one observed element by id.
+    Inspect(AgentInspect),
+
+    /// Capture a screenshot from the selected web tab.
+    Screenshot(AgentScreenshot),
+
+    /// Read buffered console, network, and page events.
+    Events(AgentEvents),
+
+    /// Render the selected web tab as a PDF.
+    Pdf(AgentPdf),
+
+    /// Upload local files into a selected file input.
+    Upload(AgentUpload),
+
+    /// List tracked downloads for the selected web tab.
+    Downloads,
+
+    /// Execute batched actions encoded as JSON.
+    Act(AgentAct),
+
+    /// Read or update the system clipboard.
+    Clipboard(AgentClipboard),
+
+    /// Stop the local controller for this Tabor socket.
+    Close,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+#[clap(group(
+    ArgGroup::new("selection")
+        .required(true)
+        .args(&["active", "tab_id"])
+))]
+pub struct AgentUse {
+    /// Select the active tab.
+    #[clap(long)]
+    pub active: bool,
+
+    /// Tab id formatted as <index>:<generation>.
+    #[clap(long, value_parser = parse_tab_id, value_name = "INDEX:GEN")]
+    pub tab_id: Option<TabIdArg>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentInspect {
+    /// Element id returned by `tabor agent observe`.
+    pub element_id: String,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentScreenshot {
+    /// Write the PNG to this path. A temp file is used by default.
+    #[clap(long, value_hint = ValueHint::FilePath)]
+    pub path: Option<PathBuf>,
+
+    /// Capture the full page instead of the viewport.
+    #[clap(long)]
+    pub full_page: bool,
+
+    /// Crop the viewport screenshot to the observed element.
+    #[clap(long)]
+    pub element_id: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentEvents {
+    /// Return events after this event id.
+    #[clap(long)]
+    pub since: Option<u64>,
+
+    /// Maximum number of events to return.
+    #[clap(long, default_value_t = 200)]
+    pub max: usize,
+
+    /// Restrict events to one or more kinds.
+    #[clap(long = "kind")]
+    pub kinds: Vec<String>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentPdf {
+    /// Write the PDF to this path. A temp file is used by default.
+    #[clap(long, value_hint = ValueHint::FilePath)]
+    pub path: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentUpload {
+    /// Element id returned by `tabor agent observe`.
+    pub element_id: String,
+
+    /// One or more local file paths to upload.
+    #[clap(required = true, value_hint = ValueHint::FilePath)]
+    pub paths: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentAct {
+    /// JSON array of agent actions.
+    pub actions_json: String,
+
+    /// Include a post-action observation in the reply.
+    #[clap(long, default_value_t = true, action = ArgAction::Set)]
+    pub observe: bool,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentClipboard {
+    #[clap(subcommand)]
+    pub command: AgentClipboardCommand,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum AgentClipboardCommand {
+    /// Read the system clipboard.
+    Get,
+
+    /// Replace the system clipboard contents.
+    Set(AgentClipboardSet),
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentClipboardSet {
+    pub text: String,
 }
 
 /// Available socket messages.

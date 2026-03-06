@@ -4,7 +4,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult, Write};
-use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,6 +138,138 @@ pub struct IpcRuntimeMetrics {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentObservation {
+    pub revision: u64,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub pending_requests: u64,
+    pub elements: Vec<AgentElement>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRect {
+    pub x: i64,
+    pub y: i64,
+    pub width: i64,
+    pub height: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPoint {
+    pub x: i64,
+    pub y: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentElement {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub editable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentElementDetail {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<AgentRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub center: Option<AgentPoint>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub editable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentActionReport {
+    pub index: usize,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentActResult {
+    pub results: Vec<AgentActionReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<AgentObservation>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AgentScreenshot {
+    pub data_base64: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpr: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_x: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_y: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentPdf {
+    pub data_base64: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AgentEvent {
+    pub id: u64,
+    pub kind: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentDownload {
+    pub id: u32,
+    pub state: String,
+    pub url: String,
+    pub suggested_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_complete: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_bytes: Option<i64>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcWebViewMetrics {
     pub live: u64,
     pub created: u64,
@@ -214,6 +345,110 @@ pub enum IpcAction {
     MouseAction { action: String },
     Esc { sequence: String },
     Command { program: Program },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentAction {
+    Goto {
+        url: String,
+    },
+    Click {
+        id: String,
+    },
+    Hover {
+        id: String,
+    },
+    HoverAt {
+        x: i64,
+        y: i64,
+    },
+    ClickAt {
+        x: i64,
+        y: i64,
+        #[serde(default)]
+        button: AgentMouseButton,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        click_count: Option<u8>,
+    },
+    MouseDown {
+        x: i64,
+        y: i64,
+        #[serde(default)]
+        button: AgentMouseButton,
+    },
+    MouseUp {
+        x: i64,
+        y: i64,
+        #[serde(default)]
+        button: AgentMouseButton,
+    },
+    Drag {
+        from_x: i64,
+        from_y: i64,
+        to_x: i64,
+        to_y: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steps: Option<u64>,
+    },
+    Fill {
+        id: String,
+        text: String,
+    },
+    Press {
+        key: String,
+        #[serde(default)]
+        modifiers: WebKeyModifiers,
+    },
+    KeyDown {
+        key: String,
+        #[serde(default)]
+        modifiers: WebKeyModifiers,
+    },
+    KeyUp {
+        key: String,
+        #[serde(default)]
+        modifiers: WebKeyModifiers,
+    },
+    Type {
+        text: String,
+    },
+    Paste {
+        text: String,
+    },
+    Scroll {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dx: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dy: Option<i64>,
+    },
+    Wheel {
+        dx: i64,
+        dy: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i64>,
+    },
+    DialogAccept {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    DialogDismiss,
+    Wait {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_contains: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -300,31 +535,42 @@ pub enum IpcRequest {
         session_id: String,
         max: Option<usize>,
     },
-    WebEval {
-        tab_id: Option<IpcTabId>,
-        script: String,
-    },
-    WebSnapshot {
-        tab_id: Option<IpcTabId>,
-        full: bool,
-    },
-    WebPdf {
+    AgentObserve {
         tab_id: Option<IpcTabId>,
     },
-    WebNetwork {
+    AgentInspect {
         tab_id: Option<IpcTabId>,
-        action: WebNetworkAction,
+        element_id: String,
     },
-    WebMouse {
+    AgentScreenshot {
         tab_id: Option<IpcTabId>,
-        action: WebMouseAction,
-        x: f64,
-        y: f64,
-        button: WebMouseButton,
+        #[serde(default)]
+        full_page: bool,
     },
-    WebKey {
+    AgentEvents {
         tab_id: Option<IpcTabId>,
-        input: WebKeyInput,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kinds: Option<Vec<String>>,
+    },
+    AgentPdf {
+        tab_id: Option<IpcTabId>,
+    },
+    AgentUpload {
+        tab_id: Option<IpcTabId>,
+        element_id: String,
+        paths: Vec<String>,
+    },
+    AgentDownloads {
+        tab_id: Option<IpcTabId>,
+    },
+    AgentAct {
+        tab_id: Option<IpcTabId>,
+        actions: Vec<AgentAction>,
+        observe: bool,
     },
     TerminalKey {
         tab_id: Option<IpcTabId>,
@@ -374,12 +620,20 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
             name: "poll_inspector_messages",
             summary: "Poll queued inspector messages.",
         },
-        IpcRequestHelp { name: "web_eval", summary: "Evaluate JavaScript in a web tab." },
-        IpcRequestHelp { name: "web_snapshot", summary: "Capture a web tab snapshot." },
-        IpcRequestHelp { name: "web_pdf", summary: "Create a PDF from a web tab." },
-        IpcRequestHelp { name: "web_network", summary: "Inspect web network activity." },
-        IpcRequestHelp { name: "web_mouse", summary: "Dispatch native web mouse input." },
-        IpcRequestHelp { name: "web_key", summary: "Dispatch native web key input." },
+        IpcRequestHelp { name: "agent_observe", summary: "Observe a web tab for agent control." },
+        IpcRequestHelp { name: "agent_inspect", summary: "Inspect an observed web element." },
+        IpcRequestHelp { name: "agent_screenshot", summary: "Capture a screenshot for a web tab." },
+        IpcRequestHelp {
+            name: "agent_events",
+            summary: "Read console, network, and page agent events.",
+        },
+        IpcRequestHelp { name: "agent_pdf", summary: "Render a web tab as PDF." },
+        IpcRequestHelp { name: "agent_upload", summary: "Upload local files to a file input." },
+        IpcRequestHelp {
+            name: "agent_downloads",
+            summary: "List tracked downloads for a web tab.",
+        },
+        IpcRequestHelp { name: "agent_act", summary: "Run batched web agent actions." },
         IpcRequestHelp { name: "terminal_key", summary: "Dispatch terminal key input." },
         IpcRequestHelp {
             name: "runtime_metrics",
@@ -404,12 +658,14 @@ impl IpcRequest {
             IpcRequest::OpenInspector { tab_id }
             | IpcRequest::ReloadWeb { tab_id }
             | IpcRequest::SetWebUrl { tab_id, .. }
-            | IpcRequest::WebEval { tab_id, .. }
-            | IpcRequest::WebSnapshot { tab_id, .. }
-            | IpcRequest::WebPdf { tab_id }
-            | IpcRequest::WebNetwork { tab_id, .. }
-            | IpcRequest::WebMouse { tab_id, .. }
-            | IpcRequest::WebKey { tab_id, .. }
+            | IpcRequest::AgentObserve { tab_id }
+            | IpcRequest::AgentInspect { tab_id, .. }
+            | IpcRequest::AgentScreenshot { tab_id, .. }
+            | IpcRequest::AgentEvents { tab_id, .. }
+            | IpcRequest::AgentPdf { tab_id }
+            | IpcRequest::AgentUpload { tab_id, .. }
+            | IpcRequest::AgentDownloads { tab_id }
+            | IpcRequest::AgentAct { tab_id, .. }
             | IpcRequest::TerminalKey { tab_id, .. } => *tab_id,
             IpcRequest::OpenUrl { target: UrlTarget::TabId { tab_id }, .. } => Some(*tab_id),
             IpcRequest::SelectTab { selection: TabSelection::ById { tab_id } } => Some(*tab_id),
@@ -442,19 +698,15 @@ pub enum SocketReply {
     InspectorAttached { session: IpcInspectorSession },
     InspectorMessages { messages: Vec<IpcInspectorMessage> },
     Config { config: serde_json::Value },
-    WebEval { result: Option<String> },
-    WebSnapshot { data: String },
-    WebPdf { data: String },
-    WebNetwork { entries: Vec<WebNetworkEntry> },
+    AgentObservation { observation: AgentObservation },
+    AgentElement { element: AgentElementDetail },
+    AgentScreenshot { screenshot: AgentScreenshot },
+    AgentEvents { last_event_id: u64, events: Vec<AgentEvent> },
+    AgentPdf { pdf: AgentPdf },
+    AgentDownloads { downloads: Vec<AgentDownload> },
+    AgentAct { result: AgentActResult },
     RuntimeMetrics { metrics: IpcRuntimeMetrics },
     Error { error: IpcError },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WebNetworkAction {
-    List { filter: Option<String> },
-    Clear,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -467,24 +719,6 @@ pub struct WebNetworkEntry {
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub error_text: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WebMouseAction {
-    Move,
-    Down,
-    Up,
-    Click,
-    DoubleClick,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WebMouseButton {
-    Left,
-    Right,
-    Middle,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,18 +740,13 @@ pub struct WebKeyModifiers {
     pub super_key: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct WebKeyInput {
-    pub key: String,
-    #[serde(default)]
-    pub key_code: Option<String>,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub modifiers: WebKeyModifiers,
-    #[serde(default)]
-    pub repeat: bool,
-    pub state: WebKeyState,
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMouseButton {
+    #[default]
+    Left,
+    Middle,
+    Right,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -645,20 +874,6 @@ pub trait IpcContext {
         session_id: String,
         max: Option<usize>,
     ) -> Result<Vec<IpcInspectorMessage>, IpcError>;
-    fn web_network(
-        &mut self,
-        tab_id: TabId,
-        action: WebNetworkAction,
-    ) -> Result<Vec<WebNetworkEntry>, IpcError>;
-    fn web_mouse(
-        &mut self,
-        tab_id: TabId,
-        action: WebMouseAction,
-        x: f64,
-        y: f64,
-        button: WebMouseButton,
-    ) -> Result<(), IpcError>;
-    fn web_key(&mut self, tab_id: TabId, input: WebKeyInput) -> Result<(), IpcError>;
     fn terminal_key(&mut self, tab_id: TabId, input: TerminalKeyInput) -> Result<(), IpcError>;
     fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError>;
 }
@@ -968,62 +1183,6 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
-        IpcRequest::WebNetwork { tab_id, action } => {
-            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
-                Some(tab_id) => tab_id.into(),
-                None => {
-                    return IpcResponse {
-                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
-                        close_window: false,
-                    };
-                },
-            };
-
-            match ctx.web_network(tab_id, action) {
-                Ok(entries) => {
-                    IpcResponse { reply: SocketReply::WebNetwork { entries }, close_window: false }
-                },
-                Err(err) => {
-                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
-                },
-            }
-        },
-        IpcRequest::WebMouse { tab_id, action, x, y, button } => {
-            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
-                Some(tab_id) => tab_id.into(),
-                None => {
-                    return IpcResponse {
-                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
-                        close_window: false,
-                    };
-                },
-            };
-
-            match ctx.web_mouse(tab_id, action, x, y, button) {
-                Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => {
-                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
-                },
-            }
-        },
-        IpcRequest::WebKey { tab_id, input } => {
-            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
-                Some(tab_id) => tab_id.into(),
-                None => {
-                    return IpcResponse {
-                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
-                        close_window: false,
-                    };
-                },
-            };
-
-            match ctx.web_key(tab_id, input) {
-                Ok(()) => IpcResponse { reply: reply_ok(), close_window: false },
-                Err(err) => {
-                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
-                },
-            }
-        },
         IpcRequest::TerminalKey { tab_id, input } => {
             let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
                 Some(tab_id) => tab_id.into(),
@@ -1050,14 +1209,19 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
             },
         },
-        IpcRequest::WebEval { .. } | IpcRequest::WebSnapshot { .. } | IpcRequest::WebPdf { .. } => {
-            IpcResponse {
-                reply: reply_error(
-                    IpcErrorCode::Unsupported,
-                    "Web automation requests must be handled at the IPC router",
-                ),
-                close_window: false,
-            }
+        IpcRequest::AgentObserve { .. }
+        | IpcRequest::AgentInspect { .. }
+        | IpcRequest::AgentScreenshot { .. }
+        | IpcRequest::AgentEvents { .. }
+        | IpcRequest::AgentPdf { .. }
+        | IpcRequest::AgentUpload { .. }
+        | IpcRequest::AgentDownloads { .. }
+        | IpcRequest::AgentAct { .. } => IpcResponse {
+            reply: reply_error(
+                IpcErrorCode::Unsupported,
+                "Agent requests must be handled at the IPC router",
+            ),
+            close_window: false,
         },
         IpcRequest::SetConfig(..) | IpcRequest::GetConfig(..) => IpcResponse {
             reply: reply_error(
@@ -1091,27 +1255,36 @@ pub fn spawn_ipc_socket(
 
     // Spawn a thread to listen on the IPC socket.
     thread::spawn_named("socket listener", move || {
-        let mut data = String::new();
         for stream in listener.incoming().filter_map(Result::ok) {
-            data.clear();
-            let mut reader = BufReader::new(&stream);
+            let proxy = event_proxy.clone();
+            thread::spawn_named("socket connection", move || {
+                let stream = Arc::new(stream);
+                let Ok(reader_stream) = stream.try_clone() else {
+                    return;
+                };
+                let mut reader = BufReader::new(reader_stream);
+                let mut data = String::new();
 
-            match reader.read_line(&mut data) {
-                Ok(0) | Err(_) => continue,
-                Ok(_) => (),
-            };
+                loop {
+                    data.clear();
+                    match reader.read_line(&mut data) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => (),
+                    };
 
-            // Read pending events on socket.
-            let message: IpcRequest = match serde_json::from_str(&data) {
-                Ok(message) => message,
-                Err(err) => {
-                    warn!("Failed to convert data from socket: {err}");
-                    continue;
-                },
-            };
+                    let message: IpcRequest = match serde_json::from_str(&data) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            warn!("Failed to convert data from socket: {err}");
+                            continue;
+                        },
+                    };
 
-            let event = Event::new(EventType::IpcRequest(message, Arc::new(stream)), None);
-            let _ = event_proxy.send_event(event);
+                    let event =
+                        Event::new(EventType::IpcRequest(message, Arc::clone(&stream)), None);
+                    let _ = proxy.send_event(event);
+                }
+            });
         }
     });
 
@@ -1124,24 +1297,44 @@ pub fn send_message(socket: Option<PathBuf>, message: IpcRequest) -> IoResult<Op
     send_raw_message(socket, &message_json)
 }
 
+pub struct IpcConnection {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl IpcConnection {
+    pub fn connect(socket: Option<PathBuf>) -> IoResult<Self> {
+        let socket_path = resolve_socket_path(socket)?;
+        let writer = UnixStream::connect(&socket_path)?;
+        let reader = BufReader::new(writer.try_clone()?);
+        Ok(Self { writer, reader })
+    }
+
+    pub fn send_message(&mut self, message: &IpcRequest) -> IoResult<Option<SocketReply>> {
+        let json = serde_json::to_string(message)?;
+        self.send_raw(&json)
+    }
+
+    pub fn send_raw(&mut self, message_json: &str) -> IoResult<Option<SocketReply>> {
+        self.writer.write_all(message_json.as_bytes())?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+        read_reply_line(&mut self.reader)
+    }
+}
+
 /// Send raw JSON to the active Tabor socket.
 pub fn send_raw_message(
     socket: Option<PathBuf>,
     message_json: &str,
 ) -> IoResult<Option<SocketReply>> {
-    let mut socket = find_socket(socket)?;
-
-    socket.write_all(message_json.as_bytes())?;
-    let _ = socket.flush();
-    socket.shutdown(Shutdown::Write)?;
-
-    read_reply(&socket)
+    let mut connection = IpcConnection::connect(socket)?;
+    connection.send_raw(message_json)
 }
 
 /// Read IPC responses.
-fn read_reply(stream: &UnixStream) -> IoResult<Option<SocketReply>> {
+fn read_reply_line<R: BufRead>(reader: &mut R) -> IoResult<Option<SocketReply>> {
     let mut buffer = String::new();
-    let mut reader = BufReader::new(stream);
     if let Ok(0) | Err(_) = reader.read_line(&mut buffer) {
         return Ok(None);
     }
@@ -1162,6 +1355,7 @@ pub fn send_reply(stream: &mut UnixStream, message: SocketReply) {
 fn send_reply_fallible(stream: &mut UnixStream, message: SocketReply) -> IoResult<()> {
     let json = serde_json::to_string(&message).map_err(IoError::other)?;
     stream.write_all(json.as_bytes())?;
+    stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
 }
@@ -1184,21 +1378,21 @@ fn socket_dir() -> PathBuf {
 }
 
 /// Find the IPC socket path.
-fn find_socket(socket_path: Option<PathBuf>) -> IoResult<UnixStream> {
+pub fn resolve_socket_path(socket_path: Option<PathBuf>) -> IoResult<PathBuf> {
     // Handle --socket CLI override.
     if let Some(socket_path) = socket_path {
-        // Ensure we inform the user about an invalid path.
-        return UnixStream::connect(&socket_path).map_err(|err| {
-            let message = format!("invalid socket path {socket_path:?}");
-            IoError::new(err.kind(), message)
-        });
+        if socket_path.exists() {
+            return Ok(socket_path);
+        }
+        let message = format!("invalid socket path {socket_path:?}");
+        return Err(IoError::new(ErrorKind::NotFound, message));
     }
 
     // Handle environment variable.
     if let Ok(path) = env::var(TABOR_SOCKET_ENV) {
         let socket_path = PathBuf::from(path);
-        if let Ok(socket) = UnixStream::connect(socket_path) {
-            return Ok(socket);
+        if socket_path.exists() {
+            return Ok(socket_path);
         }
     }
 
@@ -1219,7 +1413,7 @@ fn find_socket(socket_path: Option<PathBuf>) -> IoResult<UnixStream> {
 
         // Attempt to connect to the socket.
         match UnixStream::connect(&path) {
-            Ok(socket) => return Ok(socket),
+            Ok(_) => return Ok(path),
             // Delete orphan sockets.
             Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
                 let _ = fs::remove_file(&path);
@@ -1737,47 +1931,6 @@ mod tests {
                 drained.push(IpcInspectorMessage { session_id: session_id.clone(), payload });
             }
             Ok(drained)
-        }
-
-        fn web_network(
-            &mut self,
-            tab_id: TabId,
-            _action: WebNetworkAction,
-        ) -> Result<Vec<WebNetworkEntry>, IpcError> {
-            if !self.tabs.contains_key(&tab_id) {
-                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-            }
-            if !self.web_supported {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
-            }
-            Ok(Vec::new())
-        }
-
-        fn web_mouse(
-            &mut self,
-            tab_id: TabId,
-            _action: WebMouseAction,
-            _x: f64,
-            _y: f64,
-            _button: WebMouseButton,
-        ) -> Result<(), IpcError> {
-            if !self.tabs.contains_key(&tab_id) {
-                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-            }
-            if !self.web_supported {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
-            }
-            Ok(())
-        }
-
-        fn web_key(&mut self, tab_id: TabId, _input: WebKeyInput) -> Result<(), IpcError> {
-            if !self.tabs.contains_key(&tab_id) {
-                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-            }
-            if !self.web_supported {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
-            }
-            Ok(())
         }
 
         fn terminal_key(

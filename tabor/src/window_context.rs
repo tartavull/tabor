@@ -17,10 +17,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-#[cfg(unix)]
-use base64::Engine;
-#[cfg(unix)]
-use base64::engine::general_purpose::STANDARD as BASE64;
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
@@ -29,13 +25,8 @@ use log::info;
 #[cfg(target_os = "macos")]
 use serde::Deserialize;
 use serde_json as json;
-use winit::event::{ElementState, MouseButton};
 use winit::event::{Event as WinitEvent, Ime, Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-#[cfg(target_os = "macos")]
-use winit::keyboard::{
-    Key, KeyCode, KeyLocation, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey,
-};
 use winit::raw_window_handle::HasDisplayHandle;
 #[cfg(target_os = "macos")]
 use winit::window::CursorIcon;
@@ -75,11 +66,11 @@ use crate::event::{
 use crate::ipc;
 #[cfg(unix)]
 use crate::ipc::{
-    IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage, IpcInspectorSession,
-    IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind,
-    IpcTabPanelState, IpcTabState, IpcWebCloseMetrics, IpcWebViewMetrics, SocketReply,
-    TabSelection, TerminalKeyInput, WebKeyInput, WebMouseAction, WebMouseButton, WebNetworkAction,
-    WebNetworkEntry,
+    AgentActResult, AgentAction, AgentElementDetail, AgentEvent, AgentObservation, AgentPdf,
+    AgentScreenshot, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
+    IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
+    IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcWebCloseMetrics, IpcWebViewMetrics,
+    SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -98,8 +89,6 @@ use crate::macos::web_commands::WebCommandState;
 use crate::macos::webview::WebView;
 #[cfg(target_os = "macos")]
 use crate::tab_panel::TabFavicon;
-#[cfg(target_os = "macos")]
-use objc2_app_kit::NSEventModifierFlags;
 #[cfg(target_os = "macos")]
 use serde_json::Value as JsonValue;
 
@@ -124,6 +113,8 @@ struct TabState {
     #[cfg(target_os = "macos")]
     web_command_state: WebCommandState,
     #[cfg(target_os = "macos")]
+    agent_runtime: AgentRuntimeState,
+    #[cfg(target_os = "macos")]
     favicon: Option<TabFavicon>,
     #[cfg(target_os = "macos")]
     favicon_pending: bool,
@@ -145,6 +136,33 @@ struct WebCloseMetrics {
     last_ms: Option<f64>,
     max_ms: f64,
     total_ms: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct AgentRuntimeState {
+    preload_registered: bool,
+    injected_once: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Deserialize)]
+struct AgentScreenshotMeta {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    dpr: Option<f64>,
+    #[serde(default)]
+    scroll_x: Option<i64>,
+    #[serde(default)]
+    scroll_y: Option<i64>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct PendingAgentScreenshot {
+    meta: Option<Result<AgentScreenshotMeta, String>>,
+    data_base64: Option<Result<String, String>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -246,6 +264,622 @@ const WEB_FAVICON_JS: &str = r#"
 "#;
 
 #[cfg(target_os = "macos")]
+const AGENT_BOOTSTRAP_JS: &str = r#"
+(() => {
+  const VERSION = 2;
+  if (window.__taborAgent && window.__taborAgent.version === VERSION) {
+    return;
+  }
+
+  const state = window.__taborAgentState || (window.__taborAgentState = {
+    nextId: 1,
+    revision: 1,
+    inflight: 0,
+    observersInstalled: false,
+    networkInstalled: false,
+    dialogsInstalled: false,
+    nextDialogDecision: null
+  });
+
+  const bump = () => { state.revision += 1; };
+  const doc = () => document;
+  const round = (value) => Math.round(Number(value) || 0);
+
+  if (!state.observersInstalled) {
+    const observer = new MutationObserver(() => { bump(); });
+    observer.observe(document, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      characterData: true
+    });
+    window.addEventListener("hashchange", bump);
+    window.addEventListener("popstate", bump);
+    state.observersInstalled = true;
+  }
+
+  if (!state.networkInstalled) {
+    const finish = () => {
+      state.inflight = Math.max(0, state.inflight - 1);
+      bump();
+    };
+    if (typeof window.fetch === "function") {
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (...args) => {
+        state.inflight += 1;
+        bump();
+        try {
+          return Promise.resolve(originalFetch(...args)).finally(finish);
+        } catch (error) {
+          finish();
+          throw error;
+        }
+      };
+    }
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(...args) {
+      state.inflight += 1;
+      bump();
+      this.addEventListener("loadend", finish, { once: true });
+      return originalSend.apply(this, args);
+    };
+    state.networkInstalled = true;
+  }
+
+  if (!state.dialogsInstalled) {
+    const consumeDialogDecision = () => {
+      const decision = state.nextDialogDecision || { accept: false, text: null };
+      state.nextDialogDecision = null;
+      bump();
+      return decision;
+    };
+
+    window.alert = (message) => {
+      state.lastDialog = {
+        kind: "alert",
+        message: String(message ?? ""),
+        default_prompt_text: null
+      };
+      consumeDialogDecision();
+    };
+
+    window.confirm = (message) => {
+      state.lastDialog = {
+        kind: "confirm",
+        message: String(message ?? ""),
+        default_prompt_text: null
+      };
+      return !!consumeDialogDecision().accept;
+    };
+
+    window.prompt = (message, defaultText = "") => {
+      state.lastDialog = {
+        kind: "prompt",
+        message: String(message ?? ""),
+        default_prompt_text: defaultText == null ? null : String(defaultText)
+      };
+      const decision = consumeDialogDecision();
+      if (!decision.accept) return null;
+      if (decision.text != null) return String(decision.text);
+      return defaultText == null ? "" : String(defaultText);
+    };
+
+    state.dialogsInstalled = true;
+  }
+
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    return rect.bottom >= 0 && rect.right >= 0 &&
+      rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+  };
+
+  const editable = (el) => {
+    if (!el) return false;
+    return !!el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
+  };
+
+  const interactive = (el) => {
+    if (!visible(el)) return false;
+    if (editable(el)) return true;
+    if (el.tagName === "A" && el.href) return true;
+    if (["BUTTON", "SUMMARY"].includes(el.tagName)) return true;
+    if (el.onclick) return true;
+    if (el.getAttribute("role")) return true;
+    if (el.tabIndex >= 0) return true;
+    return false;
+  };
+
+  const role = (el) => {
+    return (
+      el.getAttribute("role") ||
+      (el.tagName || "").toLowerCase()
+    );
+  };
+
+  const compactText = (value) => {
+    if (value == null) return null;
+    const text = String(value).replace(/\s+/g, " ").trim();
+    if (!text) return null;
+    return text.length > 96 ? text.slice(0, 96) : text;
+  };
+
+  const name = (el) => {
+    return compactText(
+      el.getAttribute("aria-label") ||
+      el.getAttribute("placeholder") ||
+      el.getAttribute("title") ||
+      el.innerText ||
+      el.textContent ||
+      el.id ||
+      el.value ||
+      ""
+    ) || "";
+  };
+
+  const value = (el) => {
+    if (!editable(el)) return null;
+    if ("value" in el) return compactText(el.value || "");
+    return compactText(el.textContent || "");
+  };
+
+  const checked = (el) => {
+    if ("checked" in el) return !!el.checked;
+    return null;
+  };
+
+  const placeholder = (el) => compactText(el.getAttribute("placeholder") || "");
+
+  const inputType = (el) => {
+    if (!el || !el.tagName) return null;
+    if (el.tagName === "INPUT") return String(el.getAttribute("type") || "text").toLowerCase();
+    if (el.tagName === "TEXTAREA") return "textarea";
+    if (el.tagName === "SELECT") return "select";
+    if (el.isContentEditable) return "contenteditable";
+    return null;
+  };
+
+  const bbox = (el) => {
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (!rect) return null;
+    return {
+      x: round(rect.left),
+      y: round(rect.top),
+      width: round(rect.width),
+      height: round(rect.height)
+    };
+  };
+
+  const center = (el) => {
+    const rect = bbox(el);
+    if (!rect) return null;
+    return {
+      x: rect.x + Math.floor(rect.width / 2),
+      y: rect.y + Math.floor(rect.height / 2)
+    };
+  };
+
+  const optionNames = (el) => {
+    if (!el || el.tagName !== "SELECT" || !el.options) return null;
+    const values = Array.from(el.options)
+      .map((option) => compactText(option.label || option.textContent || option.value || ""))
+      .filter(Boolean);
+    return values.length ? values : null;
+  };
+
+  const idFor = (el) => {
+    let id = el.getAttribute("data-tabor-agent-id");
+    if (!id) {
+      id = state.nextId.toString(36);
+      state.nextId += 1;
+      el.setAttribute("data-tabor-agent-id", id);
+    }
+    return id;
+  };
+
+  const resolve = (id) => {
+    return Array.from(doc().querySelectorAll("[data-tabor-agent-id]"))
+      .find((el) => el.getAttribute("data-tabor-agent-id") === id) || null;
+  };
+
+  const elements = () => {
+    const out = [];
+    const seen = new Set();
+    const selector = [
+      "a[href]",
+      "button",
+      "input",
+      "textarea",
+      "select",
+      "summary",
+      "[role]",
+      "[contenteditable=\"true\"]",
+      "[tabindex]"
+    ].join(",");
+    for (const el of Array.from(doc().querySelectorAll(selector))) {
+      if (!interactive(el)) continue;
+      const id = idFor(el);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        role: role(el),
+        name: name(el),
+        value: value(el),
+        editable: editable(el),
+        disabled: !!el.disabled,
+        checked: checked(el)
+      });
+    }
+    return out;
+  };
+
+  const observe = () => ({
+    revision: state.revision,
+    url: window.location.href,
+    title: doc().title || "",
+    ready_state: doc().readyState || "",
+    pending_requests: state.inflight,
+    elements: elements()
+  });
+
+  const inspect = (id) => {
+    const el = resolve(id);
+    if (!el) return { error: "element not found" };
+    return {
+      id,
+      role: role(el),
+      name: name(el),
+      value: value(el),
+      text: compactText(el.innerText || el.textContent || ""),
+      href: el.getAttribute("href") || el.href || null,
+      placeholder: placeholder(el),
+      input_type: inputType(el),
+      bbox: bbox(el),
+      center: center(el),
+      editable: editable(el),
+      disabled: !!el.disabled,
+      checked: checked(el),
+      options: optionNames(el)
+    };
+  };
+
+  const dispatchKeyboard = (type, key, modifiers) => {
+    const target = doc().activeElement || doc().body;
+    const init = {
+      key,
+      ctrlKey: !!modifiers.control,
+      altKey: !!modifiers.alt,
+      shiftKey: !!modifiers.shift,
+      metaKey: !!modifiers.super_key,
+      bubbles: true,
+      cancelable: true
+    };
+    target.dispatchEvent(new KeyboardEvent(type, init));
+  };
+
+  const dispatchKey = (key, modifiers) => {
+    dispatchKeyboard("keydown", key, modifiers);
+    dispatchKeyboard("keyup", key, modifiers);
+  };
+
+  const fill = (el, text) => {
+    el.focus();
+    if ("value" in el) {
+      el.value = text;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+    if (el.isContentEditable) {
+      el.textContent = text;
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
+      return;
+    }
+    throw new Error("element is not editable");
+  };
+
+  const typeText = (text) => {
+    const target = doc().activeElement || doc().body;
+    if (!target) return;
+    if ("value" in target) {
+      const current = String(target.value || "");
+      const next = `${current}${text}`;
+      target.value = next;
+      target.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+    if (target.isContentEditable) {
+      target.textContent = `${target.textContent || ""}${text}`;
+      target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
+      return;
+    }
+    target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
+  };
+
+  const buttonCode = (button) => {
+    const name = String(button || "left").toLowerCase();
+    if (name === "right") return 2;
+    if (name === "middle") return 1;
+    return 0;
+  };
+
+  const targetAt = (x, y) => doc().elementFromPoint(x, y) || doc().body;
+
+  const mouseInit = (x, y, button, clickCount = 1) => ({
+    clientX: x,
+    clientY: y,
+    button: buttonCode(button),
+    buttons: 1,
+    detail: clickCount,
+    bubbles: true,
+    cancelable: true
+  });
+
+  const hoverAt = (x, y) => {
+    const target = targetAt(x, y);
+    target.dispatchEvent(new MouseEvent("mouseover", mouseInit(x, y, "left")));
+    target.dispatchEvent(new MouseEvent("mousemove", mouseInit(x, y, "left")));
+  };
+
+  const hoverElement = (el) => {
+    const point = center(el);
+    if (!point) throw new Error("element has no bounding box");
+    el.dispatchEvent(new MouseEvent("mouseover", mouseInit(point.x, point.y, "left")));
+    el.dispatchEvent(new MouseEvent("mousemove", mouseInit(point.x, point.y, "left")));
+    return point;
+  };
+
+  const mouseDownAt = (x, y, button) => {
+    const target = targetAt(x, y);
+    target.dispatchEvent(new MouseEvent("mousedown", mouseInit(x, y, button)));
+  };
+
+  const mouseUpAt = (x, y, button) => {
+    const target = targetAt(x, y);
+    target.dispatchEvent(new MouseEvent("mouseup", mouseInit(x, y, button)));
+  };
+
+  const clickAt = (x, y, button, clickCount = 1) => {
+    const target = targetAt(x, y);
+    hoverAt(x, y);
+    target.dispatchEvent(new MouseEvent("mousedown", mouseInit(x, y, button, clickCount)));
+    target.dispatchEvent(new MouseEvent("mouseup", mouseInit(x, y, button, clickCount)));
+    target.dispatchEvent(new MouseEvent("click", mouseInit(x, y, button, clickCount)));
+    if (clickCount >= 2) {
+      target.dispatchEvent(new MouseEvent("dblclick", mouseInit(x, y, button, clickCount)));
+    }
+    if (buttonCode(button) === 0 && typeof target.click === "function") {
+      target.click();
+    }
+  };
+
+  const clickElement = (el, button, clickCount = 1) => {
+    const point = hoverElement(el);
+    el.dispatchEvent(new MouseEvent("mousedown", mouseInit(point.x, point.y, button, clickCount)));
+    el.dispatchEvent(new MouseEvent("mouseup", mouseInit(point.x, point.y, button, clickCount)));
+    if (buttonCode(button) === 0 && clickCount === 1 && typeof el.click === "function") {
+      el.click();
+      return;
+    }
+    el.dispatchEvent(new MouseEvent("click", mouseInit(point.x, point.y, button, clickCount)));
+    if (clickCount >= 2) {
+      el.dispatchEvent(new MouseEvent("dblclick", mouseInit(point.x, point.y, button, clickCount)));
+    }
+    if (buttonCode(button) === 0 && typeof el.click === "function") {
+      el.click();
+    }
+  };
+
+  const drag = (fromX, fromY, toX, toY) => {
+    const source = targetAt(fromX, fromY);
+    const destination = targetAt(toX, toY);
+    const transfer = typeof DataTransfer === "function" ? new DataTransfer() : null;
+    const eventInit = (x, y) => ({
+      clientX: x,
+      clientY: y,
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: transfer
+    });
+    source.dispatchEvent(new DragEvent("dragstart", eventInit(fromX, fromY)));
+    destination.dispatchEvent(new DragEvent("dragenter", eventInit(toX, toY)));
+    destination.dispatchEvent(new DragEvent("dragover", eventInit(toX, toY)));
+    destination.dispatchEvent(new DragEvent("drop", eventInit(toX, toY)));
+    source.dispatchEvent(new DragEvent("dragend", eventInit(toX, toY)));
+  };
+
+  const wheelAt = (dx, dy, x, y) => {
+    const target = targetAt(x ?? Math.floor(window.innerWidth / 2), y ?? Math.floor(window.innerHeight / 2));
+    target.dispatchEvent(new WheelEvent("wheel", {
+      deltaX: dx,
+      deltaY: dy,
+      clientX: x ?? Math.floor(window.innerWidth / 2),
+      clientY: y ?? Math.floor(window.innerHeight / 2),
+      bubbles: true,
+      cancelable: true
+    }));
+    window.scrollBy(dx, dy);
+  };
+
+  const upload = async (id) => {
+    const el = resolve(id);
+    if (!el) throw new Error("element not found");
+    if (String(el.tagName || "").toLowerCase() !== "input" || inputType(el) !== "file") {
+      throw new Error("element is not a file input");
+    }
+    if (typeof el.showPicker === "function") {
+      try {
+        el.showPicker();
+      } catch (_error) {
+        el.click();
+      }
+    } else {
+      el.click();
+    }
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (el.files && el.files.length > 0) return inspect(id);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("upload timed out");
+  };
+
+  const screenshotMeta = () => ({
+    width: round(window.innerWidth),
+    height: round(window.innerHeight),
+    dpr: Number(window.devicePixelRatio || 1),
+    scroll_x: round(window.scrollX || 0),
+    scroll_y: round(window.scrollY || 0)
+  });
+
+  const waitFor = async (spec) => {
+    const timeoutMs = spec.timeout_ms || 10000;
+    if (spec.ms != null) {
+      await new Promise((resolve) => setTimeout(resolve, spec.ms));
+      return;
+    }
+    const deadline = Date.now() + timeoutMs;
+    let stableAt = 0;
+    while (Date.now() < deadline) {
+      let ok = true;
+      if (spec.id) ok = !!resolve(spec.id);
+      if (ok && spec.text) {
+        const body = doc().body ? (doc().body.innerText || doc().body.textContent || "") : "";
+        ok = body.includes(spec.text);
+      }
+      if (ok && spec.url_contains) ok = window.location.href.includes(spec.url_contains);
+      if (ok && spec.load) {
+        const mode = String(spec.load).toLowerCase();
+        if (mode === "domcontentloaded" || mode === "domcontent") {
+          ok = doc().readyState === "interactive" || doc().readyState === "complete";
+        } else if (mode === "networkidle" || mode === "network_idle") {
+          const idle = state.inflight === 0 && doc().readyState === "complete";
+          if (!idle) {
+            stableAt = 0;
+            ok = false;
+          } else if (!stableAt) {
+            stableAt = Date.now();
+            ok = false;
+          } else {
+            ok = Date.now() - stableAt >= 500;
+          }
+        } else {
+          ok = doc().readyState === "complete";
+        }
+      }
+      if (ok) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("wait timed out");
+  };
+
+  const act = async (actions, includeObservation) => {
+    const results = [];
+    const nextDialogDecision = (startIndex) => {
+      for (let index = startIndex + 1; index < actions.length; index += 1) {
+        const action = actions[index];
+        if (action.__dialogConsumed) continue;
+        if (action.type === "dialog_accept") {
+          action.__dialogConsumed = true;
+          return { accept: true, text: action.text ?? null };
+        }
+        if (action.type === "dialog_dismiss") {
+          action.__dialogConsumed = true;
+          return { accept: false, text: null };
+        }
+      }
+      return { accept: false, text: null };
+    };
+
+    for (let index = 0; index < actions.length; index += 1) {
+      const action = actions[index];
+      try {
+        if (action.__dialogConsumed) {
+          results.push({ index, ok: true });
+          continue;
+        }
+        state.nextDialogDecision = nextDialogDecision(index);
+        if (action.type === "goto") {
+          window.location.href = action.url;
+        } else if (action.type === "click") {
+          const el = resolve(action.id);
+          if (!el) throw new Error("element not found");
+          el.scrollIntoView({ block: "center", inline: "center" });
+          clickElement(el, "left", 1);
+        } else if (action.type === "hover") {
+          const el = resolve(action.id);
+          if (!el) throw new Error("element not found");
+          hoverElement(el);
+        } else if (action.type === "hover_at") {
+          hoverAt(action.x, action.y);
+        } else if (action.type === "click_at") {
+          clickAt(action.x, action.y, action.button || "left", action.click_count || 1);
+        } else if (action.type === "mouse_down") {
+          mouseDownAt(action.x, action.y, action.button || "left");
+        } else if (action.type === "mouse_up") {
+          mouseUpAt(action.x, action.y, action.button || "left");
+        } else if (action.type === "drag") {
+          drag(action.from_x, action.from_y, action.to_x, action.to_y);
+        } else if (action.type === "fill") {
+          const el = resolve(action.id);
+          if (!el) throw new Error("element not found");
+          fill(el, action.text);
+        } else if (action.type === "press") {
+          dispatchKey(action.key, action.modifiers || {});
+        } else if (action.type === "key_down") {
+          dispatchKeyboard("keydown", action.key, action.modifiers || {});
+        } else if (action.type === "key_up") {
+          dispatchKeyboard("keyup", action.key, action.modifiers || {});
+        } else if (action.type === "type") {
+          typeText(action.text);
+        } else if (action.type === "paste") {
+          typeText(action.text);
+        } else if (action.type === "scroll") {
+          window.scrollBy(action.dx || 0, action.dy || 0);
+        } else if (action.type === "wheel") {
+          wheelAt(action.dx, action.dy, action.x, action.y);
+        } else if (action.type === "dialog_accept" || action.type === "dialog_dismiss") {
+          // Consumed by alert/confirm/prompt interception when needed.
+        } else if (action.type === "wait") {
+          await waitFor(action);
+        } else {
+          throw new Error("unsupported action");
+        }
+        results.push({ index, ok: true });
+      } catch (error) {
+        results.push({
+          index,
+          ok: false,
+          error: error && error.message ? String(error.message) : String(error)
+        });
+        break;
+      } finally {
+        state.nextDialogDecision = null;
+      }
+    }
+    return {
+      results,
+      observation: includeObservation ? observe() : null
+    };
+  };
+
+  window.__taborAgent = {
+    version: VERSION,
+    observe,
+    inspect,
+    act,
+    upload,
+    screenshotMeta
+  };
+})()
+"#;
+
+#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 struct WebFaviconHint {
     #[serde(default)]
@@ -287,6 +921,47 @@ fn select_favicon_base(page_url: &str, base_uri: &str, referrer: &str) -> String
         return referrer.to_string();
     }
     page_url.to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_agent_runtime(web_view: &mut WebView, state: &mut AgentRuntimeState) {
+    if state.preload_registered {
+        return;
+    }
+
+    let _ = web_view.devtools_command_json(
+        "Page.addScriptToEvaluateOnNewDocument",
+        Some(json::json!({ "source": AGENT_BOOTSTRAP_JS })),
+        |_| {},
+    );
+    state.preload_registered = true;
+}
+
+#[cfg(target_os = "macos")]
+fn agent_script(state: &mut AgentRuntimeState, expression: &str) -> String {
+    let mut script = agent_script_prefix(state);
+    script.push_str("JSON.stringify(");
+    script.push_str(expression);
+    script.push(')');
+    script
+}
+
+#[cfg(target_os = "macos")]
+fn agent_object_script(state: &mut AgentRuntimeState, expression: &str) -> String {
+    let mut script = agent_script_prefix(state);
+    script.push_str(expression);
+    script
+}
+
+#[cfg(target_os = "macos")]
+fn agent_script_prefix(state: &mut AgentRuntimeState) -> String {
+    let mut script = String::new();
+    if !state.injected_once {
+        script.push_str(AGENT_BOOTSTRAP_JS);
+        script.push('\n');
+        state.injected_once = true;
+    }
+    script
 }
 
 impl TabState {
@@ -1022,6 +1697,8 @@ impl WindowContext {
             web_view,
             #[cfg(target_os = "macos")]
             web_command_state: Default::default(),
+            #[cfg(target_os = "macos")]
+            agent_runtime: Default::default(),
             #[cfg(target_os = "macos")]
             favicon: None,
             #[cfg(target_os = "macos")]
@@ -2404,115 +3081,7 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
-    pub(crate) fn ipc_web_eval(
-        &mut self,
-        tab_id: Option<TabId>,
-        script: String,
-        stream: Arc<UnixStream>,
-    ) {
-        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
-            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
-            return;
-        };
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (tab_id, script);
-            send_stream_error(
-                &stream,
-                IpcErrorCode::Unsupported,
-                "Web automation is only supported on macOS",
-            );
-            return;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let Some(tab) = self.tabs.get_mut(tab_id) else {
-                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
-                return;
-            };
-
-            if !tab.kind.is_web() {
-                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
-                return;
-            }
-
-            let Some(web_view) = tab.web_view.as_mut() else {
-                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
-                return;
-            };
-
-            let stream = Arc::clone(&stream);
-            web_view.eval_js_string(&script, move |result| {
-                if let Ok(mut stream) = stream.try_clone() {
-                    ipc::send_reply(&mut stream, SocketReply::WebEval { result });
-                }
-            });
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn ipc_web_snapshot(
-        &mut self,
-        tab_id: Option<TabId>,
-        full: bool,
-        stream: Arc<UnixStream>,
-        _event_loop: &ActiveEventLoop,
-    ) {
-        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
-            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
-            return;
-        };
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (tab_id, full);
-            send_stream_error(
-                &stream,
-                IpcErrorCode::Unsupported,
-                "Web automation is only supported on macOS",
-            );
-            return;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let Some(tab) = self.tabs.get_mut(tab_id) else {
-                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
-                return;
-            };
-
-            if !tab.kind.is_web() {
-                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
-                return;
-            }
-
-            let Some(web_view) = tab.web_view.as_mut() else {
-                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
-                return;
-            };
-
-            let stream = Arc::clone(&stream);
-            web_view.snapshot_png(full, move |result| {
-                let reply = match result {
-                    Ok(bytes) => SocketReply::WebSnapshot { data: BASE64.encode(bytes) },
-                    Err(err) => ipc::reply_error(IpcErrorCode::Internal, err),
-                };
-                if let Ok(mut stream) = stream.try_clone() {
-                    ipc::send_reply(&mut stream, reply);
-                }
-            });
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn ipc_web_pdf(
-        &mut self,
-        tab_id: Option<TabId>,
-        stream: Arc<UnixStream>,
-        _event_loop: &ActiveEventLoop,
-    ) {
+    pub(crate) fn ipc_agent_observe(&mut self, tab_id: Option<TabId>, stream: Arc<UnixStream>) {
         let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
             send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
             return;
@@ -2524,7 +3093,7 @@ impl WindowContext {
             send_stream_error(
                 &stream,
                 IpcErrorCode::Unsupported,
-                "Web automation is only supported on macOS",
+                "Agent control is only supported on macOS",
             );
             return;
         }
@@ -2535,22 +3104,31 @@ impl WindowContext {
                 send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
                 return;
             };
-
             if !tab.kind.is_web() {
                 send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
                 return;
             }
-
             let Some(web_view) = tab.web_view.as_mut() else {
                 send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
                 return;
             };
 
+            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
+            let script = agent_script(&mut tab.agent_runtime, "window.__taborAgent.observe()");
             let stream = Arc::clone(&stream);
-            web_view.pdf(move |result| {
+            web_view.eval_js_string(&script, move |result| {
                 let reply = match result {
-                    Ok(bytes) => SocketReply::WebPdf { data: BASE64.encode(bytes) },
-                    Err(err) => ipc::reply_error(IpcErrorCode::Internal, err),
+                    Some(raw) => match json::from_str::<AgentObservation>(&raw) {
+                        Ok(observation) => SocketReply::AgentObservation { observation },
+                        Err(err) => ipc::reply_error(
+                            IpcErrorCode::Internal,
+                            format!("Invalid agent observation: {err}"),
+                        ),
+                    },
+                    None => ipc::reply_error(
+                        IpcErrorCode::Internal,
+                        "Agent observe returned no payload",
+                    ),
                 };
                 if let Ok(mut stream) = stream.try_clone() {
                     ipc::send_reply(&mut stream, reply);
@@ -2560,237 +3138,502 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
-    pub(crate) fn ipc_web_network(
+    pub(crate) fn ipc_agent_inspect(
         &mut self,
-        tab_id: TabId,
-        action: WebNetworkAction,
-    ) -> Result<Vec<WebNetworkEntry>, IpcError> {
+        tab_id: Option<TabId>,
+        element_id: String,
+        stream: Arc<UnixStream>,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (tab_id, action);
-            return Err(IpcError::new(
+            let _ = (tab_id, element_id);
+            send_stream_error(
+                &stream,
                 IpcErrorCode::Unsupported,
-                "Web automation is only supported on macOS",
-            ));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let Some(tab) = self.tabs.get_mut(tab_id) else {
-                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-            };
-            if !tab.kind.is_web() {
-                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
-            }
-
-            let Some(web_view) = tab.web_view.as_mut() else {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
-            };
-
-            Ok(web_view.network_entries(action))
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn ipc_web_mouse(
-        &mut self,
-        tab_id: TabId,
-        action: WebMouseAction,
-        x: f64,
-        y: f64,
-        button: WebMouseButton,
-        _event_loop: &ActiveEventLoop,
-    ) -> Result<(), IpcError> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (tab_id, action, x, y, button);
-            return Err(IpcError::new(
-                IpcErrorCode::Unsupported,
-                "Web automation is only supported on macOS",
-            ));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let Some(tab) = self.tabs.get_mut(tab_id) else {
-                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-            };
-            if !tab.kind.is_web() {
-                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
-            }
-
-            let Some(web_view) = tab.web_view.as_mut() else {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
-            };
-
-            let scale = self.display.window.scale_factor;
-            let padding_x = f64::from(self.display.size_info.padding_x());
-            let padding_y = f64::from(self.display.size_info.padding_y());
-            let physical_x = padding_x + x * scale;
-            let physical_y = padding_y + y * scale;
-            let position = winit::dpi::PhysicalPosition::new(physical_x, physical_y);
-
-            let button = match button {
-                WebMouseButton::Left => MouseButton::Left,
-                WebMouseButton::Right => MouseButton::Right,
-                WebMouseButton::Middle => MouseButton::Middle,
-            };
-
-            let modifiers = NSEventModifierFlags::empty();
-
-            match action {
-                WebMouseAction::Down => {
-                    web_view.handle_mouse_input(
-                        &self.display.window,
-                        &self.display.size_info,
-                        position,
-                        ElementState::Pressed,
-                        button,
-                        modifiers,
-                    );
-                },
-                WebMouseAction::Up => {
-                    web_view.handle_mouse_input(
-                        &self.display.window,
-                        &self.display.size_info,
-                        position,
-                        ElementState::Released,
-                        button,
-                        modifiers,
-                    );
-                },
-                WebMouseAction::Click => {
-                    web_view.handle_mouse_input(
-                        &self.display.window,
-                        &self.display.size_info,
-                        position,
-                        ElementState::Pressed,
-                        button,
-                        modifiers,
-                    );
-                    web_view.handle_mouse_input(
-                        &self.display.window,
-                        &self.display.size_info,
-                        position,
-                        ElementState::Released,
-                        button,
-                        modifiers,
-                    );
-                },
-                WebMouseAction::DoubleClick => {
-                    for _ in 0..2 {
-                        web_view.handle_mouse_input(
-                            &self.display.window,
-                            &self.display.size_info,
-                            position,
-                            ElementState::Pressed,
-                            button,
-                            modifiers,
-                        );
-                        web_view.handle_mouse_input(
-                            &self.display.window,
-                            &self.display.size_info,
-                            position,
-                            ElementState::Released,
-                            button,
-                            modifiers,
-                        );
-                    }
-                },
-                WebMouseAction::Move => {
-                    return Err(IpcError::new(
-                        IpcErrorCode::Unsupported,
-                        "Web mouse move is not supported",
-                    ));
-                },
-            }
-
-            Ok(())
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn ipc_web_key(
-        &mut self,
-        tab_id: TabId,
-        input: WebKeyInput,
-    ) -> Result<(), IpcError> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (tab_id, input);
-            return Err(IpcError::new(
-                IpcErrorCode::Unsupported,
-                "Web automation is only supported on macOS",
-            ));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let Some(tab) = self.tabs.get_mut(tab_id) else {
-                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
-            };
-            if !tab.kind.is_web() {
-                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
-            }
-
-            let Some(web_view) = tab.web_view.as_mut() else {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
-            };
-
-            let key_code = input.key_code.clone();
-            let parsed = Self::parse_web_key_input(input)?;
-            let unmodified_text = default_text_for_key(&parsed.key);
-            let dispatched = web_view.dispatch_key_event(
-                &parsed.key,
-                key_code.as_deref(),
-                &parsed.text,
-                &unmodified_text,
-                parsed.state,
-                parsed.modifiers,
-                parsed.repeat,
-                parsed.location,
-                parsed.physical_key,
+                "Agent control is only supported on macOS",
             );
-            if !dispatched {
-                return Err(IpcError::new(IpcErrorCode::Unsupported, "DevTools host unavailable"));
-            }
+            return;
+        }
 
-            Ok(())
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
+            let expression =
+                format!("window.__taborAgent.inspect({})", json::to_string(&element_id).unwrap());
+            let script = agent_script(&mut tab.agent_runtime, &expression);
+            let stream = Arc::clone(&stream);
+            web_view.eval_js_string(&script, move |result| {
+                let reply = match result {
+                    Some(raw) => match json::from_str::<AgentElementDetail>(&raw) {
+                        Ok(element) => SocketReply::AgentElement { element },
+                        Err(err) => ipc::reply_error(
+                            IpcErrorCode::Internal,
+                            format!("Invalid agent element detail: {err}"),
+                        ),
+                    },
+                    None => ipc::reply_error(
+                        IpcErrorCode::Internal,
+                        "Agent inspect returned no payload",
+                    ),
+                };
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+            });
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn parse_web_key_input(input: WebKeyInput) -> Result<ParsedWebKeyInput, IpcError> {
-        let key = parse_ipc_key(&input.key)?;
-        let key_code = if let Some(code) = input.key_code.as_deref() {
-            parse_ipc_key_code(code)?
-        } else {
-            derive_key_code_from_key(&key)
+    #[cfg(unix)]
+    pub(crate) fn ipc_agent_screenshot(
+        &mut self,
+        tab_id: Option<TabId>,
+        full_page: bool,
+        stream: Arc<UnixStream>,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
         };
-        let physical_key = match key_code {
-            Some(code) => PhysicalKey::Code(code),
-            None => PhysicalKey::Unidentified(NativeKeyCode::Unidentified),
-        };
-        let location = match key_code {
-            Some(code) if is_numpad_key(code) => KeyLocation::Numpad,
-            _ => KeyLocation::Standard,
-        };
-        let text = input.text.unwrap_or_else(|| default_text_for_key(&key));
-        let state = match input.state {
-            crate::ipc::WebKeyState::Down => ElementState::Pressed,
-            crate::ipc::WebKeyState::Up => ElementState::Released,
-        };
-        let modifiers = modifiers_from_ipc(input.modifiers);
 
-        Ok(ParsedWebKeyInput {
-            key,
-            text,
-            state,
-            modifiers,
-            repeat: input.repeat,
-            location,
-            physical_key,
-        })
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, full_page);
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Agent control is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
+
+            let pending = Arc::new(Mutex::new(PendingAgentScreenshot::default()));
+            let script =
+                agent_script(&mut tab.agent_runtime, "window.__taborAgent.screenshotMeta()");
+            let stream_for_meta = Arc::clone(&stream);
+            let pending_for_meta = Arc::clone(&pending);
+            web_view.eval_js_string(&script, move |result| {
+                let meta = match result {
+                    Some(raw) => json::from_str::<AgentScreenshotMeta>(&raw)
+                        .map_err(|err| format!("Invalid screenshot metadata: {err}")),
+                    None => Err(String::from("Agent screenshot metadata returned no payload")),
+                };
+                {
+                    let mut pending = pending_for_meta.lock().unwrap();
+                    pending.meta = Some(meta);
+                }
+                finish_pending_agent_screenshot(&pending_for_meta, &stream_for_meta);
+            });
+
+            let stream_for_capture = Arc::clone(&stream);
+            let pending_for_capture = Arc::clone(&pending);
+            let params = json::json!({
+                "format": "png",
+                "captureBeyondViewport": full_page,
+                "fromSurface": true,
+            });
+            let command = web_view.devtools_command_json(
+                "Page.captureScreenshot",
+                Some(params),
+                move |result| {
+                    let data_base64 = result.and_then(|payload| {
+                        payload
+                            .get("data")
+                            .and_then(JsonValue::as_str)
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| {
+                                String::from("Page.captureScreenshot returned no image data")
+                            })
+                    });
+                    {
+                        let mut pending = pending_for_capture.lock().unwrap();
+                        pending.data_base64 = Some(data_base64);
+                    }
+                    finish_pending_agent_screenshot(&pending_for_capture, &stream_for_capture);
+                },
+            );
+            if let Err(err) = command {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::Internal,
+                    &format!("Page.captureScreenshot failed: {err}"),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_agent_events(
+        &mut self,
+        tab_id: Option<TabId>,
+        since: Option<u64>,
+        max: Option<usize>,
+        kinds: Option<Vec<String>>,
+        stream: Arc<UnixStream>,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, since, max, kinds);
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Agent control is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            let since = since.unwrap_or_default();
+            let max = max.unwrap_or(200);
+            let raw_limit = if kinds.is_some() { 2048 } else { max.max(1) };
+            let kind_filter = kinds.map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            });
+            let (payloads, last_event_id) = web_view.devtools_events_since(since, raw_limit);
+            let mut events = Vec::new();
+            for payload in payloads {
+                let event = match parse_agent_event_payload(&payload) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        send_stream_error(
+                            &stream,
+                            IpcErrorCode::Internal,
+                            &format!("Invalid agent event payload: {err}"),
+                        );
+                        return;
+                    },
+                };
+                if let Some(kind_filter) = &kind_filter {
+                    if !kind_filter.iter().any(|kind| kind == &event.kind) {
+                        continue;
+                    }
+                }
+                events.push(event);
+                if events.len() >= max {
+                    break;
+                }
+            }
+
+            if let Ok(mut stream) = stream.try_clone() {
+                ipc::send_reply(&mut stream, SocketReply::AgentEvents { last_event_id, events });
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_agent_pdf(&mut self, tab_id: Option<TabId>, stream: Arc<UnixStream>) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = tab_id;
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Agent control is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            let stream_for_reply = Arc::clone(&stream);
+            let command = web_view.devtools_command_json("Page.printToPDF", None, move |result| {
+                let reply = match result {
+                    Ok(payload) => match payload.get("data").and_then(JsonValue::as_str) {
+                        Some(data_base64) => SocketReply::AgentPdf {
+                            pdf: AgentPdf { data_base64: data_base64.to_string() },
+                        },
+                        None => ipc::reply_error(
+                            IpcErrorCode::Internal,
+                            "Page.printToPDF returned no PDF data",
+                        ),
+                    },
+                    Err(err) => ipc::reply_error(
+                        IpcErrorCode::Internal,
+                        format!("Page.printToPDF failed: {err}"),
+                    ),
+                };
+                if let Ok(mut stream) = stream_for_reply.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+            });
+            if let Err(err) = command {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::Internal,
+                    &format!("Page.printToPDF failed: {err}"),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_agent_upload(
+        &mut self,
+        tab_id: Option<TabId>,
+        element_id: String,
+        paths: Vec<String>,
+        stream: Arc<UnixStream>,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, element_id, paths);
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Agent control is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
+            let stream_for_reply = Arc::clone(&stream);
+            let command = web_view.set_file_input_files(&element_id, paths, move |result| {
+                let reply = match result {
+                    Ok(raw) => match json::from_str::<JsonValue>(&raw) {
+                        Ok(value) => {
+                            if let Some(error) = value.get("error").and_then(JsonValue::as_str) {
+                                ipc::reply_error(IpcErrorCode::InvalidRequest, error)
+                            } else {
+                                match json::from_value::<AgentElementDetail>(value) {
+                                    Ok(element) => SocketReply::AgentElement { element },
+                                    Err(err) => ipc::reply_error(
+                                        IpcErrorCode::Internal,
+                                        format!(
+                                            "Invalid agent upload result: {err}; payload={raw}"
+                                        ),
+                                    ),
+                                }
+                            }
+                        },
+                        Err(err) => ipc::reply_error(
+                            IpcErrorCode::Internal,
+                            format!("Invalid agent upload result: {err}; payload={raw}"),
+                        ),
+                    },
+                    Err(err) => ipc::reply_error(IpcErrorCode::Internal, err),
+                };
+                if let Ok(mut stream) = stream_for_reply.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+            });
+            if let Err(err) = command {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::Internal,
+                    &format!("Agent upload failed: {err}"),
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_agent_downloads(&mut self, tab_id: Option<TabId>, stream: Arc<UnixStream>) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = tab_id;
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Agent control is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            if let Ok(mut stream) = stream.try_clone() {
+                ipc::send_reply(
+                    &mut stream,
+                    SocketReply::AgentDownloads { downloads: web_view.downloads() },
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_agent_act(
+        &mut self,
+        tab_id: Option<TabId>,
+        actions: Vec<AgentAction>,
+        observe: bool,
+        stream: Arc<UnixStream>,
+    ) {
+        let Some(tab_id) = tab_id.or(self.tabs.active_id()) else {
+            send_stream_error(&stream, IpcErrorCode::NotFound, "No active tab");
+            return;
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, actions, observe);
+            send_stream_error(
+                &stream,
+                IpcErrorCode::Unsupported,
+                "Agent control is only supported on macOS",
+            );
+            return;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                send_stream_error(&stream, IpcErrorCode::NotFound, "Tab not found");
+                return;
+            };
+            if !tab.kind.is_web() {
+                send_stream_error(&stream, IpcErrorCode::InvalidRequest, "Tab is not a web tab");
+                return;
+            }
+            let Some(web_view) = tab.web_view.as_mut() else {
+                send_stream_error(&stream, IpcErrorCode::Unsupported, "Web view is unavailable");
+                return;
+            };
+
+            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
+            let actions_json = match json::to_string(&actions) {
+                Ok(actions_json) => actions_json,
+                Err(err) => {
+                    send_stream_error(
+                        &stream,
+                        IpcErrorCode::InvalidRequest,
+                        &format!("Invalid agent actions: {err}"),
+                    );
+                    return;
+                },
+            };
+            let expression = format!("window.__taborAgent.act({actions_json}, {observe})");
+            let script = agent_object_script(&mut tab.agent_runtime, &expression);
+            let stream = Arc::clone(&stream);
+            web_view.eval_js_string_with_user_gesture(&script, move |result| {
+                let reply = match result {
+                    Some(raw) => match json::from_str::<AgentActResult>(&raw) {
+                        Ok(result) => SocketReply::AgentAct { result },
+                        Err(err) => ipc::reply_error(
+                            IpcErrorCode::Internal,
+                            format!("Invalid agent action result: {err}"),
+                        ),
+                    },
+                    None => {
+                        ipc::reply_error(IpcErrorCode::Internal, "Agent act returned no payload")
+                    },
+                };
+                if let Ok(mut stream) = stream.try_clone() {
+                    ipc::send_reply(&mut stream, reply);
+                }
+            });
+        }
     }
 
     #[cfg(unix)]
@@ -3819,288 +4662,82 @@ fn terminal_control_byte(text: &str) -> Option<u8> {
     }
 }
 
-#[cfg(target_os = "macos")]
-struct ParsedWebKeyInput {
-    key: Key,
-    text: String,
-    state: ElementState,
-    modifiers: ModifiersState,
-    repeat: bool,
-    location: KeyLocation,
-    physical_key: PhysicalKey,
-}
-
-#[cfg(target_os = "macos")]
-fn parse_ipc_key(value: &str) -> Result<Key, IpcError> {
-    let trimmed = value.trim();
-    let lowered = trimmed.to_ascii_lowercase();
-    let key = match lowered.as_str() {
-        "enter" => Key::Named(NamedKey::Enter),
-        "escape" | "esc" => Key::Named(NamedKey::Escape),
-        "backspace" => Key::Named(NamedKey::Backspace),
-        "delete" => Key::Named(NamedKey::Delete),
-        "tab" => Key::Named(NamedKey::Tab),
-        "space" => Key::Named(NamedKey::Space),
-        "arrowleft" | "left" => Key::Named(NamedKey::ArrowLeft),
-        "arrowright" | "right" => Key::Named(NamedKey::ArrowRight),
-        "arrowup" | "up" => Key::Named(NamedKey::ArrowUp),
-        "arrowdown" | "down" => Key::Named(NamedKey::ArrowDown),
-        _ => {
-            let mut chars = trimmed.chars();
-            let Some(ch) = chars.next() else {
-                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "key is empty"));
-            };
-            if chars.next().is_some() {
-                return Err(IpcError::new(
-                    IpcErrorCode::InvalidRequest,
-                    "key must be a single character or named key",
-                ));
-            }
-            Key::Character(ch.to_string().into())
-        },
-    };
-
-    Ok(key)
-}
-
-#[cfg(target_os = "macos")]
-fn parse_ipc_key_code(value: &str) -> Result<Option<KeyCode>, IpcError> {
-    let lowered = value.trim().to_ascii_lowercase();
-    if lowered.is_empty() {
-        return Ok(None);
-    }
-
-    if let Some(rest) = lowered.strip_prefix("key") {
-        let mut chars = rest.chars();
-        if let (Some(letter), None) = (chars.next(), chars.next()) {
-            if letter.is_ascii_alphabetic() {
-                let code = match letter.to_ascii_uppercase() {
-                    'A' => KeyCode::KeyA,
-                    'B' => KeyCode::KeyB,
-                    'C' => KeyCode::KeyC,
-                    'D' => KeyCode::KeyD,
-                    'E' => KeyCode::KeyE,
-                    'F' => KeyCode::KeyF,
-                    'G' => KeyCode::KeyG,
-                    'H' => KeyCode::KeyH,
-                    'I' => KeyCode::KeyI,
-                    'J' => KeyCode::KeyJ,
-                    'K' => KeyCode::KeyK,
-                    'L' => KeyCode::KeyL,
-                    'M' => KeyCode::KeyM,
-                    'N' => KeyCode::KeyN,
-                    'O' => KeyCode::KeyO,
-                    'P' => KeyCode::KeyP,
-                    'Q' => KeyCode::KeyQ,
-                    'R' => KeyCode::KeyR,
-                    'S' => KeyCode::KeyS,
-                    'T' => KeyCode::KeyT,
-                    'U' => KeyCode::KeyU,
-                    'V' => KeyCode::KeyV,
-                    'W' => KeyCode::KeyW,
-                    'X' => KeyCode::KeyX,
-                    'Y' => KeyCode::KeyY,
-                    'Z' => KeyCode::KeyZ,
-                    _ => {
-                        return Err(IpcError::new(
-                            IpcErrorCode::InvalidRequest,
-                            "invalid key_code",
-                        ));
-                    },
-                };
-                return Ok(Some(code));
-            }
-        }
-    }
-
-    if let Some(rest) = lowered.strip_prefix("digit") {
-        let mut chars = rest.chars();
-        if let (Some(digit), None) = (chars.next(), chars.next()) {
-            let code = match digit {
-                '0' => KeyCode::Digit0,
-                '1' => KeyCode::Digit1,
-                '2' => KeyCode::Digit2,
-                '3' => KeyCode::Digit3,
-                '4' => KeyCode::Digit4,
-                '5' => KeyCode::Digit5,
-                '6' => KeyCode::Digit6,
-                '7' => KeyCode::Digit7,
-                '8' => KeyCode::Digit8,
-                '9' => KeyCode::Digit9,
-                _ => return Err(IpcError::new(IpcErrorCode::InvalidRequest, "invalid key_code")),
-            };
-            return Ok(Some(code));
-        }
-    }
-
-    let code = match lowered.as_str() {
-        "enter" => Some(KeyCode::Enter),
-        "escape" | "esc" => Some(KeyCode::Escape),
-        "backspace" => Some(KeyCode::Backspace),
-        "delete" => Some(KeyCode::Delete),
-        "tab" => Some(KeyCode::Tab),
-        "space" => Some(KeyCode::Space),
-        "arrowleft" | "left" => Some(KeyCode::ArrowLeft),
-        "arrowright" | "right" => Some(KeyCode::ArrowRight),
-        "arrowup" | "up" => Some(KeyCode::ArrowUp),
-        "arrowdown" | "down" => Some(KeyCode::ArrowDown),
-        _ => None,
-    };
-
-    if code.is_some() {
-        return Ok(code);
-    }
-
-    Err(IpcError::new(IpcErrorCode::InvalidRequest, "unsupported key_code"))
-}
-
-#[cfg(target_os = "macos")]
-fn derive_key_code_from_key(key: &Key) -> Option<KeyCode> {
-    match key {
-        Key::Named(named) => match named {
-            NamedKey::Enter => Some(KeyCode::Enter),
-            NamedKey::Escape => Some(KeyCode::Escape),
-            NamedKey::Backspace => Some(KeyCode::Backspace),
-            NamedKey::Delete => Some(KeyCode::Delete),
-            NamedKey::Tab => Some(KeyCode::Tab),
-            NamedKey::Space => Some(KeyCode::Space),
-            NamedKey::ArrowLeft => Some(KeyCode::ArrowLeft),
-            NamedKey::ArrowRight => Some(KeyCode::ArrowRight),
-            NamedKey::ArrowUp => Some(KeyCode::ArrowUp),
-            NamedKey::ArrowDown => Some(KeyCode::ArrowDown),
-            _ => None,
-        },
-        Key::Character(ch) => {
-            let mut chars = ch.chars();
-            let c = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            if c.is_ascii_alphabetic() {
-                return match c.to_ascii_uppercase() {
-                    'A' => Some(KeyCode::KeyA),
-                    'B' => Some(KeyCode::KeyB),
-                    'C' => Some(KeyCode::KeyC),
-                    'D' => Some(KeyCode::KeyD),
-                    'E' => Some(KeyCode::KeyE),
-                    'F' => Some(KeyCode::KeyF),
-                    'G' => Some(KeyCode::KeyG),
-                    'H' => Some(KeyCode::KeyH),
-                    'I' => Some(KeyCode::KeyI),
-                    'J' => Some(KeyCode::KeyJ),
-                    'K' => Some(KeyCode::KeyK),
-                    'L' => Some(KeyCode::KeyL),
-                    'M' => Some(KeyCode::KeyM),
-                    'N' => Some(KeyCode::KeyN),
-                    'O' => Some(KeyCode::KeyO),
-                    'P' => Some(KeyCode::KeyP),
-                    'Q' => Some(KeyCode::KeyQ),
-                    'R' => Some(KeyCode::KeyR),
-                    'S' => Some(KeyCode::KeyS),
-                    'T' => Some(KeyCode::KeyT),
-                    'U' => Some(KeyCode::KeyU),
-                    'V' => Some(KeyCode::KeyV),
-                    'W' => Some(KeyCode::KeyW),
-                    'X' => Some(KeyCode::KeyX),
-                    'Y' => Some(KeyCode::KeyY),
-                    'Z' => Some(KeyCode::KeyZ),
-                    _ => None,
-                };
-            }
-            if c.is_ascii_digit() {
-                return match c {
-                    '0' => Some(KeyCode::Digit0),
-                    '1' => Some(KeyCode::Digit1),
-                    '2' => Some(KeyCode::Digit2),
-                    '3' => Some(KeyCode::Digit3),
-                    '4' => Some(KeyCode::Digit4),
-                    '5' => Some(KeyCode::Digit5),
-                    '6' => Some(KeyCode::Digit6),
-                    '7' => Some(KeyCode::Digit7),
-                    '8' => Some(KeyCode::Digit8),
-                    '9' => Some(KeyCode::Digit9),
-                    _ => None,
-                };
-            }
-            match c {
-                ' ' => Some(KeyCode::Space),
-                '-' => Some(KeyCode::Minus),
-                '=' => Some(KeyCode::Equal),
-                '[' => Some(KeyCode::BracketLeft),
-                ']' => Some(KeyCode::BracketRight),
-                '\\' => Some(KeyCode::Backslash),
-                ';' => Some(KeyCode::Semicolon),
-                '\'' => Some(KeyCode::Quote),
-                '`' => Some(KeyCode::Backquote),
-                ',' => Some(KeyCode::Comma),
-                '.' => Some(KeyCode::Period),
-                '/' => Some(KeyCode::Slash),
-                _ => None,
-            }
-        },
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn default_text_for_key(key: &Key) -> String {
-    match key {
-        Key::Named(NamedKey::Enter) => "\r".to_string(),
-        Key::Named(NamedKey::Tab) => "\t".to_string(),
-        Key::Named(NamedKey::Backspace) => "\u{8}".to_string(),
-        Key::Character(ch) => ch.to_string(),
-        _ => String::new(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn modifiers_from_ipc(modifiers: crate::ipc::WebKeyModifiers) -> ModifiersState {
-    let mut state = ModifiersState::empty();
-    if modifiers.shift {
-        state.insert(ModifiersState::SHIFT);
-    }
-    if modifiers.control {
-        state.insert(ModifiersState::CONTROL);
-    }
-    if modifiers.alt {
-        state.insert(ModifiersState::ALT);
-    }
-    if modifiers.super_key {
-        state.insert(ModifiersState::SUPER);
-    }
-    state
-}
-
-#[cfg(target_os = "macos")]
-fn is_numpad_key(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::NumLock
-            | KeyCode::NumpadDecimal
-            | KeyCode::NumpadMultiply
-            | KeyCode::NumpadAdd
-            | KeyCode::NumpadDivide
-            | KeyCode::NumpadEnter
-            | KeyCode::NumpadSubtract
-            | KeyCode::NumpadEqual
-            | KeyCode::Numpad0
-            | KeyCode::Numpad1
-            | KeyCode::Numpad2
-            | KeyCode::Numpad3
-            | KeyCode::Numpad4
-            | KeyCode::Numpad5
-            | KeyCode::Numpad6
-            | KeyCode::Numpad7
-            | KeyCode::Numpad8
-            | KeyCode::Numpad9
-    )
-}
-
 #[cfg(unix)]
 fn send_stream_error(stream: &Arc<UnixStream>, code: IpcErrorCode, message: &str) {
     if let Ok(mut stream) = stream.try_clone() {
         ipc::send_reply(&mut stream, ipc::reply_error(code, message));
     }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_pending_agent_screenshot(
+    pending: &Arc<Mutex<PendingAgentScreenshot>>,
+    stream: &Arc<UnixStream>,
+) {
+    let Some((meta, data_base64)) = ({
+        let mut pending = pending.lock().unwrap();
+        if pending.meta.is_none() || pending.data_base64.is_none() {
+            None
+        } else {
+            Some((pending.meta.take().unwrap(), pending.data_base64.take().unwrap()))
+        }
+    }) else {
+        return;
+    };
+
+    let reply = match (meta, data_base64) {
+        (Ok(meta), Ok(data_base64)) => SocketReply::AgentScreenshot {
+            screenshot: AgentScreenshot {
+                data_base64,
+                width: meta.width,
+                height: meta.height,
+                dpr: meta.dpr,
+                scroll_x: meta.scroll_x,
+                scroll_y: meta.scroll_y,
+            },
+        },
+        (Err(err), _) | (_, Err(err)) => ipc::reply_error(IpcErrorCode::Internal, err),
+    };
+
+    if let Ok(mut stream) = stream.try_clone() {
+        ipc::send_reply(&mut stream, reply);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_agent_event_payload(payload: &str) -> Result<AgentEvent, String> {
+    let value = json::from_str::<JsonValue>(payload).map_err(|err| err.to_string())?;
+    let method = value
+        .get("method")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| String::from("missing method"))?;
+    let id =
+        value.get("id").and_then(JsonValue::as_u64).ok_or_else(|| String::from("missing id"))?;
+    let params = value.get("params").cloned();
+    Ok(AgentEvent { id, kind: agent_event_kind(method), method: method.to_string(), params })
+}
+
+#[cfg(target_os = "macos")]
+fn agent_event_kind(method: &str) -> String {
+    if method.starts_with("Network.") {
+        return String::from("network");
+    }
+    if method.starts_with("Runtime.consoleAPICalled")
+        || method.starts_with("Runtime.exception")
+        || method.starts_with("Log.entryAdded")
+    {
+        return String::from("console");
+    }
+    if method.starts_with("Page.download") {
+        return String::from("download");
+    }
+    if method.starts_with("Page.javascriptDialog") {
+        return String::from("dialog");
+    }
+    if let Some((prefix, _)) = method.split_once('.') {
+        return prefix.to_ascii_lowercase();
+    }
+    String::from("other")
 }
 
 impl Drop for WindowContext {

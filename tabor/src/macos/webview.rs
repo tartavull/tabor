@@ -1,9 +1,9 @@
 use std::error::Error;
 
-use crate::ipc::{WebNetworkAction, WebNetworkEntry};
 use serde_json::Value as JsonValue;
 
 use super::webview_cef;
+use crate::ipc::AgentDownload;
 
 pub struct WebView {
     inner: webview_cef::WebView,
@@ -62,32 +62,6 @@ impl WebView {
         self.inner.handle_key_input(window, key, text, modifiers)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_key_event(
-        &mut self,
-        key: &winit::keyboard::Key,
-        key_code: Option<&str>,
-        text: &str,
-        unmodified_text: &str,
-        state: winit::event::ElementState,
-        modifiers: winit::keyboard::ModifiersState,
-        repeat: bool,
-        location: winit::keyboard::KeyLocation,
-        physical_key: winit::keyboard::PhysicalKey,
-    ) -> bool {
-        self.inner.dispatch_key_event(
-            key,
-            key_code,
-            text,
-            unmodified_text,
-            state,
-            modifiers,
-            repeat,
-            location,
-            physical_key,
-        )
-    }
-
     pub fn handle_mouse_input(
         &mut self,
         window: &crate::display::window::Window,
@@ -111,18 +85,11 @@ impl WebView {
         self.inner.eval_js_string(script, callback);
     }
 
-    pub fn snapshot_png<F>(&mut self, full: bool, callback: F)
+    pub fn eval_js_string_with_user_gesture<F>(&mut self, script: &str, callback: F)
     where
-        F: FnOnce(Result<Vec<u8>, String>) + 'static,
+        F: FnOnce(Option<String>) + 'static,
     {
-        self.inner.snapshot_png(full, callback);
-    }
-
-    pub fn pdf<F>(&mut self, callback: F)
-    where
-        F: FnOnce(Result<Vec<u8>, String>) + 'static,
-    {
-        self.inner.pdf(callback);
+        self.inner.eval_js_string_with_user_gesture(script, callback);
     }
 
     pub fn devtools_command_json<F>(
@@ -145,6 +112,22 @@ impl WebView {
         self.inner.latest_devtools_event_id()
     }
 
+    pub fn set_file_input_files<F>(
+        &self,
+        element_id: &str,
+        paths: Vec<String>,
+        callback: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Result<String, String>) + 'static,
+    {
+        self.inner.set_file_input_files(element_id, paths, callback)
+    }
+
+    pub fn downloads(&self) -> Vec<AgentDownload> {
+        self.inner.downloads()
+    }
+
     pub fn poll_title(&mut self) -> Option<String> {
         self.inner.poll_title()
     }
@@ -159,9 +142,5 @@ impl WebView {
 
     pub fn show_inspector(&mut self) -> bool {
         self.inner.show_inspector()
-    }
-
-    pub fn network_entries(&mut self, action: WebNetworkAction) -> Vec<WebNetworkEntry> {
-        self.inner.network_entries(action)
     }
 }

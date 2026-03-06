@@ -28,7 +28,7 @@ use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use tabor_terminal::tty;
 
 #[cfg(unix)]
-mod agent_browser;
+mod agent;
 mod cli;
 mod clipboard;
 mod config;
@@ -99,6 +99,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(exit_code);
     }
 
+    #[cfg(unix)]
+    if agent::maybe_run_internal_from_argv()? {
+        return Ok(());
+    }
+
     // Load command line options.
     let options = Options::new();
 
@@ -106,7 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         #[cfg(unix)]
         Some(Subcommands::Msg(options)) => msg(options)?,
         #[cfg(unix)]
-        Some(Subcommands::AgentBrowser(options)) => agent_browser::run(options)?,
+        Some(Subcommands::Agent(options)) => agent::run(options)?,
         Some(Subcommands::Migrate(options)) => migrate::migrate(options),
         None => tabor(options)?,
     }

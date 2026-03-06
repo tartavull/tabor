@@ -446,29 +446,6 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_poll_inspector_messages(session_id, max)
     }
 
-    fn web_network(
-        &mut self,
-        tab_id: TabId,
-        action: ipc::WebNetworkAction,
-    ) -> Result<Vec<ipc::WebNetworkEntry>, ipc::IpcError> {
-        self.window.ipc_web_network(tab_id, action)
-    }
-
-    fn web_mouse(
-        &mut self,
-        tab_id: TabId,
-        action: ipc::WebMouseAction,
-        x: f64,
-        y: f64,
-        button: ipc::WebMouseButton,
-    ) -> Result<(), ipc::IpcError> {
-        self.window.ipc_web_mouse(tab_id, action, x, y, button, self.event_loop)
-    }
-
-    fn web_key(&mut self, tab_id: TabId, input: ipc::WebKeyInput) -> Result<(), ipc::IpcError> {
-        self.window.ipc_web_key(tab_id, input)
-    }
-
     fn terminal_key(
         &mut self,
         tab_id: TabId,
@@ -899,14 +876,37 @@ impl Processor {
         };
 
         match request {
-            IpcRequest::WebEval { tab_id, script } => {
-                window_context.ipc_web_eval(tab_id.map(Into::into), script, stream)
+            IpcRequest::AgentObserve { tab_id } => {
+                let _ = event_loop;
+                window_context.ipc_agent_observe(tab_id.map(Into::into), stream)
             },
-            IpcRequest::WebSnapshot { tab_id, full } => {
-                window_context.ipc_web_snapshot(tab_id.map(Into::into), full, stream, event_loop)
+            IpcRequest::AgentInspect { tab_id, element_id } => {
+                let _ = event_loop;
+                window_context.ipc_agent_inspect(tab_id.map(Into::into), element_id, stream)
             },
-            IpcRequest::WebPdf { tab_id } => {
-                window_context.ipc_web_pdf(tab_id.map(Into::into), stream, event_loop)
+            IpcRequest::AgentScreenshot { tab_id, full_page } => {
+                let _ = event_loop;
+                window_context.ipc_agent_screenshot(tab_id.map(Into::into), full_page, stream)
+            },
+            IpcRequest::AgentEvents { tab_id, since, max, kinds } => {
+                let _ = event_loop;
+                window_context.ipc_agent_events(tab_id.map(Into::into), since, max, kinds, stream)
+            },
+            IpcRequest::AgentPdf { tab_id } => {
+                let _ = event_loop;
+                window_context.ipc_agent_pdf(tab_id.map(Into::into), stream)
+            },
+            IpcRequest::AgentUpload { tab_id, element_id, paths } => {
+                let _ = event_loop;
+                window_context.ipc_agent_upload(tab_id.map(Into::into), element_id, paths, stream)
+            },
+            IpcRequest::AgentDownloads { tab_id } => {
+                let _ = event_loop;
+                window_context.ipc_agent_downloads(tab_id.map(Into::into), stream)
+            },
+            IpcRequest::AgentAct { tab_id, actions, observe } => {
+                let _ = event_loop;
+                window_context.ipc_agent_act(tab_id.map(Into::into), actions, observe, stream)
             },
             _ => (),
         }
@@ -1136,9 +1136,14 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::IpcRequest(request, stream), _) => {
                 if matches!(
                     request,
-                    IpcRequest::WebEval { .. }
-                        | IpcRequest::WebSnapshot { .. }
-                        | IpcRequest::WebPdf { .. }
+                    IpcRequest::AgentObserve { .. }
+                        | IpcRequest::AgentInspect { .. }
+                        | IpcRequest::AgentScreenshot { .. }
+                        | IpcRequest::AgentEvents { .. }
+                        | IpcRequest::AgentPdf { .. }
+                        | IpcRequest::AgentUpload { .. }
+                        | IpcRequest::AgentDownloads { .. }
+                        | IpcRequest::AgentAct { .. }
                 ) {
                     self.handle_web_ipc_request(event_loop, request, stream);
                     return;

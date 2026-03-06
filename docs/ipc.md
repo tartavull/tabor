@@ -1,38 +1,28 @@
 # IPC Protocol
 
-Tabor exposes a local Unix socket for automation. Messages are single-line JSON
-objects with a required `type` field. Use `tabor msg send` to send raw JSON.
-For a quick list of request types, run `tabor msg list-requests`.
-
-## CLI shortcuts
-
-`tabor msg` includes typed subcommands that map 1:1 to IPC requests. Run
-`tabor msg --help` for the full list and `tabor msg <command> --help` for
-flags. Tab ids are passed as `<index>:<generation>`.
-
-Examples:
-- `tabor msg list-tabs`
-- `tabor msg get-tab-state --tab-id 1:1`
-- `tabor msg open-url https://example.com --new-tab`
-- `tabor msg reload-web --tab-id 1:1`
-- `tabor msg inspector list-targets`
+Tabor exposes a local Unix socket for app control and stateful web automation.
+Use `tabor msg` for one-shot app and inspector requests. Use `tabor agent` for
+live tab takeover and repeated web actions against a running Tabor instance.
 
 ## Transport
 
 - Socket discovery:
   - `TABOR_SOCKET` environment variable (preferred).
   - `tabor --socket <PATH>` when launching Tabor.
-  - Fallback: the newest socket in the platform temp dir.
-- One request per connection. `tabor msg send` opens a socket, sends one JSON
-  object, then prints the reply (if any).
+  - Fallback: the newest live Tabor socket in the temp directory.
+- `tabor msg` opens one socket connection per request.
+- `tabor agent attach` starts a per-socket local controller and keeps one
+  persistent IPC connection open until `tabor agent close`.
 
-## Common types
+## Common Types
 
 `tab_id` is an object:
 
 ```json
 {"index":1,"generation":1}
 ```
+
+Tab ids are also accepted by typed CLI commands as `<index>:<generation>`.
 
 `TabSelection`:
 - `active`
@@ -47,248 +37,190 @@ Examples:
 - `new_tab`
 - `tab_id` with `tab_id`
 
-Tab kind (`IpcTabKind`) in tab state responses:
+Tab kind in tab state responses:
 - `"terminal"`
 - `{"web":{"url":"https://example.com"}}`
 
-## Requests and replies
+## App Control With `tabor msg`
 
-All request types are snake_case.
+Typed IPC commands map 1:1 to socket requests. Run `tabor msg --help` for the
+full list and `tabor msg list-requests` for raw request names.
 
-### ping
-Request:
-```json
-{"type":"ping"}
-```
-Reply: `{"type":"pong"}`
+Common commands:
+- `tabor msg list-tabs`
+- `tabor msg get-tab-state --tab-id 1:1`
+- `tabor msg create-tab --web https://example.com`
+- `tabor msg open-url https://example.com --target current`
+- `tabor msg select-tab --active`
+- `tabor msg move-tab --tab-id 2:1 --target-group-id 1 --target-index 0`
+- `tabor msg open-inspector --tab-id 2:1`
 
-### get_capabilities
-Request:
-```json
-{"type":"get_capabilities"}
-```
-Reply:
-```json
-{"type":"capabilities","capabilities":{"protocol_version":1,"platform":"macos","version":"0.x","web_tabs":true}}
-```
+Raw JSON remains available through `tabor msg send`:
 
-### list_tabs
-Request:
 ```json
 {"type":"list_tabs"}
 ```
-Reply:
-```json
-{"type":"tab_list","groups":[{"id":0,"name":null,"tabs":[{"tab_id":{"index":1,"generation":1},"group_id":0,"index":0,"is_active":true,"title":"...","custom_title":null,"program_name":"...","kind":"terminal","activity":null}]}]}
+
+## Stateful Web Automation With `tabor agent`
+
+`tabor agent` is the primary automation surface. It attaches to the live Tabor
+instance you already opened, lists the existing tabs, selects one of them, and
+then drives that web tab with compact observations and batched actions.
+
+There is no isolated browser-session flag in this workflow. The agent operates
+on live tabs in the attached Tabor instance.
+
+### Typical Workflow
+
+```bash
+export TABOR_SOCKET=/tmp/tabor.sock
+tabor agent attach
+tabor agent app
+tabor agent use --active
+tabor agent observe
+tabor agent act '[{"type":"click","id":"a"},{"type":"wait","load":"networkidle"}]'
+tabor agent inspect a
+tabor agent screenshot
+tabor agent events --kind console --kind network
+tabor agent pdf
+tabor agent downloads
+tabor agent close
 ```
 
-### get_tab_state
-Request:
-```json
-{"type":"get_tab_state","tab_id":{"index":1,"generation":1}}
-```
-Reply: `{"type":"tab_state","tab":{...}}`
+### `app`
 
-### create_tab
-Request:
-```json
-{"type":"create_tab","options":{"terminal_options":{},"window_identity":{},"window_kind":{"kind":"terminal"}},"group_id":2}
-```
-Reply: `{"type":"tab_created","tab_id":{"index":2,"generation":1}}`
-`window_kind` values are `{"kind":"terminal"}` or `{"kind":"web","url":"https://example.com"}`.
-`group_id` or `group_name` can be provided to place the new tab into a specific group.
+Lists the live tab inventory plus the currently selected agent tab:
 
-### create_group
-Request:
 ```json
-{"type":"create_group","name":"notifications"}
-```
-Reply: `{"type":"group_created","group_id":4}`
-
-### close_tab
-Request:
-```json
-{"type":"close_tab","tab_id":{"index":1,"generation":1}}
-```
-If `tab_id` is omitted, the active tab is closed. Reply: `{"type":"ok"}`
-
-### select_tab
-Request:
-```json
-{"type":"select_tab","selection":{"type":"next"}}
-```
-Reply: `{"type":"ok"}`
-
-### move_tab
-Request:
-```json
-{"type":"move_tab","tab_id":{"index":1,"generation":1},"target_group_id":0,"target_index":2}
-```
-Reply: `{"type":"ok"}`
-
-### set_tab_title
-Request:
-```json
-{"type":"set_tab_title","tab_id":{"index":1,"generation":1},"title":"Build"}
-```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
-
-### set_group_name
-Request:
-```json
-{"type":"set_group_name","group_id":0,"name":"Work"}
-```
-Reply: `{"type":"ok"}`
-
-### restore_closed_tab
-Request:
-```json
-{"type":"restore_closed_tab"}
-```
-Reply: `{"type":"ok"}`
-
-### open_url
-Request:
-```json
-{"type":"open_url","url":"https://example.com","target":{"type":"new_tab"}}
-```
-Reply: `{"type":"ok"}` or `{"type":"tab_created",...}` (when a new tab is created).
-
-### set_web_url
-Request:
-```json
-{"type":"set_web_url","tab_id":{"index":1,"generation":1},"url":"https://example.com"}
-```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
-
-### reload_web
-Request:
-```json
-{"type":"reload_web","tab_id":{"index":1,"generation":1}}
-```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
-
-### open_inspector
-Opens the UI Web Inspector for a web tab.
-Request:
-```json
-{"type":"open_inspector","tab_id":{"index":1,"generation":1}}
-```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
-
-### get_tab_panel
-Request:
-```json
-{"type":"get_tab_panel"}
-```
-Reply:
-```json
-{"type":"tab_panel","panel":{"enabled":true,"width":260}}
+{"type":"app","groups":[{"id":0,"name":null,"tabs":[...]}],"selected_tab_id":{"index":2,"generation":1}}
 ```
 
-### set_tab_panel
-Request:
-```json
-{"type":"set_tab_panel","enabled":true,"width":260}
-```
-Reply: `{"type":"ok"}`
+### `observe`
 
-### dispatch_action
-Dispatches a configured action by name.
-Request:
-```json
-{"type":"dispatch_action","tab_id":{"index":1,"generation":1},"action":{"type":"action","name":"copy"}}
-```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
+Returns compact state for the selected web tab:
 
-### send_input
-Request:
 ```json
-{"type":"send_input","tab_id":{"index":1,"generation":1},"text":"ls -la\n"}
+{
+  "type":"observation",
+  "observation":{
+    "revision":3,
+    "url":"https://example.com",
+    "title":"Example",
+    "ready_state":"complete",
+    "pending_requests":0,
+    "elements":[
+      {"id":"a","role":"button","name":"Submit"},
+      {"id":"b","role":"input","name":"Email","editable":true}
+    ]
+  }
+}
 ```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
 
-### run_command_bar
-Request:
-```json
-{"type":"run_command_bar","tab_id":{"index":1,"generation":1},"input":":toggle_tab_panel"}
+Only visible interactive elements are returned by default.
+
+### `inspect`
+
+Expands a single observed element when the compact observation is not enough:
+
+```bash
+tabor agent inspect a
 ```
-`tab_id` is optional (defaults to active tab). Reply: `{"type":"ok"}`
+
+### Artifact and event commands
+
+- `tabor agent screenshot [--path FILE] [--full-page] [--element-id ID]`
+- `tabor agent events [--since N] [--max N] [--kind console] [--kind network]`
+- `tabor agent pdf [--path FILE]`
+- `tabor agent upload <element-id> <file>...`
+- `tabor agent downloads`
+- `tabor agent clipboard get`
+- `tabor agent clipboard set --text 'value'`
+
+### `act`
+
+`tabor agent act` accepts a JSON array of actions and executes them as a batch.
+The default reply includes a post-action observation.
+
+Supported actions:
+- `{"type":"goto","url":"https://example.com"}`
+- `{"type":"click","id":"a"}`
+- `{"type":"hover","id":"a"}`
+- `{"type":"hover_at","x":320,"y":180}`
+- `{"type":"click_at","x":320,"y":180}`
+- `{"type":"mouse_down","x":320,"y":180}`
+- `{"type":"mouse_up","x":320,"y":180}`
+- `{"type":"drag","from_x":320,"from_y":180,"to_x":640,"to_y":240}`
+- `{"type":"fill","id":"b","text":"user@example.com"}`
+- `{"type":"press","key":"Tab","modifiers":{"shift":false,"control":false,"alt":false,"super_key":false}}`
+- `{"type":"key_down","key":"Shift"}`
+- `{"type":"key_up","key":"Shift"}`
+- `{"type":"type","text":"hello"}`
+- `{"type":"paste","text":"hello"}`
+- `{"type":"scroll","dy":600}`
+- `{"type":"wheel","dx":0,"dy":400}`
+- `{"type":"dialog_accept","text":"optional prompt text"}`
+- `{"type":"dialog_dismiss"}`
+- `{"type":"wait","id":"a","timeout_ms":5000}`
+- `{"type":"wait","text":"Success","timeout_ms":5000}`
+- `{"type":"wait","url_contains":"dashboard","timeout_ms":5000}`
+- `{"type":"wait","load":"networkidle","timeout_ms":5000}`
+- `{"type":"wait","ms":250}`
+
+Example:
+
+```bash
+tabor agent act '[
+  {"type":"fill","id":"b","text":"user@example.com"},
+  {"type":"click","id":"c"},
+  {"type":"wait","load":"networkidle","timeout_ms":5000}
+]'
+```
+
+Reply shape:
+
+```json
+{
+  "type":"act",
+  "result":{
+    "results":[{"index":0,"ok":true},{"index":1,"ok":true},{"index":2,"ok":true}],
+    "observation":{...}
+  }
+}
+```
+
+### Raw IPC Requests
+
+The raw request types exposed through `tabor msg send` are:
+- `agent_observe`
+- `agent_inspect`
+- `agent_screenshot`
+- `agent_events`
+- `agent_pdf`
+- `agent_upload`
+- `agent_downloads`
+- `agent_act`
+
+Examples:
+
+```json
+{"type":"agent_observe","tab_id":{"index":2,"generation":1}}
+{"type":"agent_inspect","tab_id":{"index":2,"generation":1},"element_id":"a"}
+{"type":"agent_screenshot","tab_id":{"index":2,"generation":1},"full_page":false}
+{"type":"agent_events","tab_id":{"index":2,"generation":1},"since":41,"max":50,"kinds":["console","network"]}
+{"type":"agent_pdf","tab_id":{"index":2,"generation":1}}
+{"type":"agent_upload","tab_id":{"index":2,"generation":1},"element_id":"a","paths":["/tmp/file.txt"]}
+{"type":"agent_downloads","tab_id":{"index":2,"generation":1}}
+{"type":"agent_act","tab_id":{"index":2,"generation":1},"actions":[{"type":"click","id":"a"}],"observe":true}
+```
 
 ## Remote Inspector (macOS)
 
 These commands require macOS and a web tab. On the CEF backend they speak the
 Chromium DevTools Protocol (CDP).
 
-### list_inspector_targets
-Targets are the open web tabs. `target_id` is derived from the tab id (generation
-in the high 32 bits, index in the low 32 bits).
-Request:
-```json
-{"type":"list_inspector_targets"}
-```
-Reply:
-```json
-{"type":"inspector_targets","targets":[{"target_id":1,"target_type":"page","url":"https://example.com","title":"Example","override_name":null,"host_app_identifier":"tabor","tab_id":{"index":1,"generation":0}}]}
-```
-
-### attach_inspector
-Request (by tab id):
-```json
-{"type":"attach_inspector","tab_id":{"index":1,"generation":1}}
-```
-Request (by target id):
-```json
-{"type":"attach_inspector","target_id":42}
-```
-Reply:
-```json
-{"type":"inspector_attached","session":{"session_id":"cef:1:1","target_id":1,"tab_id":{"index":1,"generation":0}}}
-```
-
-### send_inspector_message
-Sends a raw DevTools Protocol JSON string.
-Request (CDP JSON string):
-```json
-{"type":"send_inspector_message","session_id":"cef:1:1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}
-```
-Reply: `{"type":"ok"}`
-
-### poll_inspector_messages
-Request:
-```json
-{"type":"poll_inspector_messages","session_id":"cef:1:1","max":50}
-```
-Reply:
-```json
-{"type":"inspector_messages","messages":[{"session_id":"cef:1:1","payload":"{\"method\":\"Network.requestWillBeSent\",...}"}]}
-```
-
-### detach_inspector
-Request:
-```json
-{"type":"detach_inspector","session_id":"cef:1:1"}
-```
-Reply: `{"type":"ok"}`
-
-## Example: watch network traffic
-
-```sh
-tabor msg send '{"type":"open_url","url":"https://example.com","target":{"type":"new_tab"}}'
-tabor msg send '{"type":"attach_inspector","tab_id":{"index":1,"generation":0}}'
-tabor msg send '{"type":"send_inspector_message","session_id":"cef:1:1","message":"{\"id\":1,\"method\":\"Network.enable\"}"}'
-tabor msg send '{"type":"reload_web","tab_id":{"index":1,"generation":0}}'
-tabor msg send '{"type":"poll_inspector_messages","session_id":"cef:1:1","max":100}'
-```
-
-## Errors
-
-Errors are returned as:
-
-```json
-{"type":"error","error":{"code":"not_found","message":"Tab not found"}}
-```
-
-Possible `code` values:
-`not_found`, `invalid_request`, `unsupported`, `ambiguous`,
-`permission_denied`, `timeout`, `internal`.
+Common commands:
+- `tabor msg inspector list-targets`
+- `tabor msg inspector attach --tab-id 1:1`
+- `tabor msg inspector send --session-id cef:1:1 --message '{"id":1,"method":"Network.enable"}'`
+- `tabor msg inspector poll --session-id cef:1:1 --max 100`
+- `tabor msg inspector detach --session-id cef:1:1`

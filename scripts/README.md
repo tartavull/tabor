@@ -37,8 +37,10 @@ Run a single smoke test:
 
 ```sh
 cargo test -p tabor --test web_e2e web_popup_smoke -- --exact --nocapture
-cargo test -p tabor --test web_e2e agent_browser_fixture_smoke -- --exact --nocapture
-cargo test -p tabor --test web_e2e browser_clipboard_shortcut_smoke -- --exact --nocapture
+cargo test -p tabor --test web_e2e agent_fixture_smoke -- --exact --nocapture
+cargo test -p tabor --test web_e2e agent_wait_smoke -- --exact --nocapture
+cargo test -p tabor --test web_e2e agent_artifacts_smoke -- --exact --nocapture
+cargo test -p tabor --test web_e2e agent_events_smoke -- --exact --nocapture
 ```
 
 Use `cargo xtask` as the primary macOS entrypoint; commands always replace the canonical app bundle at `/Applications/Tabor.app`.

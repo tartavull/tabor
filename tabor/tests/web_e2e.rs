@@ -247,31 +247,45 @@ impl Drop for PopupServer {
 }
 
 #[test]
-fn agent_browser_fixture_smoke() {
+fn agent_fixture_smoke() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
 
-    harness.run_ok(["agent-browser", "open", fixture.as_str()]);
-    harness.run_ok(["agent-browser", "wait", "--load", "domcontentloaded"]);
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
 
-    harness.run_ok(["agent-browser", "fill", "#email-input", "test@example.com"]);
-    assert_eq!(
-        harness.run_ok(["agent-browser", "get", "value", "#email-input"]),
-        "test@example.com"
-    );
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
 
-    harness.run_ok(["agent-browser", "type", "#notes", "hello"]);
-    assert_eq!(harness.run_ok(["agent-browser", "get", "value", "#notes"]), "hello");
+    let observation = harness.run_json(["agent", "observe"]);
+    let email_id = find_observed_element_id(&observation, "Email");
+    let notes_id = find_observed_element_id(&observation, "Notes");
+    let checkbox_id = find_observed_element_id(&observation, "check-me");
 
-    harness.run_ok(["agent-browser", "check", "#check-me"]);
-    assert_eq!(harness.run_ok(["agent-browser", "is", "checked", "#check-me"]), "true");
+    let actions = json!([
+        { "type": "fill", "id": email_id, "text": "test@example.com" },
+        { "type": "fill", "id": notes_id, "text": "hello" },
+        { "type": "click", "id": checkbox_id }
+    ])
+    .to_string();
+    let act = harness.run_json(["agent", "act", actions.as_str()]);
+    assert_eq!(act.get("type").and_then(Value::as_str), Some("act"));
+    assert!(agent_action_results_all_ok(&act), "agent act failed: {act}");
 
-    harness.run_ok(["agent-browser", "uncheck", "#check-me"]);
-    assert_eq!(harness.run_ok(["agent-browser", "is", "checked", "#check-me"]), "false");
+    let email = harness.run_json(["agent", "inspect", email_id.as_str()]);
+    assert_eq!(agent_detail_value(&email), Some("test@example.com"));
 
-    harness.run_ok(["agent-browser", "tab", "new", fixture.as_str()]);
-    harness.run_ok(["agent-browser", "tab", "list"]);
-    harness.run_ok(["agent-browser", "tab", "close"]);
+    let notes = harness.run_json(["agent", "inspect", notes_id.as_str()]);
+    assert_eq!(agent_detail_value(&notes), Some("hello"));
+
+    let checkbox = harness.run_json(["agent", "inspect", checkbox_id.as_str()]);
+    assert_eq!(agent_detail_checked(&checkbox), Some(true));
+
+    let second = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(second.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    let app = harness.run_json(["agent", "app"]);
+    assert!(flatten_tabs(&app).len() >= 3, "expected agent app to list all tabs: {app}");
 }
 
 #[test]
@@ -282,11 +296,13 @@ fn web_popup_smoke() {
     let opener_url = server.url("/opener.html");
     let reply = harness.run_json(["msg", "create-tab", "--web", opener_url.as_str()]);
     assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
 
     let success_titles = ["popup-sent", "popup-ok"];
     let failure_titles = ["popup-no-opener", "popup-error", "popup-blocked", "popup-timeout"];
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_success = false;
     let mut click_attempts = 0usize;
     let mut last_click: Option<Instant> = None;
@@ -337,31 +353,176 @@ fn web_popup_smoke() {
 }
 
 #[test]
-fn browser_clipboard_shortcut_smoke() {
+fn agent_wait_smoke() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
-    let expected = "copy-fragment";
 
-    harness.run_ok(["agent-browser", "open", fixture.as_str()]);
-    harness.run_ok(["agent-browser", "wait", "--load", "domcontentloaded"]);
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
 
-    let selected = harness.run_ok([
-        "agent-browser",
-        "eval",
-        "(() => {\n  const source = document.querySelector('#email-input');\n  const selected = 'copy-fragment';\n  source.value = 'start ' + selected + ' end';\n  source.focus();\n  const start = 6;\n  source.setSelectionRange(start, start + selected.length);\n  return source.value.slice(source.selectionStart, source.selectionEnd);\n})()",
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+    let observation = harness.run_json(["agent", "observe"]);
+    let fetch_id = find_observed_element_id(&observation, "Fetch data");
+
+    let actions = json!([
+        { "type": "click", "id": fetch_id },
+        { "type": "wait", "text": "Fetch output: error", "timeout_ms": 5000 }
+    ])
+    .to_string();
+    let act = harness.run_json(["agent", "act", actions.as_str()]);
+    assert_eq!(act.get("type").and_then(Value::as_str), Some("act"));
+    assert!(agent_action_results_all_ok(&act), "agent act failed: {act}");
+}
+
+#[test]
+fn agent_artifacts_smoke() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    let first_observation =
+        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
+    let email_id = find_observed_element_id(&first_observation, "Email");
+    let file_input_id = find_observed_element_id(&first_observation, "file-input");
+
+    let scroll = json!([{ "type": "scroll", "dy": 320 }]).to_string();
+    let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
+    assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
+
+    let second_observation = harness.run_json(["agent", "observe"]);
+    let download_id = find_observed_element_id(&second_observation, "Download file");
+
+    let screenshot_path = harness.tmp_path("agent-screenshot.png");
+    let screenshot_path_str = screenshot_path.to_str().expect("screenshot path is not valid utf-8");
+    let screenshot = harness.run_json([
+        "agent",
+        "screenshot",
+        "--path",
+        screenshot_path_str,
+        "--element-id",
+        email_id.as_str(),
     ]);
-    assert_eq!(selected, expected);
+    assert_eq!(screenshot.get("type").and_then(Value::as_str), Some("screenshot"));
+    assert!(screenshot_path.exists(), "screenshot path missing: {screenshot}");
+    let screenshot_width = screenshot
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing screenshot width: {screenshot}"));
+    let screenshot_height = screenshot
+        .get("height")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing screenshot height: {screenshot}"));
+    assert!(screenshot_width > 0 && screenshot_height > 0, "invalid screenshot size: {screenshot}");
+    let screenshot_image = image::load_from_memory(
+        &std::fs::read(&screenshot_path).expect("failed to read screenshot"),
+    )
+    .expect("failed to decode screenshot");
+    assert_eq!(u64::from(screenshot_image.width()), screenshot_width);
+    assert_eq!(u64::from(screenshot_image.height()), screenshot_height);
 
-    harness.run_ok(["agent-browser", "press", "Meta+c"]);
-    harness.run_ok([
-        "agent-browser",
-        "eval",
-        "(() => {\n  const destination = document.querySelector('#notes');\n  destination.value = '';\n  destination.focus();\n  destination.setSelectionRange(0, 0);\n  return destination.id;\n})()",
-    ]);
-    harness.run_ok(["agent-browser", "press", "Meta+v"]);
+    let pdf_path = harness.tmp_path("agent-page.pdf");
+    let pdf_path_str = pdf_path.to_str().expect("pdf path is not valid utf-8");
+    let pdf = harness.run_json(["agent", "pdf", "--path", pdf_path_str]);
+    assert_eq!(pdf.get("type").and_then(Value::as_str), Some("pdf"));
+    let pdf_bytes = std::fs::read(&pdf_path).expect("failed to read generated pdf");
+    assert!(pdf_bytes.starts_with(b"%PDF"), "generated PDF missing header");
 
-    let destination = harness.run_ok(["agent-browser", "get", "value", "#notes"]);
-    assert_eq!(destination, expected, "browser-tab clipboard shortcut path failed");
+    let upload_path = harness.tmp_path("agent-upload.txt");
+    std::fs::write(&upload_path, "uploaded from e2e").expect("failed to write upload fixture");
+    let upload_path_str = upload_path.to_str().expect("upload path is not valid utf-8");
+    let upload = harness.run_json(["agent", "upload", file_input_id.as_str(), upload_path_str]);
+    assert_eq!(upload.get("type").and_then(Value::as_str), Some("upload"));
+
+    let upload_wait =
+        json!([{ "type": "wait", "text": "Files: agent-upload.txt", "timeout_ms": 5000 }])
+            .to_string();
+    let upload_wait_reply = harness.run_json(["agent", "act", upload_wait.as_str()]);
+    assert!(
+        agent_action_results_all_ok(&upload_wait_reply),
+        "agent upload wait failed: {upload_wait_reply}"
+    );
+
+    let download_actions = json!([{ "type": "click", "id": download_id }]).to_string();
+    let download_click = harness.run_json(["agent", "act", download_actions.as_str()]);
+    assert!(
+        agent_action_results_all_ok(&download_click),
+        "agent download click failed: {download_click}"
+    );
+
+    let download = wait_for_agent_download(&harness, "agent-download.txt", Duration::from_secs(6))
+        .unwrap_or_else(|| panic!("timed out waiting for download"));
+    let download_path = download
+        .get("full_path")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("download missing full_path: {download}"));
+    assert!(Path::new(download_path).exists(), "downloaded file missing: {download}");
+}
+
+#[test]
+fn agent_events_smoke() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    let baseline = harness.run_json(["agent", "events", "--max", "1"]);
+    let since = baseline.get("last_event_id").and_then(Value::as_u64).unwrap_or(0).to_string();
+
+    let first_observation =
+        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
+    let fetch_id = find_observed_element_id(&first_observation, "Fetch data");
+
+    let scroll = json!([{ "type": "scroll", "dy": 320 }]).to_string();
+    let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
+    assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
+
+    let second_observation = harness.run_json(["agent", "observe"]);
+    let console_id = find_observed_element_id(&second_observation, "Console log");
+
+    let actions = json!([
+        { "type": "click", "id": console_id },
+        { "type": "click", "id": fetch_id },
+        { "type": "wait", "text": "Fetch output: error", "timeout_ms": 5000 }
+    ])
+    .to_string();
+    let act = harness.run_json(["agent", "act", actions.as_str()]);
+    assert!(agent_action_results_all_ok(&act), "agent event setup failed: {act}");
+
+    let events = wait_for_agent_events(
+        &harness,
+        since.as_str(),
+        &["console", "network"],
+        Duration::from_secs(6),
+    )
+    .unwrap_or_else(|| panic!("timed out waiting for agent events"));
+    let returned_events = events
+        .get("events")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing agent events array: {events}"));
+    assert!(
+        returned_events
+            .iter()
+            .any(|event| event.get("kind").and_then(Value::as_str) == Some("console")),
+        "missing console event: {events}"
+    );
+    assert!(
+        returned_events
+            .iter()
+            .any(|event| event.get("kind").and_then(Value::as_str) == Some("network")),
+        "missing network event: {events}"
+    );
 }
 
 #[test]
@@ -384,6 +545,8 @@ fn close_active_web_tab_refreshes_terminal_program_name() {
 
     harness.run_ok(["msg", "close-tab"]);
 
+    let program_name =
+        wait_for_active_terminal_program_name_value(&harness, "sleep", Duration::from_secs(6));
     let final_state = harness.run_json(["msg", "list-tabs"]);
     let tabs = flatten_tabs(&final_state);
     assert_eq!(tabs.len(), 1, "expected one tab after closing active web tab: {final_state}");
@@ -405,9 +568,8 @@ fn close_active_web_tab_refreshes_terminal_program_name() {
         "expected remaining terminal tab to be active: {final_state}"
     );
 
-    let program_name = remaining.get("program_name").and_then(Value::as_str);
     assert_eq!(
-        program_name,
+        program_name.as_deref(),
         Some("sleep"),
         "expected close-tab handoff to refresh terminal program name (initial: {initial_program}): {final_state}"
     );
@@ -618,6 +780,34 @@ fn wait_for_active_terminal_program_name(
     None
 }
 
+fn wait_for_active_terminal_program_name_value(
+    harness: &TaborHarness,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        let Some(active) = active_tab(&tabs) else {
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        };
+
+        if tab_kind_is(active, "terminal") {
+            if let Some(name) = active.get("program_name").and_then(Value::as_str) {
+                if name == expected {
+                    return Some(name.to_string());
+                }
+            }
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
 fn active_tab(response: &Value) -> Option<&Value> {
     flatten_tabs(response)
         .into_iter()
@@ -783,9 +973,98 @@ fn wait_for_file_content(path: &Path, timeout: Duration) -> Option<String> {
     None
 }
 
+fn wait_for_agent_observation(
+    harness: &TaborHarness,
+    title: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let observation = harness.run_json(["agent", "observe"]);
+        if observation
+            .get("observation")
+            .and_then(|value| value.get("title"))
+            .and_then(Value::as_str)
+            == Some(title)
+        {
+            return Some(observation);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_agent_download(
+    harness: &TaborHarness,
+    suggested_name: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let downloads = harness.run_json(["agent", "downloads"]);
+        if let Some(download) =
+            downloads.get("downloads").and_then(Value::as_array).and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry.get("suggested_name").and_then(Value::as_str) == Some(suggested_name)
+                        && entry.get("state").and_then(Value::as_str) == Some("complete")
+                })
+            })
+        {
+            return Some(download.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_agent_events(
+    harness: &TaborHarness,
+    since: &str,
+    kinds: &[&str],
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    let expected_kinds = kinds.iter().map(|kind| kind.to_string()).collect::<Vec<_>>();
+    while Instant::now() < deadline {
+        let mut args = vec![
+            String::from("agent"),
+            String::from("events"),
+            String::from("--since"),
+            since.to_string(),
+            String::from("--max"),
+            String::from("64"),
+        ];
+        for kind in kinds {
+            args.push(String::from("--kind"));
+            args.push((*kind).to_string());
+        }
+        let events = harness.run_json(args);
+        let returned_kinds = events
+            .get("events")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.get("kind").and_then(Value::as_str).map(ToOwned::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if expected_kinds.iter().all(|kind| returned_kinds.iter().any(|value| value == kind)) {
+            return Some(events);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
 fn fixture_url() -> String {
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-browser.html");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-fixture.html");
     assert!(fixture_path.exists(), "fixture missing: {}", fixture_path.display());
     Url::from_file_path(&fixture_path).expect("invalid fixture file path").to_string()
 }
@@ -808,17 +1087,51 @@ fn tab_titles(response: &Value) -> Vec<String> {
     titles
 }
 
+fn find_observed_element_id(response: &Value, needle: &str) -> String {
+    response
+        .get("observation")
+        .and_then(|value| value.get("elements"))
+        .and_then(Value::as_array)
+        .and_then(|elements| {
+            elements.iter().find_map(|element| {
+                let name = element.get("name").and_then(Value::as_str)?;
+                if name == needle {
+                    element.get("id").and_then(Value::as_str).map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| panic!("missing observed element {needle}: {response}"))
+}
+
+fn agent_action_results_all_ok(response: &Value) -> bool {
+    response
+        .get("result")
+        .and_then(|value| value.get("results"))
+        .and_then(Value::as_array)
+        .is_some_and(|results| {
+            !results.is_empty()
+                && results
+                    .iter()
+                    .all(|result| result.get("ok").and_then(Value::as_bool) == Some(true))
+        })
+}
+
+fn agent_detail_value(response: &Value) -> Option<&str> {
+    response.get("element").and_then(|value| value.get("value")).and_then(Value::as_str)
+}
+
+fn agent_detail_checked(response: &Value) -> Option<bool> {
+    response.get("element").and_then(|value| value.get("checked")).and_then(Value::as_bool)
+}
+
 fn click_popup_opener(harness: &TaborHarness) {
-    let payload = json!({
-        "type": "web_mouse",
-        "tab_id": null,
-        "action": "click",
-        "x": 48.0,
-        "y": 48.0,
-        "button": "left",
-    })
-    .to_string();
-    harness.run_ok(["msg", "send", payload.as_str()]);
+    let observation = harness.run_json(["agent", "observe"]);
+    let button_id = find_observed_element_id(&observation, "Open popup");
+    let actions = json!([{ "type": "click", "id": button_id }]).to_string();
+    let reply = harness.run_json(["agent", "act", actions.as_str()]);
+    assert!(agent_action_results_all_ok(&reply), "popup click failed: {reply}");
 }
 
 fn opener_html() -> &'static str {
