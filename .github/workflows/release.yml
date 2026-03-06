@@ -1,8 +1,7 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  create:
   workflow_dispatch:
 
 env:
@@ -11,12 +10,35 @@ env:
 
 jobs:
   macos:
+    if: github.event_name != 'create' || (github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Resolve release tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "create" ]; then
+            RELEASE_TAG="$GITHUB_REF"
+          else
+            RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          fi
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "Release workflow requires the checked-out commit to match an exact tag."
+            exit 1
+          fi
+
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v, got: $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: brew install scdoc
       - name: Import signing certificate
@@ -128,9 +150,9 @@ jobs:
           fi
       - name: Upload Application
         run: |
-          mv ./target/release/osx/Tabor.dmg ./Tabor-${GITHUB_REF##*/}.dmg
-          cp ./Tabor-${GITHUB_REF##*/}.dmg ./Tabor.dmg
-          ./.github/workflows/upload_asset.sh ./Tabor-${GITHUB_REF##*/}.dmg $GITHUB_TOKEN
+          mv ./target/release/osx/Tabor.dmg ./Tabor-${RELEASE_TAG}.dmg
+          cp ./Tabor-${RELEASE_TAG}.dmg ./Tabor.dmg
+          ./.github/workflows/upload_asset.sh ./Tabor-${RELEASE_TAG}.dmg $GITHUB_TOKEN
           ./.github/workflows/upload_asset.sh ./Tabor.dmg $GITHUB_TOKEN
       - name: Clean up keychain
         if: always()
@@ -140,6 +162,7 @@ jobs:
           fi
 
   windows:
+    if: github.event_name != 'create' || (github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: windows-latest
 
     defaults:
@@ -150,34 +173,79 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Resolve release tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "create" ]; then
+            RELEASE_TAG="$GITHUB_REF"
+          else
+            RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          fi
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "Release workflow requires the checked-out commit to match an exact tag."
+            exit 1
+          fi
+
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v, got: $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
       - name: Test
         run: cargo test --release
       - name: Build
         run: cargo build --release
       - name: Upload portable executable
         run: |
-          cp ./target/release/tabor.exe ./Tabor-${GITHUB_REF##*/}-portable.exe
+          cp ./target/release/tabor.exe ./Tabor-${RELEASE_TAG}-portable.exe
           ./.github/workflows/upload_asset.sh \
-            ./Tabor-${GITHUB_REF##*/}-portable.exe $GITHUB_TOKEN
+            ./Tabor-${RELEASE_TAG}-portable.exe $GITHUB_TOKEN
       - name: Install WiX
         run: dotnet tool install --global wix --version 4.0.5
       - name: Create msi installer
         run: |
           wix extension add WixToolset.UI.wixext/4.0.5 WixToolset.Util.wixext/4.0.5
           wix build -arch "x64" -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext \
-          -out "./Tabor-${GITHUB_REF##*/}-installer.msi" "tabor/windows/wix/tabor.wxs"
+          -out "./Tabor-${RELEASE_TAG}-installer.msi" "tabor/windows/wix/tabor.wxs"
       - name: Upload msi installer
         run: |
           ./.github/workflows/upload_asset.sh \
-            ./Tabor-${GITHUB_REF##*/}-installer.msi $GITHUB_TOKEN
+            ./Tabor-${RELEASE_TAG}-installer.msi $GITHUB_TOKEN
 
   linux:
+    if: github.event_name != 'create' || (github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Resolve release tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "create" ]; then
+            RELEASE_TAG="$GITHUB_REF"
+          else
+            RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          fi
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "Release workflow requires the checked-out commit to match an exact tag."
+            exit 1
+          fi
+
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v, got: $RELEASE_TAG"
+              exit 1
+              ;;
+          esac
+
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: |
           sudo apt-get install cmake pkg-config libfreetype6-dev libfontconfig1-dev \
