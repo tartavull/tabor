@@ -31,6 +31,11 @@ hardened_runtime="${TABOR_CODESIGN_HARDENED_RUNTIME:-0}"
 timestamp_signing="${TABOR_CODESIGN_TIMESTAMP:-0}"
 codesign_extra_flags=()
 
+if [[ "$require_team_codesign" != "1" ]]; then
+  echo "TABOR_REQUIRE_TEAM_CODESIGN must remain 1. Unsigned or ad-hoc-signed macOS Tabor builds are forbidden." >&2
+  exit 1
+fi
+
 list_codesign_identities() {
   /usr/bin/security find-identity -v -p codesigning 2>/dev/null || true
 }
@@ -80,22 +85,18 @@ resolve_team_identity() {
 }
 
 if [[ -z "$identity" ]]; then
-  if [[ "$require_team_codesign" == "1" ]]; then
-    if ! identity="$(resolve_team_identity)"; then
-      echo "No codesigning identity found for ${required_team_name}${required_team_id:+ (${required_team_id})}." >&2
-      echo "Import/unlock the Tiny Mile signing certificate, or set TABOR_CODESIGN_IDENTITY explicitly." >&2
-      echo "Available codesigning identities:" >&2
-      list_codesign_identities >&2
-      exit 1
-    fi
-  else
-    identity="-"
+  if ! identity="$(resolve_team_identity)"; then
+    echo "No codesigning identity found for ${required_team_name}${required_team_id:+ (${required_team_id})}." >&2
+    echo "Import/unlock the Tiny Mile signing certificate, or set TABOR_CODESIGN_IDENTITY explicitly." >&2
+    echo "Available codesigning identities:" >&2
+    list_codesign_identities >&2
+    exit 1
   fi
 fi
 
 if [[ "$require_team_codesign" == "1" && "$identity" == "-" ]]; then
   echo "Ad-hoc signing is disabled when TABOR_REQUIRE_TEAM_CODESIGN=1." >&2
-  echo "Set TABOR_CODESIGN_IDENTITY to a ${required_team_name} certificate, or set TABOR_REQUIRE_TEAM_CODESIGN=0 for local debug bundles." >&2
+  echo "Set TABOR_CODESIGN_IDENTITY to a ${required_team_name} certificate." >&2
   exit 1
 fi
 if [[ "$identity" != "-" ]]; then

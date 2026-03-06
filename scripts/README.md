@@ -53,14 +53,13 @@ cargo xtask run
 cargo xtask install --release --launch
 ```
 
-`cargo xtask run-raw -- ...` is only for explicit raw-binary debugging and does not touch `/Applications/Tabor.app`.
+`cargo xtask run-raw -- ...` is disabled on macOS because raw-binary launches bypass signed `Tabor.app` verification.
 
 ## Passkey-Enabled macOS Build Mode
 
 Default macOS runs/builds intentionally skip the restricted passkey entitlement and disable WebAuthn so passkey pages cannot trigger system passkey flows unless you opt into passkey mode.
 
-macOS signing defaults to Tiny Mile US, Corp (Team ID `7A5AR5N85X`) and fails fast if that identity is unavailable, so we do not silently fall back to ad-hoc signing.
-Use `TABOR_REQUIRE_TEAM_CODESIGN=0` only for throwaway local debug bundles.
+macOS signing defaults to Tiny Mile US, Corp (Team ID `7A5AR5N85X`) and fails fast if that identity is unavailable. Unsigned or ad-hoc-signed macOS Tabor builds are not supported, including debug builds.
 
 Enable passkey mode explicitly:
 

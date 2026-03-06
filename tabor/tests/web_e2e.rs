@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use url::Url;
@@ -21,47 +23,100 @@ use url::Url;
 const START_TIMEOUT: Duration = Duration::from_secs(12);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+enum HarnessLaunchMode {
+    BackgroundBinary,
+    ForegroundAppBundle { _debug_notch_ears: bool },
+}
+
+struct TempAppBundle {
+    bundle_dir: PathBuf,
+    executable: PathBuf,
+    bundle_id: String,
+}
+
 struct TaborHarness {
-    bin: PathBuf,
+    client_bin: PathBuf,
     socket: PathBuf,
     _tmp: TempDir,
     log_path: PathBuf,
     child: Child,
+    activation_bundle_id: Option<String>,
+    kill_path: Option<PathBuf>,
 }
 
 impl TaborHarness {
     fn start() -> Self {
-        let bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
+        Self::start_with_mode(HarnessLaunchMode::BackgroundBinary)
+    }
+
+    fn start_foreground_app_bundle(debug_notch_ears: bool) -> Self {
+        Self::start_with_mode(HarnessLaunchMode::ForegroundAppBundle {
+            _debug_notch_ears: debug_notch_ears,
+        })
+    }
+
+    fn start_with_mode(mode: HarnessLaunchMode) -> Self {
+        let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let bundle = create_temp_app_bundle(&tmp, &built_bin);
+        let client_bin = bundle.executable.clone();
         let socket = tmp.path().join("tabor.sock");
         let log_path = tmp.path().join("tabor.log");
 
         let stdout = File::create(&log_path).expect("failed to create harness log file");
         let stderr = stdout.try_clone().expect("failed to clone harness log file");
 
-        let child = Command::new(&bin)
+        let mut activation_bundle_id = None;
+        let kill_path = Some(bundle.executable.clone());
+        let mut command = match mode {
+            HarnessLaunchMode::BackgroundBinary => Command::new(&bundle.executable),
+            HarnessLaunchMode::ForegroundAppBundle { .. } => {
+                activation_bundle_id = Some(bundle.bundle_id);
+                let mut command = Command::new("open");
+                command.arg("-n").arg(&bundle.bundle_dir).arg("--args");
+                command
+            },
+        };
+        command
             .arg("--socket")
             .arg(&socket)
-            .env("TABOR_BACKGROUND", "1")
-            .env("TABOR_WEBVIEW_ENGINE", "cef")
-            .env("RUST_BACKTRACE", "1")
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("failed to spawn tabor");
+            .stderr(Stdio::from(stderr));
 
-        let harness = Self { bin, socket, _tmp: tmp, log_path: log_path.clone(), child };
+        match mode {
+            HarnessLaunchMode::BackgroundBinary => {
+                command.env("TABOR_BACKGROUND", "1");
+                command.env("TABOR_WEBVIEW_ENGINE", "cef");
+                command.env("RUST_BACKTRACE", "1");
+            },
+            HarnessLaunchMode::ForegroundAppBundle { _debug_notch_ears: _ } => (),
+        }
+
+        let child = command.spawn().expect("failed to spawn tabor");
+
+        let harness = Self {
+            client_bin,
+            socket,
+            _tmp: tmp,
+            log_path: log_path.clone(),
+            child,
+            activation_bundle_id,
+            kill_path,
+        };
 
         let start = Instant::now();
         while start.elapsed() < START_TIMEOUT {
             if harness.socket.exists() && harness.run_checked(["msg", "ping"]).is_ok() {
+                if let Some(bundle_id) = harness.activation_bundle_id.as_deref() {
+                    harness.activate_bundle(bundle_id);
+                }
                 return harness;
             }
             thread::sleep(POLL_INTERVAL);
         }
 
         let log = std::fs::read_to_string(log_path).unwrap_or_else(|_| String::new());
-        panic!("failed to start tabor harness in background; log:\n{log}");
+        panic!("failed to start tabor harness; log:\n{log}");
     }
 
     fn run_output<I, S>(&self, args: I) -> Output
@@ -69,7 +124,7 @@ impl TaborHarness {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        Command::new(&self.bin)
+        Command::new(&self.client_bin)
             .env("TABOR_SOCKET", &self.socket)
             .args(args)
             .output()
@@ -177,13 +232,120 @@ impl TaborHarness {
     fn tmp_path(&self, name: &str) -> PathBuf {
         self._tmp.path().join(name)
     }
+
+    fn send_raw_request(&self, request: Value) -> Value {
+        let request = request.to_string();
+        self.run_json(["msg", "send", request.as_str()])
+    }
+
+    fn activate_bundle(&self, bundle_id: &str) {
+        let script = format!("tell application id \"{bundle_id}\" to activate");
+        let output =
+            Command::new("osascript").arg("-e").arg(&script).output().unwrap_or_else(|err| {
+                panic!("failed to run osascript activate for {bundle_id}: {err}")
+            });
+        assert!(
+            output.status.success(),
+            "failed to activate bundle {bundle_id}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 impl Drop for TaborHarness {
     fn drop(&mut self) {
+        if let Some(kill_path) = &self.kill_path {
+            let _ = Command::new("pkill").arg("-f").arg(kill_path).status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let bundle_dir = tmp.path().join("Tabor.app");
+    let contents = bundle_dir.join("Contents");
+    let macos = contents.join("MacOS");
+    std::fs::create_dir_all(&macos).expect("failed to create temp app bundle");
+
+    let info_plist_src = repo_root.join("extra/osx/Tabor.Info.plist");
+    let info_plist_dst = contents.join("Info.plist");
+    std::fs::copy(&info_plist_src, &info_plist_dst).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy Info.plist from {} to {}: {err}",
+            info_plist_src.display(),
+            info_plist_dst.display()
+        )
+    });
+    let bundle_id = format!(
+        "com.pinkbot.tabor.test.{}",
+        tmp.path().file_name().and_then(|name| name.to_str()).unwrap_or("bundle").replace('.', "-")
+    );
+    let plist_status = Command::new("/usr/libexec/PlistBuddy")
+        .arg("-c")
+        .arg(format!("Set :CFBundleIdentifier {bundle_id}"))
+        .arg(&info_plist_dst)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to update temp app bundle identifier in {}: {err}",
+                info_plist_dst.display()
+            )
+        });
+    assert!(
+        plist_status.success(),
+        "failed to set temp app bundle identifier in {}",
+        info_plist_dst.display()
+    );
+
+    let bundled_bin = macos.join("tabor");
+    std::fs::copy(bin, &bundled_bin).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy test binary from {} to {}: {err}",
+            bin.display(),
+            bundled_bin.display()
+        )
+    });
+    let mut permissions = std::fs::metadata(&bundled_bin)
+        .unwrap_or_else(|err| {
+            panic!("failed to stat copied test binary {}: {err}", bundled_bin.display())
+        })
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&bundled_bin, permissions).unwrap_or_else(|err| {
+        panic!("failed to mark copied test binary executable at {}: {err}", bundled_bin.display())
+    });
+
+    for script in ["scripts/bundle-macos-deps.sh", "scripts/create-macos-cef-helpers.sh"] {
+        let status = Command::new(repo_root.join(script))
+            .current_dir(&repo_root)
+            .arg(&bundle_dir)
+            .status()
+            .unwrap_or_else(|err| {
+                panic!("failed to run {script} for {}: {err}", bundle_dir.display())
+            });
+        assert!(
+            status.success(),
+            "{script} failed for {} with status {status}",
+            bundle_dir.display()
+        );
+    }
+
+    let sign_status = Command::new(repo_root.join("scripts/sign-macos-app.sh"))
+        .current_dir(&repo_root)
+        .arg(&bundle_dir)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!("failed to run scripts/sign-macos-app.sh for {}: {err}", bundle_dir.display())
+        });
+    assert!(
+        sign_status.success(),
+        "scripts/sign-macos-app.sh failed for {} with status {sign_status}",
+        bundle_dir.display()
+    );
+
+    TempAppBundle { bundle_dir, executable: bundled_bin, bundle_id }
 }
 
 struct PopupServer {
@@ -244,6 +406,106 @@ impl Drop for PopupServer {
             let _ = handle.join();
         }
     }
+}
+
+struct ClipboardFixtureServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ClipboardFixtureServer {
+    fn start() -> Self {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind clipboard fixture server");
+        listener
+            .set_nonblocking(true)
+            .expect("failed to set clipboard fixture server nonblocking mode");
+
+        let port =
+            listener.local_addr().expect("failed to read clipboard fixture server addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let fixture_html = include_str!("fixtures/agent-fixture.html").to_string();
+
+        let handle = thread::spawn(move || {
+            loop {
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        handle_clipboard_fixture_connection(&mut stream, fixture_html.as_bytes());
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self { port, stop, handle: Some(handle) }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+}
+
+impl Drop for ClipboardFixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WindowDebugRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WindowDebugInsets {
+    top: f64,
+    left: f64,
+    bottom: f64,
+    right: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WindowDebugState {
+    native_fullscreen: bool,
+    simple_fullscreen: bool,
+    winit_fullscreen: bool,
+    #[serde(default)]
+    real_ear_fullscreen_active: bool,
+    is_miniaturized: bool,
+    notch_ears_active: bool,
+    scale_factor: f64,
+    window_number: Option<i64>,
+    left_ear_window_number: Option<i64>,
+    right_ear_window_number: Option<i64>,
+    screen_frame_points: WindowDebugRect,
+    content_frame_screen_points: WindowDebugRect,
+    safe_area_insets_points: WindowDebugInsets,
+    auxiliary_top_left_screen_points: WindowDebugRect,
+    auxiliary_top_right_screen_points: WindowDebugRect,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WindowDebugSnapshot {
+    png_base64: String,
+    width: u32,
+    height: u32,
+    snapshot_screen_points: WindowDebugRect,
+    state: WindowDebugState,
 }
 
 #[test]
@@ -526,6 +788,427 @@ fn agent_events_smoke() {
 }
 
 #[test]
+fn browser_clipboard_api_smoke() {
+    let server = ClipboardFixtureServer::start();
+    let harness = TaborHarness::start();
+    let fixture = server.url("/fixture.html");
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    let tab_id_arg = tab_id_arg(&reply);
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    let observation =
+        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
+    let email_id = find_observed_element_id(&observation, "Email");
+    let notes_id = find_observed_element_id(&observation, "Notes");
+    let focus_notes_id = find_observed_element_id(&observation, "Focus Notes");
+    let page_copy_id = find_observed_element_id(&observation, "Page Copy");
+    let page_paste_id = find_observed_element_id(&observation, "Page Paste");
+    let clipboard_status_id = find_observed_element_id(&observation, "Clipboard API status");
+
+    let source_text = "web clipboard copy";
+    let paste_text = "web clipboard paste";
+    let notes_prefix = "prefix:";
+    let setup_actions = json!([
+        { "type": "fill", "id": email_id, "text": source_text },
+        { "type": "fill", "id": notes_id, "text": notes_prefix }
+    ])
+    .to_string();
+    let setup = harness.run_json(["agent", "act", setup_actions.as_str()]);
+    assert!(agent_action_results_all_ok(&setup), "clipboard setup failed: {setup}");
+
+    trusted_click(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        page_copy_id.as_str(),
+    );
+    let copy_wait = json!([
+        { "type": "wait", "text": format!("Clipboard API write: {source_text}"), "timeout_ms": 5000 }
+    ])
+    .to_string();
+    let copy_reply = harness.run_json(["agent", "act", copy_wait.as_str()]);
+    if !agent_action_results_all_ok(&copy_reply) {
+        let status = harness.run_json(["agent", "inspect", clipboard_status_id.as_str()]);
+        panic!("page clipboard write failed: {copy_reply}; status={status}");
+    }
+    let copied = wait_for_clipboard_text(&harness, source_text, Duration::from_secs(4))
+        .unwrap_or_else(|| panic!("timed out waiting for copied clipboard text"));
+    assert_eq!(copied, source_text);
+
+    let clipboard_seed = harness.run_json(["agent", "clipboard", "set", paste_text]);
+    assert_eq!(clipboard_seed.get("type").and_then(Value::as_str), Some("clipboard"));
+
+    trusted_click(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        focus_notes_id.as_str(),
+    );
+    trusted_click(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        page_paste_id.as_str(),
+    );
+    let paste_wait = json!([
+        { "type": "wait", "text": format!("Clipboard API read: {paste_text}"), "timeout_ms": 5000 }
+    ])
+    .to_string();
+    let paste_reply = harness.run_json(["agent", "act", paste_wait.as_str()]);
+    if !agent_action_results_all_ok(&paste_reply) {
+        let status = harness.run_json(["agent", "inspect", clipboard_status_id.as_str()]);
+        panic!("page clipboard read failed: {paste_reply}; status={status}");
+    }
+    let expected_notes = format!("{notes_prefix}{paste_text}");
+    let notes_value = wait_for_agent_value(
+        &harness,
+        notes_id.as_str(),
+        expected_notes.as_str(),
+        Duration::from_secs(4),
+    )
+    .unwrap_or_else(|| panic!("timed out waiting for pasted notes value"));
+    assert_eq!(notes_value, expected_notes);
+
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "detach",
+        "--session-id",
+        inspector_session.as_str(),
+    ]);
+}
+
+#[test]
+fn browser_native_clipboard_shortcuts_smoke() {
+    let server = ClipboardFixtureServer::start();
+    let harness = TaborHarness::start();
+    let fixture = server.url("/fixture.html");
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    let observation =
+        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
+    let email_id = find_observed_element_id(&observation, "Email");
+    let notes_id = find_observed_element_id(&observation, "Notes");
+    let select_email_id = find_observed_element_id(&observation, "Select Email");
+    let focus_notes_id = find_observed_element_id(&observation, "Focus Notes");
+    let native_clipboard_status_id =
+        find_observed_element_id(&observation, "Native clipboard status");
+
+    let source_text = "native clipboard copy";
+    let paste_text = "native clipboard paste";
+    let setup_actions = json!([
+        { "type": "fill", "id": email_id, "text": source_text },
+        { "type": "fill", "id": notes_id, "text": "" }
+    ])
+    .to_string();
+    let setup = harness.run_json(["agent", "act", setup_actions.as_str()]);
+    assert!(agent_action_results_all_ok(&setup), "native clipboard setup failed: {setup}");
+
+    let select_actions = json!([{ "type": "click", "id": select_email_id }]).to_string();
+    let select_reply = harness.run_json(["agent", "act", select_actions.as_str()]);
+    assert!(agent_action_results_all_ok(&select_reply), "email selection failed: {select_reply}");
+
+    let copy_reply = harness.run_json(["msg", "dispatch-action", "--action", "Copy"]);
+    assert_eq!(copy_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let copy_wait = json!([
+        { "type": "wait", "text": format!("Native clipboard: copy:{source_text}"), "timeout_ms": 5000 }
+    ])
+    .to_string();
+    let copy_event = harness.run_json(["agent", "act", copy_wait.as_str()]);
+    if !agent_action_results_all_ok(&copy_event) {
+        let status = harness.run_json(["agent", "inspect", native_clipboard_status_id.as_str()]);
+        panic!("native copy event missing: {copy_event}; status={status}");
+    }
+
+    let copied = wait_for_clipboard_text(&harness, source_text, Duration::from_secs(4))
+        .unwrap_or_else(|| panic!("timed out waiting for copied clipboard text"));
+    assert_eq!(copied, source_text);
+
+    let clipboard_seed = harness.run_json(["agent", "clipboard", "set", paste_text]);
+    assert_eq!(clipboard_seed.get("type").and_then(Value::as_str), Some("clipboard"));
+
+    let focus_actions = json!([{ "type": "click", "id": focus_notes_id }]).to_string();
+    let focus_reply = harness.run_json(["agent", "act", focus_actions.as_str()]);
+    assert!(agent_action_results_all_ok(&focus_reply), "notes focus failed: {focus_reply}");
+
+    let paste_reply = harness.run_json(["msg", "dispatch-action", "--action", "Paste"]);
+    assert_eq!(paste_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let paste_wait = json!([
+        { "type": "wait", "text": format!("Native clipboard: paste:{paste_text}"), "timeout_ms": 5000 }
+    ])
+    .to_string();
+    let paste_event = harness.run_json(["agent", "act", paste_wait.as_str()]);
+    if !agent_action_results_all_ok(&paste_event) {
+        let status = harness.run_json(["agent", "inspect", native_clipboard_status_id.as_str()]);
+        panic!("native paste event missing: {paste_event}; status={status}");
+    }
+
+    let notes_value =
+        wait_for_agent_value(&harness, notes_id.as_str(), paste_text, Duration::from_secs(4))
+            .unwrap_or_else(|| panic!("timed out waiting for pasted notes value"));
+    assert_eq!(notes_value, paste_text);
+}
+
+#[test]
+fn macos_fullscreen_notch_ears_red_window_snapshot() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let initial_state = window_debug_state(&harness);
+
+    if rect_is_empty(&initial_state.auxiliary_top_left_screen_points)
+        && rect_is_empty(&initial_state.auxiliary_top_right_screen_points)
+    {
+        eprintln!("skipping fullscreen notch test on a display without auxiliary notch regions");
+        return;
+    }
+
+    let toggle_reply = harness.run_json(["msg", "dispatch-action", "--action", "ToggleFullscreen"]);
+    assert_eq!(toggle_reply.get("type").and_then(Value::as_str), Some("ok"));
+    let _ = window_debug_snapshot(&harness);
+
+    let fullscreen_state = wait_for_fullscreen_window_state(&harness, Duration::from_secs(12))
+        .unwrap_or_else(|state| {
+            panic!(
+                "timed out waiting for stable fullscreen state; last_state={state:?}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert!(
+        fullscreen_state.simple_fullscreen,
+        "expected real-ear fullscreen to use simple fullscreen on a notched display: {fullscreen_state:?}"
+    );
+    assert!(
+        !fullscreen_state.native_fullscreen,
+        "real-ear fullscreen should avoid native AppKit fullscreen: {fullscreen_state:?}"
+    );
+    assert!(
+        fullscreen_state.real_ear_fullscreen_active,
+        "expected fullscreen debug state to report real-ear fullscreen: {fullscreen_state:?}"
+    );
+    assert_rect_close(
+        &fullscreen_state.content_frame_screen_points,
+        &fullscreen_state.screen_frame_points,
+        1.0,
+        "real-ear fullscreen content frame should span the fullscreen window",
+    );
+    let snapshot = window_debug_snapshot(&harness);
+    assert!(snapshot.state.simple_fullscreen, "window snapshot did not report simple fullscreen");
+    assert!(
+        snapshot.state.real_ear_fullscreen_active,
+        "window snapshot did not report active real-ear fullscreen"
+    );
+
+    let png_bytes =
+        BASE64.decode(snapshot.png_base64.as_bytes()).expect("failed to decode snapshot PNG");
+    let image =
+        image::load_from_memory(&png_bytes).expect("failed to decode window snapshot").to_rgba8();
+    assert_eq!(image.width(), snapshot.width);
+    assert_eq!(image.height(), snapshot.height);
+
+    let aux_rects = [
+        &fullscreen_state.auxiliary_top_left_screen_points,
+        &fullscreen_state.auxiliary_top_right_screen_points,
+    ];
+
+    for (index, rect) in aux_rects.iter().enumerate() {
+        if rect_is_empty(rect) {
+            continue;
+        }
+
+        let local = screen_rect_to_snapshot_pixels(
+            rect,
+            &snapshot.snapshot_screen_points,
+            snapshot.state.scale_factor,
+        );
+        if !rect_within_snapshot(&local, snapshot.width, snapshot.height) {
+            write_notch_failure_artifacts(
+                &harness,
+                &snapshot,
+                &fullscreen_state,
+                format!("auxiliary rect {index} mapped outside snapshot bounds: {local:?}"),
+            );
+        }
+
+        let red_ratio = sampled_red_ratio(&image, local);
+        if red_ratio < 0.95 {
+            write_notch_failure_artifacts(
+                &harness,
+                &snapshot,
+                &fullscreen_state,
+                format!("auxiliary rect {index} was not red enough: ratio={red_ratio:.3}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn macos_standard_zoom_button_enters_real_ear_fullscreen() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let initial_state = window_debug_state(&harness);
+
+    if rect_is_empty(&initial_state.auxiliary_top_left_screen_points)
+        && rect_is_empty(&initial_state.auxiliary_top_right_screen_points)
+    {
+        eprintln!(
+            "skipping fullscreen zoom-button test on a display without auxiliary notch regions"
+        );
+        return;
+    }
+
+    let zoom_reply = harness.run_json([
+        "msg",
+        "send",
+        r#"{"type":"window_debug_press_standard_button","button":"zoom"}"#,
+    ]);
+    assert_eq!(zoom_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let fullscreen_state = wait_for_fullscreen_window_state(&harness, Duration::from_secs(12))
+        .unwrap_or_else(|state| {
+            panic!(
+                "timed out waiting for real-ear fullscreen after zoom button press; last_state={state:?}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert!(
+        fullscreen_state.simple_fullscreen,
+        "expected standard zoom button to enter simple real-ear fullscreen: {fullscreen_state:?}"
+    );
+    assert!(
+        !fullscreen_state.native_fullscreen,
+        "standard zoom button should avoid native AppKit fullscreen on notched displays: {fullscreen_state:?}"
+    );
+    assert!(
+        fullscreen_state.real_ear_fullscreen_active,
+        "expected standard zoom button path to report active real-ear fullscreen: {fullscreen_state:?}"
+    );
+    assert_rect_close(
+        &fullscreen_state.content_frame_screen_points,
+        &fullscreen_state.screen_frame_points,
+        1.0,
+        "real-ear fullscreen content frame should span the fullscreen window after a zoom button press",
+    );
+}
+
+#[test]
+fn macos_toggle_fullscreen_action_exits_real_ear_fullscreen() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let initial_state = window_debug_state(&harness);
+
+    if rect_is_empty(&initial_state.auxiliary_top_left_screen_points)
+        && rect_is_empty(&initial_state.auxiliary_top_right_screen_points)
+    {
+        eprintln!(
+            "skipping fullscreen zoom-button test on a display without auxiliary notch regions"
+        );
+        return;
+    }
+
+    let toggle_reply = harness.run_json(["msg", "dispatch-action", "--action", "ToggleFullscreen"]);
+    assert_eq!(toggle_reply.get("type").and_then(Value::as_str), Some("ok"));
+    let _ = window_debug_snapshot(&harness);
+
+    let fullscreen_state = wait_for_fullscreen_window_state(&harness, Duration::from_secs(12))
+        .unwrap_or_else(|state| {
+            panic!(
+                "timed out waiting for real-ear fullscreen before exit test; last_state={state:?}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert!(
+        fullscreen_state.simple_fullscreen && fullscreen_state.real_ear_fullscreen_active,
+        "expected real-ear fullscreen to be active before exit test: {fullscreen_state:?}"
+    );
+
+    let exit_reply = harness.run_json(["msg", "dispatch-action", "--action", "ToggleFullscreen"]);
+    assert_eq!(exit_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let windowed_state = wait_for_windowed_window_state(&harness, Duration::from_secs(12))
+        .unwrap_or_else(|state| {
+            panic!(
+                "timed out waiting for windowed state after fullscreen exit; last_state={state:?}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert!(
+        !windowed_state.native_fullscreen
+            && !windowed_state.simple_fullscreen
+            && !windowed_state.winit_fullscreen,
+        "zoom button should exit fullscreen completely: {windowed_state:?}"
+    );
+}
+
+#[test]
+fn macos_standard_minimize_button_exits_real_ear_fullscreen_and_miniaturizes() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let initial_state = window_debug_state(&harness);
+
+    if rect_is_empty(&initial_state.auxiliary_top_left_screen_points)
+        && rect_is_empty(&initial_state.auxiliary_top_right_screen_points)
+    {
+        eprintln!(
+            "skipping fullscreen minimize-button test on a display without auxiliary notch regions"
+        );
+        return;
+    }
+
+    let enter_reply = harness.run_json(["msg", "dispatch-action", "--action", "ToggleFullscreen"]);
+    assert_eq!(enter_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let fullscreen_state = wait_for_fullscreen_window_state(&harness, Duration::from_secs(12))
+        .unwrap_or_else(|state| {
+            panic!(
+                "timed out waiting for real-ear fullscreen before minimize test; last_state={state:?}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert!(
+        fullscreen_state.simple_fullscreen && fullscreen_state.real_ear_fullscreen_active,
+        "expected real-ear fullscreen to be active before minimize test: {fullscreen_state:?}"
+    );
+
+    let minimize_reply = harness.run_json([
+        "msg",
+        "send",
+        r#"{"type":"window_debug_press_standard_button","button":"minimize"}"#,
+    ]);
+    assert_eq!(minimize_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let miniaturized_state =
+        wait_for_miniaturized_window_state(&harness, Duration::from_secs(12)).unwrap_or_else(
+            |state| {
+                panic!(
+                    "timed out waiting for miniaturized state after fullscreen minimize; last_state={state:?}; harness_log_tail:\n{}",
+                    harness.log_tail(),
+                )
+            },
+        );
+    assert!(
+        miniaturized_state.is_miniaturized,
+        "expected miniaturized state after fullscreen minimize: {miniaturized_state:?}"
+    );
+    assert!(
+        !miniaturized_state.native_fullscreen
+            && !miniaturized_state.simple_fullscreen
+            && !miniaturized_state.winit_fullscreen,
+        "minimize should leave fullscreen completely before miniaturizing: {miniaturized_state:?}"
+    );
+}
+
+#[test]
 fn close_active_web_tab_refreshes_terminal_program_name() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
@@ -724,6 +1407,247 @@ fn reopen_web_tab_after_idle_shutdown_window_keeps_instance_alive() {
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(default)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotPixelRect {
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+}
+
+fn window_debug_state(harness: &TaborHarness) -> WindowDebugState {
+    let reply = harness.send_raw_request(json!({ "type": "window_debug_state" }));
+    let Some(state) = reply.get("state") else {
+        panic!("missing window debug state payload: {reply}");
+    };
+    serde_json::from_value(state.clone())
+        .unwrap_or_else(|err| panic!("invalid window debug state reply: {err}; reply={reply}"))
+}
+
+fn window_debug_snapshot(harness: &TaborHarness) -> WindowDebugSnapshot {
+    let reply = harness.send_raw_request(json!({
+        "type": "window_debug_snapshot",
+        "highlight_notch_ears": true
+    }));
+    let Some(snapshot) = reply.get("snapshot") else {
+        panic!("missing window debug snapshot payload: {reply}");
+    };
+    serde_json::from_value(snapshot.clone())
+        .unwrap_or_else(|err| panic!("invalid window debug snapshot reply: {err}; reply={reply}"))
+}
+
+#[allow(clippy::result_large_err)]
+fn wait_for_fullscreen_window_state(
+    harness: &TaborHarness,
+    timeout: Duration,
+) -> Result<WindowDebugState, WindowDebugState> {
+    let deadline = Instant::now() + timeout;
+    let mut last_state = window_debug_state(harness);
+    let mut stable_count = 0usize;
+    let mut last_signature = None;
+
+    while Instant::now() < deadline {
+        let state = window_debug_state(harness);
+        last_state = state.clone();
+        let has_auxiliary_rects = !rect_is_empty(&state.auxiliary_top_left_screen_points)
+            || !rect_is_empty(&state.auxiliary_top_right_screen_points);
+        let fullscreen_active =
+            state.native_fullscreen || state.simple_fullscreen || state.winit_fullscreen;
+
+        if fullscreen_active && has_auxiliary_rects {
+            let signature = window_state_signature(&state);
+            if last_signature == Some(signature) {
+                stable_count += 1;
+            } else {
+                stable_count = 1;
+                last_signature = Some(signature);
+            }
+
+            if stable_count >= 3 {
+                return Ok(state);
+            }
+        } else {
+            stable_count = 0;
+            last_signature = None;
+            let _ = window_debug_snapshot(harness);
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    Err(last_state)
+}
+
+#[allow(clippy::result_large_err)]
+fn wait_for_windowed_window_state(
+    harness: &TaborHarness,
+    timeout: Duration,
+) -> Result<WindowDebugState, WindowDebugState> {
+    let deadline = Instant::now() + timeout;
+    let mut last_state = window_debug_state(harness);
+    let mut stable_count = 0usize;
+    let mut last_signature = None;
+
+    while Instant::now() < deadline {
+        let state = window_debug_state(harness);
+        last_state = state.clone();
+        let fullscreen_active =
+            state.native_fullscreen || state.simple_fullscreen || state.winit_fullscreen;
+
+        if !fullscreen_active {
+            let signature = window_state_signature(&state);
+            if last_signature == Some(signature) {
+                stable_count += 1;
+            } else {
+                stable_count = 1;
+                last_signature = Some(signature);
+            }
+
+            if stable_count >= 3 {
+                return Ok(state);
+            }
+        } else {
+            stable_count = 0;
+            last_signature = None;
+            let _ = window_debug_snapshot(harness);
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    Err(last_state)
+}
+
+#[allow(clippy::result_large_err)]
+fn wait_for_miniaturized_window_state(
+    harness: &TaborHarness,
+    timeout: Duration,
+) -> Result<WindowDebugState, WindowDebugState> {
+    let deadline = Instant::now() + timeout;
+    let mut last_state = window_debug_state(harness);
+
+    while Instant::now() < deadline {
+        let state = window_debug_state(harness);
+        last_state = state.clone();
+
+        if state.is_miniaturized {
+            return Ok(state);
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    Err(last_state)
+}
+
+fn rect_is_empty(rect: &WindowDebugRect) -> bool {
+    rect.width <= 0.0 || rect.height <= 0.0
+}
+
+fn assert_rect_close(
+    actual: &WindowDebugRect,
+    expected: &WindowDebugRect,
+    tolerance: f64,
+    label: &str,
+) {
+    let deltas = [
+        (actual.x - expected.x).abs(),
+        (actual.y - expected.y).abs(),
+        (actual.width - expected.width).abs(),
+        (actual.height - expected.height).abs(),
+    ];
+    if deltas.into_iter().any(|delta| delta > tolerance) {
+        panic!("{label}: actual={actual:?} expected={expected:?} tolerance={tolerance}");
+    }
+}
+
+fn window_state_signature(state: &WindowDebugState) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+    let content = &state.content_frame_screen_points;
+    let left = &state.auxiliary_top_left_screen_points;
+    let right = &state.auxiliary_top_right_screen_points;
+    (
+        (content.x * 1000.0).round() as i64,
+        (content.y * 1000.0).round() as i64,
+        (content.width * 1000.0).round() as i64,
+        (content.height * 1000.0).round() as i64,
+        (left.width * 1000.0).round() as i64,
+        (left.height * 1000.0).round() as i64,
+        (right.width * 1000.0).round() as i64,
+        (right.height * 1000.0).round() as i64,
+    )
+}
+
+fn screen_rect_to_snapshot_pixels(
+    rect: &WindowDebugRect,
+    snapshot_screen_points: &WindowDebugRect,
+    scale: f64,
+) -> SnapshotPixelRect {
+    let local_x = (rect.x - snapshot_screen_points.x) * scale;
+    let local_y =
+        (snapshot_screen_points.height - (rect.y - snapshot_screen_points.y) - rect.height) * scale;
+    let local_width = rect.width * scale;
+    let local_height = rect.height * scale;
+
+    SnapshotPixelRect {
+        x0: local_x.floor() as i64,
+        y0: local_y.floor() as i64,
+        x1: (local_x + local_width).ceil() as i64,
+        y1: (local_y + local_height).ceil() as i64,
+    }
+}
+
+fn rect_within_snapshot(rect: &SnapshotPixelRect, width: u32, height: u32) -> bool {
+    rect.x0 >= 0
+        && rect.y0 >= 0
+        && rect.x1 > rect.x0
+        && rect.y1 > rect.y0
+        && rect.x1 <= i64::from(width)
+        && rect.y1 <= i64::from(height)
+}
+
+fn sampled_red_ratio(image: &image::RgbaImage, rect: SnapshotPixelRect) -> f64 {
+    let mut total = 0u64;
+    let mut red = 0u64;
+
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let pixel = image.get_pixel(x as u32, y as u32);
+            total += 1;
+            if pixel[0] >= 245 && pixel[1] <= 10 && pixel[2] <= 10 {
+                red += 1;
+            }
+        }
+    }
+
+    if total == 0 { 0.0 } else { red as f64 / total as f64 }
+}
+
+fn write_notch_failure_artifacts(
+    harness: &TaborHarness,
+    snapshot: &WindowDebugSnapshot,
+    state: &WindowDebugState,
+    message: String,
+) -> ! {
+    let png_path = harness.tmp_path("fullscreen-notch-window-snapshot.png");
+    let json_path = harness.tmp_path("fullscreen-notch-window-state.json");
+    let png_bytes =
+        BASE64.decode(snapshot.png_base64.as_bytes()).expect("failed to decode failure snapshot");
+    std::fs::write(&png_path, png_bytes).unwrap_or_else(|err| {
+        panic!("failed to write snapshot artifact {}: {err}", png_path.display())
+    });
+    std::fs::write(
+        &json_path,
+        serde_json::to_vec_pretty(&json!({
+            "state": state,
+            "snapshot": snapshot,
+        }))
+        .expect("failed to serialize snapshot artifact json"),
+    )
+    .unwrap_or_else(|err| panic!("failed to write state artifact {}: {err}", json_path.display()));
+
+    panic!("{message}; snapshot={}; state={}", png_path.display(), json_path.display());
 }
 
 fn flatten_tabs(response: &Value) -> Vec<&Value> {
@@ -1062,6 +1986,160 @@ fn wait_for_agent_events(
     None
 }
 
+fn tab_id_arg(response: &Value) -> String {
+    let tab_id = response.get("tab_id").unwrap_or_else(|| panic!("missing tab_id: {response}"));
+    let index = tab_id
+        .get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing tab_id.index: {response}"));
+    let generation = tab_id
+        .get("generation")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing tab_id.generation: {response}"));
+    format!("{index}:{generation}")
+}
+
+fn attach_inspector(harness: &TaborHarness, tab_id_arg: &str) -> String {
+    let reply = harness.run_json(["msg", "inspector", "attach", "--tab-id", tab_id_arg]);
+    reply
+        .get("session")
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| panic!("missing inspector session_id: {reply}"))
+}
+
+fn trusted_click(harness: &TaborHarness, session_id: &str, command_id: &mut i64, element_id: &str) {
+    let detail = harness.run_json(["agent", "inspect", element_id]);
+    let center = detail
+        .get("element")
+        .and_then(|value| value.get("center"))
+        .unwrap_or_else(|| panic!("missing element center: {detail}"));
+    let x = center
+        .get("x")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing center.x: {detail}"));
+    let y = center
+        .get("y")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing center.y: {detail}"));
+
+    inspector_command(
+        harness,
+        session_id,
+        *command_id,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseMoved","x":x,"y":y,"button":"none","buttons":0}),
+    );
+    *command_id += 1;
+    inspector_command(
+        harness,
+        session_id,
+        *command_id,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mousePressed","x":x,"y":y,"button":"left","buttons":1,"clickCount":1}),
+    );
+    *command_id += 1;
+    inspector_command(
+        harness,
+        session_id,
+        *command_id,
+        "Input.dispatchMouseEvent",
+        json!({"type":"mouseReleased","x":x,"y":y,"button":"left","buttons":0,"clickCount":1}),
+    );
+    *command_id += 1;
+}
+
+fn inspector_command(
+    harness: &TaborHarness,
+    session_id: &str,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let message = json!({ "id": id, "method": method, "params": params }).to_string();
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "send",
+        "--session-id",
+        session_id,
+        "--message",
+        message.as_str(),
+    ]);
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        let polled = harness.run_json([
+            "msg",
+            "inspector",
+            "poll",
+            "--session-id",
+            session_id,
+            "--max",
+            "32",
+        ]);
+        let messages = polled
+            .get("messages")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("missing inspector messages: {polled}"));
+        for message in messages {
+            let payload = message
+                .get("payload")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("missing inspector payload: {polled}"));
+            let payload: Value = serde_json::from_str(payload)
+                .unwrap_or_else(|err| panic!("invalid inspector payload: {err}; raw={payload}"));
+            if payload.get("id").and_then(Value::as_i64) == Some(id) {
+                if payload.get("error").is_some() {
+                    panic!("inspector command failed: {payload}");
+                }
+                return payload;
+            }
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    panic!("timed out waiting for inspector response id={id} method={method}");
+}
+
+fn wait_for_clipboard_text(
+    harness: &TaborHarness,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let clipboard = harness.run_json(["agent", "clipboard", "get"]);
+        let text = clipboard.get("text").and_then(Value::as_str);
+        if text == Some(expected) {
+            return text.map(ToOwned::to_owned);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_agent_value(
+    harness: &TaborHarness,
+    element_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let detail = harness.run_json(["agent", "inspect", element_id]);
+        let value = agent_detail_value(&detail);
+        if value == Some(expected) {
+            return value.map(ToOwned::to_owned);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
 fn fixture_url() -> String {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-fixture.html");
@@ -1250,5 +2328,35 @@ fn handle_popup_connection(
 
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
+fn handle_clipboard_fixture_connection(stream: &mut TcpStream, fixture_html: &[u8]) {
+    let mut buf = [0u8; 4096];
+    let read = match stream.read(&mut buf) {
+        Ok(size) => size,
+        Err(_) => return,
+    };
+
+    if read == 0 {
+        return;
+    }
+
+    let request = String::from_utf8_lossy(&buf[..read]);
+    let path =
+        request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("/");
+
+    let (status_line, content_type, body): (&str, &str, &[u8]) = match path {
+        "/" | "/fixture.html" => ("HTTP/1.1 200 OK", "text/html; charset=utf-8", fixture_html),
+        _ => ("HTTP/1.1 404 Not Found", "text/plain; charset=utf-8", b"not found"),
+    };
+
+    let header = format!(
+        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
     let _ = stream.flush();
 }

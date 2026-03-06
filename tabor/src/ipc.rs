@@ -137,6 +137,62 @@ pub struct IpcRuntimeMetrics {
     pub cef_pump: Option<IpcCefPumpMetrics>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+pub struct IpcWindowDebugRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+pub struct IpcWindowDebugInsets {
+    pub top: f64,
+    pub left: f64,
+    pub bottom: f64,
+    pub right: f64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct IpcWindowDebugState {
+    pub native_fullscreen: bool,
+    pub simple_fullscreen: bool,
+    pub winit_fullscreen: bool,
+    #[serde(default)]
+    pub real_ear_fullscreen_active: bool,
+    pub is_miniaturized: bool,
+    pub notch_ears_active: bool,
+    pub scale_factor: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_number: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_ear_window_number: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_ear_window_number: Option<i64>,
+    pub screen_frame_points: IpcWindowDebugRect,
+    pub content_frame_screen_points: IpcWindowDebugRect,
+    pub safe_area_insets_points: IpcWindowDebugInsets,
+    pub auxiliary_top_left_screen_points: IpcWindowDebugRect,
+    pub auxiliary_top_right_screen_points: IpcWindowDebugRect,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcWindowDebugSnapshot {
+    pub png_base64: String,
+    pub width: u32,
+    pub height: u32,
+    pub snapshot_screen_points: IpcWindowDebugRect,
+    pub state: IpcWindowDebugState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcWindowDebugButton {
+    Close,
+    Minimize,
+    Zoom,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentObservation {
     pub revision: u64,
@@ -576,6 +632,14 @@ pub enum IpcRequest {
         tab_id: Option<IpcTabId>,
         input: TerminalKeyInput,
     },
+    WindowDebugState,
+    WindowDebugSnapshot {
+        #[serde(default)]
+        highlight_notch_ears: bool,
+    },
+    WindowDebugPressStandardButton {
+        button: IpcWindowDebugButton,
+    },
     RuntimeMetrics,
     SetConfig(IpcConfig),
     GetConfig(IpcGetConfig),
@@ -635,6 +699,18 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
         },
         IpcRequestHelp { name: "agent_act", summary: "Run batched web agent actions." },
         IpcRequestHelp { name: "terminal_key", summary: "Dispatch terminal key input." },
+        IpcRequestHelp {
+            name: "window_debug_state",
+            summary: "Read fullscreen and notch-side geometry for the active window.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_snapshot",
+            summary: "Capture a PNG snapshot of the active window with debug geometry.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_press_standard_button",
+            summary: "Trigger a macOS standard window button on the active window.",
+        },
         IpcRequestHelp {
             name: "runtime_metrics",
             summary: "Read runtime instrumentation metrics.",
@@ -705,6 +781,8 @@ pub enum SocketReply {
     AgentPdf { pdf: AgentPdf },
     AgentDownloads { downloads: Vec<AgentDownload> },
     AgentAct { result: AgentActResult },
+    WindowDebugState { state: IpcWindowDebugState },
+    WindowDebugSnapshot { snapshot: IpcWindowDebugSnapshot },
     RuntimeMetrics { metrics: IpcRuntimeMetrics },
     Error { error: IpcError },
 }
@@ -875,6 +953,15 @@ pub trait IpcContext {
         max: Option<usize>,
     ) -> Result<Vec<IpcInspectorMessage>, IpcError>;
     fn terminal_key(&mut self, tab_id: TabId, input: TerminalKeyInput) -> Result<(), IpcError>;
+    fn window_debug_state(&mut self) -> Result<IpcWindowDebugState, IpcError>;
+    fn window_debug_snapshot(
+        &mut self,
+        highlight_notch_ears: bool,
+    ) -> Result<IpcWindowDebugSnapshot, IpcError>;
+    fn window_debug_press_standard_button(
+        &mut self,
+        button: IpcWindowDebugButton,
+    ) -> Result<(), IpcError>;
     fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError>;
 }
 
@@ -1201,6 +1288,33 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::WindowDebugState => match ctx.window_debug_state() {
+            Ok(state) => {
+                IpcResponse { reply: SocketReply::WindowDebugState { state }, close_window: false }
+            },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
+        },
+        IpcRequest::WindowDebugSnapshot { highlight_notch_ears } => {
+            match ctx.window_debug_snapshot(highlight_notch_ears) {
+                Ok(snapshot) => IpcResponse {
+                    reply: SocketReply::WindowDebugSnapshot { snapshot },
+                    close_window: false,
+                },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WindowDebugPressStandardButton { button } => {
+            match ctx.window_debug_press_standard_button(button) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
         IpcRequest::RuntimeMetrics => match ctx.runtime_metrics() {
             Ok(metrics) => {
                 IpcResponse { reply: SocketReply::RuntimeMetrics { metrics }, close_window: false }
@@ -1473,10 +1587,13 @@ mod tests {
         last_action: Option<Action>,
         last_input: Option<String>,
         last_command: Option<String>,
+        last_window_button: Option<IpcWindowDebugButton>,
         web_supported: bool,
         inspector_targets: Vec<IpcInspectorTarget>,
         inspector_sessions: HashMap<String, IpcInspectorSession>,
         inspector_messages: HashMap<String, VecDeque<String>>,
+        window_debug_state: IpcWindowDebugState,
+        window_debug_snapshot: IpcWindowDebugSnapshot,
         runtime_metrics: IpcRuntimeMetrics,
     }
 
@@ -1492,10 +1609,106 @@ mod tests {
                 last_action: None,
                 last_input: None,
                 last_command: None,
+                last_window_button: None,
                 web_supported,
                 inspector_targets: Vec::new(),
                 inspector_sessions: HashMap::new(),
                 inspector_messages: HashMap::new(),
+                window_debug_state: IpcWindowDebugState {
+                    native_fullscreen: true,
+                    simple_fullscreen: false,
+                    winit_fullscreen: true,
+                    real_ear_fullscreen_active: false,
+                    is_miniaturized: false,
+                    notch_ears_active: true,
+                    scale_factor: 2.0,
+                    window_number: Some(17),
+                    left_ear_window_number: Some(18),
+                    right_ear_window_number: Some(19),
+                    screen_frame_points: IpcWindowDebugRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1512.0,
+                        height: 982.0,
+                    },
+                    content_frame_screen_points: IpcWindowDebugRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1512.0,
+                        height: 982.0,
+                    },
+                    safe_area_insets_points: IpcWindowDebugInsets {
+                        top: 32.0,
+                        left: 0.0,
+                        bottom: 0.0,
+                        right: 0.0,
+                    },
+                    auxiliary_top_left_screen_points: IpcWindowDebugRect {
+                        x: 0.0,
+                        y: 950.0,
+                        width: 640.0,
+                        height: 32.0,
+                    },
+                    auxiliary_top_right_screen_points: IpcWindowDebugRect {
+                        x: 872.0,
+                        y: 950.0,
+                        width: 640.0,
+                        height: 32.0,
+                    },
+                },
+                window_debug_snapshot: IpcWindowDebugSnapshot {
+                    png_base64: String::from("Zm9v"),
+                    width: 3024,
+                    height: 1964,
+                    snapshot_screen_points: IpcWindowDebugRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1512.0,
+                        height: 982.0,
+                    },
+                    state: IpcWindowDebugState {
+                        native_fullscreen: true,
+                        simple_fullscreen: false,
+                        winit_fullscreen: true,
+                        real_ear_fullscreen_active: false,
+                        is_miniaturized: false,
+                        notch_ears_active: true,
+                        scale_factor: 2.0,
+                        window_number: Some(17),
+                        left_ear_window_number: Some(18),
+                        right_ear_window_number: Some(19),
+                        screen_frame_points: IpcWindowDebugRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1512.0,
+                            height: 982.0,
+                        },
+                        content_frame_screen_points: IpcWindowDebugRect {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1512.0,
+                            height: 982.0,
+                        },
+                        safe_area_insets_points: IpcWindowDebugInsets {
+                            top: 32.0,
+                            left: 0.0,
+                            bottom: 0.0,
+                            right: 0.0,
+                        },
+                        auxiliary_top_left_screen_points: IpcWindowDebugRect {
+                            x: 0.0,
+                            y: 950.0,
+                            width: 640.0,
+                            height: 32.0,
+                        },
+                        auxiliary_top_right_screen_points: IpcWindowDebugRect {
+                            x: 872.0,
+                            y: 950.0,
+                            width: 640.0,
+                            height: 32.0,
+                        },
+                    },
+                },
                 runtime_metrics: IpcRuntimeMetrics {
                     webview: Some(IpcWebViewMetrics { live: 1, created: 1, dropped: 0 }),
                     web_close: Some(IpcWebCloseMetrics {
@@ -1944,6 +2157,25 @@ mod tests {
             Ok(())
         }
 
+        fn window_debug_state(&mut self) -> Result<IpcWindowDebugState, IpcError> {
+            Ok(self.window_debug_state.clone())
+        }
+
+        fn window_debug_snapshot(
+            &mut self,
+            _highlight_notch_ears: bool,
+        ) -> Result<IpcWindowDebugSnapshot, IpcError> {
+            Ok(self.window_debug_snapshot.clone())
+        }
+
+        fn window_debug_press_standard_button(
+            &mut self,
+            button: IpcWindowDebugButton,
+        ) -> Result<(), IpcError> {
+            self.last_window_button = Some(button);
+            Ok(())
+        }
+
         fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError> {
             Ok(self.runtime_metrics.clone())
         }
@@ -2148,6 +2380,28 @@ mod tests {
             panic!("expected runtime_metrics reply");
         };
         assert_eq!(metrics, ctx.runtime_metrics);
+
+        let response = handle_request(&mut ctx, IpcRequest::WindowDebugState);
+        let SocketReply::WindowDebugState { state } = response.reply else {
+            panic!("expected window_debug_state reply");
+        };
+        assert_eq!(state, ctx.window_debug_state);
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugSnapshot { highlight_notch_ears: true },
+        );
+        let SocketReply::WindowDebugSnapshot { snapshot } = response.reply else {
+            panic!("expected window_debug_snapshot reply");
+        };
+        assert_eq!(snapshot, ctx.window_debug_snapshot);
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugPressStandardButton { button: IpcWindowDebugButton::Zoom },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(ctx.last_window_button, Some(IpcWindowDebugButton::Zoom));
     }
 
     #[test]

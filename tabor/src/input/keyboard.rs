@@ -245,10 +245,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     fn process_key_bindings(&mut self, key: &KeyEvent) -> bool {
         let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
         let mods = self.ctx.modifiers().state();
-        #[cfg(target_os = "macos")]
-        let skip_web_clipboard = self.ctx.window_kind().is_web() && self.ctx.web_is_insert_mode();
-        #[cfg(not(target_os = "macos"))]
-        let skip_web_clipboard = false;
 
         // Don't suppress char if no bindings were triggered.
         let mut suppress_chars = None;
@@ -282,15 +278,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         // Get the action of a key binding.
         let mut binding_action = |binding: &KeyBinding| {
-            if skip_web_clipboard
-                && matches!(
-                    binding.action,
-                    Action::Copy | Action::CopySelection | Action::Paste | Action::PasteSelection
-                )
-            {
-                return None;
-            }
-
             let key = match (&binding.trigger, &logical_key) {
                 (BindingKey::Scancode(_), _) => BindingKey::Scancode(key.physical_key),
                 (_, code) => {

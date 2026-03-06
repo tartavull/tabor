@@ -14,10 +14,8 @@
   <string>Tabor</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
-  <key>LSMultipleInstancesProhibited</key>
-  <true/>
   <key>CFBundleShortVersionString</key>
-  <string>0.17.0-dev</string>
+  <string>0.4.0</string>
   <key>CFBundleSupportedPlatforms</key>
   <array>
     <string>MacOSX</string>
@@ -32,6 +30,8 @@
   <string></string>
   <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
+  <key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
+  <false/>
   <key>CFBundleDisplayName</key>
   <string>Tabor</string>
   <key>CFBundleURLTypes</key>

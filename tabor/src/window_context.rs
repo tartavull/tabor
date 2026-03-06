@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::io::Cursor;
 use std::io::Write;
 use std::mem;
 #[cfg(not(windows))]
@@ -17,10 +19,16 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+use base64::Engine;
+#[cfg(target_os = "macos")]
+use base64::engine::general_purpose::STANDARD as BASE64;
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
 use glutin::platform::x11::X11GlConfigExt;
+#[cfg(target_os = "macos")]
+use image::{DynamicImage, RgbaImage};
 use log::info;
 #[cfg(target_os = "macos")]
 use serde::Deserialize;
@@ -70,6 +78,7 @@ use crate::ipc::{
     AgentScreenshot, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
     IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
     IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcWebCloseMetrics, IpcWebViewMetrics,
+    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
     SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
@@ -1780,6 +1789,9 @@ impl WindowContext {
         }
 
         self.macos_fullscreen_or_simple_fullscreen = fullscreen_or_simple_fullscreen;
+        if !native_fullscreen {
+            self.display.window.clear_macos_notch_ear_windows();
+        }
         self.display.pending_update.dirty = true;
         self.display.damage_tracker.frame().mark_fully_damaged();
         self.dirty = true;
@@ -2733,6 +2745,214 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         {
             Ok(IpcRuntimeMetrics::default())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_state(&self) -> Result<IpcWindowDebugState, IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.display.window.macos_window_debug_state().ok_or_else(|| {
+                IpcError::new(IpcErrorCode::Unsupported, "Window debug state unavailable")
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Window debug state is only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_snapshot(
+        &mut self,
+        scheduler: &mut Scheduler,
+        highlight_notch_ears: bool,
+    ) -> Result<IpcWindowDebugSnapshot, IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.draw_inner(scheduler, highlight_notch_ears);
+
+            let state = self.ipc_window_debug_state()?;
+            let (main_width, main_height, pixels) = self.display.window_snapshot_rgba();
+            let main_image =
+                RgbaImage::from_raw(main_width, main_height, pixels).ok_or_else(|| {
+                    IpcError::new(
+                        IpcErrorCode::Internal,
+                        "Failed to construct window snapshot image",
+                    )
+                })?;
+            let debug_notch_ears_enabled = highlight_notch_ears
+                || std::env::var_os("TABOR_DEBUG_NOTCH_EARS").is_some_and(|value| value != "0");
+
+            let (snapshot_screen_points, image) = if state.notch_ears_active {
+                let mut canvas = RgbaImage::new(
+                    Self::round_snapshot_dimension(
+                        state.screen_frame_points.width * state.scale_factor,
+                    )?,
+                    Self::round_snapshot_dimension(
+                        state.screen_frame_points.height * state.scale_factor,
+                    )?,
+                );
+
+                let content_rect = Self::screen_rect_to_snapshot_pixels(
+                    state.content_frame_screen_points,
+                    state.screen_frame_points,
+                    state.scale_factor,
+                );
+                Self::blit_window_snapshot(&mut canvas, &main_image, content_rect);
+
+                if debug_notch_ears_enabled {
+                    for rect in [
+                        state.auxiliary_top_left_screen_points,
+                        state.auxiliary_top_right_screen_points,
+                    ] {
+                        let rect = Self::screen_rect_to_snapshot_pixels(
+                            rect,
+                            state.screen_frame_points,
+                            state.scale_factor,
+                        );
+                        Self::fill_snapshot_rect(&mut canvas, rect, image::Rgba([255, 0, 0, 255]));
+                    }
+                }
+
+                (state.screen_frame_points, canvas)
+            } else {
+                (state.content_frame_screen_points, main_image)
+            };
+
+            let mut png = Cursor::new(Vec::new());
+            let width = image.width();
+            let height = image.height();
+            DynamicImage::ImageRgba8(image).write_to(&mut png, image::ImageFormat::Png).map_err(
+                |err| {
+                    IpcError::new(
+                        IpcErrorCode::Internal,
+                        format!("Failed to encode window snapshot PNG: {err}"),
+                    )
+                },
+            )?;
+
+            Ok(IpcWindowDebugSnapshot {
+                png_base64: BASE64.encode(png.into_inner()),
+                width,
+                height,
+                snapshot_screen_points,
+                state,
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (scheduler, highlight_notch_ears);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Window debug snapshots are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_press_standard_button(
+        &self,
+        button: IpcWindowDebugButton,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.display.window.macos_press_standard_window_button(button).map_err(|err| {
+                IpcError::new(
+                    IpcErrorCode::Unsupported,
+                    format!("Failed to press macOS standard button: {err}"),
+                )
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = button;
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Window standard buttons are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn round_snapshot_dimension(value: f64) -> Result<u32, IpcError> {
+        if value <= 0.0 {
+            return Err(IpcError::new(
+                IpcErrorCode::Internal,
+                format!("Invalid snapshot dimension: {value}"),
+            ));
+        }
+
+        Ok(value.round() as u32)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn screen_rect_to_snapshot_pixels(
+        rect: IpcWindowDebugRect,
+        snapshot_screen_points: IpcWindowDebugRect,
+        scale_factor: f64,
+    ) -> (i64, i64, i64, i64) {
+        let local_x = (rect.x - snapshot_screen_points.x) * scale_factor;
+        let local_y =
+            (snapshot_screen_points.height - (rect.y - snapshot_screen_points.y) - rect.height)
+                * scale_factor;
+        let width = rect.width * scale_factor;
+        let height = rect.height * scale_factor;
+        let x0 = local_x.floor() as i64;
+        let y0 = local_y.floor() as i64;
+        let x1 = (local_x + width).ceil() as i64;
+        let y1 = (local_y + height).ceil() as i64;
+
+        (x0, y0, x1, y1)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn blit_window_snapshot(
+        canvas: &mut RgbaImage,
+        source: &RgbaImage,
+        target_rect: (i64, i64, i64, i64),
+    ) {
+        let (x0, y0, _, _) = target_rect;
+        for (source_x, source_y, pixel) in source.enumerate_pixels() {
+            let target_x = x0 + i64::from(source_x);
+            let target_y = y0 + i64::from(source_y);
+            if target_x < 0
+                || target_y < 0
+                || target_x >= i64::from(canvas.width())
+                || target_y >= i64::from(canvas.height())
+            {
+                continue;
+            }
+            canvas.put_pixel(target_x as u32, target_y as u32, *pixel);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fill_snapshot_rect(
+        canvas: &mut RgbaImage,
+        rect: (i64, i64, i64, i64),
+        color: image::Rgba<u8>,
+    ) {
+        let (x0, y0, x1, y1) = rect;
+        let clipped_x0 = x0.max(0).min(i64::from(canvas.width()));
+        let clipped_y0 = y0.max(0).min(i64::from(canvas.height()));
+        let clipped_x1 = x1.max(clipped_x0).min(i64::from(canvas.width()));
+        let clipped_y1 = y1.max(clipped_y0).min(i64::from(canvas.height()));
+
+        if clipped_x0 >= clipped_x1 || clipped_y0 >= clipped_y1 {
+            return;
+        }
+
+        for y in clipped_y0 as u32..clipped_y1 as u32 {
+            for x in clipped_x0 as u32..clipped_x1 as u32 {
+                canvas.put_pixel(x, y, color);
+            }
         }
     }
 
@@ -3956,8 +4176,11 @@ impl WindowContext {
         self.update_config(config);
     }
 
-    /// Draw the window.
-    pub fn draw(&mut self, scheduler: &mut Scheduler) {
+    fn draw_inner(
+        &mut self,
+        scheduler: &mut Scheduler,
+        #[cfg(target_os = "macos")] highlight_notch_ears: bool,
+    ) {
         self.display.window.requested_redraw = false;
 
         if self.occluded {
@@ -3997,6 +4220,8 @@ impl WindowContext {
                     &self.config,
                     url,
                     &tab.command_state,
+                    #[cfg(target_os = "macos")]
+                    highlight_notch_ears,
                 );
             },
             DrawMode::Terminal => {
@@ -4008,9 +4233,20 @@ impl WindowContext {
                     &self.config,
                     &mut tab.search_state,
                     &tab.command_state,
+                    #[cfg(target_os = "macos")]
+                    highlight_notch_ears,
                 );
             },
         }
+    }
+
+    /// Draw the window.
+    pub fn draw(&mut self, scheduler: &mut Scheduler) {
+        self.draw_inner(
+            scheduler,
+            #[cfg(target_os = "macos")]
+            false,
+        );
     }
 
     /// Process events for this terminal window.
@@ -4291,6 +4527,16 @@ impl WindowContext {
                         },
                         crate::tab_panel::TabPanelCommand::RenameGroup(group_id) => {
                             self.begin_group_rename(group_id);
+                        },
+                        crate::tab_panel::TabPanelCommand::WindowClose => {
+                            self.display.window.request_close();
+                        },
+                        crate::tab_panel::TabPanelCommand::WindowMinimize => {
+                            self.display.window.set_minimized(true);
+                        },
+                        crate::tab_panel::TabPanelCommand::WindowToggleFullscreen => {
+                            self.display.window.toggle_fullscreen();
+                            self.display.pending_update.dirty = true;
                         },
                     }
                 }

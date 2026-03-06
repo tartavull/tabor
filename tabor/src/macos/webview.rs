@@ -78,6 +78,18 @@ impl WebView {
         self.inner.exec_js(script);
     }
 
+    pub fn copy_selection(&mut self) {
+        self.inner.copy_selection();
+    }
+
+    pub fn cut_selection(&mut self) {
+        self.inner.cut_selection();
+    }
+
+    pub fn paste(&mut self) {
+        self.inner.paste();
+    }
+
     pub fn eval_js_string<F>(&mut self, script: &str, callback: F)
     where
         F: FnOnce(Option<String>) + 'static,

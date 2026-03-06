@@ -272,14 +272,15 @@ If all goes well, this should place a binary at `target/release/tabor`.
 cargo xtask install --release --launch
 ```
 
-This installs `Tabor.app` into `/Applications` when writable, otherwise `~/Applications`, so it can be launched from Spotlight or Dock.
+This builds, signs, verifies, and installs `Tabor.app` at `/Applications/Tabor.app`. The command fails fast if `/Applications` is not writable.
 
-To build the app bundle without installing it:
+To build and install the signed app bundle without launching it:
 
 ```sh
 cargo xtask app --release
-open target/release/osx/Tabor.app
 ```
+
+There is no supported unsigned macOS debug launch path. `cargo xtask run-raw` is disabled on macOS because it bypasses signed app-bundle verification.
 
 #### Universal Binary
 

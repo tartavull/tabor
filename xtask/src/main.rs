@@ -198,7 +198,7 @@ Commands:
   app      Build/package and install Tabor.app to /Applications
   run      Build/package/install Tabor.app to /Applications, then launch
   install  Build/package and install Tabor.app to /Applications
-  run-raw  Debug-only: build and run the raw tabor binary directly
+  run-raw  Build and run the raw tabor binary directly (disabled on macOS)
 
 Flags:
   --release    Build release profile (default: debug)
@@ -214,7 +214,7 @@ Environment:
   TABOR_CODESIGN_PROVISIONING_PROFILE
   TABOR_CODESIGN_IDENTITY
   TABOR_CODESIGN_TEAM_ID / TABOR_CODESIGN_TEAM_NAME
-  TABOR_REQUIRE_TEAM_CODESIGN (default: 1)
+  TABOR_REQUIRE_TEAM_CODESIGN (must remain 1 on macOS)
   TABOR_CEF_PATH / CEF_PATH
 "
     );
@@ -232,6 +232,13 @@ fn run_raw_binary(
     options: BuildOptions,
     args: &[String],
 ) -> Result<ExitStatus, Box<dyn Error>> {
+    if cfg!(target_os = "macos") {
+        return Err(
+            "`cargo xtask run-raw` is disabled on macOS because it bypasses signed Tabor.app launches"
+                .into(),
+        );
+    }
+
     build_tabor_binary(root, options)?;
 
     let binary = tabor_binary_path(root, options.profile_release());
@@ -323,6 +330,7 @@ fn install_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box
     }
 
     copy_with_ditto(&app_dir, &install_path)?;
+    verify_macos_app_bundle_signature(&install_path)?;
 
     if staging_root.exists() {
         make_tree_user_writable(&staging_root)?;
@@ -370,6 +378,8 @@ fn dir_is_writable(path: &Path) -> bool {
 }
 
 fn launch_app_bundle(app_dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
+    verify_macos_app_bundle_signature(app_dir)?;
+
     let mut command = Command::new("open");
     command.arg("-n").arg(app_dir);
 
@@ -450,6 +460,20 @@ fn copy_with_ditto(source: &Path, destination: &Path) -> Result<(), Box<dyn Erro
     let mut command = Command::new("ditto");
     command.arg(source).arg(destination);
     run_checked(&mut command, "ditto copy")
+}
+
+fn verify_macos_app_bundle_signature(app_dir: &Path) -> Result<(), Box<dyn Error>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+
+    let mut verify = Command::new("codesign");
+    verify.args(["--verify", "--deep", "--strict"]).arg(app_dir);
+    run_checked(&mut verify, "verify app bundle signature")?;
+
+    let mut inspect = Command::new("codesign");
+    inspect.arg("-dvv").arg(app_dir);
+    run_checked(&mut inspect, "inspect app bundle signature")
 }
 
 fn staging_app_bundle_path() -> Result<PathBuf, Box<dyn Error>> {

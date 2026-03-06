@@ -62,6 +62,25 @@
     </div>
 
     <div class="row">
+      <button id="select-email">Select Email</button>
+      <button id="focus-notes">Focus Notes</button>
+    </div>
+
+    <div class="row">
+      <button id="page-copy">Page Copy</button>
+      <button id="page-paste">Page Paste</button>
+      <div id="clipboard-api-status" role="status" aria-label="Clipboard API status">
+        Clipboard API: idle
+      </div>
+    </div>
+
+    <div class="row">
+      <div id="native-clipboard-status" role="status" aria-label="Native clipboard status">
+        Native clipboard: idle
+      </div>
+    </div>
+
+    <div class="row">
       <div id="editable" contenteditable="true">Editable</div>
     </div>
 
@@ -125,6 +144,14 @@
       const promptBtn = document.getElementById('btn-prompt');
       const promptResult = document.getElementById('prompt-result');
       const confirmResult = document.getElementById('confirm-result');
+      const emailInput = document.getElementById('email-input');
+      const notes = document.getElementById('notes');
+      const selectEmailBtn = document.getElementById('select-email');
+      const focusNotesBtn = document.getElementById('focus-notes');
+      const pageCopyBtn = document.getElementById('page-copy');
+      const pagePasteBtn = document.getElementById('page-paste');
+      const clipboardApiStatus = document.getElementById('clipboard-api-status');
+      const nativeClipboardStatus = document.getElementById('native-clipboard-status');
       const dragSrc = document.getElementById('drag-src');
       const dragDst = document.getElementById('drag-dst');
       const fileInput = document.getElementById('file-input');
@@ -154,6 +181,70 @@
       promptBtn.addEventListener('click', () => {
         const value = prompt('Prompt me', 'default');
         promptResult.textContent = value == null ? 'Prompt result: cancelled' : `Prompt result: ${value}`;
+      });
+
+      selectEmailBtn.addEventListener('click', () => {
+        emailInput.focus();
+        emailInput.setSelectionRange(0, emailInput.value.length);
+      });
+
+      focusNotesBtn.addEventListener('click', () => {
+        notes.focus();
+        const cursor = notes.value.length;
+        notes.setSelectionRange(cursor, cursor);
+      });
+
+      const activeSelectionText = () => {
+        const active = document.activeElement;
+        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+          const value = active.value;
+          const start = active.selectionStart;
+          const end = active.selectionEnd;
+          if (typeof value === 'string' && typeof start === 'number' && typeof end === 'number') {
+            return value.substring(start, end);
+          }
+        }
+        const selection = window.getSelection();
+        return selection ? selection.toString() : '';
+      };
+
+      document.addEventListener('copy', () => {
+        nativeClipboardStatus.textContent = `Native clipboard: copy:${activeSelectionText()}`;
+      });
+
+      document.addEventListener('cut', () => {
+        nativeClipboardStatus.textContent = `Native clipboard: cut:${activeSelectionText()}`;
+      });
+
+      document.addEventListener('paste', (event) => {
+        const text = event.clipboardData?.getData('text/plain') || '';
+        nativeClipboardStatus.textContent = `Native clipboard: paste:${text}`;
+      });
+
+      pageCopyBtn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(emailInput.value);
+          clipboardApiStatus.textContent = `Clipboard API write: ${emailInput.value}`;
+        } catch (err) {
+          clipboardApiStatus.textContent = `Clipboard API write: ${err?.name || String(err)}`;
+        }
+      });
+
+      pagePasteBtn.addEventListener('click', async () => {
+        try {
+          const text = await navigator.clipboard.readText();
+          notes.focus();
+          const start = typeof notes.selectionStart === 'number' ? notes.selectionStart : notes.value.length;
+          const end = typeof notes.selectionEnd === 'number' ? notes.selectionEnd : start;
+          const value = notes.value;
+          notes.value = value.slice(0, start) + text + value.slice(end);
+          const cursor = start + text.length;
+          notes.setSelectionRange(cursor, cursor);
+          notes.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: text }));
+          clipboardApiStatus.textContent = `Clipboard API read: ${text}`;
+        } catch (err) {
+          clipboardApiStatus.textContent = `Clipboard API read: ${err?.name || String(err)}`;
+        }
       });
 
       dragSrc.addEventListener('dragstart', (event) => {

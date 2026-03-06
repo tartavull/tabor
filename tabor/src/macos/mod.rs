@@ -1,7 +1,10 @@
 use std::cell::RefCell;
+use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt::Write;
 use std::mem;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -68,6 +71,10 @@ pub(crate) fn webview_metrics() -> WebViewMetrics {
 static CEF_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
 const CEF_APPLICATION_CLASS_NAME: &[u8] = b"TaborCefApplication\0";
 
+pub(crate) fn cef_handling_send_event() -> bool {
+    CEF_HANDLING_SEND_EVENT.load(Ordering::Relaxed)
+}
+
 pub fn ensure_cef_application() {
     let mtm = MainThreadMarker::new().expect("CEF application setup must run on main thread");
     let class = cef_application_class();
@@ -88,6 +95,47 @@ pub fn ensure_cef_application() {
     );
 
     let _ = mtm;
+}
+
+pub fn enforce_signed_app_launch() -> Result<(), Box<dyn Error>> {
+    let exe_path = std::env::current_exe()?;
+    let app_bundle = enclosing_app_bundle(&exe_path).ok_or_else(|| {
+        format!(
+            "Refusing to launch Tabor outside a signed macOS app bundle. Current executable: {}",
+            exe_path.display()
+        )
+    })?;
+
+    let mut verify = Command::new("codesign");
+    verify.args(["--verify", "--deep", "--strict"]).arg(&app_bundle);
+    let verify_status = verify.status()?;
+    if !verify_status.success() {
+        return Err(format!("codesign verification failed for {}", app_bundle.display()).into());
+    }
+
+    let inspect = Command::new("codesign").arg("-dvv").arg(&app_bundle).output()?;
+    if !inspect.status.success() {
+        return Err(format!("codesign inspection failed for {}", app_bundle.display()).into());
+    }
+
+    let inspect_text = String::from_utf8_lossy(&inspect.stderr);
+    let team_identifier =
+        inspect_text.lines().find_map(|line| line.strip_prefix("TeamIdentifier=")).unwrap_or("");
+    if team_identifier.is_empty() || team_identifier == "not set" {
+        return Err(format!(
+            "Refusing to launch unsigned or ad-hoc-signed Tabor bundle {}",
+            app_bundle.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn enclosing_app_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+        .map(Path::to_path_buf)
 }
 
 unsafe extern "C-unwind" fn cef_app_is_handling_send_event(_this: &AnyObject, _sel: Sel) -> Bool {

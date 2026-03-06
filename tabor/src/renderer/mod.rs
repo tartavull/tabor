@@ -346,6 +346,40 @@ impl Renderer {
         }
     }
 
+    pub fn read_front_buffer_rgba(&self, width: u32, height: u32) -> Vec<u8> {
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+
+        let mut pixels = vec![0; width as usize * height as usize * 4];
+
+        unsafe {
+            gl::Finish();
+            gl::ReadBuffer(gl::FRONT);
+            gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+            gl::ReadPixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                pixels.as_mut_ptr().cast(),
+            );
+        }
+
+        let row_len = width as usize * 4;
+        for row in 0..(height as usize / 2) {
+            let top_start = row * row_len;
+            let bottom_start = (height as usize - 1 - row) * row_len;
+            for offset in 0..row_len {
+                pixels.swap(top_start + offset, bottom_start + offset);
+            }
+        }
+
+        pixels
+    }
+
     /// Set the viewport for cell rendering.
     #[inline]
     pub fn set_viewport(&self, size: &SizeInfo) {

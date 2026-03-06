@@ -31,6 +31,13 @@ const TAB_INDENT_COLS: usize = 1;
 const ACTIVITY_INDICATOR_COLS: usize = 2;
 const ACTIVITY_INDICATOR_FILLED: char = '\u{25CF}';
 const ACTIVITY_INDICATOR_OUTLINE: char = '\u{25CB}';
+const WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
+const WINDOW_CONTROL_MARGIN_X_PX: f64 = 12.0;
+const WINDOW_CONTROL_SPACING_PX: f64 = 8.0;
+const WINDOW_CONTROL_SIZE_PX: f64 = 12.0;
+const WINDOW_CONTROL_CLOSE_COLOR: Rgb = Rgb::new(255, 95, 86);
+const WINDOW_CONTROL_MINIMIZE_COLOR: Rgb = Rgb::new(255, 189, 46);
+const WINDOW_CONTROL_FULLSCREEN_COLOR: Rgb = Rgb::new(39, 201, 63);
 
 #[derive(Default, Clone, Copy)]
 pub struct PanelDimensions {
@@ -92,7 +99,8 @@ pub struct TabPanel {
     enabled: bool,
     width_cols: usize,
     width_px: f32,
-    top_inset_px: f32,
+    window_controls: PanelWindowControls,
+    pressed_window_control: Option<WindowControlKind>,
     groups: Vec<TabPanelGroup>,
     new_group_id: Option<usize>,
     edit: Option<EditState>,
@@ -130,8 +138,23 @@ impl TabPanel {
         self.width_px = dimensions.width;
     }
 
-    pub fn set_top_inset_px(&mut self, inset: f32) {
-        self.top_inset_px = inset.max(0.0);
+    pub fn clear_window_controls(&mut self) {
+        self.window_controls = PanelWindowControls::default();
+        self.pressed_window_control = None;
+    }
+
+    pub fn set_native_window_controls_inset_px(&mut self, inset: f32) {
+        self.window_controls =
+            PanelWindowControls::new(PanelWindowControlsMode::NativeInset, inset.max(0.0));
+        self.pressed_window_control = None;
+    }
+
+    pub fn set_fullscreen_window_controls_band_px(&mut self, band_height: f32) {
+        self.window_controls = PanelWindowControls::new(
+            PanelWindowControlsMode::FullscreenCustom,
+            band_height.max(0.0),
+        );
+        self.pressed_window_control = None;
     }
 
     pub fn width(&self) -> f32 {
@@ -344,7 +367,9 @@ impl TabPanel {
             Some(CursorIcon::EwResize)
         } else {
             match hit {
-                Some(PanelHit::Tab { .. }) => Some(CursorIcon::Pointer),
+                Some(PanelHit::Tab { .. } | PanelHit::WindowControl { .. }) => {
+                    Some(CursorIcon::Pointer)
+                },
                 _ => Some(CursorIcon::Default),
             }
         };
@@ -380,7 +405,7 @@ impl TabPanel {
                 Some(PanelHit::Group { group_index }) => {
                     self.groups.get(group_index).map(|group| TabPanelCommand::RenameGroup(group.id))
                 },
-                None => None,
+                Some(PanelHit::WindowControl { .. }) | None => None,
             };
 
             return TabPanelMouseUpdate { capture, needs_redraw: command.is_some(), command };
@@ -400,11 +425,26 @@ impl TabPanel {
         }
 
         let hit = self.hit_test(position, &panel_size_info);
+        if let Some(pressed) = self.pressed_window_control.take() {
+            let command = match (state, hit) {
+                (ElementState::Released, Some(PanelHit::WindowControl { kind }))
+                    if kind == pressed =>
+                {
+                    Some(pressed.command())
+                },
+                _ => None,
+            };
+            return TabPanelMouseUpdate { capture: true, needs_redraw: true, command };
+        }
         let mut needs_redraw = false;
         let mut command = None;
 
         match state {
             ElementState::Pressed => match hit {
+                Some(PanelHit::WindowControl { kind }) => {
+                    self.pressed_window_control = Some(kind);
+                    needs_redraw = true;
+                },
                 Some(PanelHit::Tab { tab_id }) => {
                     if !self.is_close_hit(position, &panel_size_info, tab_id) {
                         self.drag = Some(DragState::new(DragItem::Tab(tab_id), position));
@@ -518,6 +558,12 @@ impl TabPanel {
                 divider,
                 1.0,
             ));
+        }
+
+        for rect in self.window_control_rects(size_info) {
+            let hovered = self.hover.window_control == Some(rect.kind);
+            let pressed = self.pressed_window_control == Some(rect.kind);
+            push_window_control_circle_rects(rects, rect, hovered, pressed);
         }
 
         let line_height = panel_size_info.cell_height();
@@ -825,7 +871,7 @@ impl TabPanel {
             return false;
         }
 
-        if self.drag.is_some() || self.resize.is_some() {
+        if self.drag.is_some() || self.resize.is_some() || self.pressed_window_control.is_some() {
             return true;
         }
 
@@ -861,11 +907,8 @@ impl TabPanel {
     }
 
     fn panel_size_info(&self, size_info: &SizeInfo) -> SizeInfo {
-        let top_inset = if self.top_inset_px > 0.0 {
-            self.top_inset_px.max(self.panel_cell_height(size_info))
-        } else {
-            0.0
-        };
+        let top_inset =
+            self.window_controls.panel_content_inset_px(self.panel_cell_height(size_info));
 
         SizeInfo::new(
             self.width_px,
@@ -877,6 +920,38 @@ impl TabPanel {
             size_info.padding_y() + top_inset,
             false,
         )
+    }
+
+    fn window_control_rects(&self, size_info: &SizeInfo) -> Vec<WindowControlRect> {
+        if self.window_controls.mode != PanelWindowControlsMode::FullscreenCustom {
+            return Vec::new();
+        }
+
+        let band_height = self.window_controls.band_height_px.max(0.0) as f64;
+        if band_height <= 0.0 {
+            return Vec::new();
+        }
+
+        let size = window_control_metric_px(band_height, WINDOW_CONTROL_SIZE_PX)
+            .min((band_height - 4.0).max(WINDOW_CONTROL_SIZE_PX));
+        let top = ((band_height - size) / 2.0).max(0.0);
+        let mut x = window_control_metric_px(band_height, WINDOW_CONTROL_MARGIN_X_PX);
+        let spacing = window_control_metric_px(band_height, WINDOW_CONTROL_SPACING_PX);
+
+        [WindowControlKind::Close, WindowControlKind::Minimize, WindowControlKind::ToggleFullscreen]
+            .into_iter()
+            .filter_map(|kind| {
+                let rect = WindowControlRect { kind, x, y: top, size };
+                x += size + spacing;
+                if rect.x + rect.size <= f64::from(self.width_px)
+                    && rect.y + rect.size <= f64::from(size_info.height())
+                {
+                    Some(rect)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn is_close_hit(
@@ -1086,6 +1161,10 @@ impl TabPanel {
             return None;
         }
 
+        if let Some(kind) = self.window_control_hit(position, size_info) {
+            return Some(PanelHit::WindowControl { kind });
+        }
+
         let top = size_info.padding_y() as f64;
         if position.y < top {
             return None;
@@ -1106,6 +1185,17 @@ impl TabPanel {
                 PanelItemKind::GhostGroupHeader { .. } => None,
             }
         })
+    }
+
+    fn window_control_hit(
+        &self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+    ) -> Option<WindowControlKind> {
+        self.window_control_rects(size_info)
+            .into_iter()
+            .find(|rect| rect.contains(position))
+            .map(|rect| rect.kind)
     }
 
     fn layout(&self, size_info: &SizeInfo) -> PanelLayout {
@@ -1606,15 +1696,87 @@ impl EditState {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct HoverState {
     tab: Option<TabId>,
+    window_control: Option<WindowControlKind>,
 }
 
 impl HoverState {
     fn from_hit(hit: &Option<PanelHit>) -> Self {
         match hit {
-            Some(PanelHit::Tab { tab_id }) => HoverState { tab: Some(*tab_id) },
+            Some(PanelHit::Tab { tab_id }) => {
+                HoverState { tab: Some(*tab_id), window_control: None }
+            },
+            Some(PanelHit::WindowControl { kind }) => {
+                HoverState { tab: None, window_control: Some(*kind) }
+            },
             Some(PanelHit::Group { .. }) => HoverState::default(),
             None => HoverState::default(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct PanelWindowControls {
+    mode: PanelWindowControlsMode,
+    band_height_px: f32,
+}
+
+impl PanelWindowControls {
+    fn new(mode: PanelWindowControlsMode, band_height_px: f32) -> Self {
+        Self { mode, band_height_px }
+    }
+
+    fn panel_content_inset_px(self, panel_cell_height: f32) -> f32 {
+        match self.mode {
+            PanelWindowControlsMode::NativeInset if self.band_height_px > 0.0 => {
+                self.band_height_px.max(panel_cell_height)
+            },
+            PanelWindowControlsMode::None
+            | PanelWindowControlsMode::NativeInset
+            | PanelWindowControlsMode::FullscreenCustom => 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PanelWindowControlsMode {
+    #[default]
+    None,
+    NativeInset,
+    FullscreenCustom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowControlKind {
+    Close,
+    Minimize,
+    ToggleFullscreen,
+}
+
+impl WindowControlKind {
+    fn command(self) -> TabPanelCommand {
+        match self {
+            WindowControlKind::Close => TabPanelCommand::WindowClose,
+            WindowControlKind::Minimize => TabPanelCommand::WindowMinimize,
+            WindowControlKind::ToggleFullscreen => TabPanelCommand::WindowToggleFullscreen,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WindowControlRect {
+    kind: WindowControlKind,
+    x: f64,
+    y: f64,
+    size: f64,
+}
+
+impl WindowControlRect {
+    fn contains(self, position: PhysicalPosition<f64>) -> bool {
+        let padding = window_control_hit_padding_px(self.size);
+        position.x >= self.x - padding
+            && position.x <= self.x + self.size + padding
+            && position.y >= self.y - padding
+            && position.y <= self.y + self.size + padding
     }
 }
 
@@ -1706,6 +1868,7 @@ struct RenderLayout {
 enum PanelHit {
     Group { group_index: usize },
     Tab { tab_id: TabId },
+    WindowControl { kind: WindowControlKind },
 }
 
 #[derive(Default)]
@@ -1815,6 +1978,151 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     Rgb::new(mix_channel(a.r, b.r), mix_channel(a.g, b.g), mix_channel(a.b, b.b))
 }
 
+fn window_control_color(kind: WindowControlKind, hovered: bool, pressed: bool) -> Rgb {
+    let base = match kind {
+        WindowControlKind::Close => WINDOW_CONTROL_CLOSE_COLOR,
+        WindowControlKind::Minimize => WINDOW_CONTROL_MINIMIZE_COLOR,
+        WindowControlKind::ToggleFullscreen => WINDOW_CONTROL_FULLSCREEN_COLOR,
+    };
+
+    if pressed {
+        mix(base, Rgb::new(0, 0, 0), 0.2)
+    } else if hovered {
+        mix(base, Rgb::new(255, 255, 255), 0.18)
+    } else {
+        base
+    }
+}
+
+fn window_control_metric_px(band_height: f64, reference_px: f64) -> f64 {
+    (band_height * (reference_px / WINDOW_CONTROL_REFERENCE_BAND_PX)).round().max(reference_px)
+}
+
+fn window_control_hit_padding_px(size: f64) -> f64 {
+    (size * 0.2).round().max(3.0)
+}
+
+fn push_window_control_circle_rects(
+    rects: &mut Vec<RenderRect>,
+    rect: WindowControlRect,
+    hovered: bool,
+    pressed: bool,
+) {
+    let fill = window_control_color(rect.kind, hovered, pressed);
+    let border = mix(fill, Rgb::new(0, 0, 0), if pressed { 0.34 } else { 0.22 });
+    let inner_radius = (rect.size / 2.0 - 1.0).max(2.0);
+    let outer_radius = inner_radius + 0.85;
+
+    push_circle_scanlines(rects, rect, outer_radius, border, 1.0);
+    push_circle_scanlines(rects, rect, inner_radius, fill, 1.0);
+
+    let highlight = mix(fill, Rgb::new(255, 255, 255), if pressed { 0.08 } else { 0.34 });
+    let highlight_center_y = rect.y + rect.size * if pressed { 0.32 } else { 0.28 };
+    push_ellipse_scanlines(
+        rects,
+        rect.x + rect.size / 2.0,
+        highlight_center_y,
+        (inner_radius - 1.2).max(1.0),
+        (inner_radius * 0.62).max(1.0),
+        highlight,
+        if pressed { 0.12 } else { 0.32 },
+        rect.y + rect.size / 2.0,
+    );
+
+    let lower_shadow = mix(fill, Rgb::new(0, 0, 0), if pressed { 0.18 } else { 0.1 });
+    push_ellipse_scanlines(
+        rects,
+        rect.x + rect.size / 2.0,
+        rect.y + rect.size * 0.7,
+        (inner_radius - 1.4).max(1.0),
+        (inner_radius * 0.4).max(1.0),
+        lower_shadow,
+        if pressed { 0.14 } else { 0.08 },
+        rect.y + rect.size,
+    );
+}
+
+fn push_circle_scanlines(
+    rects: &mut Vec<RenderRect>,
+    rect: WindowControlRect,
+    radius: f64,
+    color: Rgb,
+    alpha: f32,
+) {
+    let center_x = rect.x + rect.size / 2.0;
+    let center_y = rect.y + rect.size / 2.0;
+    let top = rect.y.floor() as i32;
+    let bottom = (rect.y + rect.size).ceil() as i32;
+
+    for row in top..bottom {
+        let scan_y = row as f64 + 0.5;
+        let dy = (scan_y - center_y).abs();
+        if dy > radius {
+            continue;
+        }
+
+        let half = (radius * radius - dy * dy).sqrt();
+        let x0 = (center_x - half).ceil();
+        let x1 = (center_x + half).floor();
+        if x1 < x0 {
+            continue;
+        }
+
+        rects.push(RenderRect::new(
+            x0 as f32,
+            row as f32,
+            (x1 - x0 + 1.0) as f32,
+            1.0,
+            color,
+            alpha,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_ellipse_scanlines(
+    rects: &mut Vec<RenderRect>,
+    center_x: f64,
+    center_y: f64,
+    radius_x: f64,
+    radius_y: f64,
+    color: Rgb,
+    alpha: f32,
+    max_y: f64,
+) {
+    let top = (center_y - radius_y).floor() as i32;
+    let bottom = max_y.ceil() as i32;
+
+    for row in top..bottom {
+        let scan_y = row as f64 + 0.5;
+        let dy = (scan_y - center_y).abs();
+        if dy > radius_y {
+            continue;
+        }
+
+        let row_alpha = alpha * (1.0 - (dy / radius_y) as f32 * 0.6);
+        if row_alpha <= 0.0 {
+            continue;
+        }
+
+        let half = radius_x * (1.0 - (dy * dy) / (radius_y * radius_y)).sqrt();
+        let x0 = (center_x - half).ceil();
+        let x1 = (center_x + half).floor();
+        if x1 < x0 {
+            continue;
+        }
+
+        rects.push(RenderRect::new(
+            x0 as f32,
+            row as f32,
+            (x1 - x0 + 1.0) as f32,
+            1.0,
+            color,
+            row_alpha.clamp(0.0, 1.0),
+        ));
+    }
+}
+
 const DRAG_THRESHOLD_PX: f64 = 4.0;
 
 #[cfg(test)]
@@ -1854,6 +2162,10 @@ mod tests {
 
         let size_info = SizeInfo::new(800.0, 600.0, 10.0, 20.0, 0.0, 0.0, 0.0, false);
         (panel, size_info)
+    }
+
+    fn centered_position(rect: WindowControlRect) -> PhysicalPosition<f64> {
+        PhysicalPosition::new(rect.x + rect.size / 2.0, rect.y + rect.size / 2.0)
     }
 
     #[test]
@@ -1911,6 +2223,55 @@ mod tests {
             matches!(release.command, Some(TabPanelCommand::Move { tab_id, .. }) if tab_id == first_tab),
             "expected drag move command, got {:?}",
             release.command
+        );
+    }
+
+    #[test]
+    fn fullscreen_window_controls_emit_window_commands() {
+        let (mut panel, _) = panel_and_size();
+        let size_info = SizeInfo::new(800.0, 600.0, 10.0, 20.0, 0.0, 0.0, 36.0, false);
+        panel.set_fullscreen_window_controls_band_px(36.0);
+
+        let controls = panel.window_control_rects(&size_info);
+        assert_eq!(controls.len(), 3, "expected fullscreen window controls to be visible");
+
+        let cases = [
+            (controls[0], TabPanelCommand::WindowClose),
+            (controls[1], TabPanelCommand::WindowMinimize),
+            (controls[2], TabPanelCommand::WindowToggleFullscreen),
+        ];
+
+        for (rect, expected) in cases {
+            let hover = panel.cursor_moved(centered_position(rect), &size_info);
+            assert!(hover.capture, "control hover should capture the pointer");
+            assert_eq!(hover.cursor, Some(CursorIcon::Pointer));
+
+            let press = panel.mouse_input(ElementState::Pressed, MouseButton::Left, &size_info);
+            assert!(press.capture, "control press should stay inside the panel");
+            assert!(press.command.is_none(), "press should not dispatch immediately");
+
+            let release = panel.mouse_input(ElementState::Released, MouseButton::Left, &size_info);
+            assert_eq!(release.command, Some(expected), "unexpected command for control hit");
+        }
+    }
+
+    #[test]
+    fn fullscreen_window_controls_scale_with_retina_band_height() {
+        let (mut panel, _) = panel_and_size();
+        let size_info = SizeInfo::new(800.0, 600.0, 10.0, 20.0, 0.0, 0.0, 74.0, false);
+        panel.set_fullscreen_window_controls_band_px(74.0);
+
+        let controls = panel.window_control_rects(&size_info);
+        assert_eq!(controls.len(), 3, "expected fullscreen window controls to be visible");
+        assert_eq!(
+            controls[0].size, 24.0,
+            "expected retina controls to render at native 24 px size"
+        );
+        assert_eq!(controls[0].x, 24.0, "expected retina controls to use native left margin");
+        assert_eq!(
+            controls[1].x - controls[0].x - controls[0].size,
+            16.0,
+            "expected retina controls to use native spacing",
         );
     }
 }

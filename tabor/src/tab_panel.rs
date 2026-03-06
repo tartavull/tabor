@@ -76,7 +76,7 @@ pub struct TabPanelGroup {
     pub tabs: Vec<TabPanelTab>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabPanelCommand {
     Focus(TabId),
     Close(TabId),
@@ -84,4 +84,7 @@ pub enum TabPanelCommand {
     MoveGroup { group_id: usize, target_index: usize },
     RenameTab(TabId),
     RenameGroup(usize),
+    WindowClose,
+    WindowMinimize,
+    WindowToggleFullscreen,
 }

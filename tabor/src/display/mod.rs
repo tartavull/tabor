@@ -432,6 +432,11 @@ pub struct Display {
 
 impl Display {
     #[cfg(target_os = "macos")]
+    fn macos_debug_notch_ears_enabled() -> bool {
+        std::env::var_os("TABOR_DEBUG_NOTCH_EARS").is_some_and(|value| value != "0")
+    }
+
+    #[cfg(target_os = "macos")]
     fn macos_show_semaphore_controls(
         tab_panel_enabled: bool,
         decorations: Decorations,
@@ -449,36 +454,59 @@ impl Display {
         panel_dimensions: PanelDimensions,
         padding_y_px: f32,
         config: &UiConfig,
-    ) {
+        highlight_notch_ears: bool,
+    ) -> f32 {
         tab_panel.set_enabled(config.window.tab_panel.enabled);
         tab_panel.set_dimensions(panel_dimensions);
 
         let (native_fullscreen, simple_fullscreen, _) = window.macos_fullscreen_flags();
         let is_fullscreen_or_simple_fullscreen = native_fullscreen || simple_fullscreen;
-        let show_controls = Self::macos_show_semaphore_controls(
+        let show_native_controls = Self::macos_show_semaphore_controls(
             tab_panel.is_enabled(),
             config.window.decorations,
             is_fullscreen_or_simple_fullscreen,
         );
+        let show_fullscreen_controls = window.macos_real_ear_fullscreen_active();
 
-        let background_color = if show_controls {
+        let background_color = if show_native_controls {
             TabPanel::background_color(config)
         } else {
             config.colors.primary.background
         };
         window.set_macos_background_color(background_color);
-
-        let top_inset = if show_controls {
-            window.layout_macos_window_controls(panel_dimensions.width, padding_y_px).unwrap_or(0.0)
+        if native_fullscreen && !show_fullscreen_controls {
+            window.sync_macos_notch_ear_windows(background_color, highlight_notch_ears);
         } else {
-            0.0
-        };
+            window.clear_macos_notch_ear_windows();
+        }
 
-        tab_panel.set_top_inset_px(top_inset);
+        let fullscreen_top_padding =
+            if show_fullscreen_controls { window.macos_real_ear_top_padding_px() } else { 0.0 };
+
+        if show_native_controls {
+            let top_inset = window
+                .layout_macos_window_controls(panel_dimensions.width, padding_y_px)
+                .unwrap_or(0.0);
+            tab_panel.set_native_window_controls_inset_px(top_inset);
+        } else if show_fullscreen_controls {
+            let band_height_px = padding_y_px + fullscreen_top_padding;
+            let _ = window
+                .layout_macos_fullscreen_window_controls(panel_dimensions.width, band_height_px);
+            tab_panel.set_fullscreen_window_controls_band_px(band_height_px);
+        } else {
+            window.restore_macos_window_controls();
+            tab_panel.clear_window_controls();
+        }
+
+        fullscreen_top_padding
     }
 
     #[cfg(target_os = "macos")]
-    fn sync_macos_tab_panel_semaphore_inset_for_draw(&mut self, config: &UiConfig) {
+    fn sync_macos_tab_panel_semaphore_inset_for_draw(
+        &mut self,
+        config: &UiConfig,
+        force_notch_ears: bool,
+    ) {
         let scale_factor = self.window.scale_factor as f32;
         let padding = config.window.padding(scale_factor);
         let panel_dimensions = compute_panel_dimensions(
@@ -489,12 +517,13 @@ impl Display {
             scale_factor,
         );
 
-        Self::sync_macos_tab_panel_semaphore_inset(
+        let _ = Self::sync_macos_tab_panel_semaphore_inset(
             &self.window,
             &mut self.tab_panel,
             panel_dimensions,
             padding.1,
             config,
+            force_notch_ears || Self::macos_debug_notch_ears_enabled(),
         );
     }
     pub fn new(
@@ -554,11 +583,23 @@ impl Display {
         );
         #[cfg(not(target_os = "macos"))]
         let panel_dimensions = PanelDimensions::default();
+        #[cfg(target_os = "macos")]
+        let mut tab_panel = TabPanel::new();
+        #[cfg(target_os = "macos")]
+        let fullscreen_top_padding = Self::sync_macos_tab_panel_semaphore_inset(
+            &window,
+            &mut tab_panel,
+            panel_dimensions,
+            padding.1,
+            config,
+            Self::macos_debug_notch_ears_enabled(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let fullscreen_top_padding = 0.0;
         let panel_padding = panel_dimensions.width;
         let dynamic_padding = config.window.dynamic_padding
             && config.window.dimensions().is_none()
             && panel_dimensions.columns == 0;
-
         // Create new size with at least one column and row.
         let size_info = SizeInfo::new(
             viewport_size.width as f32,
@@ -567,7 +608,7 @@ impl Display {
             cell_height,
             padding.0 + panel_padding,
             padding.0,
-            padding.1,
+            padding.1 + fullscreen_top_padding,
             dynamic_padding,
         );
 
@@ -604,19 +645,6 @@ impl Display {
 
         let mut damage_tracker = DamageTracker::new(size_info.screen_lines(), size_info.columns());
         damage_tracker.debug = config.debug.highlight_damage;
-
-        #[cfg(target_os = "macos")]
-        let mut tab_panel = TabPanel::new();
-        #[cfg(target_os = "macos")]
-        {
-            Self::sync_macos_tab_panel_semaphore_inset(
-                &window,
-                &mut tab_panel,
-                panel_dimensions,
-                padding.1,
-                config,
-            );
-        }
         // Show only after startup layout is complete, so macOS controls do not visibly jump.
         window.set_visible(true);
 
@@ -628,6 +656,8 @@ impl Display {
         #[cfg(not(windows))]
         if !_tabbed {
             match config.window.startup_mode {
+                #[cfg(target_os = "macos")]
+                StartupMode::Fullscreen => window.set_preferred_fullscreen(true),
                 #[cfg(target_os = "macos")]
                 StartupMode::SimpleFullscreen => window.set_simple_fullscreen(true),
                 StartupMode::Maximized if !is_wayland => window.set_maximized(true),
@@ -828,9 +858,19 @@ impl Display {
         );
         #[cfg(not(target_os = "macos"))]
         let panel_dimensions = PanelDimensions::default();
+        #[cfg(target_os = "macos")]
+        let fullscreen_top_padding = Self::sync_macos_tab_panel_semaphore_inset(
+            &self.window,
+            &mut self.tab_panel,
+            panel_dimensions,
+            padding.1,
+            config,
+            Self::macos_debug_notch_ears_enabled(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let fullscreen_top_padding = 0.0;
         let panel_padding = panel_dimensions.width;
         let dynamic_padding = config.window.dynamic_padding && panel_dimensions.columns == 0;
-
         let mut new_size = SizeInfo::new(
             width,
             height,
@@ -838,20 +878,9 @@ impl Display {
             cell_height,
             padding.0 + panel_padding,
             padding.0,
-            padding.1,
+            padding.1 + fullscreen_top_padding,
             dynamic_padding,
         );
-
-        #[cfg(target_os = "macos")]
-        {
-            Self::sync_macos_tab_panel_semaphore_inset(
-                &self.window,
-                &mut self.tab_panel,
-                panel_dimensions,
-                padding.1,
-                config,
-            );
-        }
 
         // Update number of column/lines in the viewport.
         //
@@ -921,11 +950,21 @@ impl Display {
         info!("Width: {}, Height: {}", self.size_info.width(), self.size_info.height());
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn window_snapshot_rgba(&mut self) -> (u32, u32, Vec<u8>) {
+        self.make_current();
+        let width = self.size_info.width() as u32;
+        let height = self.size_info.height() as u32;
+        let pixels = self.renderer.read_front_buffer_rgba(width, height);
+        (width, height, pixels)
+    }
+
     /// Draw the screen.
     ///
     /// A reference to Term whose state is being drawn must be provided.
     ///
     /// This call may block if vsync is enabled.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw<T: EventListener>(
         &mut self,
         mut terminal: MutexGuard<'_, Term<T>>,
@@ -934,9 +973,10 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
         command_state: &CommandState,
+        #[cfg(target_os = "macos")] force_notch_ears: bool,
     ) {
         #[cfg(target_os = "macos")]
-        self.sync_macos_tab_panel_semaphore_inset_for_draw(config);
+        self.sync_macos_tab_panel_semaphore_inset_for_draw(config, force_notch_ears);
 
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
@@ -1251,9 +1291,10 @@ impl Display {
         config: &UiConfig,
         url: &str,
         command_state: &CommandState,
+        #[cfg(target_os = "macos")] force_notch_ears: bool,
     ) {
         #[cfg(target_os = "macos")]
-        self.sync_macos_tab_panel_semaphore_inset_for_draw(config);
+        self.sync_macos_tab_panel_semaphore_inset_for_draw(config, force_notch_ears);
 
         let size_info = self.size_info;
         let metrics = self.glyph_cache.font_metrics();

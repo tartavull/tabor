@@ -563,6 +563,14 @@ fn permission_decision(requested_permissions: u32) -> PermissionDecision {
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
+fn permission_request_result(requested_permissions: u32) -> PermissionRequestResult {
+    match permission_decision(requested_permissions) {
+        PermissionDecision::Allow => PermissionRequestResult::ACCEPT,
+        PermissionDecision::Deny => PermissionRequestResult::DENY,
+    }
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
 fn should_block_permission_request(requested_permissions: u32) -> bool {
     matches!(permission_decision(requested_permissions), PermissionDecision::Deny)
 }
@@ -606,7 +614,10 @@ cef::wrap_permission_handler! {
                 return 1;
             }
 
-            0
+            if let Some(callback) = callback {
+                callback.cont(requested_permissions);
+            }
+            1
         }
 
         fn on_show_permission_prompt(
@@ -617,15 +628,14 @@ cef::wrap_permission_handler! {
             requested_permissions: u32,
             callback: Option<&mut cef::PermissionPromptCallback>,
         ) -> ::std::os::raw::c_int {
-            if should_block_permission_request(requested_permissions) {
-                if let Some(callback) = callback {
-                    callback.cont(PermissionRequestResult::DENY);
-                }
-                log_blocked_permission_request("prompt", requesting_origin, requested_permissions);
-                return 1;
+            let result = permission_request_result(requested_permissions);
+            if let Some(callback) = callback {
+                callback.cont(result);
             }
-
-            0
+            if matches!(result, PermissionRequestResult::DENY) {
+                log_blocked_permission_request("prompt", requesting_origin, requested_permissions);
+            }
+            1
         }
     }
 }
@@ -688,6 +698,35 @@ cef::wrap_task! {
     }
 }
 
+#[derive(Clone, Copy)]
+enum FrameEditCommand {
+    Copy,
+    Cut,
+    Paste,
+}
+
+cef::wrap_task! {
+    struct FrameEditTask {
+        browser: cef::Browser,
+        command: FrameEditCommand,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let frame = self.browser.focused_frame().or_else(|| self.browser.main_frame());
+            let Some(frame) = frame else {
+                return;
+            };
+
+            match self.command {
+                FrameEditCommand::Copy => frame.copy(),
+                FrameEditCommand::Cut => frame.cut(),
+                FrameEditCommand::Paste => frame.paste(),
+            }
+        }
+    }
+}
+
 cef::wrap_task! {
     struct CloseBrowserTask {
         browser: cef::Browser,
@@ -710,6 +749,14 @@ pub struct WebView {
     _devtools_observer: cef::DevToolsMessageObserver,
     _devtools_registration: Option<cef::Registration>,
     _client: cef::Client,
+}
+
+fn browser_settings() -> cef::BrowserSettings {
+    cef::BrowserSettings {
+        javascript_access_clipboard: cef::State::ENABLED,
+        javascript_dom_paste: cef::State::ENABLED,
+        ..cef::BrowserSettings::default()
+    }
 }
 
 impl WebView {
@@ -744,7 +791,7 @@ impl WebView {
             #[cfg(feature = "passkey-webauthn")]
             let mut client = TaborClient::new(display_handler, download_handler);
 
-            let browser_settings = cef::BrowserSettings::default();
+            let browser_settings = browser_settings();
             let initial_url = if url.is_empty() { "about:blank" } else { url };
             let browser = cef::browser_host_create_browser_sync(
                 Some(&window_info),
@@ -1017,6 +1064,18 @@ impl WebView {
         self.eval_js_string(script, |_| {});
     }
 
+    pub fn copy_selection(&mut self) {
+        self.run_frame_edit_command(FrameEditCommand::Copy);
+    }
+
+    pub fn cut_selection(&mut self) {
+        self.run_frame_edit_command(FrameEditCommand::Cut);
+    }
+
+    pub fn paste(&mut self) {
+        self.run_frame_edit_command(FrameEditCommand::Paste);
+    }
+
     pub fn eval_js_string<F>(&mut self, script: &str, callback: F)
     where
         F: FnOnce(Option<String>) + 'static,
@@ -1057,6 +1116,27 @@ impl WebView {
             };
             callback(output);
         });
+    }
+
+    fn run_frame_edit_command(&self, command: FrameEditCommand) {
+        if should_run_frame_edit_inline(
+            cef::currently_on(cef::ThreadId::UI) == 1,
+            super::cef_handling_send_event(),
+        ) {
+            let frame = self.browser.focused_frame().or_else(|| self.browser.main_frame());
+            let Some(frame) = frame else {
+                return;
+            };
+
+            match command {
+                FrameEditCommand::Copy => frame.copy(),
+                FrameEditCommand::Cut => frame.cut(),
+                FrameEditCommand::Paste => frame.paste(),
+            }
+        } else {
+            let mut task = FrameEditTask::new(self.browser.clone(), command);
+            let _ = cef::post_task(cef::ThreadId::UI, Some(&mut task));
+        }
     }
 
     pub fn devtools_command_json<F>(
@@ -1354,6 +1434,10 @@ impl WebView {
 
         Ok(())
     }
+}
+
+fn should_run_frame_edit_inline(on_ui_thread: bool, handling_send_event: bool) -> bool {
+    on_ui_thread && !handling_send_event
 }
 
 impl Drop for WebView {
@@ -1873,10 +1957,28 @@ fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
 
 #[cfg(test)]
 mod tests {
+    use super::should_run_frame_edit_inline;
     #[cfg(not(feature = "passkey-webauthn"))]
-    use super::{PermissionDecision, permission_decision, should_block_permission_request};
+    use super::{
+        PermissionDecision, browser_settings, permission_decision, permission_request_result,
+        should_block_permission_request,
+    };
     #[cfg(not(feature = "passkey-webauthn"))]
-    use cef::PermissionRequestTypes as Permission;
+    use cef::{PermissionRequestResult, PermissionRequestTypes as Permission};
+
+    #[test]
+    fn browser_settings_enable_javascript_clipboard_access() {
+        let settings = browser_settings();
+        assert_eq!(settings.javascript_access_clipboard, cef::State::ENABLED);
+        assert_eq!(settings.javascript_dom_paste, cef::State::ENABLED);
+    }
+
+    #[test]
+    fn frame_edit_commands_defer_during_send_event() {
+        assert!(should_run_frame_edit_inline(true, false));
+        assert!(!should_run_frame_edit_inline(true, true));
+        assert!(!should_run_frame_edit_inline(false, false));
+    }
 
     #[cfg(not(feature = "passkey-webauthn"))]
     #[test]
@@ -1884,6 +1986,7 @@ mod tests {
         let permissions = Permission::CAMERA_STREAM.get_raw() | Permission::MIC_STREAM.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert!(!should_block_permission_request(permissions));
+        assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
@@ -1892,6 +1995,7 @@ mod tests {
         let permissions = Permission::AR_SESSION.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Deny);
         assert!(should_block_permission_request(permissions));
+        assert_eq!(permission_request_result(permissions), PermissionRequestResult::DENY);
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
@@ -1900,6 +2004,7 @@ mod tests {
         let unknown_bit = 1_u32 << 30;
         assert_eq!(permission_decision(unknown_bit), PermissionDecision::Deny);
         assert!(should_block_permission_request(unknown_bit));
+        assert_eq!(permission_request_result(unknown_bit), PermissionRequestResult::DENY);
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
@@ -1907,6 +2012,7 @@ mod tests {
     fn permission_policy_denies_empty_permissions() {
         assert_eq!(permission_decision(0), PermissionDecision::Deny);
         assert!(should_block_permission_request(0));
+        assert_eq!(permission_request_result(0), PermissionRequestResult::DENY);
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
@@ -1915,5 +2021,15 @@ mod tests {
         let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert!(!should_block_permission_request(permissions));
+        assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn permission_policy_allows_clipboard_permission() {
+        let permissions = Permission::CLIPBOARD.get_raw();
+        assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
+        assert!(!should_block_permission_request(permissions));
+        assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
     }
 }

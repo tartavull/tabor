@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use core_graphics::display::{CGDisplay, CGPoint};
 use monitor::VideoModeHandle;
-use objc2::rc::{autoreleasepool, Retained};
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject};
+use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability, sel};
 use objc2_app_kit::{
     NSAppKitVersionNumber, NSAppKitVersionNumber10_12, NSAppearance, NSAppearanceCustomization,
     NSAppearanceNameAqua, NSApplication, NSApplicationPresentationOptions, NSBackingStoreType,
@@ -19,10 +19,10 @@ use objc2_app_kit::{
     NSWindowSharingType, NSWindowStyleMask, NSWindowTabbingMode, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    ns_string, CGFloat, MainThreadMarker, NSArray, NSCopying, NSDictionary, NSKeyValueChangeKey,
+    CGFloat, MainThreadMarker, NSArray, NSCopying, NSDictionary, NSKeyValueChangeKey,
     NSKeyValueChangeNewKey, NSKeyValueChangeOldKey, NSKeyValueObservingOptions, NSObject,
     NSObjectNSDelayedPerforming, NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSPoint,
-    NSRect, NSSize, NSString,
+    NSRect, NSSize, NSString, ns_string,
 };
 use tracing::{trace, warn};
 
@@ -31,8 +31,8 @@ use super::cursor::cursor_from_icon;
 use super::monitor::{self, flip_window_screen_coordinates, get_display_id};
 use super::observer::RunLoop;
 use super::view::WinitView;
-use super::window::WinitWindow;
-use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId};
+use super::window::{WindowState, WinitWindow};
+use super::{Fullscreen, MonitorHandle, OsError, WindowId, ffi};
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{InnerSizeWriter, WindowEvent};
@@ -426,6 +426,34 @@ declare_class!(
 
     // Key-Value Observing
     unsafe impl WindowDelegate {
+        #[method(winitHandlePreferredFullscreenToggle:)]
+        fn winit_handle_preferred_fullscreen_toggle(&self, _: Option<&AnyObject>) -> Bool {
+            trace_scope!("winitHandlePreferredFullscreenToggle:");
+
+            if self.ivars().in_fullscreen_transition.get()
+                || self.ivars().fullscreen.borrow().is_some()
+            {
+                return false.into();
+            }
+
+            self.set_simple_fullscreen(!self.ivars().is_simple_fullscreen.get()).into()
+        }
+
+        #[method(winitHandleOverlayClose:)]
+        fn winit_handle_overlay_close(&self, _: Option<&AnyObject>) {
+            trace_scope!("winitHandleOverlayClose:");
+            self.queue_event(WindowEvent::CloseRequested);
+        }
+
+        #[method(winitHandleOverlayMiniaturize:)]
+        fn winit_handle_overlay_miniaturize(&self, _: Option<&AnyObject>) {
+            trace_scope!("winitHandleOverlayMiniaturize:");
+            if self.ivars().is_simple_fullscreen.get() {
+                self.set_simple_fullscreen(false);
+            }
+            self.set_minimized(true);
+        }
+
         #[method(observeValueForKeyPath:ofObject:change:context:)]
         fn observe_value(
             &self,
@@ -562,7 +590,7 @@ fn new_window(
 
         let window: Option<Retained<WinitWindow>> = unsafe {
             msg_send_id![
-                super(mtm.alloc().set_ivars(())),
+                super(mtm.alloc().set_ivars(WindowState::default())),
                 initWithContentRect: frame,
                 styleMask: masks,
                 backing: NSBackingStoreType::NSBackingStoreBuffered,
@@ -817,16 +845,18 @@ impl WindowDelegate {
     fn handle_scale_factor_changed(&self, scale_factor: CGFloat) {
         let app_delegate = &self.ivars().app_delegate;
         let window = self.window();
-
-        let content_size = window.contentRectForFrameRect(window.frame()).size;
-        let content_size = LogicalSize::new(content_size.width, content_size.height);
+        let view_size = self.view().frame().size;
+        let content_size = LogicalSize::new(view_size.width, view_size.height);
 
         let suggested_size = content_size.to_physical(scale_factor);
         let new_inner_size = Arc::new(Mutex::new(suggested_size));
-        app_delegate.handle_window_event(window.id(), WindowEvent::ScaleFactorChanged {
-            scale_factor,
-            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
-        });
+        app_delegate.handle_window_event(
+            window.id(),
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
+            },
+        );
         let physical_size = *new_inner_size.lock().unwrap();
         drop(new_inner_size);
 
@@ -936,8 +966,8 @@ impl WindowDelegate {
 
     #[inline]
     pub fn inner_size(&self) -> PhysicalSize<u32> {
-        let content_rect = self.window().contentRectForFrameRect(self.window().frame());
-        let logical = LogicalSize::new(content_rect.size.width, content_rect.size.height);
+        let frame = self.view().frame();
+        let logical = LogicalSize::new(frame.size.width, frame.size.height);
         logical.to_physical(self.scale_factor())
     }
 
@@ -1119,7 +1149,7 @@ impl WindowDelegate {
             CursorGrabMode::Locked => false,
             CursorGrabMode::None => true,
             CursorGrabMode::Confined => {
-                return Err(ExternalError::NotSupported(NotSupportedError::new()))
+                return Err(ExternalError::NotSupported(NotSupportedError::new()));
             },
         };
 
@@ -1877,11 +1907,7 @@ pub fn appearance_to_theme(appearance: &NSAppearance) -> Theme {
         dark_appearance_name().copy(),
     ]));
     if let Some(best_match) = best_match {
-        if *best_match == *dark_appearance_name() {
-            Theme::Dark
-        } else {
-            Theme::Light
-        }
+        if *best_match == *dark_appearance_name() { Theme::Dark } else { Theme::Light }
     } else {
         warn!(?appearance, "failed to determine the theme of the appearance");
         // Default to light in this case

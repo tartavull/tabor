@@ -35,7 +35,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   fi
 
   if $run_raw; then
-    exec cargo xtask run-raw -- "$@"
+    echo "Raw macOS Tabor launches are disabled because they bypass signed Tabor.app verification." >&2
+    exit 1
   fi
 
   exec cargo xtask run -- "$@"

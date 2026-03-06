@@ -113,7 +113,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         #[cfg(unix)]
         Some(Subcommands::Agent(options)) => agent::run(options)?,
         Some(Subcommands::Migrate(options)) => migrate::migrate(options),
-        None => tabor(options)?,
+        None => {
+            #[cfg(target_os = "macos")]
+            macos::enforce_signed_app_launch()?;
+            tabor(options)?
+        },
     }
 
     Ok(())

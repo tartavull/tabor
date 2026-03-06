@@ -461,6 +461,24 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         )
     }
 
+    fn window_debug_state(&mut self) -> Result<ipc::IpcWindowDebugState, ipc::IpcError> {
+        self.window.ipc_window_debug_state()
+    }
+
+    fn window_debug_snapshot(
+        &mut self,
+        highlight_notch_ears: bool,
+    ) -> Result<ipc::IpcWindowDebugSnapshot, ipc::IpcError> {
+        self.window.ipc_window_debug_snapshot(self.scheduler, highlight_notch_ears)
+    }
+
+    fn window_debug_press_standard_button(
+        &mut self,
+        button: ipc::IpcWindowDebugButton,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_press_standard_button(button)
+    }
+
     fn runtime_metrics(&mut self) -> Result<ipc::IpcRuntimeMetrics, ipc::IpcError> {
         self.window.ipc_runtime_metrics()
     }
@@ -3055,14 +3073,14 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(target_os = "macos")]
     fn web_paste_text(&mut self, text: &str) {
-        let script =
-            format!("document.execCommand('insertText', false, {});", Self::js_string(text));
-        self.web_exec_js(&script);
-    }
+        if text.is_empty() {
+            return;
+        }
 
-    #[cfg(target_os = "macos")]
-    fn web_is_insert_mode(&self) -> bool {
-        self.tab_kind.is_web() && self.web_command_state.mode() == WebMode::Insert
+        let Some(web_view) = self.web_view.as_mut() else {
+            return;
+        };
+        web_view.paste();
     }
 }
 
@@ -3148,40 +3166,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let Some(web_view) = self.web_view.as_mut() else {
             return;
         };
-        let proxy = self.event_proxy.clone();
-        let window_id = self.display.window.id();
-        let tab_id = self.tab_id;
-        let script = r#"(function() {
-  const el = document.activeElement;
-  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
-    if (typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {
-      const start = el.selectionStart;
-      const end = el.selectionEnd;
-      const text = el.value.substring(start, end);
-      if (start !== end) {
-        const value = el.value;
-        el.value = value.slice(0, start) + value.slice(end);
-        el.setSelectionRange(start, start);
-        el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteByCut', data: text}));
-      }
-      return text;
-    }
-  }
-  const sel = window.getSelection();
-  const text = sel ? sel.toString() : '';
-  if (text && sel && sel.rangeCount) {
-    sel.deleteFromDocument();
-  }
-  return text;
-})()"#;
-        web_view.eval_js_string(script, move |result| {
-            let Some(text) = result.filter(|text| !text.is_empty()) else {
-                return;
-            };
-            let command = WebCommand::CopyToClipboard { text };
-            let event = Event::for_tab(EventType::WebCommand(command), window_id, tab_id);
-            let _ = proxy.send_event(event);
-        });
+        web_view.cut_selection();
     }
 
     #[cfg(target_os = "macos")]
@@ -3189,15 +3174,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let Some(web_view) = self.web_view.as_mut() else {
             return;
         };
-        let text = self.clipboard.load(ClipboardType::Clipboard);
-        if text.is_empty() {
-            return;
-        }
-        let text_json = serde_json::to_string(&text).unwrap_or_else(|_| String::from("\"\""));
-        let script = format!(
-            "(function() {{\n  const text = {text_json};\n  const el = document.activeElement;\n  if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {{\n    if (typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {{\n      const start = el.selectionStart;\n      const end = el.selectionEnd;\n      const value = el.value;\n      el.value = value.slice(0, start) + text + value.slice(end);\n      const pos = start + text.length;\n      el.setSelectionRange(pos, pos);\n      el.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertFromPaste', data: text}}));\n      return true;\n    }}\n  }}\n  if (el && el.isContentEditable) {{\n    document.execCommand('insertText', false, text);\n    return true;\n  }}\n  return false;\n}})()",
-        );
-        web_view.exec_js(&script);
+        web_view.paste();
     }
 
     fn update_search(&mut self) {
@@ -3790,33 +3767,10 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     }
 
     fn web_copy_selection(&mut self) {
-        let proxy = self.event_proxy.clone();
-        let window_id = self.display.window.id();
-        let tab_id = self.tab_id;
-        let script = r#"(function() {
-  const active = document.activeElement;
-  if (active) {
-    const tag = active.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA") {
-      const value = active.value;
-      const start = active.selectionStart;
-      const end = active.selectionEnd;
-      if (typeof value === "string" && typeof start === "number" && typeof end === "number" && start !== end) {
-        return value.substring(start, end);
-      }
-    }
-  }
-  const sel = window.getSelection();
-  return sel ? sel.toString() : "";
-})();"#;
-        self.web_eval_js_string(script, move |result| {
-            let Some(text) = result.filter(|text| !text.is_empty()) else {
-                return;
-            };
-            let command = WebCommand::CopyToClipboard { text };
-            let event = Event::for_tab(EventType::WebCommand(command), window_id, tab_id);
-            let _ = proxy.send_event(event);
-        });
+        let Some(web_view) = self.web_view.as_mut() else {
+            return;
+        };
+        web_view.copy_selection();
     }
 
     fn web_scroll_by(&mut self, dx: f64, dy: f64) {

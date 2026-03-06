@@ -1,7 +1,10 @@
 #![allow(clippy::unnecessary_cast)]
 
+use std::cell::Cell;
+
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::{declare_class, mutability, ClassType, DeclaredClass};
+use objc2::runtime::AnyObject;
+use objc2::{ClassType, DeclaredClass, declare_class, msg_send, mutability};
 use objc2_app_kit::{NSResponder, NSWindow};
 use objc2_foundation::{MainThreadBound, MainThreadMarker, NSObject};
 
@@ -91,6 +94,11 @@ impl From<u64> for WindowId {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct WindowState {
+    prefer_simple_fullscreen: Cell<bool>,
+}
+
 declare_class!(
     #[derive(Debug)]
     pub struct WinitWindow;
@@ -102,7 +110,9 @@ declare_class!(
         const NAME: &'static str = "WinitWindow";
     }
 
-    impl DeclaredClass for WinitWindow {}
+    impl DeclaredClass for WinitWindow {
+        type Ivars = WindowState;
+    }
 
     unsafe impl WinitWindow {
         #[method(canBecomeMainWindow)]
@@ -115,6 +125,54 @@ declare_class!(
         fn can_become_key_window(&self) -> bool {
             trace_scope!("canBecomeKeyWindow");
             true
+        }
+
+        #[method(setWinitPreferSimpleFullscreen:)]
+        fn set_winit_prefer_simple_fullscreen(&self, prefer_simple_fullscreen: bool) {
+            self.ivars().prefer_simple_fullscreen.set(prefer_simple_fullscreen);
+        }
+
+        #[method(toggleFullScreen:)]
+        fn toggle_full_screen(&self, sender: Option<&AnyObject>) {
+            trace_scope!("toggleFullScreen:");
+
+            if sender.is_some() && self.ivars().prefer_simple_fullscreen.get() {
+                if let Some(delegate) = unsafe { self.delegate() } {
+                    let handled: bool = unsafe {
+                        msg_send![&*delegate, winitHandlePreferredFullscreenToggle: sender]
+                    };
+                    if handled {
+                        return;
+                    }
+                }
+            }
+
+            let _: () = unsafe { msg_send![super(self), toggleFullScreen: sender] };
+        }
+
+        #[method(winitPerformClose:)]
+        fn winit_perform_close(&self, sender: Option<&AnyObject>) {
+            trace_scope!("winitPerformClose:");
+
+            if let Some(delegate) = unsafe { self.delegate() } {
+                let _: () = unsafe { msg_send![&*delegate, winitHandleOverlayClose: sender] };
+                return;
+            }
+
+            let _: () = unsafe { msg_send![super(self), performClose: sender] };
+        }
+
+        #[method(winitPerformMiniaturize:)]
+        fn winit_perform_miniaturize(&self, sender: Option<&AnyObject>) {
+            trace_scope!("winitPerformMiniaturize:");
+
+            if let Some(delegate) = unsafe { self.delegate() } {
+                let _: () =
+                    unsafe { msg_send![&*delegate, winitHandleOverlayMiniaturize: sender] };
+                return;
+            }
+
+            let _: () = unsafe { msg_send![super(self), miniaturize: sender] };
         }
     }
 );

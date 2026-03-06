@@ -90,7 +90,7 @@ for helper_name in "${helpers[@]}"; do
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.17.0-dev</string>
+  <string>0.4.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSUIElement</key>

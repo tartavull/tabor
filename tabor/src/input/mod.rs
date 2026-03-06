@@ -123,10 +123,6 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn web_paste_text(&mut self, _text: &str) {}
     #[cfg(target_os = "macos")]
-    fn web_is_insert_mode(&self) -> bool {
-        false
-    }
-    #[cfg(target_os = "macos")]
     fn select_next_tab(&mut self) {}
     #[cfg(target_os = "macos")]
     fn select_previous_tab(&mut self) {}
