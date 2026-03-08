@@ -60,6 +60,8 @@ use crate::config::{self, UiConfig};
 #[cfg(not(windows))]
 use crate::daemon::foreground_process_path;
 use crate::daemon::spawn_daemon;
+#[cfg(target_os = "macos")]
+use crate::display::browser_layout::{BrowserViewMode, BrowserViewportLayout};
 use crate::display::color::Rgb;
 use crate::display::hint::HintMatch;
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
@@ -87,6 +89,8 @@ use crate::tab_panel::TAB_ACTIVITY_TICK_INTERVAL;
 use crate::tabs::{TabCommand, TabId};
 use crate::web_url::normalize_web_url;
 use crate::window_context::WindowContext;
+#[cfg(unix)]
+use crate::window_context::{IpcEventContext, WindowDebugMouseDrag};
 use crate::window_kind::WindowKind;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSEventModifierFlags;
@@ -471,6 +475,29 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         highlight_notch_ears: bool,
     ) -> Result<ipc::IpcWindowDebugSnapshot, ipc::IpcError> {
         self.window.ipc_window_debug_snapshot(self.scheduler, highlight_notch_ears)
+    }
+
+    fn window_debug_mouse_drag(
+        &mut self,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        steps: Option<usize>,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_mouse_drag(
+            WindowDebugMouseDrag {
+                start: PhysicalPosition::new(x0, y0),
+                end: PhysicalPosition::new(x1, y1),
+                steps,
+            },
+            IpcEventContext {
+                event_loop: self.event_loop,
+                event_proxy: self.event_proxy,
+                clipboard: self.clipboard,
+                scheduler: self.scheduler,
+            },
+        )
     }
 
     fn window_debug_press_standard_button(
@@ -1565,6 +1592,8 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     WebCursorRequest,
     #[cfg(target_os = "macos")]
+    WebViewDirty,
+    #[cfg(target_os = "macos")]
     CefSchedule(Duration),
     #[cfg(target_os = "macos")]
     CefTick,
@@ -1830,6 +1859,8 @@ pub struct ActionContext<'a, N, T> {
     pub tab_kind: &'a mut WindowKind,
     pub terminal_view_mode: &'a mut TerminalViewMode,
     #[cfg(target_os = "macos")]
+    pub browser_view_mode: &'a mut BrowserViewMode,
+    #[cfg(target_os = "macos")]
     pub web_view: Option<&'a mut WebView>,
     #[cfg(target_os = "macos")]
     pub web_command_state: &'a mut WebCommandState,
@@ -1849,11 +1880,28 @@ pub struct ActionContext<'a, N, T> {
 }
 
 #[cfg(target_os = "macos")]
+fn browser_viewport_layout(
+    display: &Display,
+    config: &UiConfig,
+    browser_view_mode: BrowserViewMode,
+) -> BrowserViewportLayout {
+    let size_info = display.size_info_for_status_lines(1);
+    BrowserViewportLayout::new(
+        &size_info,
+        display.window.scale_factor,
+        browser_view_mode,
+        &config.browser.multi_column,
+    )
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn request_web_cursor_update(
     web_view: &mut WebView,
     web_command_state: &mut WebCommandState,
     display: &Display,
+    config: &UiConfig,
+    browser_view_mode: BrowserViewMode,
     position: PhysicalPosition<f64>,
     event_proxy: &EventLoopProxy<Event>,
     scheduler: &mut Scheduler,
@@ -1862,21 +1910,13 @@ pub(crate) fn request_web_cursor_update(
 ) {
     web_command_state.set_last_cursor_pos(position);
 
-    let scale_factor = display.window.scale_factor;
-    let size_info = display.size_info;
-    let origin_x = f64::from(size_info.padding_x()) / scale_factor;
-    let origin_y = f64::from(size_info.padding_y()) / scale_factor;
-    let width = f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
-        / scale_factor;
-    let height =
-        f64::from(size_info.cell_height() * size_info.screen_lines() as f32) / scale_factor;
-
-    let local_x = position.x / scale_factor - origin_x;
-    let local_y = position.y / scale_factor - origin_y;
-
-    if local_x < 0.0 || local_y < 0.0 || local_x >= width || local_y >= height {
+    let scale_factor = display.window.scale_factor.max(f64::MIN_POSITIVE);
+    let layout = browser_viewport_layout(display, config, browser_view_mode);
+    let visual_x = (position.x / scale_factor).floor().max(0.0) as usize;
+    let visual_y = (position.y / scale_factor).floor().max(0.0) as usize;
+    let Some((logical_x, logical_y)) = layout.logical_point_for_visual(visual_x, visual_y) else {
         return;
-    }
+    };
 
     if web_command_state.cursor_pending() {
         return;
@@ -1906,7 +1946,7 @@ pub(crate) fn request_web_cursor_update(
     web_command_state.set_last_cursor_request(now);
 
     let proxy = event_proxy.clone();
-    let script = web_cursor_script(local_x, local_y);
+    let script = web_cursor_script(logical_x as f64, logical_y as f64);
 
     web_view.eval_js_string(&script, move |result| {
         let cursor = result.as_deref().and_then(web_cursor_from_css);
@@ -2035,14 +2075,30 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     fn toggle_multi_column_terminal(&mut self) {
+        #[cfg(target_os = "macos")]
         if self.tab_kind.is_web() {
-            return;
+            *self.browser_view_mode = match *self.browser_view_mode {
+                BrowserViewMode::Normal => BrowserViewMode::MultiColumn,
+                BrowserViewMode::MultiColumn => BrowserViewMode::Normal,
+            };
         }
 
-        *self.terminal_view_mode = match *self.terminal_view_mode {
-            TerminalViewMode::Normal => TerminalViewMode::MultiColumn,
-            TerminalViewMode::MultiColumn => TerminalViewMode::Normal,
-        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            *self.terminal_view_mode = match *self.terminal_view_mode {
+                TerminalViewMode::Normal => TerminalViewMode::MultiColumn,
+                TerminalViewMode::MultiColumn => TerminalViewMode::Normal,
+            };
+        }
+
+        #[cfg(target_os = "macos")]
+        if !self.tab_kind.is_web() {
+            *self.terminal_view_mode = match *self.terminal_view_mode {
+                TerminalViewMode::Normal => TerminalViewMode::MultiColumn,
+                TerminalViewMode::MultiColumn => TerminalViewMode::Normal,
+            };
+        }
+
         self.mouse.hint_highlight_dirty = true;
         self.display.highlighted_hint = None;
         self.display.vi_highlighted_hint = None;
@@ -2132,6 +2188,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             web_view,
             self.web_command_state,
             self.display,
+            self.config,
+            *self.browser_view_mode,
             position,
             self.event_proxy,
             self.scheduler,
@@ -3090,14 +3148,73 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let Some(web_view) = self.web_view.as_mut() else {
             return;
         };
-        web_view.handle_mouse_input(
-            &self.display.window,
-            &self.display.size_info,
-            position,
-            state,
-            button,
-            modifiers,
-        );
+        web_view.handle_mouse_input(&self.display.window, position, state, button, modifiers);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_mouse_move(&mut self, position: PhysicalPosition<f64>) {
+        if !self.tab_kind.is_web() {
+            return;
+        }
+
+        let x = position.x.clamp(0.0, self.display.size_info.width() as f64 - 1.0) as usize;
+        let y = position.y.clamp(0.0, self.display.size_info.height() as f64 - 1.0) as usize;
+        self.mouse.x = x;
+        self.mouse.y = y;
+        self.mouse.inside_text_area = true;
+
+        let modifiers = web_modifier_flags(self.modifiers().state());
+        let Some(web_view) = self.web_view.as_mut() else {
+            return;
+        };
+        let _ = web_view.handle_mouse_move(&self.display.window, position, modifiers);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_mouse_leave(&mut self) {
+        if let Some(web_view) = self.web_view.as_mut() {
+            web_view.handle_mouse_leave();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn web_mouse_wheel(
+        &mut self,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+    ) {
+        if !self.tab_kind.is_web() {
+            return;
+        }
+
+        let Some(position) = self.web_command_state.last_cursor_pos() else {
+            return;
+        };
+
+        let (delta_x, delta_y) = match delta {
+            winit::event::MouseScrollDelta::LineDelta(columns, lines) => (
+                f64::from(columns) * f64::from(self.display.size_info.cell_width()),
+                f64::from(lines) * f64::from(self.display.size_info.cell_height()),
+            ),
+            winit::event::MouseScrollDelta::PixelDelta(delta) => match phase {
+                winit::event::TouchPhase::Started => {
+                    self.mouse.accumulated_scroll = Default::default();
+                    (0.0, 0.0)
+                },
+                _ => (delta.x, delta.y),
+            },
+        };
+
+        let modifiers = web_modifier_flags(self.modifiers().state());
+        if let Some(web_view) = self.web_view.as_mut() {
+            let _ = web_view.handle_mouse_wheel(
+                &self.display.window,
+                position,
+                delta_x,
+                delta_y,
+                modifiers,
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -4786,6 +4903,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::WebFavicon { .. }
                 | EventType::WebCursor { .. }
                 | EventType::WebCursorRequest
+                | EventType::WebViewDirty
                 | EventType::CefSchedule(_)
                 | EventType::CefTick
                 | EventType::CefWatchdog
@@ -4888,6 +5006,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
+                        #[cfg(target_os = "macos")]
+                        if self.ctx.window_kind().is_web() {
+                            self.ctx.web_mouse_leave();
+                        }
 
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;
@@ -4895,12 +5017,32 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
+                            #[cfg(target_os = "macos")]
+                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                                if let Some(web_view) = self.ctx.web_view.as_mut() {
+                                    web_view.handle_ime_commit(&text);
+                                }
+                                self.ctx.display.ime.set_preedit(None);
+                                *self.ctx.dirty = true;
+                                return;
+                            }
+
                             *self.ctx.dirty = true;
                             // Don't use bracketed paste for single char input.
                             self.ctx.paste(&text, text.chars().count() > 1);
                             self.ctx.update_cursor_blinking();
                         },
                         Ime::Preedit(text, cursor_offset) => {
+                            #[cfg(target_os = "macos")]
+                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                                if let Some(web_view) = self.ctx.web_view.as_mut() {
+                                    web_view.handle_ime_preedit(&text, cursor_offset);
+                                }
+                                self.ctx.display.ime.set_preedit(None);
+                                *self.ctx.dirty = true;
+                                return;
+                            }
+
                             let preedit =
                                 (!text.is_empty()).then(|| Preedit::new(text, cursor_offset));
 
@@ -4911,10 +5053,27 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             }
                         },
                         Ime::Enabled => {
+                            #[cfg(target_os = "macos")]
+                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                                self.ctx.display.ime.set_preedit(None);
+                                *self.ctx.dirty = true;
+                                return;
+                            }
+
                             self.ctx.display.ime.set_enabled(true);
                             *self.ctx.dirty = true;
                         },
                         Ime::Disabled => {
+                            #[cfg(target_os = "macos")]
+                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                                if let Some(web_view) = self.ctx.web_view.as_mut() {
+                                    web_view.cancel_ime_composition();
+                                }
+                                self.ctx.display.ime.set_preedit(None);
+                                *self.ctx.dirty = true;
+                                return;
+                            }
+
                             self.ctx.display.ime.set_enabled(false);
                             *self.ctx.dirty = true;
                         },

@@ -45,6 +45,7 @@ use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
+use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
@@ -56,7 +57,12 @@ use crate::display::tab_panel::{PanelDimensions, TabPanel, compute_panel_dimensi
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
 use crate::event::{CommandState, Event, EventType, Mouse, SearchState};
+#[cfg(target_os = "macos")]
+use crate::macos::webview::{WebPopupSurfaceRef, WebView};
 use crate::message_bar::{MessageBuffer, MessageType};
+use crate::renderer::images::ImageSlice;
+#[cfg(target_os = "macos")]
+use crate::renderer::images::SurfaceSlot;
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
 use crate::renderer::{self, GlyphCache, Renderer, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -69,6 +75,7 @@ struct PanelDimensions {
     width: f32,
 }
 
+pub mod browser_layout;
 pub mod color;
 pub mod content;
 pub mod cursor;
@@ -80,6 +87,25 @@ pub mod window;
 mod tab_panel;
 #[cfg(target_os = "macos")]
 pub(crate) use tab_panel::{TabPanelEditOutcome, TabPanelEditTarget};
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(crate) struct MacOsWebDraw<'a> {
+    web_view: Option<&'a WebView>,
+    browser_layout: BrowserViewportLayout,
+    force_notch_ears: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> MacOsWebDraw<'a> {
+    pub(crate) fn new(
+        web_view: Option<&'a WebView>,
+        browser_layout: BrowserViewportLayout,
+        force_notch_ears: bool,
+    ) -> Self {
+        Self { web_view, browser_layout, force_notch_ears }
+    }
+}
 
 mod bell;
 mod damage;
@@ -1343,10 +1369,10 @@ impl Display {
         config: &UiConfig,
         url: &str,
         command_state: &CommandState,
-        #[cfg(target_os = "macos")] force_notch_ears: bool,
+        #[cfg(target_os = "macos")] macos: MacOsWebDraw<'_>,
     ) {
         #[cfg(target_os = "macos")]
-        self.sync_macos_tab_panel_semaphore_inset_for_draw(config, force_notch_ears);
+        self.sync_macos_tab_panel_semaphore_inset_for_draw(config, macos.force_notch_ears);
 
         let size_info = self.size_info;
         let metrics = self.glyph_cache.font_metrics();
@@ -1361,6 +1387,46 @@ impl Display {
 
         #[cfg(target_os = "macos")]
         self.renderer.set_viewport(&size_info);
+
+        #[cfg(target_os = "macos")]
+        if let Some(web_view) = macos.web_view {
+            web_view.with_surfaces(|surface, popup| {
+                if let Some(surface) = surface {
+                    let slices = browser_main_image_slices(
+                        macos.browser_layout,
+                        self.window.scale_factor,
+                        surface.width,
+                        surface.height,
+                    );
+                    self.renderer.draw_web_surface_slices(
+                        &size_info,
+                        SurfaceSlot::Main,
+                        surface.io_surface,
+                        surface.width,
+                        surface.height,
+                        surface.format,
+                        &slices,
+                    );
+                }
+
+                if let Some(popup) = popup {
+                    let slices = browser_popup_image_slices(
+                        macos.browser_layout,
+                        self.window.scale_factor,
+                        popup,
+                    );
+                    self.renderer.draw_web_surface_slices(
+                        &size_info,
+                        SurfaceSlot::Popup,
+                        popup.surface.io_surface,
+                        popup.surface.width,
+                        popup.surface.height,
+                        popup.surface.format,
+                        &slices,
+                    );
+                }
+            });
+        }
 
         let mut rects = Vec::new();
 
@@ -1986,7 +2052,7 @@ impl Display {
     }
 
     /// Request a new frame for a window on Wayland.
-    fn request_frame(&mut self, scheduler: &mut Scheduler) {
+    pub(crate) fn request_frame(&mut self, scheduler: &mut Scheduler) {
         // Mark that we've used a frame.
         self.window.has_frame = false;
 
@@ -2010,6 +2076,109 @@ impl Display {
 
         scheduler.schedule(event, swap_timeout, false, timer_id);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn dip_to_physical(value: usize, scale_factor: f64) -> usize {
+    ((value as f64) * scale_factor).round().max(0.0) as usize
+}
+
+#[cfg(target_os = "macos")]
+fn browser_main_image_slices(
+    layout: BrowserViewportLayout,
+    scale_factor: f64,
+    image_width_px: usize,
+    image_height_px: usize,
+) -> Vec<ImageSlice> {
+    let viewport = layout.viewport();
+    let viewport_height_px = dip_to_physical(viewport.height, scale_factor).max(1);
+    let viewport_width_px = dip_to_physical(layout.logical_width(), scale_factor).max(1);
+    let mut slices = Vec::with_capacity(layout.column_count());
+
+    for column_index in 0..layout.column_count() {
+        let Some(column_rect) = layout.column_rect(column_index) else {
+            continue;
+        };
+
+        let src_y_px = column_index.saturating_mul(viewport_height_px);
+        if src_y_px >= image_height_px {
+            continue;
+        }
+
+        let src_height_px = viewport_height_px.min(image_height_px.saturating_sub(src_y_px));
+        let dest_height_px = ((src_height_px as f64 / viewport_height_px as f64)
+            * dip_to_physical(column_rect.height, scale_factor) as f64)
+            .round() as usize;
+
+        slices.push(ImageSlice {
+            dest_x_px: dip_to_physical(column_rect.x, scale_factor),
+            dest_y_px: dip_to_physical(column_rect.y, scale_factor),
+            dest_width_px: dip_to_physical(column_rect.width, scale_factor),
+            dest_height_px,
+            src_x_px: 0,
+            src_y_px,
+            src_width_px: image_width_px.min(viewport_width_px),
+            src_height_px,
+        });
+    }
+
+    slices
+}
+
+#[cfg(target_os = "macos")]
+fn browser_popup_image_slices(
+    layout: BrowserViewportLayout,
+    scale_factor: f64,
+    popup: WebPopupSurfaceRef,
+) -> Vec<ImageSlice> {
+    let viewport_height = layout.viewport().height;
+    if viewport_height == 0 || popup.width == 0 || popup.height == 0 {
+        return Vec::new();
+    }
+
+    let popup_scale_x = popup.surface.width as f64 / popup.width as f64;
+    let popup_scale_y = popup.surface.height as f64 / popup.height as f64;
+    let popup_left = popup.x;
+    let popup_top = popup.y;
+    let popup_bottom = popup.y.saturating_add(popup.height);
+
+    let mut slices = Vec::new();
+
+    for column_index in 0..layout.column_count() {
+        let column_top = column_index.saturating_mul(viewport_height);
+        let column_bottom = column_top.saturating_add(viewport_height);
+        let slice_top = popup_top.max(column_top);
+        let slice_bottom = popup_bottom.min(column_bottom);
+        if slice_top >= slice_bottom {
+            continue;
+        }
+
+        let Some(column_rect) = layout.column_rect(column_index) else {
+            continue;
+        };
+
+        let logical_slice_height = slice_bottom.saturating_sub(slice_top);
+        let src_y_px =
+            ((slice_top.saturating_sub(popup_top) as f64) * popup_scale_y).round() as usize;
+        let src_height_px = ((logical_slice_height as f64) * popup_scale_y).round() as usize;
+        let src_width_px = ((popup.width as f64) * popup_scale_x).round() as usize;
+
+        slices.push(ImageSlice {
+            dest_x_px: dip_to_physical(column_rect.x.saturating_add(popup_left), scale_factor),
+            dest_y_px: dip_to_physical(
+                column_rect.y.saturating_add(slice_top.saturating_sub(column_top)),
+                scale_factor,
+            ),
+            dest_width_px: dip_to_physical(popup.width, scale_factor),
+            dest_height_px: dip_to_physical(logical_slice_height, scale_factor),
+            src_x_px: 0,
+            src_y_px,
+            src_width_px: src_width_px.min(popup.surface.width),
+            src_height_px: src_height_px.min(popup.surface.height.saturating_sub(src_y_px)),
+        });
+    }
+
+    slices
 }
 
 impl Drop for Display {
@@ -2199,6 +2368,8 @@ fn window_size(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::config::browser::MultiColumnBrowserConfig;
+    use crate::display::browser_layout::BrowserViewMode;
 
     #[test]
     fn macos_window_controls_visibility_policy() {
@@ -2223,5 +2394,98 @@ mod tests {
         let show_controls = Display::macos_show_semaphore_controls(true, Decorations::Full, false);
         let top_inset = if show_controls { measured_inset } else { 0.0 };
         assert_eq!(top_inset, measured_inset);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn browser_layout(width: usize, height: usize) -> BrowserViewportLayout {
+        let size = SizeInfo::new(width as f32, height as f32, 1., 1., 0., 0., 0., false);
+        BrowserViewportLayout::new(
+            &size,
+            1.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn browser_main_image_slices_follow_column_layout() {
+        let layout = browser_layout(1950, 600);
+        let slices = browser_main_image_slices(layout, 1.0, layout.logical_width(), 1200);
+
+        assert_eq!(slices.len(), 2);
+        assert_eq!(
+            slices[0],
+            ImageSlice {
+                dest_x_px: 0,
+                dest_y_px: 0,
+                dest_width_px: 975,
+                dest_height_px: 600,
+                src_x_px: 0,
+                src_y_px: 0,
+                src_width_px: 975,
+                src_height_px: 600,
+            }
+        );
+        assert_eq!(
+            slices[1],
+            ImageSlice {
+                dest_x_px: 975,
+                dest_y_px: 0,
+                dest_width_px: 975,
+                dest_height_px: 600,
+                src_x_px: 0,
+                src_y_px: 600,
+                src_width_px: 975,
+                src_height_px: 600,
+            }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn browser_popup_image_slices_split_across_columns() {
+        let layout = browser_layout(1950, 600);
+        let popup = crate::macos::webview::WebPopupSurfaceRef {
+            x: 40,
+            y: 560,
+            width: 100,
+            height: 80,
+            surface: crate::macos::webview::WebSurfaceRef {
+                io_surface: std::ptr::null_mut(),
+                width: 100,
+                height: 80,
+                format: cef::ColorType::BGRA_8888,
+            },
+        };
+        let slices = browser_popup_image_slices(layout, 1.0, popup);
+
+        assert_eq!(slices.len(), 2);
+        assert_eq!(
+            slices[0],
+            ImageSlice {
+                dest_x_px: 40,
+                dest_y_px: 560,
+                dest_width_px: 100,
+                dest_height_px: 40,
+                src_x_px: 0,
+                src_y_px: 0,
+                src_width_px: 100,
+                src_height_px: 40,
+            }
+        );
+        assert_eq!(
+            slices[1],
+            ImageSlice {
+                dest_x_px: 1015,
+                dest_y_px: 0,
+                dest_width_px: 100,
+                dest_height_px: 40,
+                src_x_px: 0,
+                src_y_px: 40,
+                src_width_px: 100,
+                src_height_px: 40,
+            }
+        );
     }
 }

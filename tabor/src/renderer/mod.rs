@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,11 +25,15 @@ use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+pub mod images;
 pub mod platform;
 pub mod rects;
 mod shader;
 mod text;
 
+#[cfg(target_os = "macos")]
+use images::SurfaceSlot;
+use images::{ImageRenderer, ImageSlice};
 pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
@@ -89,6 +95,7 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    image_renderer: ImageRenderer,
     robustness: bool,
 }
 
@@ -150,15 +157,17 @@ impl Renderer {
             None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
-        let (text_renderer, rect_renderer) = if use_glsl3 {
+        let (text_renderer, rect_renderer, image_renderer) = if use_glsl3 {
             let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
-            (text_renderer, rect_renderer)
+            let image_renderer = ImageRenderer::new(context, ShaderVersion::Glsl3)?;
+            (text_renderer, rect_renderer, image_renderer)
         } else {
             let text_renderer =
                 TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Gles2)?;
-            (text_renderer, rect_renderer)
+            let image_renderer = ImageRenderer::new(context, ShaderVersion::Gles2)?;
+            (text_renderer, rect_renderer, image_renderer)
         };
 
         // Enable debug logging for OpenGL as well.
@@ -171,7 +180,7 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        Ok(Self { text_renderer, rect_renderer, image_renderer, robustness })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -283,6 +292,29 @@ impl Renderer {
             // Restore viewport with padding.
             self.set_viewport(size_info);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_web_surface_slices(
+        &mut self,
+        size_info: &SizeInfo,
+        slot: SurfaceSlot,
+        io_surface: *mut c_void,
+        surface_width_px: usize,
+        surface_height_px: usize,
+        format: cef::ColorType,
+        slices: &[ImageSlice],
+    ) {
+        self.image_renderer.draw_iosurface(
+            size_info,
+            slot,
+            io_surface,
+            surface_width_px,
+            surface_height_px,
+            format,
+            slices,
+        );
     }
 
     /// Fill the window with `color` and `alpha`.

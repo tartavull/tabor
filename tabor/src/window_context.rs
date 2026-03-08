@@ -33,7 +33,8 @@ use log::info;
 #[cfg(target_os = "macos")]
 use serde::Deserialize;
 use serde_json as json;
-use winit::event::{Event as WinitEvent, Ime, Modifiers, WindowEvent};
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 #[cfg(target_os = "macos")]
@@ -60,6 +61,7 @@ use crate::config::UiConfig;
 #[cfg(not(windows))]
 use crate::daemon::foreground_process_name;
 use crate::display::Display;
+use crate::display::browser_layout::{BrowserViewMode, BrowserViewportLayout};
 use crate::display::color::Rgb;
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
@@ -72,15 +74,19 @@ use crate::event::{
     Mouse, SearchState, TouchPurpose, request_web_cursor_update,
 };
 #[cfg(unix)]
+use crate::input::ActionContext as _;
+#[cfg(unix)]
 use crate::ipc;
 #[cfg(unix)]
 use crate::ipc::{
     AgentActResult, AgentAction, AgentElementDetail, AgentEvent, AgentObservation, AgentPdf,
-    AgentScreenshot, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
+    AgentScreenshot, IpcBrowserAccelerationInfo, IpcBrowserAccelerationState,
+    IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
     IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
     IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
-    IpcWebCloseMetrics, IpcWebViewMetrics, IpcWindowDebugButton, IpcWindowDebugRect,
-    IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection, TerminalKeyInput,
+    IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebViewMetrics, IpcWindowDebugButton,
+    IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
+    TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -96,7 +102,7 @@ use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
-use crate::macos::webview::WebView;
+use crate::macos::webview::{WebAccelerationState, WebView};
 #[cfg(target_os = "macos")]
 use crate::tab_panel::TabFavicon;
 #[cfg(target_os = "macos")]
@@ -117,6 +123,7 @@ struct TabState {
     inline_search_state: InlineSearchState,
     command_state: CommandState,
     terminal_view_mode: TerminalViewMode,
+    browser_view_mode: BrowserViewMode,
     mouse: Mouse,
     touch: TouchPurpose,
     cursor_blink_timed_out: bool,
@@ -140,6 +147,7 @@ struct TabState {
 #[cfg(target_os = "macos")]
 struct ClosedTab {
     kind: WindowKind,
+    browser_view_mode: BrowserViewMode,
 }
 
 #[cfg(target_os = "macos")]
@@ -169,6 +177,21 @@ struct AgentScreenshotMeta {
     scroll_x: Option<i64>,
     #[serde(default)]
     scroll_y: Option<i64>,
+}
+
+#[cfg(unix)]
+pub(crate) struct IpcEventContext<'a> {
+    pub event_loop: &'a ActiveEventLoop,
+    pub event_proxy: &'a EventLoopProxy<Event>,
+    pub clipboard: &'a mut Clipboard,
+    pub scheduler: &'a mut Scheduler,
+}
+
+#[cfg(unix)]
+pub(crate) struct WindowDebugMouseDrag {
+    pub start: PhysicalPosition<f64>,
+    pub end: PhysicalPosition<f64>,
+    pub steps: Option<usize>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1673,9 +1696,18 @@ impl WindowContext {
         }
 
         #[cfg(target_os = "macos")]
+        let browser_view_mode = BrowserViewMode::default();
+
+        #[cfg(target_os = "macos")]
         let web_view = match &window_kind {
             WindowKind::Web { url } => {
-                Some(WebView::new(&display.window, &size_info, tab_id, url, proxy)?)
+                let layout = Self::browser_viewport_for_kind(
+                    display,
+                    config,
+                    &window_kind,
+                    browser_view_mode,
+                );
+                Some(WebView::new(&display.window, &size_info, layout, tab_id, url, proxy)?)
             },
             WindowKind::Terminal => None,
         };
@@ -1704,6 +1736,10 @@ impl WindowContext {
             inline_search_state: Default::default(),
             command_state: Default::default(),
             terminal_view_mode: Default::default(),
+            #[cfg(target_os = "macos")]
+            browser_view_mode,
+            #[cfg(not(target_os = "macos"))]
+            browser_view_mode: Default::default(),
             mouse: Default::default(),
             touch: Default::default(),
             cursor_blink_timed_out: Default::default(),
@@ -1903,6 +1939,7 @@ impl WindowContext {
             let active_id = self.tabs.active_id();
 
             for tab in self.tabs.iter_mut() {
+                let layout = Self::browser_viewport_for_tab(&self.display, &self.config, tab);
                 let Some(web_view) = tab.web_view.as_mut() else {
                     continue;
                 };
@@ -1910,13 +1947,10 @@ impl WindowContext {
                 let visible = Some(tab.id) == active_id;
                 web_view.set_visible(visible);
                 web_view.set_focus(visible);
-                if visible {
-                    web_view.update_frame(&self.display.window, &self.display.size_info);
-                }
+                web_view.update_frame(&self.display.window, &self.display.size_info, layout);
             }
 
             if active_id.is_some() {
-                // Keep the winit content view as first responder after web->terminal handoff.
                 self.display.window.focus_content_view();
             }
         }
@@ -2113,6 +2147,7 @@ impl WindowContext {
         let Some(position) = tab.web_command_state.last_cursor_pos() else {
             return;
         };
+        let browser_view_mode = tab.browser_view_mode;
         let Some(web_view) = tab.web_view.as_mut() else {
             return;
         };
@@ -2121,6 +2156,8 @@ impl WindowContext {
             web_view,
             &mut tab.web_command_state,
             &self.display,
+            &self.config,
+            browser_view_mode,
             position,
             event_proxy,
             scheduler,
@@ -2322,7 +2359,10 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         if tab.kind.is_web() {
             closed_web = true;
-            self.closed_tabs.push(ClosedTab { kind: tab.kind.clone() });
+            self.closed_tabs.push(ClosedTab {
+                kind: tab.kind.clone(),
+                browser_view_mode: tab.browser_view_mode,
+            });
             const MAX_CLOSED_TABS: usize = 10;
             if self.closed_tabs.len() > MAX_CLOSED_TABS {
                 self.closed_tabs.remove(0);
@@ -2364,7 +2404,10 @@ impl WindowContext {
 
         let mut options = WindowOptions::default();
         options.window_kind = closed.kind;
-        let _ = self.create_tab(options, proxy)?;
+        let tab_id = self.create_tab(options, proxy)?;
+        if let Some(tab) = self.tabs.get_mut(tab_id) {
+            tab.browser_view_mode = closed.browser_view_mode;
+        }
         Ok(())
     }
 
@@ -2445,6 +2488,11 @@ impl WindowContext {
                                 &self.config,
                                 tab,
                             ),
+                            browser_layout: Self::ipc_browser_layout(
+                                &self.display,
+                                &self.config,
+                                tab,
+                            ),
                         })
                     })
                     .collect();
@@ -2471,6 +2519,7 @@ impl WindowContext {
             kind: IpcTabKind::from(&tab.kind),
             activity,
             terminal_layout: Self::ipc_terminal_layout(&self.display, &self.config, tab),
+            browser_layout: Self::ipc_browser_layout(&self.display, &self.config, tab),
         })
     }
 
@@ -2716,7 +2765,10 @@ impl WindowContext {
         }
 
         let parsed = ParsedOptions::from_options(&options);
+        let old_is_searching =
+            self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some());
         self.add_window_config(self.config.clone(), &parsed);
+        self.apply_ipc_display_update(old_is_searching);
         Ok(())
     }
 
@@ -2731,6 +2783,16 @@ impl WindowContext {
                     live: webview.live as u64,
                     created: webview.created,
                     dropped: webview.dropped,
+                    accelerated_frames: webview.accelerated_frames,
+                    frame_delivery_mode: match webview.frame_delivery_mode {
+                        crate::macos::webview::WebFrameDeliveryMode::CefInternal => {
+                            IpcWebFrameDeliveryMode::CefInternal
+                        },
+                    },
+                    external_begin_frames: webview.external_begin_frames,
+                    accelerated_startup_failures: webview.accelerated_startup_failures,
+                    unexpected_cpu_paints: webview.unexpected_cpu_paints,
+                    live_accelerated_surfaces: webview.live_accelerated_surfaces,
                 }),
                 web_close: Some(self.web_close_metrics.to_ipc()),
                 cef_pump: Some(IpcCefPumpMetrics {
@@ -2881,6 +2943,46 @@ impl WindowContext {
                 "Window standard buttons are only available on macOS",
             ))
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_mouse_drag(
+        &mut self,
+        drag: WindowDebugMouseDrag,
+        context: IpcEventContext<'_>,
+    ) -> Result<(), IpcError> {
+        let Some(tab_id) = self.tabs.active_id() else {
+            return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+        };
+        if !self.tabs.get(tab_id).is_some_and(|tab| tab.kind.is_web()) {
+            return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Active tab is not a web tab"));
+        }
+
+        let steps = drag.steps.unwrap_or(24).max(1);
+        self.with_action_context(
+            tab_id,
+            context.event_loop,
+            context.event_proxy,
+            context.clipboard,
+            context.scheduler,
+            move |ctx| {
+                let start = drag.start;
+                let end = drag.end;
+                ctx.web_mouse_move(start);
+                ctx.web_request_cursor_update(start);
+                ctx.web_mouse_input(ElementState::Pressed, MouseButton::Left);
+                for step in 1..=steps {
+                    let t = step as f64 / steps as f64;
+                    let point = PhysicalPosition::new(
+                        start.x + (end.x - start.x) * t,
+                        start.y + (end.y - start.y) * t,
+                    );
+                    ctx.web_mouse_move(point);
+                    ctx.web_request_cursor_update(point);
+                }
+                ctx.web_mouse_input(ElementState::Released, MouseButton::Left);
+            },
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -3839,6 +3941,8 @@ impl WindowContext {
             let expression = format!("window.__taborAgent.act({actions_json}, {observe})");
             let script = agent_object_script(&mut tab.agent_runtime, &expression);
             let stream = Arc::clone(&stream);
+            web_view.set_visible(true);
+            web_view.set_focus(true);
             web_view.eval_js_string_with_user_gesture(&script, move |result| {
                 let reply = match result {
                     Some(raw) => match json::from_str::<AgentActResult>(&raw) {
@@ -3900,6 +4004,8 @@ impl WindowContext {
                 tab_id: active_tab.id,
                 tab_kind: &mut active_tab.kind,
                 terminal_view_mode: &mut active_tab.terminal_view_mode,
+                #[cfg(target_os = "macos")]
+                browser_view_mode: &mut active_tab.browser_view_mode,
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
@@ -3996,6 +4102,29 @@ impl WindowContext {
         Self::terminal_viewport_for_kind(display, config, &tab.kind, tab.terminal_view_mode)
     }
 
+    fn browser_viewport_for_kind(
+        display: &Display,
+        config: &UiConfig,
+        kind: &WindowKind,
+        browser_view_mode: BrowserViewMode,
+    ) -> BrowserViewportLayout {
+        let size_info = display.size_info_for_status_lines(usize::from(kind.is_web()));
+        BrowserViewportLayout::new(
+            &size_info,
+            display.window.scale_factor,
+            browser_view_mode,
+            &config.browser.multi_column,
+        )
+    }
+
+    fn browser_viewport_for_tab(
+        display: &Display,
+        config: &UiConfig,
+        tab: &TabState,
+    ) -> BrowserViewportLayout {
+        Self::browser_viewport_for_kind(display, config, &tab.kind, tab.browser_view_mode)
+    }
+
     #[cfg(unix)]
     fn ipc_terminal_layout(
         display: &Display,
@@ -4011,6 +4140,53 @@ impl WindowContext {
             mode: tab.terminal_view_mode,
             target_columns: layout.target_columns(),
             strip_count: layout.strip_count(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn ipc_browser_layout(
+        display: &Display,
+        config: &UiConfig,
+        tab: &TabState,
+    ) -> Option<IpcBrowserLayoutState> {
+        if !tab.kind.is_web() {
+            return None;
+        }
+
+        let layout = Self::browser_viewport_for_tab(display, config, tab);
+        let columns = (0..layout.column_count())
+            .filter_map(|column_index| layout.column_rect(column_index))
+            .collect();
+        let acceleration = tab
+            .web_view
+            .as_ref()
+            .map(|web_view| web_view.acceleration_info())
+            .expect("web tabs should have a WebView");
+
+        Some(IpcBrowserLayoutState {
+            mode: layout.mode(),
+            target_width_px: layout.target_width_px(),
+            logical_width: layout.logical_width(),
+            logical_height: layout.logical_height(),
+            column_count: layout.column_count(),
+            viewport: layout.viewport(),
+            columns,
+            acceleration: IpcBrowserAccelerationInfo {
+                state: match acceleration.state {
+                    WebAccelerationState::Pending => IpcBrowserAccelerationState::Pending,
+                    WebAccelerationState::Ready => IpcBrowserAccelerationState::Ready,
+                    WebAccelerationState::Failed => IpcBrowserAccelerationState::Failed,
+                },
+                frame_delivery_mode: match acceleration.frame_delivery_mode {
+                    crate::macos::webview::WebFrameDeliveryMode::CefInternal => {
+                        IpcWebFrameDeliveryMode::CefInternal
+                    },
+                },
+                main_surface_width: acceleration.main_surface_width,
+                main_surface_height: acceleration.main_surface_height,
+                popup_surface_width: acceleration.popup_surface_width,
+                popup_surface_height: acceleration.popup_surface_height,
+            },
         })
     }
 
@@ -4156,6 +4332,10 @@ impl WindowContext {
             self.display.pending_update.dirty = true;
         }
 
+        if old_config.browser != self.config.browser {
+            self.display.pending_update.dirty = true;
+        }
+
         // Update title on config reload according to the following table.
         //
         // │cli │ dynamic_title │ current_title == old_config ││ set_title │
@@ -4261,6 +4441,8 @@ impl WindowContext {
                     WindowKind::Web { url } => url.as_str(),
                     WindowKind::Terminal => "",
                 };
+                let browser_layout =
+                    Self::browser_viewport_for_tab(&self.display, &self.config, tab);
                 self.display.draw_web(
                     scheduler,
                     &self.message_buffer,
@@ -4268,7 +4450,11 @@ impl WindowContext {
                     url,
                     &tab.command_state,
                     #[cfg(target_os = "macos")]
-                    highlight_notch_ears,
+                    crate::display::MacOsWebDraw::new(
+                        tab.web_view.as_ref(),
+                        browser_layout,
+                        highlight_notch_ears,
+                    ),
                 );
             },
             DrawMode::Terminal => {
@@ -4369,6 +4555,19 @@ impl WindowContext {
                         self.handle_web_cursor_request(tab_id, event_proxy, scheduler);
                         continue;
                     },
+                    #[cfg(target_os = "macos")]
+                    EventType::WebViewDirty => {
+                        let Some(tab_id) = event.tab_id() else {
+                            continue;
+                        };
+                        if Some(tab_id) == active_id {
+                            self.dirty = true;
+                            if self.display.window.has_frame {
+                                self.display.window.request_redraw();
+                            }
+                        }
+                        continue;
+                    },
                     EventType::Terminal(term_event) => {
                         let Some(tab_id) = event.tab_id() else {
                             continue;
@@ -4431,6 +4630,8 @@ impl WindowContext {
                 tab_id: active_tab.id,
                 tab_kind: &mut active_tab.kind,
                 terminal_view_mode: &mut active_tab.terminal_view_mode,
+                #[cfg(target_os = "macos")]
+                browser_view_mode: &mut active_tab.browser_view_mode,
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
@@ -4854,8 +5055,9 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         for tab in tabs.iter_mut() {
+            let layout = Self::browser_viewport_for_tab(display, config, tab);
             if let Some(web_view) = tab.web_view.as_mut() {
-                web_view.update_frame(&display.window, &display.size_info);
+                web_view.update_frame(&display.window, &display.size_info, layout);
             }
         }
 

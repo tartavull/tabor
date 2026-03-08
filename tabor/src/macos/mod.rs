@@ -40,10 +40,16 @@ pub mod webview;
 mod webview_cef;
 
 pub(crate) use open_documents::register_open_documents_handler;
+use webview::WebFrameDeliveryMode;
 
 static WEBVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WEBVIEW_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WEBVIEW_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WEBVIEW_ACCELERATED_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WEBVIEW_EXTERNAL_BEGIN_FRAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WEBVIEW_ACCELERATED_STARTUP_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WEBVIEW_UNEXPECTED_CPU_PAINTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WEBVIEW_LIVE_ACCELERATED_SURFACES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "passkey-webauthn")]
 static PASSKEY_AUTH_REQUESTED: AtomicBool = AtomicBool::new(false);
 thread_local! {
@@ -58,6 +64,12 @@ pub(crate) struct WebViewMetrics {
     pub live: usize,
     pub created: u64,
     pub dropped: u64,
+    pub accelerated_frames: u64,
+    pub frame_delivery_mode: WebFrameDeliveryMode,
+    pub external_begin_frames: u64,
+    pub accelerated_startup_failures: u64,
+    pub unexpected_cpu_paints: u64,
+    pub live_accelerated_surfaces: u64,
 }
 
 pub(crate) fn webview_metrics() -> WebViewMetrics {
@@ -65,6 +77,13 @@ pub(crate) fn webview_metrics() -> WebViewMetrics {
         live: WEBVIEW_COUNT.load(Ordering::SeqCst),
         created: WEBVIEW_CREATED_TOTAL.load(Ordering::SeqCst),
         dropped: WEBVIEW_DROPPED_TOTAL.load(Ordering::SeqCst),
+        accelerated_frames: WEBVIEW_ACCELERATED_FRAMES_TOTAL.load(Ordering::SeqCst),
+        frame_delivery_mode: WebFrameDeliveryMode::CefInternal,
+        external_begin_frames: WEBVIEW_EXTERNAL_BEGIN_FRAMES_TOTAL.load(Ordering::SeqCst),
+        accelerated_startup_failures: WEBVIEW_ACCELERATED_STARTUP_FAILURES_TOTAL
+            .load(Ordering::SeqCst),
+        unexpected_cpu_paints: WEBVIEW_UNEXPECTED_CPU_PAINTS_TOTAL.load(Ordering::SeqCst),
+        live_accelerated_surfaces: WEBVIEW_LIVE_ACCELERATED_SURFACES.load(Ordering::SeqCst),
     }
 }
 
@@ -288,6 +307,28 @@ pub(crate) fn unregister_webview() {
     if prev == 1 {
         set_autofill_override(false);
     }
+}
+
+pub(crate) fn record_accelerated_frame() {
+    WEBVIEW_ACCELERATED_FRAMES_TOTAL.fetch_add(1, Ordering::SeqCst);
+}
+
+pub(crate) fn record_accelerated_startup_failure() {
+    WEBVIEW_ACCELERATED_STARTUP_FAILURES_TOTAL.fetch_add(1, Ordering::SeqCst);
+}
+
+pub(crate) fn record_unexpected_cpu_paint() {
+    WEBVIEW_UNEXPECTED_CPU_PAINTS_TOTAL.fetch_add(1, Ordering::SeqCst);
+}
+
+pub(crate) fn register_accelerated_surface() {
+    WEBVIEW_LIVE_ACCELERATED_SURFACES.fetch_add(1, Ordering::SeqCst);
+}
+
+pub(crate) fn unregister_accelerated_surface() {
+    WEBVIEW_LIVE_ACCELERATED_SURFACES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1))
+        .expect("WebView accelerated surface counter underflow");
 }
 
 fn set_autofill_override(enabled: bool) {

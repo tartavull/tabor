@@ -615,6 +615,159 @@ fn web_popup_smoke() {
 }
 
 #[test]
+fn accelerated_web_multi_column_stays_gpu_backed_after_resize_and_scroll() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    harness.run_ok(["msg", "config", "browser.multi_column.target_width_px=150"]);
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    let ready_layout =
+        wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+            layout.get("acceleration").and_then(|value| value.get("state")).and_then(Value::as_str)
+                == Some("ready")
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("frame_delivery_mode"))
+                    .and_then(Value::as_str)
+                    == Some("cef_internal")
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("main_surface_width"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("main_surface_height"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    > 0
+        })
+        .unwrap_or_else(|| panic!("timed out waiting for accelerated browser layout"));
+    assert_eq!(ready_layout.get("mode").and_then(Value::as_str), Some("normal"));
+
+    let baseline = runtime_metrics(&harness);
+    let baseline_accelerated_frames = webview_metric(&baseline, "accelerated_frames");
+    let baseline_external_begin_frames = webview_metric(&baseline, "external_begin_frames");
+    let baseline_unexpected_cpu_paints = webview_metric(&baseline, "unexpected_cpu_paints");
+    assert_eq!(
+        webview_frame_delivery_mode(&baseline),
+        "cef_internal",
+        "unexpected webview frame delivery mode: {baseline}"
+    );
+    assert_eq!(
+        baseline_external_begin_frames, 0,
+        "external begin frames should be unused in cef_internal mode: {baseline}"
+    );
+
+    let toggle_reply =
+        harness.run_json(["msg", "dispatch-action", "--action", "ToggleMultiColumnTerminal"]);
+    assert_eq!(toggle_reply.get("type").and_then(Value::as_str), Some("ok"));
+    let _ = harness.run_ok(["msg", "set-tab-panel", "--width", "480"]);
+
+    let multi_column_layout =
+        wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+            layout.get("mode").and_then(Value::as_str) == Some("multi_column")
+                && layout.get("column_count").and_then(Value::as_u64).unwrap_or(0) >= 2
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("state"))
+                    .and_then(Value::as_str)
+                    == Some("ready")
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("frame_delivery_mode"))
+                    .and_then(Value::as_str)
+                    == Some("cef_internal")
+        })
+        .unwrap_or_else(|| panic!("timed out waiting for multi-column accelerated browser layout"));
+    assert!(
+        multi_column_layout.get("column_count").and_then(Value::as_u64).unwrap_or(0) >= 2,
+        "expected at least two browser columns after toggle: {multi_column_layout}"
+    );
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+    wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+        .unwrap_or_else(|| panic!("timed out waiting for browser observation before scroll"));
+
+    let scroll = json!([{ "type": "scroll", "dy": 960 }]).to_string();
+    let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
+    assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut settled_metrics = None;
+    while Instant::now() < deadline {
+        let metrics = runtime_metrics(&harness);
+        let accelerated_frames = webview_metric(&metrics, "accelerated_frames");
+        let external_begin_frames = webview_metric(&metrics, "external_begin_frames");
+        let unexpected_cpu_paints = webview_metric(&metrics, "unexpected_cpu_paints");
+        let live_accelerated_surfaces = webview_metric(&metrics, "live_accelerated_surfaces");
+
+        if accelerated_frames > baseline_accelerated_frames
+            && external_begin_frames == baseline_external_begin_frames
+            && unexpected_cpu_paints == baseline_unexpected_cpu_paints
+            && live_accelerated_surfaces >= 1
+            && webview_frame_delivery_mode(&metrics) == "cef_internal"
+        {
+            settled_metrics = Some(metrics);
+            break;
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    let final_metrics = settled_metrics.unwrap_or_else(|| {
+        let metrics = runtime_metrics(&harness);
+        panic!("accelerated browser metrics did not advance after resize+scroll: {metrics}");
+    });
+    assert_eq!(
+        webview_metric(&final_metrics, "unexpected_cpu_paints"),
+        baseline_unexpected_cpu_paints,
+        "unexpected CPU paint callbacks were observed: {final_metrics}"
+    );
+    assert_eq!(
+        webview_metric(&final_metrics, "external_begin_frames"),
+        baseline_external_begin_frames,
+        "external begin frames advanced unexpectedly: {final_metrics}"
+    );
+    assert_eq!(
+        webview_frame_delivery_mode(&final_metrics),
+        "cef_internal",
+        "unexpected final webview frame delivery mode: {final_metrics}"
+    );
+
+    let final_layout =
+        wait_for_active_browser_layout_where(&harness, Duration::from_secs(4), |layout| {
+            layout.get("mode").and_then(Value::as_str) == Some("multi_column")
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("state"))
+                    .and_then(Value::as_str)
+                    == Some("ready")
+        })
+        .unwrap_or_else(|| panic!("timed out waiting for final accelerated multi-column layout"));
+    assert!(
+        final_layout
+            .get("acceleration")
+            .and_then(|value| value.get("main_surface_width"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+            && final_layout
+                .get("acceleration")
+                .and_then(|value| value.get("main_surface_height"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0,
+        "accelerated surface dimensions disappeared after resize+scroll: {final_layout}"
+    );
+}
+
+#[test]
 fn agent_wait_smoke() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
@@ -1738,6 +1891,31 @@ fn active_tab(response: &Value) -> Option<&Value> {
         .find(|tab| tab.get("is_active").and_then(Value::as_bool) == Some(true))
 }
 
+fn wait_for_active_browser_layout_where<F>(
+    harness: &TaborHarness,
+    timeout: Duration,
+    predicate: F,
+) -> Option<Value>
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        if let Some(layout) = active_tab(&tabs)
+            .filter(|tab| tab_kind_is(tab, "web"))
+            .and_then(|tab| tab.get("browser_layout"))
+            .filter(|layout| predicate(layout))
+        {
+            return Some(layout.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
 fn ensure_active_web_tab(harness: &TaborHarness, max_switches: usize) {
     for _ in 0..max_switches {
         let tabs = harness.run_json(["msg", "list-tabs"]);
@@ -1824,6 +2002,24 @@ fn webview_counts(metrics_response: &Value) -> (u64, u64, u64) {
         .unwrap_or_else(|| panic!("missing webview.dropped: {metrics_response}"));
 
     (live, created, dropped)
+}
+
+fn webview_metric(metrics_response: &Value, key: &str) -> u64 {
+    metrics_response
+        .get("metrics")
+        .and_then(|metrics| metrics.get("webview"))
+        .and_then(|webview| webview.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing webview.{key}: {metrics_response}"))
+}
+
+fn webview_frame_delivery_mode(metrics_response: &Value) -> &str {
+    metrics_response
+        .get("metrics")
+        .and_then(|metrics| metrics.get("webview"))
+        .and_then(|webview| webview.get("frame_delivery_mode"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing webview.frame_delivery_mode: {metrics_response}"))
 }
 
 fn web_close_count(metrics_response: &Value) -> u64 {

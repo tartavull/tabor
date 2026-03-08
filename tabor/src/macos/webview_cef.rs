@@ -1,21 +1,25 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::fmt::Write;
 use std::fs;
 use std::mem;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc as StdRc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cef::{
     CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler,
     ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
     ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplDownloadHandler,
     ImplDownloadItem, ImplFrame, ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler,
-    ImplPermissionPromptCallback, ImplTask, PermissionHandler, PermissionRequestResult, Task,
-    WrapClient, WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler,
-    WrapPermissionHandler, WrapTask, rc::Rc,
+    ImplPermissionPromptCallback, ImplRenderHandler, ImplTask, PermissionHandler,
+    PermissionRequestResult, RenderHandler, Task, WrapClient, WrapDevToolsMessageObserver,
+    WrapDisplayHandler, WrapDownloadHandler, WrapPermissionHandler, WrapRenderHandler, WrapTask,
+    rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
@@ -25,18 +29,23 @@ use objc2::{MainThreadMarker, msg_send, sel};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, MouseButton};
+use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::raw_window_handle::RawWindowHandle;
+use winit::window::WindowId;
 
+use super::keycodes::macos_scancode_from_physical_key;
+use super::webview::{
+    WebAccelerationInfo, WebAccelerationState, WebFrameDeliveryMode, WebPopupSurfaceRef,
+    WebSurfaceRef,
+};
 use crate::display::SizeInfo;
+use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::window::Window;
 use crate::event::Event;
 use crate::ipc::{AgentDownload, WebNetworkEntry};
 use crate::tabs::TabId;
-use tabor_terminal::grid::Dimensions;
-
-use super::keycodes::macos_scancode_from_physical_key;
 #[cfg(target_pointer_width = "32")]
 type CGFloat = f32;
 #[cfg(target_pointer_width = "64")]
@@ -97,6 +106,152 @@ struct AutomationState {
     downloads: HashMap<u32, AgentDownload>,
     download_order: Vec<u32>,
     download_dir: PathBuf,
+}
+
+const ACCELERATED_BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+const ACCELERATED_BROWSER_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRetain(cf: *const c_void) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+}
+
+#[derive(Debug)]
+struct AcceleratedSurface {
+    io_surface: NonNull<c_void>,
+    width: usize,
+    height: usize,
+    format: cef::ColorType,
+}
+
+impl AcceleratedSurface {
+    fn from_info(info: &cef::AcceleratedPaintInfo) -> Result<Self, String> {
+        let width = info.extra.coded_size.width.max(0) as usize;
+        let height = info.extra.coded_size.height.max(0) as usize;
+        let Some(io_surface) = NonNull::new(info.shared_texture_io_surface) else {
+            return Err(String::from("Accelerated paint returned a null IOSurface"));
+        };
+
+        if width == 0 || height == 0 {
+            return Err(String::from("Accelerated paint returned an empty IOSurface"));
+        }
+
+        if info.format != cef::ColorType::BGRA_8888 && info.format != cef::ColorType::RGBA_8888 {
+            return Err(format!("Unsupported accelerated color format: {:?}", info.format));
+        }
+
+        unsafe {
+            CFRetain(io_surface.as_ptr().cast());
+        }
+        super::register_accelerated_surface();
+
+        Ok(Self { io_surface, width, height, format: info.format })
+    }
+
+    fn as_public_ref(&self) -> WebSurfaceRef {
+        WebSurfaceRef {
+            io_surface: self.io_surface.as_ptr(),
+            width: self.width,
+            height: self.height,
+            format: self.format,
+        }
+    }
+}
+
+impl Drop for AcceleratedSurface {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.io_surface.as_ptr().cast());
+        }
+        super::unregister_accelerated_surface();
+    }
+}
+
+#[derive(Debug, Default)]
+struct PopupSurfaceState {
+    rect: cef::Rect,
+    surface: Option<AcceleratedSurface>,
+}
+
+#[derive(Debug)]
+struct PaintState {
+    layout: BrowserViewportLayout,
+    screen_rect: cef::Rect,
+    scale_factor: f32,
+    acceleration_state: WebAccelerationState,
+    main: Option<AcceleratedSurface>,
+    popup: PopupSurfaceState,
+    failure_reason: Option<String>,
+}
+
+impl PaintState {
+    fn new(layout: BrowserViewportLayout, screen_rect: cef::Rect, scale_factor: f64) -> Self {
+        Self {
+            layout,
+            screen_rect,
+            scale_factor: browser_device_scale_factor(scale_factor),
+            acceleration_state: WebAccelerationState::Pending,
+            main: None,
+            popup: PopupSurfaceState::default(),
+            failure_reason: None,
+        }
+    }
+
+    fn update_geometry(
+        &mut self,
+        layout: BrowserViewportLayout,
+        screen_rect: cef::Rect,
+        scale_factor: f64,
+    ) {
+        self.layout = layout;
+        self.screen_rect = screen_rect;
+        self.scale_factor = browser_device_scale_factor(scale_factor);
+    }
+
+    fn set_main_surface(&mut self, surface: AcceleratedSurface) {
+        self.main = Some(surface);
+        self.acceleration_state = WebAccelerationState::Ready;
+        self.failure_reason = None;
+    }
+
+    fn set_popup_surface(&mut self, surface: AcceleratedSurface) {
+        self.popup.surface = Some(surface);
+    }
+
+    fn clear_popup_surface(&mut self) {
+        self.popup.surface = None;
+    }
+
+    fn fail(&mut self, reason: impl Into<String>) {
+        self.acceleration_state = WebAccelerationState::Failed;
+        self.failure_reason = Some(reason.into());
+        self.main = None;
+        self.popup.surface = None;
+    }
+
+    fn startup_status(&self) -> (WebAccelerationState, Option<String>) {
+        (self.acceleration_state, self.failure_reason.clone())
+    }
+
+    fn acceleration_info(&self) -> WebAccelerationInfo {
+        WebAccelerationInfo {
+            state: self.acceleration_state,
+            frame_delivery_mode: WebFrameDeliveryMode::CefInternal,
+            main_surface_width: self.main.as_ref().map(|surface| surface.width),
+            main_surface_height: self.main.as_ref().map(|surface| surface.height),
+            popup_surface_width: self.popup.surface.as_ref().map(|surface| surface.width),
+            popup_surface_height: self.popup.surface.as_ref().map(|surface| surface.height),
+        }
+    }
+}
+
+fn browser_device_scale_factor(scale_factor: f64) -> f32 {
+    scale_factor.max(f32::MIN_POSITIVE as f64) as f32
+}
+
+fn scaled_browser_wheel_delta_y(layout: BrowserViewportLayout, delta_y: f64) -> f64 {
+    delta_y * layout.column_count().max(1) as f64
 }
 
 impl AutomationState {
@@ -398,6 +553,163 @@ cef::wrap_display_handler! {
     }
 }
 
+cef::wrap_render_handler! {
+    struct TaborRenderHandler {
+        paint_state: StdRc<RefCell<PaintState>>,
+        event_proxy: EventLoopProxy<Event>,
+        window_id: WindowId,
+        tab_id: TabId,
+    }
+
+    impl RenderHandler {
+        fn root_screen_rect(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            rect: Option<&mut cef::Rect>,
+        ) -> ::std::os::raw::c_int {
+            let Some(rect) = rect else {
+                return 0;
+            };
+
+            *rect = self.paint_state.borrow().screen_rect.clone();
+            1
+        }
+
+        fn view_rect(&self, _browser: Option<&mut cef::Browser>, rect: Option<&mut cef::Rect>) {
+            let Some(rect) = rect else {
+                return;
+            };
+
+            let paint_state = self.paint_state.borrow();
+            *rect = cef::Rect {
+                x: 0,
+                y: 0,
+                width: paint_state.layout.logical_width() as i32,
+                height: paint_state.layout.logical_height() as i32,
+            };
+        }
+
+        fn screen_point(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            view_x: ::std::os::raw::c_int,
+            view_y: ::std::os::raw::c_int,
+            screen_x: Option<&mut ::std::os::raw::c_int>,
+            screen_y: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let paint_state = self.paint_state.borrow();
+            if let Some(screen_x) = screen_x {
+                *screen_x = paint_state.screen_rect.x + view_x;
+            }
+            if let Some(screen_y) = screen_y {
+                *screen_y = paint_state.screen_rect.y + view_y;
+            }
+            1
+        }
+
+        fn screen_info(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            screen_info: Option<&mut cef::ScreenInfo>,
+        ) -> ::std::os::raw::c_int {
+            let Some(screen_info) = screen_info else {
+                return 0;
+            };
+
+            let paint_state = self.paint_state.borrow();
+            screen_info.device_scale_factor = paint_state.scale_factor;
+            screen_info.depth = 32;
+            screen_info.depth_per_component = 8;
+            screen_info.is_monochrome = 0;
+            screen_info.rect = paint_state.screen_rect.clone();
+            screen_info.available_rect = paint_state.screen_rect.clone();
+            1
+        }
+
+        fn on_popup_show(&self, _browser: Option<&mut cef::Browser>, show: ::std::os::raw::c_int) {
+            if show == 0 {
+                self.paint_state.borrow_mut().clear_popup_surface();
+                let event =
+                    Event::for_tab(crate::event::EventType::WebViewDirty, self.window_id, self.tab_id);
+                let _ = self.event_proxy.send_event(event);
+            }
+        }
+
+        fn on_popup_size(&self, _browser: Option<&mut cef::Browser>, rect: Option<&cef::Rect>) {
+            let Some(rect) = rect else {
+                return;
+            };
+
+            self.paint_state.borrow_mut().popup.rect = rect.clone();
+        }
+
+        fn on_paint(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            type_: cef::PaintElementType,
+            _dirty_rects: Option<&[cef::Rect]>,
+            _buffer: *const u8,
+            _width: ::std::os::raw::c_int,
+            _height: ::std::os::raw::c_int,
+        ) {
+            super::record_unexpected_cpu_paint();
+            if type_ != cef::PaintElementType::VIEW {
+                return;
+            }
+
+            let mut paint_state = self.paint_state.borrow_mut();
+            if paint_state.acceleration_state == WebAccelerationState::Pending {
+                paint_state.fail(
+                    "Received CPU paint callback before accelerated rendering became ready",
+                );
+            }
+        }
+
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            type_: cef::PaintElementType,
+            _dirty_rects: Option<&[cef::Rect]>,
+            info: Option<&cef::AcceleratedPaintInfo>,
+        ) {
+            let Some(info) = info else {
+                if type_ == cef::PaintElementType::VIEW {
+                    let mut paint_state = self.paint_state.borrow_mut();
+                    if paint_state.acceleration_state == WebAccelerationState::Pending {
+                        paint_state.fail("Accelerated paint callback was missing IOSurface info");
+                    }
+                }
+                return;
+            };
+
+            let surface = match AcceleratedSurface::from_info(info) {
+                Ok(surface) => surface,
+                Err(err) => {
+                    let mut paint_state = self.paint_state.borrow_mut();
+                    if type_ == cef::PaintElementType::VIEW {
+                        paint_state.fail(err);
+                    } else if type_ == cef::PaintElementType::POPUP {
+                        paint_state.clear_popup_surface();
+                    }
+                    return;
+                },
+            };
+
+            let mut paint_state = self.paint_state.borrow_mut();
+            match type_ {
+                t if t == cef::PaintElementType::VIEW => paint_state.set_main_surface(surface),
+                t if t == cef::PaintElementType::POPUP => paint_state.set_popup_surface(surface),
+                _ => return,
+            }
+            super::record_accelerated_frame();
+
+            let event =
+                Event::for_tab(crate::event::EventType::WebViewDirty, self.window_id, self.tab_id);
+            let _ = self.event_proxy.send_event(event);
+        }
+    }
+}
+
 cef::wrap_download_handler! {
     struct TaborDownloadHandler {
         automation_state: StdRc<RefCell<AutomationState>>,
@@ -643,6 +955,7 @@ cef::wrap_permission_handler! {
 cef::wrap_client! {
     struct TaborClient {
         display_handler: cef::DisplayHandler,
+        render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
         permission_handler: cef::PermissionHandler,
     }
@@ -650,6 +963,10 @@ cef::wrap_client! {
     impl Client {
         fn display_handler(&self) -> Option<cef::DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+
+        fn render_handler(&self) -> Option<cef::RenderHandler> {
+            Some(self.render_handler.clone())
         }
 
         fn download_handler(&self) -> Option<cef::DownloadHandler> {
@@ -666,12 +983,17 @@ cef::wrap_client! {
 cef::wrap_client! {
     struct TaborClient {
         display_handler: cef::DisplayHandler,
+        render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
     }
 
     impl Client {
         fn display_handler(&self) -> Option<cef::DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+
+        fn render_handler(&self) -> Option<cef::RenderHandler> {
+            Some(self.render_handler.clone())
         }
 
         fn download_handler(&self) -> Option<cef::DownloadHandler> {
@@ -744,8 +1066,11 @@ pub struct WebView {
     last_title: Option<String>,
     last_url: Option<String>,
     title_state: StdRc<RefCell<Option<String>>>,
+    paint_state: StdRc<RefCell<PaintState>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
     automation_state: StdRc<RefCell<AutomationState>>,
+    last_mouse_event: Option<cef::MouseEvent>,
+    mouse_button_flags: u32,
     _devtools_observer: cef::DevToolsMessageObserver,
     _devtools_registration: Option<cef::Registration>,
     _client: cef::Client,
@@ -755,6 +1080,7 @@ fn browser_settings() -> cef::BrowserSettings {
     cef::BrowserSettings {
         javascript_access_clipboard: cef::State::ENABLED,
         javascript_dom_paste: cef::State::ENABLED,
+        windowless_frame_rate: 60,
         ..cef::BrowserSettings::default()
     }
 }
@@ -762,10 +1088,11 @@ fn browser_settings() -> cef::BrowserSettings {
 impl WebView {
     pub fn new(
         window: &Window,
-        size_info: &SizeInfo,
-        _tab_id: TabId,
+        _size_info: &SizeInfo,
+        layout: BrowserViewportLayout,
+        tab_id: TabId,
         url: &str,
-        _proxy: &winit::event_loop::EventLoopProxy<Event>,
+        proxy: &EventLoopProxy<Event>,
     ) -> Result<Self, Box<dyn Error>> {
         let _mtm = MainThreadMarker::new()
             .ok_or_else(|| std::io::Error::other("WebView must be created on main thread"))?;
@@ -775,9 +1102,13 @@ impl WebView {
 
         let result = (|| {
             let parent = ns_view(window)?;
-            let frame = webview_frame(window, size_info);
-            let bounds = cef_rect(window, size_info);
-            let window_info = cef::WindowInfo::default().set_as_child(parent.cast(), &bounds);
+            let screen_rect = cef_screen_rect(window, layout);
+            let paint_state =
+                StdRc::new(RefCell::new(PaintState::new(layout, screen_rect, window.scale_factor)));
+            let render_handler =
+                TaborRenderHandler::new(paint_state.clone(), proxy.clone(), window.id(), tab_id);
+            let mut window_info = cef::WindowInfo::default().set_as_windowless(parent.cast());
+            window_info.shared_texture_enabled = 1;
 
             let title_state = StdRc::new(RefCell::new(None));
             let automation_state = StdRc::new(RefCell::new(AutomationState::new()));
@@ -786,10 +1117,15 @@ impl WebView {
             #[cfg(not(feature = "passkey-webauthn"))]
             let mut client = {
                 let permission_handler = TaborPermissionHandler::new();
-                TaborClient::new(display_handler, download_handler, permission_handler)
+                TaborClient::new(
+                    display_handler,
+                    render_handler,
+                    download_handler,
+                    permission_handler,
+                )
             };
             #[cfg(feature = "passkey-webauthn")]
-            let mut client = TaborClient::new(display_handler, download_handler);
+            let mut client = TaborClient::new(display_handler, render_handler, download_handler);
 
             let browser_settings = browser_settings();
             let initial_url = if url.is_empty() { "about:blank" } else { url };
@@ -804,14 +1140,14 @@ impl WebView {
             .ok_or_else(|| std::io::Error::other("Failed to create CEF browser"))?;
 
             if let Some(view) = browser_view(&browser) {
-                unsafe {
-                    let _: () = msg_send![view, setFrame: frame];
-                    disable_cef_view_first_responder(view);
-                    let _: () = msg_send![parent, addSubview: view];
-                }
+                disable_cef_view_first_responder(view);
             }
             if let Some(host) = browser.host() {
+                host.set_windowless_frame_rate(60);
+                host.notify_screen_info_changed();
                 host.was_resized();
+                host.invalidate(cef::PaintElementType::VIEW);
+                host.invalidate(cef::PaintElementType::POPUP);
             }
 
             let devtools_state = StdRc::new(RefCell::new(DevToolsState::new()));
@@ -825,14 +1161,18 @@ impl WebView {
                 last_title: None,
                 last_url: None,
                 title_state,
+                paint_state,
                 devtools_state,
                 automation_state,
+                last_mouse_event: None,
+                mouse_button_flags: 0,
                 _devtools_observer: observer,
                 _devtools_registration: registration,
                 _client: client,
             };
 
             web_view.enable_devtools_domains();
+            web_view.wait_for_accelerated_surface()?;
 
             Ok(web_view)
         })();
@@ -845,13 +1185,12 @@ impl WebView {
     }
 
     pub fn set_visible(&mut self, visible: bool) {
-        if let Some(view) = browser_view(&self.browser) {
-            unsafe {
-                let _: () = msg_send![view, setHidden: !visible];
-            }
-        }
         if let Some(host) = self.browser.host() {
             host.was_hidden(if visible { 0 } else { 1 });
+            if visible {
+                host.invalidate(cef::PaintElementType::VIEW);
+                host.invalidate(cef::PaintElementType::POPUP);
+            }
         }
     }
 
@@ -861,15 +1200,57 @@ impl WebView {
         }
     }
 
-    pub fn update_frame(&mut self, window: &Window, size_info: &SizeInfo) {
-        if let Some(view) = browser_view(&self.browser) {
-            let frame = webview_frame(window, size_info);
-            unsafe {
-                let _: () = msg_send![view, setFrame: frame];
-            }
+    pub fn update_frame(
+        &mut self,
+        window: &Window,
+        _size_info: &SizeInfo,
+        layout: BrowserViewportLayout,
+    ) {
+        {
+            let screen_rect = cef_screen_rect(window, layout);
+            let mut paint_state = self.paint_state.borrow_mut();
+            paint_state.update_geometry(layout, screen_rect, window.scale_factor);
         }
         if let Some(host) = self.browser.host() {
+            host.notify_screen_info_changed();
             host.was_resized();
+            host.invalidate(cef::PaintElementType::VIEW);
+            host.invalidate(cef::PaintElementType::POPUP);
+        }
+    }
+
+    pub fn acceleration_info(&self) -> WebAccelerationInfo {
+        self.paint_state.borrow().acceleration_info()
+    }
+
+    fn wait_for_accelerated_surface(&self) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + ACCELERATED_BROWSER_STARTUP_TIMEOUT;
+
+        loop {
+            let (state, failure_reason) = self.paint_state.borrow().startup_status();
+            match state {
+                WebAccelerationState::Ready => return Ok(()),
+                WebAccelerationState::Failed => {
+                    super::record_accelerated_startup_failure();
+                    return Err(std::io::Error::other(
+                        failure_reason
+                            .unwrap_or_else(|| String::from("Accelerated browser startup failed")),
+                    )
+                    .into());
+                },
+                WebAccelerationState::Pending => (),
+            }
+
+            if Instant::now() >= deadline {
+                super::record_accelerated_startup_failure();
+                return Err(std::io::Error::other(
+                    "Timed out waiting for accelerated browser surface",
+                )
+                .into());
+            }
+
+            crate::macos::cef::do_message_loop_work();
+            thread::sleep(ACCELERATED_BROWSER_STARTUP_POLL_INTERVAL);
         }
     }
 
@@ -899,30 +1280,20 @@ impl WebView {
     pub fn handle_mouse_input(
         &mut self,
         window: &Window,
-        size_info: &SizeInfo,
         position: PhysicalPosition<f64>,
         state: ElementState,
         button: MouseButton,
-        _modifiers: objc2_app_kit::NSEventModifierFlags,
+        modifiers: objc2_app_kit::NSEventModifierFlags,
     ) -> bool {
         let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-
-        let scale_factor = window.scale_factor;
-        let origin_x = f64::from(size_info.padding_x()) / scale_factor;
-        let origin_y = f64::from(size_info.padding_y()) / scale_factor;
-        let width =
-            f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
-                / scale_factor;
-        let height =
-            f64::from(size_info.cell_height() * size_info.screen_lines() as f32) / scale_factor;
-
-        let local_x = position.x / scale_factor - origin_x;
-        let local_y = position.y / scale_factor - origin_y;
-        if local_x < 0.0 || local_y < 0.0 || local_x >= width || local_y >= height {
+        let button_flag = cef_mouse_button_flag(button);
+        let event_button_flags = match state {
+            ElementState::Pressed => self.mouse_button_flags | button_flag,
+            ElementState::Released => self.mouse_button_flags & !button_flag,
+        };
+        let Some(event) = self.mouse_event(window, position, modifiers, event_button_flags) else {
             return false;
-        }
-
-        let event = cef::MouseEvent { x: local_x as i32, y: local_y as i32, modifiers: 0 };
+        };
 
         let button_type = match button {
             MouseButton::Left => cef::MouseButtonType::LEFT,
@@ -936,6 +1307,8 @@ impl WebView {
         let Some(host) = self.browser.host() else {
             return false;
         };
+        self.last_mouse_event = Some(event.clone());
+        self.mouse_button_flags = event_button_flags;
 
         match state {
             ElementState::Pressed => {
@@ -947,6 +1320,116 @@ impl WebView {
         }
 
         true
+    }
+
+    pub fn handle_mouse_move(
+        &mut self,
+        window: &Window,
+        position: PhysicalPosition<f64>,
+        modifiers: objc2_app_kit::NSEventModifierFlags,
+    ) -> bool {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        let Some(event) = self.mouse_event(window, position, modifiers, self.mouse_button_flags)
+        else {
+            self.handle_mouse_leave();
+            return false;
+        };
+        let Some(host) = self.browser.host() else {
+            return false;
+        };
+
+        self.last_mouse_event = Some(event.clone());
+        host.send_mouse_move_event(Some(&event), 0);
+        true
+    }
+
+    pub fn handle_mouse_leave(&mut self) {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        let Some(host) = self.browser.host() else {
+            return;
+        };
+
+        let event = self.last_mouse_event.clone().unwrap_or_default();
+        host.send_mouse_move_event(Some(&event), 1);
+    }
+
+    pub fn handle_mouse_wheel(
+        &mut self,
+        window: &Window,
+        position: PhysicalPosition<f64>,
+        delta_x: f64,
+        delta_y: f64,
+        modifiers: objc2_app_kit::NSEventModifierFlags,
+    ) -> bool {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        let Some(event) = self.mouse_event(window, position, modifiers, self.mouse_button_flags)
+        else {
+            return false;
+        };
+        let Some(host) = self.browser.host() else {
+            return false;
+        };
+
+        let layout = self.paint_state.borrow().layout;
+        let scaled_delta_y = scaled_browser_wheel_delta_y(layout, delta_y);
+
+        self.last_mouse_event = Some(event.clone());
+        host.send_mouse_wheel_event(
+            Some(&event),
+            delta_x.round() as i32,
+            scaled_delta_y.round() as i32,
+        );
+        true
+    }
+
+    pub fn handle_ime_commit(&mut self, text: &str) {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        let Some(host) = self.browser.host() else {
+            return;
+        };
+
+        let text = CefString::from(text);
+        host.ime_commit_text(Some(&text), None, text.to_string().chars().count() as i32);
+        host.ime_finish_composing_text(0);
+    }
+
+    pub fn handle_ime_preedit(&mut self, text: &str, cursor_offset: Option<(usize, usize)>) {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        let Some(host) = self.browser.host() else {
+            return;
+        };
+
+        if text.is_empty() {
+            host.ime_cancel_composition();
+            return;
+        }
+
+        let text = CefString::from(text);
+        let replacement_range = None;
+        let selection_range =
+            cursor_offset.map(|(from, to)| cef::Range { from: from as u32, to: to as u32 });
+        let underline = cef::CompositionUnderline {
+            range: cef::Range { from: 0, to: text.to_string().chars().count() as u32 },
+            color: 0xFFFF_FFFF,
+            background_color: 0,
+            thick: 0,
+            style: cef::CompositionUnderlineStyle::SOLID,
+            ..cef::CompositionUnderline::default()
+        };
+
+        host.ime_set_composition(
+            Some(&text),
+            Some(&[underline]),
+            replacement_range.as_ref(),
+            selection_range.as_ref(),
+        );
+    }
+
+    pub fn cancel_ime_composition(&mut self) {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        if let Some(host) = self.browser.host() {
+            host.ime_cancel_composition();
+        }
     }
 
     pub fn handle_key_input(
@@ -1350,6 +1833,23 @@ impl WebView {
         true
     }
 
+    pub fn with_surfaces<R>(
+        &self,
+        func: impl FnOnce(Option<WebSurfaceRef>, Option<WebPopupSurfaceRef>) -> R,
+    ) -> R {
+        let paint_state = self.paint_state.borrow();
+        let main = paint_state.main.as_ref().map(AcceleratedSurface::as_public_ref);
+        let popup = paint_state.popup.surface.as_ref().map(|surface| WebPopupSurfaceRef {
+            x: paint_state.popup.rect.x.max(0) as usize,
+            y: paint_state.popup.rect.y.max(0) as usize,
+            width: paint_state.popup.rect.width.max(0) as usize,
+            height: paint_state.popup.rect.height.max(0) as usize,
+            surface: surface.as_public_ref(),
+        });
+
+        func(main, popup)
+    }
+
     fn enable_devtools_domains(&self) {
         self.devtools_fire("DOM.enable", None);
         self.devtools_fire("Network.enable", None);
@@ -1433,6 +1933,26 @@ impl WebView {
         }
 
         Ok(())
+    }
+
+    fn mouse_event(
+        &self,
+        window: &Window,
+        position: PhysicalPosition<f64>,
+        modifiers: objc2_app_kit::NSEventModifierFlags,
+        button_flags: u32,
+    ) -> Option<cef::MouseEvent> {
+        let scale_factor = window.scale_factor.max(f64::MIN_POSITIVE);
+        let x = (position.x / scale_factor).floor().max(0.0) as usize;
+        let y = (position.y / scale_factor).floor().max(0.0) as usize;
+        let layout = self.paint_state.borrow().layout;
+        let (logical_x, logical_y) = layout.logical_point_for_visual(x, y)?;
+
+        Some(cef::MouseEvent {
+            x: logical_x as i32,
+            y: logical_y as i32,
+            modifiers: cef_mouse_event_flags(modifiers, button_flags),
+        })
     }
 }
 
@@ -1533,6 +2053,37 @@ fn finish_string_result_callback(callback: &StringResultCallback, result: Result
     if let Some(callback) = callback.borrow_mut().take() {
         callback(result);
     }
+}
+
+fn cef_mouse_button_flag(button: MouseButton) -> u32 {
+    use cef::sys::cef_event_flags_t;
+
+    match button {
+        MouseButton::Left => cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0,
+        MouseButton::Middle => cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0,
+        MouseButton::Right => cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0,
+        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => 0,
+    }
+}
+
+fn cef_mouse_event_flags(modifiers: objc2_app_kit::NSEventModifierFlags, button_flags: u32) -> u32 {
+    use cef::sys::cef_event_flags_t;
+
+    let mut flags = cef_event_flags_t::EVENTFLAG_NONE;
+    if modifiers.contains(objc2_app_kit::NSEventModifierFlags::Shift) {
+        flags |= cef_event_flags_t::EVENTFLAG_SHIFT_DOWN;
+    }
+    if modifiers.contains(objc2_app_kit::NSEventModifierFlags::Control) {
+        flags |= cef_event_flags_t::EVENTFLAG_CONTROL_DOWN;
+    }
+    if modifiers.contains(objc2_app_kit::NSEventModifierFlags::Option) {
+        flags |= cef_event_flags_t::EVENTFLAG_ALT_DOWN;
+    }
+    if modifiers.contains(objc2_app_kit::NSEventModifierFlags::Command) {
+        flags |= cef_event_flags_t::EVENTFLAG_COMMAND_DOWN;
+    }
+
+    flags.0 | button_flags
 }
 
 fn cef_event_flags(modifiers: ModifiersState, repeat: bool, location: KeyLocation) -> u32 {
@@ -1825,27 +2376,35 @@ fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
     }
 }
 
-fn webview_frame(window: &Window, size_info: &SizeInfo) -> CGRect {
-    let scale_factor = window.scale_factor;
-    let x = (f64::from(size_info.padding_x()) / scale_factor) as CGFloat;
-    let y = (f64::from(size_info.padding_y()) / scale_factor) as CGFloat;
-    let width = (f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
-        / scale_factor) as CGFloat;
-    let height = (f64::from(size_info.cell_height() * size_info.screen_lines() as f32)
-        / scale_factor) as CGFloat;
+fn cef_screen_rect(window: &Window, layout: BrowserViewportLayout) -> cef::Rect {
+    let layout_viewport = layout.viewport();
+    let fallback = cef::Rect {
+        x: layout_viewport.x as i32,
+        y: layout_viewport.y as i32,
+        width: layout_viewport.width as i32,
+        height: layout_viewport.height as i32,
+    };
 
-    CGRect { origin: CGPoint { x, y }, size: CGSize { width, height } }
-}
+    let Ok(view) = ns_view(window) else {
+        return fallback;
+    };
 
-fn cef_rect(window: &Window, size_info: &SizeInfo) -> cef::Rect {
-    let scale_factor = window.scale_factor;
-    let x = (f64::from(size_info.padding_x()) / scale_factor) as i32;
-    let y = (f64::from(size_info.padding_y()) / scale_factor) as i32;
-    let width = (f64::from(size_info.width() - size_info.padding_x() - size_info.padding_right())
-        / scale_factor) as i32;
-    let height = (f64::from(size_info.cell_height() * size_info.screen_lines() as f32)
-        / scale_factor) as i32;
-    cef::Rect { x, y, width, height }
+    unsafe {
+        let view_bounds: CGRect = msg_send![view, bounds];
+        let window_rect: CGRect =
+            msg_send![view, convertRect: view_bounds, toView: std::ptr::null_mut::<AnyObject>()];
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if ns_window.is_null() {
+            return fallback;
+        }
+        let screen_rect: CGRect = msg_send![ns_window, convertRectToScreen: window_rect];
+        cef::Rect {
+            x: (screen_rect.origin.x + layout_viewport.x as CGFloat) as i32,
+            y: (screen_rect.origin.y + layout_viewport.y as CGFloat) as i32,
+            width: layout_viewport.width as i32,
+            height: layout_viewport.height as i32,
+        }
+    }
 }
 
 fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
@@ -1855,12 +2414,6 @@ fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
 }
 
 fn close_browser_resources(browser: &cef::Browser) {
-    if let Some(view) = browser_view(browser) {
-        unsafe {
-            let _: () = msg_send![view, removeFromSuperview];
-        }
-    }
-
     if let Some(host) = browser.host() {
         host.close_browser(1);
     }
@@ -1957,14 +2510,20 @@ fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
 
 #[cfg(test)]
 mod tests {
-    use super::should_run_frame_edit_inline;
+    use super::{
+        PaintState, browser_device_scale_factor, cef_mouse_button_flag, cef_mouse_event_flags,
+        scaled_browser_wheel_delta_y, should_run_frame_edit_inline,
+    };
     #[cfg(not(feature = "passkey-webauthn"))]
     use super::{
         PermissionDecision, browser_settings, permission_decision, permission_request_result,
         should_block_permission_request,
     };
+    use cef::sys::cef_event_flags_t;
     #[cfg(not(feature = "passkey-webauthn"))]
     use cef::{PermissionRequestResult, PermissionRequestTypes as Permission};
+    use objc2_app_kit::NSEventModifierFlags;
+    use winit::event::MouseButton;
 
     #[test]
     fn browser_settings_enable_javascript_clipboard_access() {
@@ -1978,6 +2537,94 @@ mod tests {
         assert!(should_run_frame_edit_inline(true, false));
         assert!(!should_run_frame_edit_inline(true, true));
         assert!(!should_run_frame_edit_inline(false, false));
+    }
+
+    #[test]
+    fn browser_device_scale_factor_uses_window_scale_factor() {
+        assert_eq!(browser_device_scale_factor(2.0), 2.0);
+        assert_eq!(browser_device_scale_factor(1.5), 1.5);
+        assert!(browser_device_scale_factor(0.0) > 0.0);
+    }
+
+    #[test]
+    fn paint_state_tracks_scale_factor_updates() {
+        let layout = crate::display::browser_layout::BrowserViewportLayout::normal(
+            crate::display::browser_layout::BrowserViewportRect {
+                x: 0,
+                y: 0,
+                width: 900,
+                height: 600,
+            },
+            900,
+        );
+        let mut paint_state =
+            PaintState::new(layout, cef::Rect { x: 0, y: 0, width: 900, height: 600 }, 2.0);
+        assert_eq!(paint_state.scale_factor, 2.0);
+
+        paint_state.update_geometry(
+            layout,
+            cef::Rect { x: 10, y: 20, width: 900, height: 600 },
+            1.5,
+        );
+
+        assert_eq!(paint_state.scale_factor, 1.5);
+        assert_eq!(paint_state.screen_rect.x, 10);
+        assert_eq!(paint_state.screen_rect.y, 20);
+    }
+
+    #[test]
+    fn scaled_browser_wheel_delta_y_matches_visible_column_count() {
+        let normal = crate::display::browser_layout::BrowserViewportLayout::normal(
+            crate::display::browser_layout::BrowserViewportRect {
+                x: 0,
+                y: 0,
+                width: 1100,
+                height: 708,
+            },
+            900,
+        );
+        assert_eq!(scaled_browser_wheel_delta_y(normal, 48.0), 48.0);
+
+        let folded = crate::display::browser_layout::BrowserViewportLayout::new(
+            &crate::display::SizeInfo::new(1100.0, 708.0, 1.0, 1.0, 0.0, 0.0, 0.0, false),
+            1.0,
+            crate::display::browser_layout::BrowserViewMode::MultiColumn,
+            &crate::config::browser::MultiColumnBrowserConfig { target_width_px: 400 },
+        );
+        assert_eq!(folded.column_count(), 2);
+        assert_eq!(scaled_browser_wheel_delta_y(folded, 48.0), 96.0);
+    }
+
+    #[test]
+    fn mouse_button_flags_match_cef_button_state_bits() {
+        assert_eq!(
+            cef_mouse_button_flag(MouseButton::Left),
+            cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0
+        );
+        assert_eq!(
+            cef_mouse_button_flag(MouseButton::Middle),
+            cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0
+        );
+        assert_eq!(
+            cef_mouse_button_flag(MouseButton::Right),
+            cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0
+        );
+        assert_eq!(cef_mouse_button_flag(MouseButton::Back), 0);
+    }
+
+    #[test]
+    fn mouse_event_flags_include_keyboard_modifiers_and_pressed_buttons() {
+        let modifiers = NSEventModifierFlags::Shift | NSEventModifierFlags::Command;
+        let button_flags =
+            cef_mouse_button_flag(MouseButton::Left) | cef_mouse_button_flag(MouseButton::Right);
+
+        let flags = cef_mouse_event_flags(modifiers, button_flags);
+
+        assert_ne!(flags & cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0, 0);
+        assert_ne!(flags & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0, 0);
+        assert_ne!(flags & cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0, 0);
+        assert_ne!(flags & cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0, 0);
+        assert_eq!(flags & cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0, 0);
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]

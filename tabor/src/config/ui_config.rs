@@ -24,6 +24,7 @@ use crate::config::bindings::{
     self, Action, Binding, BindingKey, KeyBinding, KeyLocation, ModeWrapper, ModsWrapper,
     MouseBinding,
 };
+use crate::config::browser::Browser;
 use crate::config::color::Colors;
 use crate::config::cursor::Cursor;
 use crate::config::debug::Debug;
@@ -71,6 +72,9 @@ pub struct UiConfig {
 
     /// Bell configuration.
     pub bell: BellConfig,
+
+    /// Browser configuration.
+    pub browser: Browser,
 
     /// RGB values for colors.
     pub colors: Colors,
@@ -733,5 +737,18 @@ mod tests {
                 "Should not match url in string {url_like}, but instead got: {matches:?}"
             )
         }
+    }
+
+    #[test]
+    fn browser_multi_column_target_width_deserializes() {
+        let config: UiConfig = toml::from_str(
+            r#"
+            [browser.multi_column]
+            target_width_px = 1200
+            "#,
+        )
+        .expect("browser config should deserialize");
+
+        assert_eq!(config.browser.multi_column.target_width_px, 1200);
     }
 }

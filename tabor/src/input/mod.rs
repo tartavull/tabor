@@ -124,6 +124,12 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn web_mouse_input(&mut self, _state: ElementState, _button: MouseButton) {}
     #[cfg(target_os = "macos")]
+    fn web_mouse_move(&mut self, _position: PhysicalPosition<f64>) {}
+    #[cfg(target_os = "macos")]
+    fn web_mouse_leave(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn web_mouse_wheel(&mut self, _delta: MouseScrollDelta, _phase: TouchPhase) {}
+    #[cfg(target_os = "macos")]
     fn web_copy_selection(&mut self) {}
     #[cfg(target_os = "macos")]
     fn web_paste_text(&mut self, _text: &str) {}
@@ -513,6 +519,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
         if self.ctx.window_kind().is_web() {
             #[cfg(target_os = "macos")]
+            self.ctx.web_mouse_move(position);
+            #[cfg(target_os = "macos")]
             self.ctx.web_request_cursor_update(position);
             return;
         }
@@ -799,6 +807,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     pub fn mouse_wheel_input(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
         if self.ctx.window_kind().is_web() {
+            #[cfg(target_os = "macos")]
+            self.ctx.web_mouse_wheel(delta, phase);
             return;
         }
 

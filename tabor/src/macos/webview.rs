@@ -1,23 +1,74 @@
 use std::error::Error;
+use std::ffi::c_void;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, KeyEvent, MouseButton};
+use winit::keyboard::ModifiersState;
 
 use super::webview_cef;
+use crate::display::browser_layout::BrowserViewportLayout;
 use crate::ipc::AgentDownload;
 
 pub struct WebView {
     inner: webview_cef::WebView,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAccelerationState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WebFrameDeliveryMode {
+    #[default]
+    CefInternal,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct WebSurfaceRef {
+    pub io_surface: *mut c_void,
+    pub width: usize,
+    pub height: usize,
+    pub format: cef::ColorType,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct WebPopupSurfaceRef {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub surface: WebSurfaceRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebAccelerationInfo {
+    pub state: WebAccelerationState,
+    pub frame_delivery_mode: WebFrameDeliveryMode,
+    pub main_surface_width: Option<usize>,
+    pub main_surface_height: Option<usize>,
+    pub popup_surface_width: Option<usize>,
+    pub popup_surface_height: Option<usize>,
+}
+
 impl WebView {
     pub fn new(
         window: &crate::display::window::Window,
         size_info: &crate::display::SizeInfo,
+        layout: BrowserViewportLayout,
         tab_id: crate::tabs::TabId,
         url: &str,
         proxy: &winit::event_loop::EventLoopProxy<crate::event::Event>,
     ) -> Result<Self, Box<dyn Error>> {
-        Ok(Self { inner: webview_cef::WebView::new(window, size_info, tab_id, url, proxy)? })
+        Ok(Self {
+            inner: webview_cef::WebView::new(window, size_info, layout, tab_id, url, proxy)?,
+        })
     }
 
     pub fn set_visible(&mut self, visible: bool) {
@@ -32,8 +83,13 @@ impl WebView {
         &mut self,
         window: &crate::display::window::Window,
         size_info: &crate::display::SizeInfo,
+        layout: BrowserViewportLayout,
     ) {
-        self.inner.update_frame(window, size_info);
+        self.inner.update_frame(window, size_info, layout);
+    }
+
+    pub fn acceleration_info(&self) -> WebAccelerationInfo {
+        self.inner.acceleration_info()
     }
 
     pub fn load_url(&mut self, url: &str) -> bool {
@@ -55,9 +111,9 @@ impl WebView {
     pub fn handle_key_input(
         &mut self,
         window: &crate::display::window::Window,
-        key: &winit::event::KeyEvent,
+        key: &KeyEvent,
         text: &str,
-        modifiers: winit::keyboard::ModifiersState,
+        modifiers: ModifiersState,
     ) -> bool {
         self.inner.handle_key_input(window, key, text, modifiers)
     }
@@ -65,13 +121,48 @@ impl WebView {
     pub fn handle_mouse_input(
         &mut self,
         window: &crate::display::window::Window,
-        size_info: &crate::display::SizeInfo,
-        position: winit::dpi::PhysicalPosition<f64>,
-        state: winit::event::ElementState,
-        button: winit::event::MouseButton,
+        position: PhysicalPosition<f64>,
+        state: ElementState,
+        button: MouseButton,
         modifiers: objc2_app_kit::NSEventModifierFlags,
     ) -> bool {
-        self.inner.handle_mouse_input(window, size_info, position, state, button, modifiers)
+        self.inner.handle_mouse_input(window, position, state, button, modifiers)
+    }
+
+    pub fn handle_mouse_move(
+        &mut self,
+        window: &crate::display::window::Window,
+        position: PhysicalPosition<f64>,
+        modifiers: objc2_app_kit::NSEventModifierFlags,
+    ) -> bool {
+        self.inner.handle_mouse_move(window, position, modifiers)
+    }
+
+    pub fn handle_mouse_leave(&mut self) {
+        self.inner.handle_mouse_leave();
+    }
+
+    pub fn handle_mouse_wheel(
+        &mut self,
+        window: &crate::display::window::Window,
+        position: PhysicalPosition<f64>,
+        delta_x: f64,
+        delta_y: f64,
+        modifiers: objc2_app_kit::NSEventModifierFlags,
+    ) -> bool {
+        self.inner.handle_mouse_wheel(window, position, delta_x, delta_y, modifiers)
+    }
+
+    pub fn handle_ime_commit(&mut self, text: &str) {
+        self.inner.handle_ime_commit(text);
+    }
+
+    pub fn handle_ime_preedit(&mut self, text: &str, cursor_offset: Option<(usize, usize)>) {
+        self.inner.handle_ime_preedit(text, cursor_offset);
+    }
+
+    pub fn cancel_ime_composition(&mut self) {
+        self.inner.cancel_ime_composition();
     }
 
     pub fn exec_js(&mut self, script: &str) {
@@ -154,5 +245,12 @@ impl WebView {
 
     pub fn show_inspector(&mut self) -> bool {
         self.inner.show_inspector()
+    }
+
+    pub fn with_surfaces<R>(
+        &self,
+        func: impl FnOnce(Option<WebSurfaceRef>, Option<WebPopupSurfaceRef>) -> R,
+    ) -> R {
+        self.inner.with_surfaces(func)
     }
 }

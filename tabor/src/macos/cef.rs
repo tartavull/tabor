@@ -226,6 +226,7 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     let mut settings = Settings {
         no_sandbox: 1,
         external_message_pump: 1,
+        windowless_rendering_enabled: 1,
         remote_debugging_port: remote_debugging_port(),
         ..Settings::default()
     };

@@ -20,6 +20,7 @@ use tabor_terminal::vi_mode::ViMotion;
 use crate::cli::{IpcConfig, IpcGetConfig, Options, WindowOptions};
 use crate::config::ui_config::Program;
 use crate::config::{Action, MouseAction, SearchAction, ViAction};
+use crate::display::browser_layout::{BrowserViewMode, BrowserViewportRect};
 use crate::display::terminal_layout::TerminalViewMode;
 use crate::event::{Event, EventType};
 use crate::tabs::TabId;
@@ -78,6 +79,46 @@ pub struct IpcTerminalLayoutState {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcBrowserAccelerationState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcWebFrameDeliveryMode {
+    CefInternal,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcBrowserAccelerationInfo {
+    pub state: IpcBrowserAccelerationState,
+    pub frame_delivery_mode: IpcWebFrameDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_surface_width: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_surface_height: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popup_surface_width: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub popup_surface_height: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcBrowserLayoutState {
+    pub mode: BrowserViewMode,
+    pub target_width_px: usize,
+    pub logical_width: usize,
+    pub logical_height: usize,
+    pub column_count: usize,
+    pub viewport: BrowserViewportRect,
+    pub columns: Vec<BrowserViewportRect>,
+    pub acceleration: IpcBrowserAccelerationInfo,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcTabState {
     pub tab_id: IpcTabId,
     pub group_id: usize,
@@ -90,6 +131,8 @@ pub struct IpcTabState {
     pub activity: Option<IpcTabActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_layout: Option<IpcTerminalLayoutState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_layout: Option<IpcBrowserLayoutState>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -340,6 +383,12 @@ pub struct IpcWebViewMetrics {
     pub live: u64,
     pub created: u64,
     pub dropped: u64,
+    pub accelerated_frames: u64,
+    pub frame_delivery_mode: IpcWebFrameDeliveryMode,
+    pub external_begin_frames: u64,
+    pub accelerated_startup_failures: u64,
+    pub unexpected_cpu_paints: u64,
+    pub live_accelerated_surfaces: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -647,6 +696,14 @@ pub enum IpcRequest {
         #[serde(default)]
         highlight_notch_ears: bool,
     },
+    WindowDebugMouseDrag {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        #[serde(default)]
+        steps: Option<usize>,
+    },
     WindowDebugPressStandardButton {
         button: IpcWindowDebugButton,
     },
@@ -716,6 +773,10 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
         IpcRequestHelp {
             name: "window_debug_snapshot",
             summary: "Capture a PNG snapshot of the active window with debug geometry.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_mouse_drag",
+            summary: "Dispatch a left-button drag through the active window input path.",
         },
         IpcRequestHelp {
             name: "window_debug_press_standard_button",
@@ -968,6 +1029,14 @@ pub trait IpcContext {
         &mut self,
         highlight_notch_ears: bool,
     ) -> Result<IpcWindowDebugSnapshot, IpcError>;
+    fn window_debug_mouse_drag(
+        &mut self,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        steps: Option<usize>,
+    ) -> Result<(), IpcError>;
     fn window_debug_press_standard_button(
         &mut self,
         button: IpcWindowDebugButton,
@@ -1317,6 +1386,14 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::WindowDebugMouseDrag { x0, y0, x1, y1, steps } => {
+            match ctx.window_debug_mouse_drag(x0, y0, x1, y1, steps) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
         IpcRequest::WindowDebugPressStandardButton { button } => {
             match ctx.window_debug_press_standard_button(button) {
                 Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
@@ -1579,6 +1656,7 @@ mod tests {
         custom_title: Option<String>,
         program_name: String,
         kind: IpcTabKind,
+        browser_layout: Option<IpcBrowserLayoutState>,
     }
 
     struct MockGroup {
@@ -1597,6 +1675,7 @@ mod tests {
         last_action: Option<Action>,
         last_input: Option<String>,
         last_command: Option<String>,
+        last_window_drag: Option<(f64, f64, f64, f64, Option<usize>)>,
         last_window_button: Option<IpcWindowDebugButton>,
         web_supported: bool,
         inspector_targets: Vec<IpcInspectorTarget>,
@@ -1619,6 +1698,7 @@ mod tests {
                 last_action: None,
                 last_input: None,
                 last_command: None,
+                last_window_drag: None,
                 last_window_button: None,
                 web_supported,
                 inspector_targets: Vec::new(),
@@ -1720,7 +1800,17 @@ mod tests {
                     },
                 },
                 runtime_metrics: IpcRuntimeMetrics {
-                    webview: Some(IpcWebViewMetrics { live: 1, created: 1, dropped: 0 }),
+                    webview: Some(IpcWebViewMetrics {
+                        live: 1,
+                        created: 1,
+                        dropped: 0,
+                        accelerated_frames: 12,
+                        frame_delivery_mode: IpcWebFrameDeliveryMode::CefInternal,
+                        external_begin_frames: 18,
+                        accelerated_startup_failures: 0,
+                        unexpected_cpu_paints: 0,
+                        live_accelerated_surfaces: 1,
+                    }),
                     web_close: Some(IpcWebCloseMetrics {
                         count: 0,
                         last_ms: None,
@@ -1757,6 +1847,29 @@ mod tests {
                 title,
                 custom_title: None,
                 program_name: String::new(),
+                browser_layout: match &kind {
+                    IpcTabKind::Terminal => None,
+                    IpcTabKind::Web { .. } => Some(IpcBrowserLayoutState {
+                        mode: BrowserViewMode::MultiColumn,
+                        target_width_px: 900,
+                        logical_width: 900,
+                        logical_height: 1200,
+                        column_count: 2,
+                        viewport: BrowserViewportRect { x: 0, y: 0, width: 1950, height: 600 },
+                        columns: vec![
+                            BrowserViewportRect { x: 0, y: 0, width: 900, height: 600 },
+                            BrowserViewportRect { x: 1050, y: 0, width: 900, height: 600 },
+                        ],
+                        acceleration: IpcBrowserAccelerationInfo {
+                            state: IpcBrowserAccelerationState::Ready,
+                            frame_delivery_mode: IpcWebFrameDeliveryMode::CefInternal,
+                            main_surface_width: Some(900),
+                            main_surface_height: Some(1200),
+                            popup_surface_width: None,
+                            popup_surface_height: None,
+                        },
+                    }),
+                },
                 kind,
             };
             self.tabs.insert(tab_id, tab);
@@ -1834,6 +1947,7 @@ mod tests {
                                 kind: tab.kind.clone(),
                                 activity: None,
                                 terminal_layout: None,
+                                browser_layout: tab.browser_layout.clone(),
                             })
                         })
                         .collect();
@@ -1856,6 +1970,7 @@ mod tests {
                 kind: tab.kind.clone(),
                 activity: None,
                 terminal_layout: None,
+                browser_layout: tab.browser_layout.clone(),
             })
         }
 
@@ -2180,6 +2295,18 @@ mod tests {
             Ok(self.window_debug_snapshot.clone())
         }
 
+        fn window_debug_mouse_drag(
+            &mut self,
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+            steps: Option<usize>,
+        ) -> Result<(), IpcError> {
+            self.last_window_drag = Some((x0, y0, x1, y1, steps));
+            Ok(())
+        }
+
         fn window_debug_press_standard_button(
             &mut self,
             button: IpcWindowDebugButton,
@@ -2284,6 +2411,10 @@ mod tests {
             panic!("expected tab_state reply");
         };
         assert_eq!(tab.tab_id, web_id.into());
+        let browser_layout = tab.browser_layout.expect("web tabs should report browser layout");
+        assert_eq!(browser_layout.mode, BrowserViewMode::MultiColumn);
+        assert_eq!(browser_layout.target_width_px, 900);
+        assert_eq!(browser_layout.column_count, 2);
     }
 
     #[test]
@@ -2407,6 +2538,19 @@ mod tests {
             panic!("expected window_debug_snapshot reply");
         };
         assert_eq!(snapshot, ctx.window_debug_snapshot);
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugMouseDrag {
+                x0: 10.0,
+                y0: 20.0,
+                x1: 110.0,
+                y1: 40.0,
+                steps: Some(8),
+            },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(ctx.last_window_drag, Some((10.0, 20.0, 110.0, 40.0, Some(8))));
 
         let response = handle_request(
             &mut ctx,
