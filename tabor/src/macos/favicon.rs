@@ -8,12 +8,12 @@ use image::{Rgba, RgbaImage};
 use url::Url;
 
 use crate::display::SizeInfo;
+use crate::tab_panel_icons::tab_panel_icon_slot_layout;
 
 const MAX_FAVICON_BYTES: usize = 512 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const FAVICON_SCALE: f32 = 2.0;
 
 #[derive(Clone, Debug)]
 pub struct FaviconImage {
@@ -35,11 +35,10 @@ impl FaviconImage {
         character: char,
         size_info: &SizeInfo,
         metrics: Metrics,
+        text_offset_y: f32,
     ) -> RasterizedGlyph {
-        let cell_width = size_info.cell_width().round().max(1.0) as i32;
-        let cell_height = size_info.cell_height().round().max(1.0) as i32;
-        let base_size = cell_width.min(cell_height).max(1) as f32;
-        let icon_size = (base_size * FAVICON_SCALE).round().max(1.0) as u32;
+        let layout = tab_panel_icon_slot_layout(size_info, text_offset_y);
+        let icon_size = layout.icon_square_px().max(1) as u32;
 
         let mut image = self.to_image();
         if image.width() != icon_size || image.height() != icon_size {
@@ -48,19 +47,15 @@ impl FaviconImage {
 
         let mut buffer = image.into_raw();
         premultiply_rgba(&mut buffer);
-
-        let slot_width = (cell_width as f32 * FAVICON_SCALE).round().max(1.0) as i32;
-        let offset_x = (slot_width - icon_size as i32).max(0) / 2;
-        let offset_y = (cell_height - icon_size as i32).max(0) / 2;
-        let top = cell_height - offset_y + metrics.descent.round() as i32;
+        let (left, top) = layout.glyph_position(icon_size as i32, icon_size as i32, metrics);
 
         RasterizedGlyph {
             character,
             width: icon_size as i32,
             height: icon_size as i32,
             top,
-            left: offset_x,
-            advance: (cell_width, 0),
+            left,
+            advance: (layout.advance_px(), 0),
             buffer: BitmapBuffer::Rgba(buffer),
         }
     }

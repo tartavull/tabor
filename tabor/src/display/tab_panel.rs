@@ -21,7 +21,14 @@ use crate::display::color::Rgb;
 use crate::renderer::rects::RenderRect;
 use crate::renderer::{GlyphCache, Renderer};
 use crate::tab_panel::{TabPanelCommand, TabPanelGroup, TabPanelTab};
+use crate::tab_panel_icons::{
+    TAB_PANEL_ACTIVITY_FILLED_CHAR, TAB_PANEL_ACTIVITY_OUTLINE_CHAR, TAB_PANEL_CLOSE_CHAR,
+    TAB_PANEL_WEB_GLOBE_CHAR,
+};
+#[cfg(target_os = "macos")]
+use crate::tab_panel_icons::{TabPanelIconKind, rasterized_tab_panel_icon_glyph};
 use crate::tabs::TabId;
+use crate::window_kind::TabKind;
 
 const RESIZE_HANDLE_WIDTH_PX: f64 = 6.0;
 const PANEL_ICON_SCALE: f32 = 2.0;
@@ -29,8 +36,6 @@ const PANEL_ROW_PADDING_PX: f32 = 4.0;
 const GROUP_HEADER_INDENT_COLS: usize = 1;
 const TAB_INDENT_COLS: usize = 1;
 const ACTIVITY_INDICATOR_COLS: usize = 2;
-const ACTIVITY_INDICATOR_FILLED: char = '\u{25CF}';
-const ACTIVITY_INDICATOR_OUTLINE: char = '\u{25CB}';
 const WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
 const WINDOW_CONTROL_MARGIN_X_PX: f64 = 12.0;
 const WINDOW_CONTROL_SPACING_PX: f64 = 8.0;
@@ -628,7 +633,8 @@ impl TabPanel {
             let font_key = glyph_cache.font_key;
             let font_size = glyph_cache.font_size;
             let metrics = glyph_cache.font_metrics();
-            let mut missing = Vec::new();
+            let text_offset_y = self.panel_text_offset_y(size_info);
+            let mut missing_favicons = Vec::new();
 
             for item in &layout.items {
                 if let PanelItemKind::Tab { tab } = &item.kind {
@@ -636,7 +642,7 @@ impl TabPanel {
                         let key =
                             GlyphKey { font_key, size: font_size, character: favicon.character };
                         if !glyph_cache.has_glyph(&key) {
-                            missing.push((key, favicon.clone()));
+                            missing_favicons.push((key, favicon.clone()));
                         }
                     }
                 }
@@ -650,28 +656,54 @@ impl TabPanel {
                         let key =
                             GlyphKey { font_key, size: font_size, character: favicon.character };
                         if !glyph_cache.has_glyph(&key) {
-                            missing.push((key, favicon.clone()));
+                            missing_favicons.push((key, favicon.clone()));
                         }
                     }
                 }
             }
 
-            if !missing.is_empty() {
-                renderer.with_loader(|mut api| {
-                    for (key, favicon) in missing {
-                        let rasterized = favicon.image.rasterized_glyph(
-                            favicon.character,
-                            &panel_size_info,
-                            metrics,
-                        );
-                        glyph_cache.insert_custom_glyph(key, rasterized, &mut api);
+            renderer.with_loader(|mut api| {
+                for kind in [
+                    TabPanelIconKind::Close,
+                    TabPanelIconKind::ActivityFilled,
+                    TabPanelIconKind::ActivityOutline,
+                    TabPanelIconKind::WebFallback,
+                ] {
+                    let key = GlyphKey { font_key, size: font_size, character: kind.character() };
+                    if glyph_cache.has_glyph(&key) {
+                        continue;
                     }
-                });
-            }
+
+                    let rasterized = rasterized_tab_panel_icon_glyph(
+                        kind,
+                        &panel_size_info,
+                        metrics,
+                        text_offset_y,
+                    );
+                    glyph_cache.insert_custom_glyph(key, rasterized, &mut api);
+                }
+
+                for (key, favicon) in missing_favicons {
+                    if glyph_cache.has_glyph(&key) {
+                        continue;
+                    }
+                    let rasterized = favicon.image.rasterized_glyph(
+                        favicon.character,
+                        &panel_size_info,
+                        metrics,
+                        text_offset_y,
+                    );
+                    glyph_cache.insert_custom_glyph(key, rasterized, &mut api);
+                }
+            });
         }
 
         renderer.set_viewport(&panel_size_info);
         renderer.set_text_projection(&panel_size_info);
+        let text_offset_y = self.panel_text_offset_y(size_info);
+        if text_offset_y != 0.0 {
+            renderer.set_text_projection_with_offset(&panel_size_info, (0.0, text_offset_y));
+        }
 
         let base = config.colors.primary.background;
         let fg = config.colors.primary.foreground;
@@ -742,23 +774,18 @@ impl TabPanel {
                         _ => tab.title.clone(),
                     };
                     let show_close = !dragging && !is_ghost && self.hover.tab == Some(tab.tab_id);
-                    #[cfg(target_os = "macos")]
-                    let show_inline_close_favicon = show_close && tab.favicon.is_some();
-                    #[cfg(not(target_os = "macos"))]
-                    let show_inline_close_favicon = false;
-                    let show_inline_close_indicator = show_close && tab.activity.is_some();
-                    let show_inline_close =
-                        show_inline_close_favicon || show_inline_close_indicator;
+                    let tab_icon = tab_panel_icon_char(tab);
+                    let show_inline_close_icon = show_close && tab_icon.is_some();
+                    let show_inline_close_indicator =
+                        show_close && tab.activity.is_some() && !show_inline_close_icon;
+                    let show_inline_close = show_inline_close_icon || show_inline_close_indicator;
                     let show_trailing_close = show_close && !show_inline_close;
-                    #[cfg(target_os = "macos")]
-                    let label = if let Some(favicon) = &tab.favicon {
-                        let icon = if show_inline_close_favicon { 'x' } else { favicon.character };
+                    let label = if let Some(icon) = tab_icon {
+                        let icon = if show_inline_close_icon { TAB_PANEL_CLOSE_CHAR } else { icon };
                         format!("{}  {}", icon, title)
                     } else {
                         title
                     };
-                    #[cfg(not(target_os = "macos"))]
-                    let label = title;
                     let text = truncate_to_columns(&label, max_cols);
                     let bg = if is_ghost {
                         ghost_bg
@@ -775,7 +802,11 @@ impl TabPanel {
                         } else {
                             indicator.color
                         };
-                        let glyph = if show_inline_close_indicator { 'x' } else { indicator.glyph };
+                        let glyph = if show_inline_close_indicator {
+                            TAB_PANEL_CLOSE_CHAR
+                        } else {
+                            indicator.glyph
+                        };
                         let indicator_fg =
                             if show_inline_close_indicator { fg } else { indicator_color };
                         let point = Point::new(item.line, Column(indent));
@@ -805,7 +836,7 @@ impl TabPanel {
                             point,
                             fg,
                             bg,
-                            "x".chars(),
+                            std::iter::once(TAB_PANEL_CLOSE_CHAR),
                             &panel_size_info,
                             glyph_cache,
                         );
@@ -826,14 +857,11 @@ impl TabPanel {
                         let text_col = indent + indicator_cols;
                         let max_cols = self.width_cols.saturating_sub(text_col + 1);
                         let title = tab.title.clone();
-                        #[cfg(target_os = "macos")]
-                        let label = if let Some(favicon) = &tab.favicon {
-                            format!("{}  {}", favicon.character, title)
+                        let label = if let Some(icon) = tab_panel_icon_char(&tab) {
+                            format!("{}  {}", icon, title)
                         } else {
                             title
                         };
-                        #[cfg(not(target_os = "macos"))]
-                        let label = title;
                         let text = truncate_to_columns(&label, max_cols);
                         if let Some(indicator) = tab_activity_indicator(&tab, now, base, fg, config)
                         {
@@ -904,6 +932,11 @@ impl TabPanel {
     fn panel_cell_height(&self, size_info: &SizeInfo) -> f32 {
         let min_height = (size_info.cell_width() * PANEL_ICON_SCALE).ceil();
         size_info.cell_height().max(min_height) + PANEL_ROW_PADDING_PX
+    }
+
+    fn panel_text_offset_y(&self, size_info: &SizeInfo) -> f32 {
+        let height_delta = self.panel_cell_height(size_info) - size_info.cell_height();
+        -(height_delta / 2.0)
     }
 
     fn panel_size_info(&self, size_info: &SizeInfo) -> SizeInfo {
@@ -989,8 +1022,7 @@ impl TabPanel {
 
         let (tab, _, _) = self.find_tab(tab_id)?;
 
-        #[cfg(target_os = "macos")]
-        if tab.favicon.is_some() {
+        if tab_panel_icon_char(&tab).is_some() {
             let indicator_cols = if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
             return Some(TAB_INDENT_COLS + indicator_cols);
         }
@@ -1939,6 +1971,24 @@ struct ActivityIndicator {
     color: Rgb,
 }
 
+#[cfg(target_os = "macos")]
+fn tab_panel_icon_char(tab: &TabPanelTab) -> Option<char> {
+    match &tab.kind {
+        TabKind::Web { .. } => {
+            tab.favicon.as_ref().map(|favicon| favicon.character).or(Some(TAB_PANEL_WEB_GLOBE_CHAR))
+        },
+        TabKind::Terminal => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tab_panel_icon_char(tab: &TabPanelTab) -> Option<char> {
+    match &tab.kind {
+        TabKind::Web { .. } => Some(TAB_PANEL_WEB_GLOBE_CHAR),
+        TabKind::Terminal => None,
+    }
+}
+
 fn tab_activity_indicator(
     tab: &TabPanelTab,
     now: Instant,
@@ -1950,7 +2000,7 @@ fn tab_activity_indicator(
 
     if activity.is_active(now) {
         return Some(ActivityIndicator {
-            glyph: ACTIVITY_INDICATOR_FILLED,
+            glyph: TAB_PANEL_ACTIVITY_FILLED_CHAR,
             color: config.colors.normal.green,
         });
     }
@@ -1962,10 +2012,10 @@ fn tab_activity_indicator(
             base_blue.g.saturating_sub(0x28),
             base_blue.b.saturating_add(0x28),
         );
-        return Some(ActivityIndicator { glyph: ACTIVITY_INDICATOR_FILLED, color: blue });
+        return Some(ActivityIndicator { glyph: TAB_PANEL_ACTIVITY_FILLED_CHAR, color: blue });
     }
 
-    Some(ActivityIndicator { glyph: ACTIVITY_INDICATOR_OUTLINE, color: mix(fg, base, 0.5) })
+    Some(ActivityIndicator { glyph: TAB_PANEL_ACTIVITY_OUTLINE_CHAR, color: mix(fg, base, 0.5) })
 }
 
 fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
@@ -2273,5 +2323,25 @@ mod tests {
             16.0,
             "expected retina controls to use native spacing",
         );
+    }
+
+    #[test]
+    fn panel_text_offset_centers_extra_row_height() {
+        let (panel, size_info) = panel_and_size();
+        assert_eq!(panel.panel_cell_height(&size_info), 24.0);
+        assert_eq!(panel.panel_text_offset_y(&size_info), -2.0);
+    }
+
+    #[test]
+    fn web_tabs_without_site_favicon_use_left_close_slot() {
+        let tab_id = TabId::new(1, 0);
+        let (mut panel, size_info) = panel_and_size();
+        let _ = panel.set_groups(vec![group_with_tabs(&[(tab_id, true)])], None);
+
+        let hover = panel.cursor_moved(PhysicalPosition::new(20.0, 30.0), &size_info);
+        assert!(hover.capture);
+        assert_eq!(panel.inline_close_col(tab_id), Some(TAB_INDENT_COLS));
+        assert!(panel.is_close_hit(PhysicalPosition::new(15.0, 30.0), &size_info, tab_id));
+        assert!(!panel.is_close_hit(PhysicalPosition::new(195.0, 30.0), &size_info, tab_id));
     }
 }

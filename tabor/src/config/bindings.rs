@@ -136,6 +136,9 @@ pub enum Action {
     /// Reset font size to the config value.
     ResetFontSize,
 
+    /// Toggle folded multi-column terminal rendering for the active terminal tab.
+    ToggleMultiColumnTerminal,
+
     /// Scroll exactly one page up.
     ScrollPageUp,
 

@@ -40,14 +40,14 @@ use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::CursorIcon;
 use winit::window::WindowId;
 
-use tabor_terminal::event::{Event as TerminalEvent, EventListener, Notify};
+use tabor_terminal::event::{Event as TerminalEvent, EventListener, Notify, WindowSize};
 use tabor_terminal::event_loop::Notifier;
 use tabor_terminal::grid::{BidirectionalIterator, Dimensions, Scroll};
 use tabor_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use tabor_terminal::selection::{Selection, SelectionType};
 use tabor_terminal::term::cell::Flags;
 use tabor_terminal::term::search::{Match, RegexSearch};
-use tabor_terminal::term::{self, ClipboardType, Term, TermMode};
+use tabor_terminal::term::{ClipboardType, Term, TermMode};
 use tabor_terminal::vte::ansi::NamedColor;
 
 #[cfg(unix)]
@@ -62,6 +62,7 @@ use crate::daemon::foreground_process_path;
 use crate::daemon::spawn_daemon;
 use crate::display::color::Rgb;
 use crate::display::hint::HintMatch;
+use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
@@ -1827,6 +1828,7 @@ pub struct ActionContext<'a, N, T> {
     pub command_history: &'a mut CommandHistory,
     pub tab_id: TabId,
     pub tab_kind: &'a mut WindowKind,
+    pub terminal_view_mode: &'a mut TerminalViewMode,
     #[cfg(target_os = "macos")]
     pub web_view: Option<&'a mut WebView>,
     #[cfg(target_os = "macos")]
@@ -1913,6 +1915,10 @@ pub(crate) fn request_web_cursor_update(
     });
 }
 
+fn terminal_text_area_size(size_info: SizeInfo, layout: TerminalViewportLayout) -> WindowSize {
+    layout.logical_size(&size_info).into()
+}
+
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
     #[inline]
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, val: B) {
@@ -1928,6 +1934,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn size_info(&self) -> SizeInfo {
         self.display.size_info
+    }
+
+    #[inline]
+    fn terminal_viewport_layout(&self) -> TerminalViewportLayout {
+        self.display.terminal_viewport().with_terminal_content(self.terminal)
     }
 
     fn scroll(&mut self, scroll: Scroll) {
@@ -1952,7 +1963,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             || self.mouse.right_button_state == ElementState::Pressed
         {
             let display_offset = self.terminal.grid().display_offset();
-            let point = self.mouse.point(&self.size_info(), display_offset);
+            let point = self.mouse.point(
+                &self.size_info(),
+                &self.terminal_viewport_layout(),
+                display_offset,
+            );
             self.update_selection(point, self.mouse.cell_side);
         }
 
@@ -2017,6 +2032,24 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         *self.dirty = true;
 
         input::ActionContext::copy_selection(self, ClipboardType::Selection);
+    }
+
+    fn toggle_multi_column_terminal(&mut self) {
+        if self.tab_kind.is_web() {
+            return;
+        }
+
+        *self.terminal_view_mode = match *self.terminal_view_mode {
+            TerminalViewMode::Normal => TerminalViewMode::MultiColumn,
+            TerminalViewMode::MultiColumn => TerminalViewMode::Normal,
+        };
+        self.mouse.hint_highlight_dirty = true;
+        self.display.highlighted_hint = None;
+        self.display.vi_highlighted_hint = None;
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.display.damage_tracker.next_frame().mark_fully_damaged();
+        *self.dirty = true;
     }
 
     fn toggle_selection(&mut self, ty: SelectionType, point: Point, side: Side) {
@@ -2751,7 +2784,8 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
         // Load mouse point, treating message bar and padding as the closest cell.
         let display_offset = self.terminal().grid().display_offset();
-        let point = self.mouse().point(&self.size_info(), display_offset);
+        let point =
+            self.mouse().point(&self.size_info(), &self.terminal_viewport_layout(), display_offset);
 
         let cell_side = self.mouse().cell_side;
 
@@ -4327,7 +4361,14 @@ mod tests {
     use tempfile::tempdir;
     use url::Url;
 
-    use super::{CommandHistory, CommandTarget, command_url_prefix, parse_command_target};
+    use crate::config::terminal::MultiColumnTerminalConfig;
+    use crate::display::SizeInfo;
+    use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
+
+    use super::{
+        CommandHistory, CommandTarget, command_url_prefix, parse_command_target,
+        terminal_text_area_size,
+    };
 
     #[test]
     fn command_url_prefix_parses_basic() {
@@ -4486,6 +4527,20 @@ mod tests {
             _ => panic!("expected web url target"),
         }
     }
+
+    #[test]
+    fn terminal_text_area_size_uses_logical_multi_column_dimensions() {
+        let size_info = SizeInfo::new(250.0, 40.0, 1.0, 1.0, 0.0, 0.0, 0.0, false);
+        let layout = TerminalViewportLayout::new(
+            &size_info,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+        );
+
+        let window_size = terminal_text_area_size(size_info, layout);
+        assert_eq!(window_size.num_cols, 100);
+        assert_eq!(window_size.num_lines, 80);
+    }
 }
 
 /// Identified purpose of the touch input.
@@ -4589,14 +4644,13 @@ impl Mouse {
     /// If the coordinates are outside of the terminal grid, like positions inside the padding, the
     /// coordinates will be clamped to the closest grid coordinates.
     #[inline]
-    pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
-        let col = self.x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
-        let col = min(Column(col), size.last_column());
-
-        let line = self.y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
-        let line = min(line, size.bottommost_line().0 as usize);
-
-        term::viewport_to_point(display_offset, Point::new(line, col))
+    pub fn point(
+        &self,
+        size: &SizeInfo,
+        layout: &TerminalViewportLayout,
+        display_offset: usize,
+    ) -> Point {
+        layout.logical_terminal_point_from_pixels_clamped(size, self.x, self.y, display_offset)
     }
 }
 
@@ -4706,7 +4760,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.ctx.write_to_pty(format(color.0).into_bytes());
                     },
                     TerminalEvent::TextAreaSizeRequest(format) => {
-                        let text = format(self.ctx.size_info().into());
+                        let text = format(terminal_text_area_size(
+                            self.ctx.size_info(),
+                            self.ctx.terminal_viewport_layout(),
+                        ));
                         self.ctx.write_to_pty(text.into_bytes());
                     },
                     TerminalEvent::PtyWrite(text) => self.ctx.write_to_pty(text.into_bytes()),

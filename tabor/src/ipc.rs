@@ -20,6 +20,7 @@ use tabor_terminal::vi_mode::ViMotion;
 use crate::cli::{IpcConfig, IpcGetConfig, Options, WindowOptions};
 use crate::config::ui_config::Program;
 use crate::config::{Action, MouseAction, SearchAction, ViAction};
+use crate::display::terminal_layout::TerminalViewMode;
 use crate::event::{Event, EventType};
 use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
@@ -70,6 +71,13 @@ pub struct IpcTabActivity {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTerminalLayoutState {
+    pub mode: TerminalViewMode,
+    pub target_columns: usize,
+    pub strip_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcTabState {
     pub tab_id: IpcTabId,
     pub group_id: usize,
@@ -80,6 +88,8 @@ pub struct IpcTabState {
     pub program_name: String,
     pub kind: IpcTabKind,
     pub activity: Option<IpcTabActivity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_layout: Option<IpcTerminalLayoutState>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1823,6 +1833,7 @@ mod tests {
                                 program_name: tab.program_name.clone(),
                                 kind: tab.kind.clone(),
                                 activity: None,
+                                terminal_layout: None,
                             })
                         })
                         .collect();
@@ -1844,6 +1855,7 @@ mod tests {
                 program_name: tab.program_name.clone(),
                 kind: tab.kind.clone(),
                 activity: None,
+                terminal_layout: None,
             })
         }
 

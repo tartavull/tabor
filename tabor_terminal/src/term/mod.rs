@@ -183,6 +183,13 @@ pub enum TermDamage<'a> {
     Partial(TermDamageIterator<'a>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResizeAnchor {
+    #[default]
+    Top,
+    Bottom,
+}
+
 /// Iterator over the terminal's viewport damaged lines.
 #[derive(Clone, Debug)]
 pub struct TermDamageIterator<'a> {
@@ -653,6 +660,11 @@ impl<T> Term<T> {
 
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
+        self.resize_with_anchor(size, ResizeAnchor::Top);
+    }
+
+    /// Resize terminal to new dimensions using an explicit vertical anchor.
+    pub fn resize_with_anchor<S: Dimensions>(&mut self, size: S, anchor: ResizeAnchor) {
         let old_cols = self.columns();
         let old_lines = self.screen_lines();
 
@@ -671,11 +683,18 @@ impl<T> Term<T> {
         let mut delta = num_lines as i32 - old_lines as i32;
         let min_delta = cmp::min(0, num_lines as i32 - self.grid.cursor.point.line.0 - 1);
         delta = cmp::min(cmp::max(delta, min_delta), history_size as i32);
-        self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
+        if anchor == ResizeAnchor::Bottom && !is_alt {
+            delta += Self::anchor_grid_to_bottom(&mut self.grid) as i32;
+        }
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if anchor == ResizeAnchor::Bottom && is_alt {
+            Self::anchor_grid_to_bottom(&mut self.inactive_grid);
+        }
+
+        self.vi_mode_cursor.point.line += delta;
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -702,6 +721,33 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
+    }
+
+    fn anchor_grid_to_bottom(grid: &mut Grid<Cell>) -> usize {
+        if grid.display_offset() != 0 {
+            return 0;
+        }
+
+        let bottommost_used_line = Self::bottommost_used_line(grid);
+        let lines_below_content = grid.screen_lines().saturating_sub(bottommost_used_line + 1);
+        if lines_below_content == 0 {
+            return 0;
+        }
+
+        let region = Line(0)..Line(grid.screen_lines() as i32);
+        grid.scroll_down(&region, lines_below_content);
+        grid.cursor.point.line += lines_below_content;
+        grid.saved_cursor.point.line += lines_below_content;
+        lines_below_content
+    }
+
+    fn bottommost_used_line(grid: &Grid<Cell>) -> usize {
+        let last_non_empty_line = (0..grid.screen_lines())
+            .rev()
+            .find(|line| !grid[Line(*line as i32)].is_clear())
+            .unwrap_or(0);
+
+        cmp::max(grid.cursor.point.line.0 as usize, last_non_empty_line)
     }
 
     /// Active terminal modes.
@@ -2937,6 +2983,67 @@ mod tests {
 
         assert_eq!(term.history_size(), 0);
         assert_eq!(term.grid.cursor.point, Point::new(Line(19), Column(0)));
+    }
+
+    #[test]
+    fn grow_lines_bottom_anchor_keeps_short_primary_content_at_bottom() {
+        let mut size = TermSize::new(10, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        term.input('x');
+        assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(1)));
+
+        size.screen_lines = 12;
+        term.resize_with_anchor(size, ResizeAnchor::Bottom);
+
+        assert_eq!(term.grid.cursor.point, Point::new(Line(11), Column(1)));
+        assert_eq!(term.grid[Line(11)][Column(0)].c, 'x');
+        assert_eq!(term.grid[Line(0)][Column(0)].c, ' ');
+    }
+
+    #[test]
+    fn grow_lines_bottom_anchor_moves_selection_with_primary_content() {
+        let mut size = TermSize::new(10, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        term.input('x');
+        term.selection =
+            Some(Selection::new(SelectionType::Simple, Point::new(Line(0), Column(0)), Side::Left));
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(Point::new(Line(0), Column(0)), Side::Right);
+        }
+
+        size.screen_lines = 12;
+        term.resize_with_anchor(size, ResizeAnchor::Bottom);
+
+        let selection = term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&term))
+            .expect("selection should remain valid");
+        assert_eq!(selection.start.line, Line(11));
+        assert_eq!(selection.end.line, Line(11));
+    }
+
+    #[test]
+    fn grow_lines_bottom_anchor_preserves_primary_buffer_while_alt_screen_is_active() {
+        let mut size = TermSize::new(10, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        term.input('x');
+        term.set_private_mode(NamedPrivateMode::SwapScreenAndSetRestoreCursor.into());
+        term.input('y');
+
+        size.screen_lines = 12;
+        term.resize_with_anchor(size, ResizeAnchor::Bottom);
+
+        assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(2)));
+        assert_eq!(term.grid[Line(0)][Column(1)].c, 'y');
+
+        term.unset_private_mode(NamedPrivateMode::SwapScreenAndSetRestoreCursor.into());
+
+        assert_eq!(term.grid.cursor.point, Point::new(Line(11), Column(1)));
+        assert_eq!(term.grid[Line(11)][Column(0)].c, 'x');
     }
 
     #[test]

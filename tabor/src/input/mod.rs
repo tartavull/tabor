@@ -41,6 +41,7 @@ use crate::config::{
     Action, BindingMode, MouseAction, MouseEvent, SearchAction, UiConfig, ViAction,
 };
 use crate::display::hint::HintMatch;
+use crate::display::terminal_layout::TerminalViewportLayout;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, SizeInfo};
 #[cfg(target_os = "macos")]
@@ -85,6 +86,9 @@ pub trait ActionContext<T: EventListener> {
     fn write_to_pty<B: Into<Cow<'static, [u8]>>>(&self, _data: B) {}
     fn mark_dirty(&mut self) {}
     fn size_info(&self) -> SizeInfo;
+    fn terminal_viewport_layout(&self) -> TerminalViewportLayout {
+        TerminalViewportLayout::normal(self.size_info())
+    }
     fn copy_selection(&mut self, _ty: ClipboardType) {}
     fn start_selection(&mut self, _ty: SelectionType, _point: Point, _side: Side) {}
     fn toggle_selection(&mut self, _ty: SelectionType, _point: Point, _side: Side) {}
@@ -106,6 +110,7 @@ pub trait ActionContext<T: EventListener> {
     fn create_new_tab(&mut self) {}
     fn change_font_size(&mut self, _delta: f32) {}
     fn reset_font_size(&mut self) {}
+    fn toggle_multi_column_terminal(&mut self) {}
     fn pop_message(&mut self) {}
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
@@ -409,6 +414,7 @@ impl<T: EventListener> Execute<T> for Action {
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),
+            Action::ToggleMultiColumnTerminal => ctx.toggle_multi_column_terminal(),
             Action::ScrollPageUp
             | Action::ScrollPageDown
             | Action::ScrollHalfPageUp
@@ -512,6 +518,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         let size_info = self.ctx.size_info();
+        let layout = self.ctx.terminal_viewport_layout();
 
         let (x, y) = position.into();
 
@@ -522,17 +529,17 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         let display_offset = self.ctx.terminal().grid().display_offset();
-        let old_point = self.ctx.mouse().point(&size_info, display_offset);
+        let old_point = self.ctx.mouse().point(&size_info, &layout, display_offset);
 
         let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
 
-        let inside_text_area = size_info.contains_point(x, y);
+        let inside_text_area = layout.contains_point(&size_info, x, y);
         let cell_side = self.cell_side(x);
 
-        let point = self.ctx.mouse().point(&size_info, display_offset);
+        let point = self.ctx.mouse().point(&size_info, &layout, display_offset);
         let cell_changed = old_point != point;
 
         // If the mouse hasn't changed cells, do nothing.
@@ -600,7 +607,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     fn mouse_report(&mut self, button: u8, state: ElementState) {
         let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        let point = self.ctx.mouse().point(
+            &self.ctx.size_info(),
+            &self.ctx.terminal_viewport_layout(),
+            display_offset,
+        );
 
         // Assure the mouse point is not in the scrollback.
         if point.line < 0 {
@@ -708,7 +719,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
             // Load mouse point, treating message bar and padding as the closest cell.
             let display_offset = self.ctx.terminal().grid().display_offset();
-            let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+            let point = self.ctx.mouse().point(
+                &self.ctx.size_info(),
+                &self.ctx.terminal_viewport_layout(),
+                display_offset,
+            );
 
             if let MouseButton::Left = button {
                 self.on_left_click(point)
@@ -1162,15 +1177,17 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return None;
         }
 
-        let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&size, display_offset);
         let last_line = size.screen_lines().saturating_sub(1);
+        let line = mouse.y.saturating_sub(size.padding_y() as usize) / size.cell_height() as usize;
+        let line = min(line, last_line);
 
-        if point.line != last_line {
+        if line != last_line {
             return None;
         }
 
-        if point.column + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns() {
+        let col = mouse.x.saturating_sub(size.padding_x() as usize) / size.cell_width() as usize;
+        let col = min(col, size.columns().saturating_sub(1));
+        if col + message_bar::CLOSE_BUTTON_TEXT.len() >= size.columns() {
             Some(CursorIcon::Pointer)
         } else {
             Some(CursorIcon::Default)
@@ -1180,7 +1197,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Icon state of the cursor.
     fn cursor_state(&mut self) -> CursorIcon {
         let display_offset = self.ctx.terminal().grid().display_offset();
-        let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+        let point = self.ctx.mouse().point(
+            &self.ctx.size_info(),
+            &self.ctx.terminal_viewport_layout(),
+            display_offset,
+        );
         let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
 
         // Function to check if mouse is on top of a hint.

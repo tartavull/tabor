@@ -48,7 +48,7 @@ use tabor_terminal::sync::FairMutex;
 #[cfg(target_os = "macos")]
 use tabor_terminal::term::MIN_COLUMNS;
 use tabor_terminal::term::test::TermSize;
-use tabor_terminal::term::{Term, TermMode};
+use tabor_terminal::term::{ResizeAnchor, Term, TermMode};
 use tabor_terminal::tty;
 use tabor_terminal::vte::ansi::NamedColor;
 
@@ -61,6 +61,7 @@ use crate::config::UiConfig;
 use crate::daemon::foreground_process_name;
 use crate::display::Display;
 use crate::display::color::Rgb;
+use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
 #[cfg(target_os = "macos")]
 use crate::display::{TabPanelEditOutcome, TabPanelEditTarget};
@@ -77,9 +78,9 @@ use crate::ipc::{
     AgentActResult, AgentAction, AgentElementDetail, AgentEvent, AgentObservation, AgentPdf,
     AgentScreenshot, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
     IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
-    IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcWebCloseMetrics, IpcWebViewMetrics,
-    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
-    SocketReply, TabSelection, TerminalKeyInput,
+    IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
+    IpcWebCloseMetrics, IpcWebViewMetrics, IpcWindowDebugButton, IpcWindowDebugRect,
+    IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -99,6 +100,8 @@ use crate::macos::webview::WebView;
 #[cfg(target_os = "macos")]
 use crate::tab_panel::TabFavicon;
 #[cfg(target_os = "macos")]
+use crate::tab_panel_icons::FIRST_DYNAMIC_FAVICON_CHAR;
+#[cfg(target_os = "macos")]
 use serde_json::Value as JsonValue;
 
 struct TabState {
@@ -113,6 +116,7 @@ struct TabState {
     search_state: SearchState,
     inline_search_state: InlineSearchState,
     command_state: CommandState,
+    terminal_view_mode: TerminalViewMode,
     mouse: Mouse,
     touch: TouchPurpose,
     cursor_blink_timed_out: bool,
@@ -1603,7 +1607,7 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             next_favicon_id: 0,
             #[cfg(target_os = "macos")]
-            next_favicon_char: 0xE000,
+            next_favicon_char: FIRST_DYNAMIC_FAVICON_CHAR,
             #[cfg(target_os = "macos")]
             cef_inspector: CefInspectorState::new(),
             #[cfg(target_os = "macos")]
@@ -1632,11 +1636,12 @@ impl WindowContext {
     ) -> Result<TabId, Box<dyn Error>> {
         let tab_id = tabs.allocate_id();
         let event_proxy = EventProxy::new(proxy.clone(), display.window.id(), tab_id);
+        let size_info = display.size_info_for_status_lines(usize::from(window_kind.is_web()));
 
-        let terminal = Term::new(config.term_options(), &display.size_info, event_proxy.clone());
+        let terminal = Term::new(config.term_options(), &size_info, event_proxy.clone());
         let terminal = Arc::new(FairMutex::new(terminal));
 
-        let pty = tty::new(&pty_config, display.size_info.into(), display.window.id().into())?;
+        let pty = tty::new(&pty_config, size_info.into(), display.window.id().into())?;
 
         #[cfg(not(windows))]
         let master_fd = pty.file().as_raw_fd();
@@ -1670,7 +1675,7 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         let web_view = match &window_kind {
             WindowKind::Web { url } => {
-                Some(WebView::new(&display.window, &display.size_info, tab_id, url, proxy)?)
+                Some(WebView::new(&display.window, &size_info, tab_id, url, proxy)?)
             },
             WindowKind::Terminal => None,
         };
@@ -1698,6 +1703,7 @@ impl WindowContext {
             search_state: Default::default(),
             inline_search_state: Default::default(),
             command_state: Default::default(),
+            terminal_view_mode: Default::default(),
             mouse: Default::default(),
             touch: Default::default(),
             cursor_blink_timed_out: Default::default(),
@@ -2125,16 +2131,7 @@ impl WindowContext {
 
     #[cfg(target_os = "macos")]
     fn allocate_favicon_char(&mut self) -> char {
-        const BMP_END: u32 = 0xF8FF;
-        const SUP_START: u32 = 0xF0000;
-        const SUP_END: u32 = 0xFFFFD;
-
-        if self.next_favicon_char == BMP_END + 1 {
-            self.next_favicon_char = SUP_START;
-        }
-        if self.next_favicon_char > SUP_END {
-            panic!("Ran out of favicon glyph slots");
-        }
+        self.next_favicon_char = normalize_favicon_char_counter(self.next_favicon_char);
 
         let value = self.next_favicon_char;
         self.next_favicon_char = self.next_favicon_char.saturating_add(1);
@@ -2443,6 +2440,11 @@ impl WindowContext {
                             program_name: tab.program_name.clone(),
                             kind: IpcTabKind::from(&tab.kind),
                             activity,
+                            terminal_layout: Self::ipc_terminal_layout(
+                                &self.display,
+                                &self.config,
+                                tab,
+                            ),
                         })
                     })
                     .collect();
@@ -2468,6 +2470,7 @@ impl WindowContext {
             program_name: tab.program_name.clone(),
             kind: IpcTabKind::from(&tab.kind),
             activity,
+            terminal_layout: Self::ipc_terminal_layout(&self.display, &self.config, tab),
         })
     }
 
@@ -3896,6 +3899,7 @@ impl WindowContext {
                 command_history: &mut self.command_history,
                 tab_id: active_tab.id,
                 tab_kind: &mut active_tab.kind,
+                terminal_view_mode: &mut active_tab.terminal_view_mode,
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
@@ -3948,7 +3952,6 @@ impl WindowContext {
                     active_id,
                     &mut self.tabs,
                     &mut self.display,
-                    &self.message_buffer,
                     old_is_searching,
                     &self.config,
                 );
@@ -3965,6 +3968,50 @@ impl WindowContext {
                 .last_output
                 .map(|last| now.saturating_duration_since(last).as_millis() as u64),
         }
+    }
+
+    fn terminal_viewport_for_kind(
+        display: &Display,
+        config: &UiConfig,
+        kind: &WindowKind,
+        terminal_view_mode: TerminalViewMode,
+    ) -> TerminalViewportLayout {
+        let size_info = display.size_info_for_status_lines(usize::from(kind.is_web()));
+        if kind.is_web() {
+            TerminalViewportLayout::normal(size_info)
+        } else {
+            TerminalViewportLayout::new(
+                &size_info,
+                terminal_view_mode,
+                &config.terminal.multi_column,
+            )
+        }
+    }
+
+    fn terminal_viewport_for_tab(
+        display: &Display,
+        config: &UiConfig,
+        tab: &TabState,
+    ) -> TerminalViewportLayout {
+        Self::terminal_viewport_for_kind(display, config, &tab.kind, tab.terminal_view_mode)
+    }
+
+    #[cfg(unix)]
+    fn ipc_terminal_layout(
+        display: &Display,
+        config: &UiConfig,
+        tab: &TabState,
+    ) -> Option<IpcTerminalLayoutState> {
+        if tab.kind.is_web() {
+            return None;
+        }
+
+        let layout = Self::terminal_viewport_for_tab(display, config, tab);
+        Some(IpcTerminalLayoutState {
+            mode: tab.terminal_view_mode,
+            target_columns: layout.target_columns(),
+            strip_count: layout.strip_count(),
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -4383,6 +4430,7 @@ impl WindowContext {
                 command_history: &mut self.command_history,
                 tab_id: active_tab.id,
                 tab_kind: &mut active_tab.kind,
+                terminal_view_mode: &mut active_tab.terminal_view_mode,
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
@@ -4421,7 +4469,6 @@ impl WindowContext {
                     active_id,
                     &mut self.tabs,
                     &mut self.display,
-                    &self.message_buffer,
                     old_is_searching,
                     &self.config,
                 );
@@ -4708,7 +4755,10 @@ impl WindowContext {
                 tab.notifier.notify(format(color.0).into_bytes());
             },
             TerminalEvent::TextAreaSizeRequest(format) => {
-                let text = format(self.display.size_info.into());
+                let logical_size =
+                    Self::terminal_viewport_for_tab(&self.display, &self.config, tab)
+                        .logical_size(&self.display.size_info);
+                let text = format(logical_size.into());
                 tab.notifier.notify(text.into_bytes());
             },
             TerminalEvent::PtyWrite(text) => {
@@ -4736,8 +4786,9 @@ impl WindowContext {
 
         let serialized_grid = json::to_string(&grid).expect("serialize grid");
 
-        let size_info = &self.display.size_info;
-        let size = TermSize::new(size_info.columns(), size_info.screen_lines());
+        let logical_size = Self::terminal_viewport_for_tab(&self.display, &self.config, tab)
+            .logical_size(&self.display.size_info);
+        let size = TermSize::new(logical_size.columns(), logical_size.screen_lines());
         let serialized_size = json::to_string(&size).expect("serialize size");
 
         let serialized_config = format!("{{\"history_size\":{}}}", grid.history_size());
@@ -4760,7 +4811,6 @@ impl WindowContext {
         active_id: TabId,
         tabs: &mut TabManager,
         display: &mut Display,
-        message_buffer: &MessageBuffer,
         old_is_searching: bool,
         config: &UiConfig,
     ) {
@@ -4784,9 +4834,9 @@ impl WindowContext {
             display.handle_update(
                 &mut terminal,
                 &mut active_tab.notifier,
-                message_buffer,
                 &mut active_tab.search_state,
                 web_status_bar,
+                Some(active_tab.terminal_view_mode),
                 config,
             );
 
@@ -4809,18 +4859,19 @@ impl WindowContext {
             }
         }
 
-        let new_size = display.size_info;
         for tab in tabs.iter_mut() {
             if tab.id == active_id {
                 continue;
             }
 
+            let layout = Self::terminal_viewport_for_tab(display, config, tab);
+            let new_size = layout.logical_size(&display.size_info);
             let mut tab_terminal = tab.terminal.lock();
             if tab_terminal.screen_lines() != new_size.screen_lines()
                 || tab_terminal.columns() != new_size.columns()
             {
                 tab.notifier.on_resize(new_size.into());
-                tab_terminal.resize(new_size);
+                tab_terminal.resize_with_anchor(new_size, ResizeAnchor::Top);
             }
         }
     }
@@ -4986,6 +5037,27 @@ fn agent_event_kind(method: &str) -> String {
     String::from("other")
 }
 
+#[cfg(target_os = "macos")]
+fn normalize_favicon_char_counter(next_favicon_char: u32) -> u32 {
+    const BMP_END: u32 = 0xF8FF;
+    const SUP_START: u32 = 0xF0000;
+    const SUP_END: u32 = 0xFFFFD;
+
+    let next_favicon_char = if next_favicon_char < FIRST_DYNAMIC_FAVICON_CHAR {
+        FIRST_DYNAMIC_FAVICON_CHAR
+    } else if next_favicon_char > BMP_END && next_favicon_char < SUP_START {
+        SUP_START
+    } else {
+        next_favicon_char
+    };
+
+    if next_favicon_char > SUP_END {
+        panic!("Ran out of favicon glyph slots");
+    }
+
+    next_favicon_char
+}
+
 impl Drop for WindowContext {
     fn drop(&mut self) {
         // Shutdown each tab's PTY.
@@ -5009,5 +5081,13 @@ mod tests {
     fn draw_mode_selects_terminal() {
         let mode = draw_mode(&WindowKind::Terminal);
         assert_eq!(mode, DrawMode::Terminal);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dynamic_favicon_chars_start_after_static_sidebar_icons() {
+        assert_eq!(normalize_favicon_char_counter(0xE000), FIRST_DYNAMIC_FAVICON_CHAR);
+        assert_eq!(normalize_favicon_char_counter(0xE00F), FIRST_DYNAMIC_FAVICON_CHAR);
+        assert_eq!(normalize_favicon_char_counter(0xF900), 0xF0000);
     }
 }

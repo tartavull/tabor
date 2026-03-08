@@ -12,7 +12,7 @@ use glutin::display::{GetGlDisplay, GlDisplay};
 use log::{LevelFilter, debug, info};
 use unicode_width::UnicodeWidthChar;
 
-use tabor_terminal::index::Point;
+use tabor_terminal::index::{Column, Line, Point};
 use tabor_terminal::term::cell::Flags;
 
 use crate::config::debug::RendererPreference;
@@ -216,6 +216,7 @@ impl Renderer {
 
             Some(RenderableCell {
                 point: Point::new(point.line, point.column + i),
+                logical_point: Point::new(Line(point.line as i32), Column(point.column.0 + i)),
                 character,
                 extra: None,
                 flags,

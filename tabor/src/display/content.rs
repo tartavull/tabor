@@ -15,6 +15,7 @@ use tabor_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use crate::config::UiConfig;
 use crate::display::color::{CellRgb, DIM_FACTOR, List, Rgb};
 use crate::display::hint::{self, HintState};
+use crate::display::terminal_layout::TerminalViewportLayout;
 use crate::display::{Display, SizeInfo};
 use crate::event::SearchState;
 
@@ -28,13 +29,14 @@ pub struct RenderableContent<'a> {
     terminal_content: TerminalContent<'a>,
     cursor: RenderableCursor,
     cursor_shape: CursorShape,
-    cursor_point: Point<usize>,
+    cursor_point: Option<Point<usize>>,
     search: Option<HintMatches<'a>>,
     hint: Option<Hint<'a>>,
     config: &'a UiConfig,
     colors: &'a List,
     focused_match: Option<&'a Match>,
     size: &'a SizeInfo,
+    layout: TerminalViewportLayout,
 }
 
 impl<'a> RenderableContent<'a> {
@@ -44,6 +46,7 @@ impl<'a> RenderableContent<'a> {
         term: &'a Term<T>,
         search_state: &'a mut SearchState,
     ) -> Self {
+        let layout = display.terminal_viewport.with_terminal_content(term);
         let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
         let focused_match = search_state.focused_match();
         let terminal_content = term.renderable_content();
@@ -64,7 +67,7 @@ impl<'a> RenderableContent<'a> {
         // Convert terminal cursor point to viewport position.
         let cursor_point = terminal_content.cursor.point;
         let display_offset = terminal_content.display_offset;
-        let cursor_point = term::point_to_viewport(display_offset, cursor_point).unwrap();
+        let cursor_point = visual_cursor_point(layout, display_offset, cursor_point);
 
         let hint = if display.hint_state.active() {
             display.hint_state.update_matches(term);
@@ -84,6 +87,7 @@ impl<'a> RenderableContent<'a> {
             search,
             config,
             hint,
+            layout,
         }
     }
 
@@ -143,7 +147,7 @@ impl<'a> RenderableContent<'a> {
         RenderableCursor {
             width,
             shape: self.cursor_shape,
-            point: self.cursor_point,
+            point: self.cursor_point.expect("cursor point must match the visible cursor cell"),
             cursor_color,
             text_color,
         }
@@ -161,9 +165,11 @@ impl Iterator for RenderableContent<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let cell = self.terminal_content.display_iter.next()?;
-            let mut cell = RenderableCell::new(self, cell);
+            let Some(mut cell) = RenderableCell::new(self, cell) else {
+                continue;
+            };
 
-            if self.cursor_point == cell.point {
+            if self.cursor_point == Some(cell.point) {
                 // Store the cursor which should be rendered.
                 self.cursor = self.renderable_cursor(&cell);
                 if self.cursor.shape == CursorShape::Block {
@@ -189,6 +195,7 @@ impl Iterator for RenderableContent<'_> {
 pub struct RenderableCell {
     pub character: char,
     pub point: Point<usize>,
+    pub logical_point: Point,
     pub fg: Rgb,
     pub bg: Rgb,
     pub bg_alpha: f32,
@@ -206,7 +213,7 @@ pub struct RenderableCellExtra {
 }
 
 impl RenderableCell {
-    fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>) -> Self {
+    fn new(content: &mut RenderableContent<'_>, cell: Indexed<&Cell>) -> Option<Self> {
         // Lookup RGB values.
         let mut fg = Self::compute_fg_rgb(content, cell.fg, cell.flags);
         let mut bg = Self::compute_bg_rgb(content, cell.bg);
@@ -232,7 +239,7 @@ impl RenderableCell {
         let mut character = cell.c;
         let mut flags = cell.flags;
 
-        let num_cols = content.size.columns();
+        let num_cols = content.layout.logical_size(content.size).columns();
         if let Some((c, is_first)) = content
             .hint
             .as_mut()
@@ -279,7 +286,8 @@ impl RenderableCell {
 
         // Convert cell point to viewport position.
         let cell_point = cell.point;
-        let point = term::point_to_viewport(display_offset, cell_point).unwrap();
+        let point = term::point_to_viewport(display_offset, cell_point)
+            .and_then(|point| content.layout.visual_point_for_logical_viewport(point))?;
 
         let underline = cell
             .underline_color()
@@ -295,7 +303,17 @@ impl RenderableCell {
             })
         });
 
-        RenderableCell { flags, character, bg_alpha, point, fg, bg, underline, extra }
+        Some(RenderableCell {
+            flags,
+            character,
+            bg_alpha,
+            point,
+            logical_point: cell_point,
+            fg,
+            bg,
+            underline,
+            extra,
+        })
     }
 
     /// Check if cell contains any renderable content.
@@ -548,5 +566,56 @@ impl Deref for HintMatches<'_> {
 
     fn deref(&self) -> &Self::Target {
         self.matches.deref()
+    }
+}
+
+fn visual_cursor_point(
+    layout: TerminalViewportLayout,
+    display_offset: usize,
+    cursor_point: Point,
+) -> Option<Point<usize>> {
+    term::point_to_viewport(display_offset, cursor_point)
+        .and_then(|point| layout.visual_point_for_logical_viewport(point))
+}
+
+#[cfg(test)]
+mod tests {
+    use tabor_terminal::grid::Dimensions;
+    use tabor_terminal::index::{Column, Line};
+
+    use crate::config::terminal::MultiColumnTerminalConfig;
+    use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
+
+    use super::{Point, SizeInfo, visual_cursor_point};
+
+    fn size(columns: usize, lines: usize) -> SizeInfo {
+        SizeInfo::new(columns as f32, lines as f32, 1., 1., 0., 0., 0., false)
+    }
+
+    #[test]
+    fn visual_cursor_point_returns_none_when_folded_cursor_is_scrolled_out() {
+        let size_info = size(220, 70);
+        let layout = TerminalViewportLayout::new(
+            &size_info,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+        );
+        let cursor_point = Point::new(Line(0), Column(0));
+        let display_offset = layout.logical_size(&size_info).screen_lines();
+
+        assert_eq!(visual_cursor_point(layout, display_offset, cursor_point), None);
+    }
+
+    #[test]
+    fn visual_cursor_point_top_aligns_short_folded_content() {
+        let size_info = size(300, 4);
+        let layout = TerminalViewportLayout::new(
+            &size_info,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+        );
+        let cursor_point = Point::new(Line(0), Column(0));
+
+        assert_eq!(visual_cursor_point(layout, 0, cursor_point), Some(Point::new(0, Column(0))));
     }
 }

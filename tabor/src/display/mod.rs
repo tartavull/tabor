@@ -32,7 +32,7 @@ use tabor_terminal::index::{Column, Direction, Line, Point};
 use tabor_terminal::selection::Selection;
 use tabor_terminal::term::cell::Flags;
 use tabor_terminal::term::{
-    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, Term, TermDamage, TermMode,
+    self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, ResizeAnchor, Term, TermDamage, TermMode,
 };
 use tabor_terminal::vte::ansi::{CursorShape, NamedColor};
 
@@ -53,6 +53,7 @@ use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
 #[cfg(target_os = "macos")]
 use crate::display::tab_panel::{PanelDimensions, TabPanel, compute_panel_dimensions};
+use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
 use crate::event::{CommandState, Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
@@ -72,6 +73,7 @@ pub mod color;
 pub mod content;
 pub mod cursor;
 pub mod hint;
+pub mod terminal_layout;
 pub mod window;
 
 #[cfg(target_os = "macos")]
@@ -371,6 +373,8 @@ pub struct Display {
     pub window: Window,
 
     pub size_info: SizeInfo,
+    pub terminal_viewport: TerminalViewportLayout,
+    active_status_lines: usize,
 
     #[cfg(target_os = "macos")]
     pub tab_panel: TabPanel,
@@ -685,6 +689,8 @@ impl Display {
             glyph_cache,
             hint_state,
             size_info,
+            terminal_viewport: TerminalViewportLayout::normal(size_info),
+            active_status_lines: 0,
             font_size,
             window,
             pending_renderer_update: Default::default(),
@@ -698,6 +704,24 @@ impl Display {
             meter: Default::default(),
             ime: Default::default(),
         })
+    }
+
+    pub fn terminal_viewport(&self) -> TerminalViewportLayout {
+        self.terminal_viewport
+    }
+
+    pub fn size_info_for_status_lines(&self, status_lines: usize) -> SizeInfo {
+        let mut size_info = self.size_info;
+        match status_lines.cmp(&self.active_status_lines) {
+            cmp::Ordering::Less => {
+                size_info.screen_lines += self.active_status_lines - status_lines;
+            },
+            cmp::Ordering::Greater => {
+                size_info.reserve_lines(status_lines - self.active_status_lines);
+            },
+            cmp::Ordering::Equal => (),
+        }
+        size_info
     }
 
     #[inline]
@@ -810,9 +834,9 @@ impl Display {
         &mut self,
         terminal: &mut Term<T>,
         pty_resize_handle: &mut dyn OnResize,
-        _message_buffer: &MessageBuffer,
         search_state: &mut SearchState,
         web_status_bar: bool,
+        terminal_view_mode: Option<TerminalViewMode>,
         config: &UiConfig,
     ) where
         T: EventListener,
@@ -887,23 +911,33 @@ impl Display {
         // Message bar is rendered inline with the footer bar, so it doesn't reserve extra lines.
         let status_lines = usize::from(web_status_bar);
         new_size.reserve_lines(status_lines);
+        self.active_status_lines = status_lines;
 
         // Update resize increments.
         if config.window.resize_increments {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
-        // Resize when terminal when its dimensions have changed.
+        self.terminal_viewport = terminal_view_mode.map_or_else(
+            || TerminalViewportLayout::normal(new_size),
+            |mode| TerminalViewportLayout::new(&new_size, mode, &config.terminal.multi_column),
+        );
+        let logical_size = self.terminal_viewport.logical_size(&new_size);
+
+        // Resize the active terminal when its logical dimensions have changed.
+        if terminal.screen_lines() != logical_size.screen_lines()
+            || terminal.columns() != logical_size.columns()
+        {
+            // Resize PTY.
+            pty_resize_handle.on_resize(logical_size.into());
+
+            // Resize terminal.
+            terminal.resize_with_anchor(logical_size, ResizeAnchor::Top);
+        }
+
         if self.size_info.screen_lines() != new_size.screen_lines
             || self.size_info.columns() != new_size.columns()
         {
-            // Resize PTY.
-            pty_resize_handle.on_resize(new_size.into());
-
-            // Resize terminal.
-            terminal.resize(new_size);
-
-            // Resize damage tracking.
             self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
         }
 
@@ -978,6 +1012,8 @@ impl Display {
         #[cfg(target_os = "macos")]
         self.sync_macos_tab_panel_semaphore_inset_for_draw(config, force_notch_ears);
 
+        let terminal_viewport = self.terminal_viewport.with_terminal_content(&terminal);
+
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
@@ -1001,14 +1037,21 @@ impl Display {
         let vi_mode = terminal.mode().contains(TermMode::VI);
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
 
+        let folded_terminal = terminal_viewport.is_multi_column();
+
         // Add damage from the terminal.
-        match terminal.damage() {
-            TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
-            TermDamage::Partial(damaged_lines) => {
-                for damage in damaged_lines {
-                    self.damage_tracker.frame().damage_line(damage);
-                }
-            },
+        if folded_terminal {
+            self.damage_tracker.frame().mark_fully_damaged();
+            self.damage_tracker.next_frame().mark_fully_damaged();
+        } else {
+            match terminal.damage() {
+                TermDamage::Full => self.damage_tracker.frame().mark_fully_damaged(),
+                TermDamage::Partial(damaged_lines) => {
+                    for damage in damaged_lines {
+                        self.damage_tracker.frame().damage_line(damage);
+                    }
+                },
+            }
         }
         terminal.reset_damage();
 
@@ -1020,7 +1063,8 @@ impl Display {
 
         // Add damage from tabor's UI elements overlapping terminal.
 
-        let requires_full_damage = self.visual_bell.intensity() != 0.
+        let requires_full_damage = folded_terminal
+            || self.visual_bell.intensity() != 0.
             || self.hint_state.active()
             || search_state.regex().is_some()
             || command_active;
@@ -1029,10 +1073,13 @@ impl Display {
             self.damage_tracker.next_frame().mark_fully_damaged();
         }
 
-        let vi_cursor_viewport_point =
-            vi_cursor_point.and_then(|cursor| term::point_to_viewport(display_offset, cursor));
+        let vi_cursor_viewport_point = vi_cursor_point
+            .and_then(|cursor| term::point_to_viewport(display_offset, cursor))
+            .and_then(|point| terminal_viewport.visual_point_for_logical_viewport(point));
         self.damage_tracker.damage_vi_cursor(vi_cursor_viewport_point);
-        self.damage_tracker.damage_selection(selection_range, display_offset);
+        if !folded_terminal {
+            self.damage_tracker.damage_selection(selection_range, display_offset);
+        }
 
         // Make sure this window's OpenGL context is active.
         self.make_current();
@@ -1060,7 +1107,7 @@ impl Display {
             let cells = grid_cells.into_iter().map(|mut cell| {
                 // Underline hints hovered by mouse or vi mode cursor.
                 if has_highlighted_hint {
-                    let point = term::viewport_to_point(display_offset, cell.point);
+                    let point = cell.logical_point;
                     let hyperlink = cell.extra.as_ref().and_then(|extra| extra.hyperlink.as_ref());
 
                     let should_highlight = |hint: &Option<HintMatch>| {
@@ -1086,7 +1133,9 @@ impl Display {
             // Indicate vi mode by showing the cursor's position in the top right corner.
             let line = (-vi_cursor_point.line.0 + size_info.bottommost_line().0) as usize;
             let obstructed_column = Some(vi_cursor_point)
-                .filter(|point| point.line == -(display_offset as i32))
+                .and_then(|point| term::point_to_viewport(display_offset, point))
+                .and_then(|point| terminal_viewport.visual_point_for_logical_viewport(point))
+                .filter(|point| point.line == 0)
                 .map(|point| point.column);
             self.draw_line_indicator(config, total_lines, obstructed_column, line);
         } else if search_state.regex().is_some() {
@@ -1195,6 +1244,9 @@ impl Display {
                     let num_lines = self.size_info.screen_lines();
                     match vi_cursor_viewport_point {
                         None => term::point_to_viewport(display_offset, cursor_point)
+                            .and_then(|point| {
+                                terminal_viewport.visual_point_for_logical_viewport(point)
+                            })
                             .filter(|point| point.line < num_lines),
                         point => point,
                     }
@@ -1251,7 +1303,7 @@ impl Display {
         // Draw hyperlink uri preview.
         if has_highlighted_hint {
             let cursor_point = vi_cursor_point.or(Some(cursor_point));
-            self.draw_hyperlink_preview(config, cursor_point, display_offset);
+            self.draw_hyperlink_preview(config, terminal_viewport, cursor_point, display_offset);
         }
 
         // Notify winit that we're about to present.
@@ -1453,6 +1505,8 @@ impl Display {
         mouse: &Mouse,
         modifiers: ModifiersState,
     ) -> bool {
+        let terminal_viewport = self.terminal_viewport.with_terminal_content(term);
+
         // Update vi mode cursor hint.
         let vi_highlighted_hint = if term.mode().contains(TermMode::VI) {
             let mods = ModifiersState::all();
@@ -1483,7 +1537,7 @@ impl Display {
         }
 
         // Find highlighted hint at mouse position.
-        let point = mouse.point(&self.size_info, term.grid().display_offset());
+        let point = mouse.point(&self.size_info, &terminal_viewport, term.grid().display_offset());
         let highlighted_hint = hint::highlighted_at(term, config, point, modifiers);
 
         // Update cursor shape.
@@ -1676,6 +1730,7 @@ impl Display {
     fn draw_hyperlink_preview(
         &mut self,
         config: &UiConfig,
+        layout: TerminalViewportLayout,
         cursor_point: Option<Point>,
         display_offset: usize,
     ) {
@@ -1705,8 +1760,10 @@ impl Display {
         }
 
         // Find the line in viewport we can draw preview on without obscuring protected lines.
-        let viewport_bottom = self.size_info.bottommost_line() - Line(display_offset as i32);
-        let viewport_top = viewport_bottom - (self.size_info.screen_lines() - 1);
+        let viewport_bottom =
+            layout.logical_size(&self.size_info).bottommost_line() - Line(display_offset as i32);
+        let viewport_top =
+            viewport_bottom - (layout.logical_size(&self.size_info).screen_lines() - 1);
         let uri_lines = (viewport_top.0..=viewport_bottom.0)
             .rev()
             .map(|line| Some(Line(line)))
@@ -1719,7 +1776,10 @@ impl Display {
                 }
             })
             .take(uris.len())
-            .flat_map(|line| term::point_to_viewport(display_offset, Point::new(line, Column(0))));
+            .filter_map(|line| {
+                term::point_to_viewport(display_offset, Point::new(line, Column(0)))
+                    .and_then(|point| layout.visual_point_for_logical_viewport(point))
+            });
 
         let fg = config.colors.footer_bar_foreground();
         let bg = config.colors.footer_bar_background();
@@ -1883,6 +1943,10 @@ impl Display {
 
     /// Check whether a hint highlight needs to be cleared.
     fn validate_hint_highlights(&mut self, display_offset: usize) {
+        if self.terminal_viewport.is_multi_column() {
+            return;
+        }
+
         let frame = self.damage_tracker.frame();
         let hints = [
             (&mut self.highlighted_hint, &mut self.highlighted_hint_age, true),

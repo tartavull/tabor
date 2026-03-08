@@ -49,6 +49,7 @@ mod renderer;
 mod scheduler;
 mod string;
 mod tab_panel;
+mod tab_panel_icons;
 mod tabs;
 mod web_url;
 mod window_context;
