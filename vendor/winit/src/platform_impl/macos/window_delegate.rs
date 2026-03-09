@@ -209,6 +209,7 @@ declare_class!(
             trace_scope!("windowDidBecomeKey:");
             // TODO: center the cursor if the window had mouse grab when it
             // lost focus
+            self.restore_key_view_focus();
             self.queue_event(WindowEvent::Focused(true));
         }
 
@@ -296,6 +297,7 @@ declare_class!(
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
                 self.set_fullscreen(target_fullscreen);
             }
+            self.restore_key_view_focus();
         }
 
         /// Invoked when exited fullscreen
@@ -308,6 +310,7 @@ declare_class!(
             if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
                 self.set_fullscreen(target_fullscreen);
             }
+            self.restore_key_view_focus();
         }
 
         /// Invoked when fail to enter fullscreen
@@ -880,11 +883,15 @@ impl WindowDelegate {
         self.queue_event(WindowEvent::Moved(position));
     }
 
+    fn restore_key_view_focus(&self) {
+        let _ = self.window().makeFirstResponder(Some(&self.view()));
+    }
+
     fn set_style_mask(&self, mask: NSWindowStyleMask) {
         self.window().setStyleMask(mask);
         // If we don't do this, key handling will break
         // (at least until the window is clicked again/etc.)
-        let _ = self.window().makeFirstResponder(Some(&self.view()));
+        self.restore_key_view_focus();
     }
 
     pub fn set_title(&self, title: &str) {

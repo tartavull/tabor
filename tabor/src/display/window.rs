@@ -74,7 +74,7 @@ const MACOS_TRAFFIC_LIGHT_MARGIN_X: f64 = 12.0;
 #[cfg(target_os = "macos")]
 const MACOS_TRAFFIC_LIGHT_MARGIN_Y: f64 = 8.0;
 #[cfg(target_os = "macos")]
-const MACOS_FULLSCREEN_WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
+pub(crate) const MACOS_FULLSCREEN_WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
 #[cfg(target_os = "macos")]
 const MACOS_FULLSCREEN_WINDOW_CONTROL_MARGIN_X_PX: f64 = 12.0;
 #[cfg(target_os = "macos")]
@@ -666,6 +666,24 @@ impl Window {
         self.macos_notch_geometry()
             .map(|geometry| (geometry.safe_area_insets.top * self.scale_factor) as f32)
             .unwrap_or(0.0)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_fullscreen_window_controls_band_height_px(&self, padding_y_px: f32) -> f32 {
+        macos_fullscreen_window_controls_band_height_px(
+            self.scale_factor,
+            padding_y_px,
+            self.macos_real_ear_top_padding_px(),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_fullscreen_window_controls_extra_top_padding_px(&self, padding_y_px: f32) -> f32 {
+        macos_fullscreen_window_controls_extra_top_padding_px(
+            self.scale_factor,
+            padding_y_px,
+            self.macos_real_ear_top_padding_px(),
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -1382,6 +1400,30 @@ bitflags! {
 fn macos_real_ear_fullscreen_enabled(window_config: &WindowConfig) -> bool {
     window_config.tab_panel.enabled
         && matches!(window_config.decorations, Decorations::Full | Decorations::Transparent)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_fullscreen_window_controls_band_height_px(
+    scale_factor: f64,
+    padding_y_px: f32,
+    fullscreen_top_padding_px: f32,
+) -> f32 {
+    let min_band_height = (MACOS_FULLSCREEN_WINDOW_CONTROL_REFERENCE_BAND_PX * scale_factor) as f32;
+    (padding_y_px + fullscreen_top_padding_px).max(min_band_height)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_fullscreen_window_controls_extra_top_padding_px(
+    scale_factor: f64,
+    padding_y_px: f32,
+    fullscreen_top_padding_px: f32,
+) -> f32 {
+    (macos_fullscreen_window_controls_band_height_px(
+        scale_factor,
+        padding_y_px,
+        fullscreen_top_padding_px,
+    ) - padding_y_px)
+        .max(0.0)
 }
 
 #[cfg(target_os = "macos")]

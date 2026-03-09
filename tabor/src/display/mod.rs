@@ -107,6 +107,14 @@ impl<'a> MacOsWebDraw<'a> {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacosSemaphoreLayoutMode {
+    Hidden,
+    WindowedInset,
+    FullscreenCustom,
+}
+
 mod bell;
 mod damage;
 mod meter;
@@ -547,14 +555,20 @@ impl Display {
     }
 
     #[cfg(target_os = "macos")]
-    fn macos_show_semaphore_controls(
+    fn macos_semaphore_layout_mode(
         tab_panel_enabled: bool,
         decorations: Decorations,
         is_fullscreen_or_simple_fullscreen: bool,
-    ) -> bool {
-        tab_panel_enabled
-            && matches!(decorations, Decorations::Full | Decorations::Transparent)
-            && !is_fullscreen_or_simple_fullscreen
+    ) -> MacosSemaphoreLayoutMode {
+        if !tab_panel_enabled
+            || !matches!(decorations, Decorations::Full | Decorations::Transparent)
+        {
+            MacosSemaphoreLayoutMode::Hidden
+        } else if is_fullscreen_or_simple_fullscreen {
+            MacosSemaphoreLayoutMode::FullscreenCustom
+        } else {
+            MacosSemaphoreLayoutMode::WindowedInset
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -571,12 +585,13 @@ impl Display {
 
         let (native_fullscreen, simple_fullscreen, _) = window.macos_fullscreen_flags();
         let is_fullscreen_or_simple_fullscreen = native_fullscreen || simple_fullscreen;
-        let show_native_controls = Self::macos_show_semaphore_controls(
+        let layout_mode = Self::macos_semaphore_layout_mode(
             tab_panel.is_enabled(),
             config.window.decorations,
             is_fullscreen_or_simple_fullscreen,
         );
-        let show_fullscreen_controls = window.macos_real_ear_fullscreen_active();
+        let show_native_controls = layout_mode == MacosSemaphoreLayoutMode::WindowedInset;
+        let show_fullscreen_controls = layout_mode == MacosSemaphoreLayoutMode::FullscreenCustom;
 
         let background_color = if show_native_controls {
             TabPanel::background_color(config)
@@ -590,8 +605,11 @@ impl Display {
             window.clear_macos_notch_ear_windows();
         }
 
-        let fullscreen_top_padding =
-            if show_fullscreen_controls { window.macos_real_ear_top_padding_px() } else { 0.0 };
+        let fullscreen_top_padding = if show_fullscreen_controls {
+            window.macos_fullscreen_window_controls_extra_top_padding_px(padding_y_px)
+        } else {
+            0.0
+        };
 
         if show_native_controls {
             let top_inset = window
@@ -599,7 +617,8 @@ impl Display {
                 .unwrap_or(0.0);
             tab_panel.set_native_window_controls_inset_px(top_inset);
         } else if show_fullscreen_controls {
-            let band_height_px = padding_y_px + fullscreen_top_padding;
+            let band_height_px =
+                window.macos_fullscreen_window_controls_band_height_px(padding_y_px);
             let _ = window
                 .layout_macos_fullscreen_window_controls(panel_dimensions.width, band_height_px);
             tab_panel.set_fullscreen_window_controls_band_px(band_height_px);
@@ -2456,27 +2475,67 @@ mod tests {
 
     #[test]
     fn macos_window_controls_visibility_policy() {
-        assert!(Display::macos_show_semaphore_controls(true, Decorations::Full, false));
-        assert!(Display::macos_show_semaphore_controls(true, Decorations::Transparent, false));
-
-        assert!(!Display::macos_show_semaphore_controls(true, Decorations::Full, true));
-        assert!(!Display::macos_show_semaphore_controls(true, Decorations::Transparent, true));
-        assert!(!Display::macos_show_semaphore_controls(false, Decorations::Full, false));
-        assert!(!Display::macos_show_semaphore_controls(true, Decorations::Buttonless, false));
-        assert!(!Display::macos_show_semaphore_controls(true, Decorations::None, false));
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(true, Decorations::Full, false),
+            MacosSemaphoreLayoutMode::WindowedInset
+        );
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(true, Decorations::Transparent, false),
+            MacosSemaphoreLayoutMode::WindowedInset
+        );
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(true, Decorations::Full, true),
+            MacosSemaphoreLayoutMode::FullscreenCustom
+        );
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(true, Decorations::Transparent, true),
+            MacosSemaphoreLayoutMode::FullscreenCustom
+        );
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(false, Decorations::Full, false),
+            MacosSemaphoreLayoutMode::Hidden
+        );
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(true, Decorations::Buttonless, false),
+            MacosSemaphoreLayoutMode::Hidden
+        );
+        assert_eq!(
+            Display::macos_semaphore_layout_mode(true, Decorations::None, false),
+            MacosSemaphoreLayoutMode::Hidden
+        );
     }
 
     #[test]
     fn macos_fullscreen_roundtrip_uses_measured_inset() {
         let measured_inset = 26.0_f32;
 
-        let show_controls = Display::macos_show_semaphore_controls(true, Decorations::Full, true);
-        let top_inset = if show_controls { measured_inset } else { 0.0 };
-        assert_eq!(top_inset, 0.0);
+        let windowed_layout = Display::macos_semaphore_layout_mode(true, Decorations::Full, false);
+        let windowed_top_inset = match windowed_layout {
+            MacosSemaphoreLayoutMode::WindowedInset => measured_inset,
+            MacosSemaphoreLayoutMode::Hidden | MacosSemaphoreLayoutMode::FullscreenCustom => 0.0,
+        };
+        assert_eq!(windowed_top_inset, measured_inset);
 
-        let show_controls = Display::macos_show_semaphore_controls(true, Decorations::Full, false);
-        let top_inset = if show_controls { measured_inset } else { 0.0 };
-        assert_eq!(top_inset, measured_inset);
+        let fullscreen_layout = Display::macos_semaphore_layout_mode(true, Decorations::Full, true);
+        let fullscreen_band_height = match fullscreen_layout {
+            MacosSemaphoreLayoutMode::FullscreenCustom => {
+                crate::display::window::macos_fullscreen_window_controls_band_height_px(
+                    1.0, 4.0, 0.0,
+                )
+            },
+            MacosSemaphoreLayoutMode::Hidden | MacosSemaphoreLayoutMode::WindowedInset => 0.0,
+        };
+        assert_eq!(fullscreen_band_height, 37.0);
+    }
+
+    #[test]
+    fn macos_native_fullscreen_reserves_minimum_control_band() {
+        assert_eq!(
+            crate::display::window::macos_fullscreen_window_controls_extra_top_padding_px(
+                1.0, 4.0, 0.0,
+            ),
+            33.0
+        );
     }
 
     #[test]
