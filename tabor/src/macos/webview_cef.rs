@@ -246,6 +246,67 @@ impl PaintState {
     }
 }
 
+#[derive(Clone)]
+struct WebViewDirtyNotifier {
+    window_id: WindowId,
+    tab_id: TabId,
+    sender: WebViewDirtySender,
+}
+
+#[derive(Clone)]
+enum WebViewDirtySender {
+    Proxy(EventLoopProxy<Event>),
+    #[cfg(test)]
+    Recorder(StdRc<RefCell<Vec<Event>>>),
+}
+
+impl WebViewDirtyNotifier {
+    fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: TabId) -> Self {
+        Self { window_id, tab_id, sender: WebViewDirtySender::Proxy(proxy) }
+    }
+
+    fn event(&self) -> Event {
+        Event::for_tab(crate::event::EventType::WebViewDirty, self.window_id, self.tab_id)
+    }
+
+    fn send(&self) {
+        let event = self.event();
+        match &self.sender {
+            WebViewDirtySender::Proxy(proxy) => {
+                let _ = proxy.send_event(event);
+            },
+            #[cfg(test)]
+            WebViewDirtySender::Recorder(events) => {
+                events.borrow_mut().push(event);
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn recorder(window_id: WindowId, tab_id: TabId) -> (Self, StdRc<RefCell<Vec<Event>>>) {
+        let events = StdRc::new(RefCell::new(Vec::new()));
+        let notifier =
+            Self { window_id, tab_id, sender: WebViewDirtySender::Recorder(events.clone()) };
+        (notifier, events)
+    }
+}
+
+fn handle_ime_composition_range_change(
+    dirty_notifier: &WebViewDirtyNotifier,
+    _selected_range: Option<&cef::Range>,
+    _character_bounds: Option<&[cef::Rect]>,
+) {
+    dirty_notifier.send();
+}
+
+fn handle_text_selection_change(
+    dirty_notifier: &WebViewDirtyNotifier,
+    _selected_text: Option<&cef::CefString>,
+    _selected_range: Option<&cef::Range>,
+) {
+    dirty_notifier.send();
+}
+
 fn browser_device_scale_factor(scale_factor: f64) -> f32 {
     scale_factor.max(f32::MIN_POSITIVE as f64) as f32
 }
@@ -589,9 +650,7 @@ cef::wrap_display_handler! {
 cef::wrap_render_handler! {
     struct TaborRenderHandler {
         paint_state: StdRc<RefCell<PaintState>>,
-        event_proxy: EventLoopProxy<Event>,
-        window_id: WindowId,
-        tab_id: TabId,
+        dirty_notifier: WebViewDirtyNotifier,
     }
 
     impl RenderHandler {
@@ -672,9 +731,7 @@ cef::wrap_render_handler! {
         fn on_popup_show(&self, _browser: Option<&mut cef::Browser>, show: ::std::os::raw::c_int) {
             if show == 0 {
                 self.paint_state.borrow_mut().clear_popup_surface();
-                let event =
-                    Event::for_tab(crate::event::EventType::WebViewDirty, self.window_id, self.tab_id);
-                let _ = self.event_proxy.send_event(event);
+                self.dirty_notifier.send();
             }
         }
 
@@ -746,9 +803,29 @@ cef::wrap_render_handler! {
             }
             super::record_accelerated_frame();
 
-            let event =
-                Event::for_tab(crate::event::EventType::WebViewDirty, self.window_id, self.tab_id);
-            let _ = self.event_proxy.send_event(event);
+            self.dirty_notifier.send();
+        }
+
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            selected_range: Option<&cef::Range>,
+            character_bounds: Option<&[cef::Rect]>,
+        ) {
+            handle_ime_composition_range_change(
+                &self.dirty_notifier,
+                selected_range,
+                character_bounds,
+            );
+        }
+
+        fn on_text_selection_changed(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            selected_text: Option<&cef::CefString>,
+            selected_range: Option<&cef::Range>,
+        ) {
+            handle_text_selection_change(&self.dirty_notifier, selected_text, selected_range);
         }
     }
 }
@@ -1156,8 +1233,10 @@ impl WebView {
             let screen_rect = cef_screen_rect(window, layout);
             let paint_state =
                 StdRc::new(RefCell::new(PaintState::new(layout, screen_rect, window.scale_factor)));
-            let render_handler =
-                TaborRenderHandler::new(paint_state.clone(), proxy.clone(), window.id(), tab_id);
+            let render_handler = TaborRenderHandler::new(
+                paint_state.clone(),
+                WebViewDirtyNotifier::new(proxy.clone(), window.id(), tab_id),
+            );
             let mut window_info = cef::WindowInfo::default().set_as_windowless(parent.cast());
             window_info.shared_texture_enabled = 1;
 
@@ -2578,10 +2657,11 @@ fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
 #[cfg(test)]
 mod tests {
     use super::{
-        PaintState, browser_device_scale_factor, browser_screen_point, browser_settings,
-        cef_mouse_button_flag, cef_mouse_event_flags, scaled_browser_wheel_delta_y,
-        should_invalidate_after_frame_edit, should_invalidate_after_key_input,
-        should_run_frame_edit_inline,
+        PaintState, WebViewDirtyNotifier, browser_device_scale_factor, browser_screen_point,
+        browser_settings, cef_mouse_button_flag, cef_mouse_event_flags,
+        handle_ime_composition_range_change, handle_text_selection_change,
+        scaled_browser_wheel_delta_y, should_invalidate_after_frame_edit,
+        should_invalidate_after_key_input, should_run_frame_edit_inline,
     };
     #[cfg(not(feature = "passkey-webauthn"))]
     use super::{
@@ -2592,7 +2672,9 @@ mod tests {
     #[cfg(not(feature = "passkey-webauthn"))]
     use cef::{PermissionRequestResult, PermissionRequestTypes as Permission};
     use objc2_app_kit::NSEventModifierFlags;
+    use std::cell::RefCell;
     use winit::event::{ElementState, MouseButton};
+    use winit::window::WindowId;
 
     #[test]
     fn browser_settings_enable_javascript_clipboard_access() {
@@ -2723,6 +2805,47 @@ mod tests {
         assert_ne!(flags & cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0, 0);
         assert_ne!(flags & cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0, 0);
         assert_eq!(flags & cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0, 0);
+    }
+
+    fn test_dirty_notifier(
+        window_id: WindowId,
+        tab_id: crate::tabs::TabId,
+    ) -> (WebViewDirtyNotifier, std::rc::Rc<RefCell<Vec<crate::event::Event>>>) {
+        WebViewDirtyNotifier::recorder(window_id, tab_id)
+    }
+
+    #[test]
+    fn text_selection_changes_emit_webview_dirty() {
+        let window_id = WindowId::dummy();
+        let tab_id = crate::tabs::TabId::new(7, 11);
+        let (dirty_notifier, events) = test_dirty_notifier(window_id, tab_id);
+
+        handle_text_selection_change(&dirty_notifier, None, Some(&cef::Range { from: 0, to: 0 }));
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1, "expected a dirty event after text selection changes");
+        assert_eq!(events[0].window_id(), Some(window_id));
+        assert_eq!(events[0].tab_id(), Some(tab_id));
+        assert!(matches!(events[0].payload(), crate::event::EventType::WebViewDirty));
+    }
+
+    #[test]
+    fn ime_composition_changes_emit_webview_dirty() {
+        let window_id = WindowId::dummy();
+        let tab_id = crate::tabs::TabId::new(7, 11);
+        let (dirty_notifier, events) = test_dirty_notifier(window_id, tab_id);
+
+        handle_ime_composition_range_change(
+            &dirty_notifier,
+            Some(&cef::Range { from: 0, to: 0 }),
+            None,
+        );
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1, "expected a dirty event after IME composition changes");
+        assert_eq!(events[0].window_id(), Some(window_id));
+        assert_eq!(events[0].tab_id(), Some(tab_id));
+        assert!(matches!(events[0].payload(), crate::event::EventType::WebViewDirty));
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
