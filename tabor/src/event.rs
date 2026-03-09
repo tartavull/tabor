@@ -1225,6 +1225,15 @@ impl ApplicationHandler<Event> for Processor {
                     window_context.handle_tab_command(command);
                 }
             },
+            (EventType::SetMultiColumnCount(command), Some(window_id)) => {
+                let Some(window_context) = self.windows.get_mut(&window_id) else {
+                    return;
+                };
+                let Some(tab_id) = tab_id else {
+                    return;
+                };
+                window_context.set_multi_column_count(tab_id, command);
+            },
             #[cfg(target_os = "macos")]
             (EventType::CloseTab(tab_id), Some(window_id)) => {
                 let Some(window_context) = self.windows.get_mut(&window_id) else {
@@ -1569,6 +1578,18 @@ pub enum WebCommand {
     SetMark { name: char, url: String, scroll_x: f64, scroll_y: f64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiColumnCommandScope {
+    Local,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiColumnCommand {
+    pub scope: MultiColumnCommandScope,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum EventType {
     Terminal(TerminalEvent),
@@ -1578,6 +1599,7 @@ pub enum EventType {
     CreateWindow(WindowOptions),
     CreateTab(WindowOptions),
     TabCommand(TabCommand),
+    SetMultiColumnCount(MultiColumnCommand),
     #[cfg(target_os = "macos")]
     WebCommand(WebCommand),
     #[cfg(target_os = "macos")]
@@ -1861,6 +1883,8 @@ pub struct ActionContext<'a, N, T> {
     #[cfg(target_os = "macos")]
     pub browser_view_mode: &'a mut BrowserViewMode,
     #[cfg(target_os = "macos")]
+    pub browser_multi_column_count: Option<usize>,
+    #[cfg(target_os = "macos")]
     pub web_view: Option<&'a mut WebView>,
     #[cfg(target_os = "macos")]
     pub web_command_state: &'a mut WebCommandState,
@@ -1884,6 +1908,7 @@ fn browser_viewport_layout(
     display: &Display,
     config: &UiConfig,
     browser_view_mode: BrowserViewMode,
+    exact_column_count: Option<usize>,
 ) -> BrowserViewportLayout {
     let size_info = display.size_info_for_status_lines(1);
     BrowserViewportLayout::new(
@@ -1891,6 +1916,7 @@ fn browser_viewport_layout(
         display.window.scale_factor,
         browser_view_mode,
         &config.browser.multi_column,
+        exact_column_count,
     )
 }
 
@@ -1902,6 +1928,7 @@ pub(crate) fn request_web_cursor_update(
     display: &Display,
     config: &UiConfig,
     browser_view_mode: BrowserViewMode,
+    browser_multi_column_count: Option<usize>,
     position: PhysicalPosition<f64>,
     event_proxy: &EventLoopProxy<Event>,
     scheduler: &mut Scheduler,
@@ -1911,7 +1938,8 @@ pub(crate) fn request_web_cursor_update(
     web_command_state.set_last_cursor_pos(position);
 
     let scale_factor = display.window.scale_factor.max(f64::MIN_POSITIVE);
-    let layout = browser_viewport_layout(display, config, browser_view_mode);
+    let layout =
+        browser_viewport_layout(display, config, browser_view_mode, browser_multi_column_count);
     let visual_x = (position.x / scale_factor).floor().max(0.0) as usize;
     let visual_y = (position.y / scale_factor).floor().max(0.0) as usize;
     let Some((logical_x, logical_y)) = layout.logical_point_for_visual(visual_x, visual_y) else {
@@ -2190,6 +2218,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             self.display,
             self.config,
             *self.browser_view_mode,
+            self.browser_multi_column_count,
             position,
             self.event_proxy,
             self.scheduler,
@@ -3600,6 +3629,22 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     },
                 }
             },
+            "c" | "c!" => {
+                let args = parts.collect::<Vec<_>>();
+                let command = match parse_multi_column_command(command, &args) {
+                    Ok(command) => command,
+                    Err(message) => {
+                        self.push_command_error(message);
+                        return;
+                    },
+                };
+                let event = Event::for_tab(
+                    EventType::SetMultiColumnCount(command),
+                    self.display.window.id(),
+                    self.tab_id,
+                );
+                let _ = self.event_proxy.send_event(event);
+            },
             "T" => {
                 let query = parts.collect::<Vec<_>>().join(" ");
                 if query.is_empty() {
@@ -4342,6 +4387,29 @@ enum CommandTarget {
     TerminalDir(PathBuf),
 }
 
+fn parse_multi_column_command(command: &str, args: &[&str]) -> Result<MultiColumnCommand, String> {
+    let scope = match command {
+        "c" => MultiColumnCommandScope::Local,
+        "c!" => MultiColumnCommandScope::Global,
+        _ => return Err(format!("Unknown command: {command}")),
+    };
+
+    let [count] = args else {
+        return if args.is_empty() {
+            Err(format!("Missing column count for :{command}"))
+        } else {
+            Err(format!("Expected a single column count for :{command}"))
+        };
+    };
+
+    let count = count.parse::<usize>().map_err(|_| format!("Invalid column count `{count}`"))?;
+    if count == 0 {
+        return Err(String::from("Column count must be at least 1"));
+    }
+
+    Ok(MultiColumnCommand { scope, count })
+}
+
 fn parse_command_target(input: &str) -> Result<CommandTarget, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -4483,7 +4551,8 @@ mod tests {
     use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 
     use super::{
-        CommandHistory, CommandTarget, command_url_prefix, parse_command_target,
+        CommandHistory, CommandTarget, MultiColumnCommand, MultiColumnCommandScope,
+        command_url_prefix, parse_command_target, parse_multi_column_command,
         terminal_text_area_size,
     };
 
@@ -4503,6 +4572,38 @@ mod tests {
         assert_eq!(command_url_prefix(":r"), None);
         assert_eq!(command_url_prefix(":open"), None);
         assert_eq!(command_url_prefix(":T"), None);
+    }
+
+    #[test]
+    fn parse_multi_column_command_parses_local_scope() {
+        assert_eq!(
+            parse_multi_column_command("c", &["3"]).unwrap(),
+            MultiColumnCommand { scope: MultiColumnCommandScope::Local, count: 3 }
+        );
+    }
+
+    #[test]
+    fn parse_multi_column_command_parses_global_scope() {
+        assert_eq!(
+            parse_multi_column_command("c!", &["4"]).unwrap(),
+            MultiColumnCommand { scope: MultiColumnCommandScope::Global, count: 4 }
+        );
+    }
+
+    #[test]
+    fn parse_multi_column_command_rejects_missing_count() {
+        assert_eq!(
+            parse_multi_column_command("c", &[]).unwrap_err(),
+            "Missing column count for :c"
+        );
+    }
+
+    #[test]
+    fn parse_multi_column_command_rejects_zero() {
+        assert_eq!(
+            parse_multi_column_command("c!", &["0"]).unwrap_err(),
+            "Column count must be at least 1"
+        );
     }
 
     #[test]
@@ -4652,6 +4753,7 @@ mod tests {
             &size_info,
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
 
         let window_size = terminal_text_area_size(size_info, layout);
@@ -4896,6 +4998,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::CreateWindow(_)
                 | EventType::CreateTab(_)
                 | EventType::TabCommand(_)
+                | EventType::SetMultiColumnCount(_)
                 | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
                 | EventType::CloseTab(_)
@@ -4916,6 +5019,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::CreateWindow(_)
                 | EventType::CreateTab(_)
                 | EventType::TabCommand(_)
+                | EventType::SetMultiColumnCount(_)
                 | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
                 | EventType::Frame => (),

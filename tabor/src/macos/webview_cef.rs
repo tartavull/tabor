@@ -250,8 +250,41 @@ fn browser_device_scale_factor(scale_factor: f64) -> f32 {
     scale_factor.max(f32::MIN_POSITIVE as f64) as f32
 }
 
+fn browser_screen_point(
+    layout: BrowserViewportLayout,
+    screen_rect: cef::Rect,
+    view_x: i32,
+    view_y: i32,
+) -> Option<(i32, i32)> {
+    let view_x = usize::try_from(view_x).ok()?;
+    let view_y = usize::try_from(view_y).ok()?;
+    let (visual_x, visual_y) = layout.visual_point_for_logical(view_x, view_y)?;
+    let viewport = layout.viewport();
+    Some((
+        screen_rect.x + visual_x as i32 - viewport.x as i32,
+        screen_rect.y + visual_y as i32 - viewport.y as i32,
+    ))
+}
+
 fn scaled_browser_wheel_delta_y(layout: BrowserViewportLayout, delta_y: f64) -> f64 {
     delta_y * layout.column_count().max(1) as f64
+}
+
+fn invalidate_browser_surfaces(browser: &cef::Browser) {
+    let Some(host) = browser.host() else {
+        return;
+    };
+
+    host.invalidate(cef::PaintElementType::VIEW);
+    host.invalidate(cef::PaintElementType::POPUP);
+}
+
+fn should_invalidate_after_key_input(state: ElementState) -> bool {
+    matches!(state, ElementState::Pressed)
+}
+
+fn should_invalidate_after_frame_edit(command: FrameEditCommand) -> bool {
+    !matches!(command, FrameEditCommand::Copy)
 }
 
 impl AutomationState {
@@ -598,11 +631,21 @@ cef::wrap_render_handler! {
             screen_y: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             let paint_state = self.paint_state.borrow();
+            let Some((mapped_x, mapped_y)) =
+                browser_screen_point(
+                    paint_state.layout,
+                    paint_state.screen_rect.clone(),
+                    view_x,
+                    view_y,
+                )
+            else {
+                return 0;
+            };
             if let Some(screen_x) = screen_x {
-                *screen_x = paint_state.screen_rect.x + view_x;
+                *screen_x = mapped_x;
             }
             if let Some(screen_y) = screen_y {
-                *screen_y = paint_state.screen_rect.y + view_y;
+                *screen_y = mapped_y;
             }
             1
         }
@@ -1006,6 +1049,7 @@ cef::wrap_task! {
     struct SendKeyTask {
         browser: cef::Browser,
         events: Vec<cef::KeyEvent>,
+        invalidate_after: bool,
     }
 
     impl Task {
@@ -1015,6 +1059,9 @@ cef::wrap_task! {
             };
             for event in &self.events {
                 host.send_key_event(Some(event));
+            }
+            if self.invalidate_after {
+                invalidate_browser_surfaces(&self.browser);
             }
         }
     }
@@ -1044,6 +1091,10 @@ cef::wrap_task! {
                 FrameEditCommand::Copy => frame.copy(),
                 FrameEditCommand::Cut => frame.cut(),
                 FrameEditCommand::Paste => frame.paste(),
+            }
+
+            if should_invalidate_after_frame_edit(self.command) {
+                invalidate_browser_surfaces(&self.browser);
             }
         }
     }
@@ -1187,10 +1238,9 @@ impl WebView {
     pub fn set_visible(&mut self, visible: bool) {
         if let Some(host) = self.browser.host() {
             host.was_hidden(if visible { 0 } else { 1 });
-            if visible {
-                host.invalidate(cef::PaintElementType::VIEW);
-                host.invalidate(cef::PaintElementType::POPUP);
-            }
+        }
+        if visible {
+            invalidate_browser_surfaces(&self.browser);
         }
     }
 
@@ -1214,9 +1264,8 @@ impl WebView {
         if let Some(host) = self.browser.host() {
             host.notify_screen_info_changed();
             host.was_resized();
-            host.invalidate(cef::PaintElementType::VIEW);
-            host.invalidate(cef::PaintElementType::POPUP);
         }
+        invalidate_browser_surfaces(&self.browser);
     }
 
     pub fn acceleration_info(&self) -> WebAccelerationInfo {
@@ -1319,6 +1368,7 @@ impl WebView {
             },
         }
 
+        invalidate_browser_surfaces(&self.browser);
         true
     }
 
@@ -1340,6 +1390,9 @@ impl WebView {
 
         self.last_mouse_event = Some(event.clone());
         host.send_mouse_move_event(Some(&event), 0);
+        if self.mouse_button_flags != 0 {
+            invalidate_browser_surfaces(&self.browser);
+        }
         true
     }
 
@@ -1379,6 +1432,7 @@ impl WebView {
             delta_x.round() as i32,
             scaled_delta_y.round() as i32,
         );
+        invalidate_browser_surfaces(&self.browser);
         true
     }
 
@@ -1391,6 +1445,7 @@ impl WebView {
         let text = CefString::from(text);
         host.ime_commit_text(Some(&text), None, text.to_string().chars().count() as i32);
         host.ime_finish_composing_text(0);
+        invalidate_browser_surfaces(&self.browser);
     }
 
     pub fn handle_ime_preedit(&mut self, text: &str, cursor_offset: Option<(usize, usize)>) {
@@ -1401,6 +1456,7 @@ impl WebView {
 
         if text.is_empty() {
             host.ime_cancel_composition();
+            invalidate_browser_surfaces(&self.browser);
             return;
         }
 
@@ -1423,12 +1479,14 @@ impl WebView {
             replacement_range.as_ref(),
             selection_range.as_ref(),
         );
+        invalidate_browser_surfaces(&self.browser);
     }
 
     pub fn cancel_ime_composition(&mut self) {
         let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
         if let Some(host) = self.browser.host() {
             host.ime_cancel_composition();
+            invalidate_browser_surfaces(&self.browser);
         }
     }
 
@@ -1529,14 +1587,18 @@ impl WebView {
             return false;
         }
 
+        let invalidate_after = should_invalidate_after_key_input(state);
         if cef::currently_on(cef::ThreadId::UI) == 1 {
             if let Some(host) = self.browser.host() {
                 for event in &events {
                     host.send_key_event(Some(event));
                 }
             }
+            if invalidate_after {
+                invalidate_browser_surfaces(&self.browser);
+            }
         } else {
-            let mut task = SendKeyTask::new(self.browser.clone(), events);
+            let mut task = SendKeyTask::new(self.browser.clone(), events, invalidate_after);
             let _ = cef::post_task(cef::ThreadId::UI, Some(&mut task));
         }
 
@@ -1589,6 +1651,7 @@ impl WebView {
         dict_set_bool(&mut params, "awaitPromise", true);
         dict_set_bool(&mut params, "userGesture", user_gesture);
 
+        let browser = self.browser.clone();
         self.devtools_execute("Runtime.evaluate", Some(params), move |result| {
             let output = match result {
                 Ok(payload) => runtime_result_to_string(&payload),
@@ -1597,6 +1660,7 @@ impl WebView {
                     None
                 },
             };
+            invalidate_browser_surfaces(&browser);
             callback(output);
         });
     }
@@ -1615,6 +1679,9 @@ impl WebView {
                 FrameEditCommand::Copy => frame.copy(),
                 FrameEditCommand::Cut => frame.cut(),
                 FrameEditCommand::Paste => frame.paste(),
+            }
+            if should_invalidate_after_frame_edit(command) {
+                invalidate_browser_surfaces(&self.browser);
             }
         } else {
             let mut task = FrameEditTask::new(self.browser.clone(), command);
@@ -2511,19 +2578,21 @@ fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
 #[cfg(test)]
 mod tests {
     use super::{
-        PaintState, browser_device_scale_factor, cef_mouse_button_flag, cef_mouse_event_flags,
-        scaled_browser_wheel_delta_y, should_run_frame_edit_inline,
+        PaintState, browser_device_scale_factor, browser_screen_point, browser_settings,
+        cef_mouse_button_flag, cef_mouse_event_flags, scaled_browser_wheel_delta_y,
+        should_invalidate_after_frame_edit, should_invalidate_after_key_input,
+        should_run_frame_edit_inline,
     };
     #[cfg(not(feature = "passkey-webauthn"))]
     use super::{
-        PermissionDecision, browser_settings, permission_decision, permission_request_result,
+        PermissionDecision, permission_decision, permission_request_result,
         should_block_permission_request,
     };
     use cef::sys::cef_event_flags_t;
     #[cfg(not(feature = "passkey-webauthn"))]
     use cef::{PermissionRequestResult, PermissionRequestTypes as Permission};
     use objc2_app_kit::NSEventModifierFlags;
-    use winit::event::MouseButton;
+    use winit::event::{ElementState, MouseButton};
 
     #[test]
     fn browser_settings_enable_javascript_clipboard_access() {
@@ -2537,6 +2606,19 @@ mod tests {
         assert!(should_run_frame_edit_inline(true, false));
         assert!(!should_run_frame_edit_inline(true, true));
         assert!(!should_run_frame_edit_inline(false, false));
+    }
+
+    #[test]
+    fn key_presses_request_repaint_but_key_releases_do_not() {
+        assert!(should_invalidate_after_key_input(ElementState::Pressed));
+        assert!(!should_invalidate_after_key_input(ElementState::Released));
+    }
+
+    #[test]
+    fn frame_edit_repaint_only_for_mutating_commands() {
+        assert!(!should_invalidate_after_frame_edit(super::FrameEditCommand::Copy));
+        assert!(should_invalidate_after_frame_edit(super::FrameEditCommand::Cut));
+        assert!(should_invalidate_after_frame_edit(super::FrameEditCommand::Paste));
     }
 
     #[test]
@@ -2590,9 +2672,25 @@ mod tests {
             1.0,
             crate::display::browser_layout::BrowserViewMode::MultiColumn,
             &crate::config::browser::MultiColumnBrowserConfig { target_width_px: 400 },
+            None,
         );
         assert_eq!(folded.column_count(), 2);
         assert_eq!(scaled_browser_wheel_delta_y(folded, 48.0), 96.0);
+    }
+
+    #[test]
+    fn browser_screen_point_uses_folded_visual_coordinates() {
+        let folded = crate::display::browser_layout::BrowserViewportLayout::new(
+            &crate::display::SizeInfo::new(1950.0, 600.0, 1.0, 1.0, 0.0, 0.0, 0.0, false),
+            1.0,
+            crate::display::browser_layout::BrowserViewMode::MultiColumn,
+            &crate::config::browser::MultiColumnBrowserConfig::default(),
+            None,
+        );
+        let screen_rect = cef::Rect { x: 500, y: 200, width: 1950, height: 600 };
+
+        assert_eq!(folded.column_count(), 2);
+        assert_eq!(browser_screen_point(folded, screen_rect, 17, 745), Some((1492, 345)));
     }
 
     #[test]

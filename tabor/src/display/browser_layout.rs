@@ -67,12 +67,30 @@ impl BrowserViewportLayout {
         scale_factor: f64,
         mode: BrowserViewMode,
         config: &MultiColumnBrowserConfig,
+        exact_column_count: Option<usize>,
     ) -> Self {
         let target_width_px = max(config.target_width_px, 1);
         let viewport = Self::viewport_from_size_info(size_info, scale_factor);
 
         if mode != BrowserViewMode::MultiColumn {
             return Self::normal(viewport, target_width_px);
+        }
+
+        if let Some(exact_column_count) = exact_column_count {
+            let column_count = exact_column_count.max(1).min(max(viewport.width, 1));
+            let logical_width = max(viewport.width / column_count, 1);
+            let left_padding_px =
+                viewport.width.saturating_sub(logical_width.saturating_mul(column_count));
+
+            return Self {
+                mode,
+                viewport,
+                target_width_px: logical_width,
+                logical_width,
+                logical_height: viewport.height.saturating_mul(column_count),
+                column_count,
+                left_padding_px,
+            };
         }
 
         let column_count = max(viewport.width / target_width_px, 1);
@@ -218,6 +236,7 @@ mod tests {
             1.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig { target_width_px },
+            None,
         )
     }
 
@@ -228,6 +247,7 @@ mod tests {
             1.0,
             BrowserViewMode::Normal,
             &MultiColumnBrowserConfig::default(),
+            None,
         );
 
         assert_eq!(layout.mode(), BrowserViewMode::Normal);
@@ -244,6 +264,7 @@ mod tests {
             1.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
         );
 
         assert_eq!(layout.column_count(), 2);
@@ -265,12 +286,31 @@ mod tests {
             1.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
         );
         let logical = (17, 745);
         let visual = layout.visual_point_for_logical(logical.0, logical.1).unwrap();
 
         assert_eq!(visual, (992, 145));
         assert_eq!(layout.logical_point_for_visual(visual.0, visual.1), Some(logical));
+    }
+
+    #[test]
+    fn exact_column_count_preserves_requested_column_count() {
+        let layout = BrowserViewportLayout::new(
+            &size(1103, 600),
+            1.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+            Some(3),
+        );
+
+        assert_eq!(layout.column_count(), 3);
+        assert_eq!(layout.logical_width(), 367);
+        assert_eq!(
+            layout.column_rect(2),
+            Some(BrowserViewportRect { x: 736, y: 0, width: 367, height: 600 })
+        );
     }
 
     #[test]
@@ -319,6 +359,7 @@ mod tests {
             1.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
         );
 
         assert_eq!(layout.mode(), BrowserViewMode::MultiColumn);
@@ -340,6 +381,7 @@ mod tests {
             2.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
         );
 
         assert_eq!(

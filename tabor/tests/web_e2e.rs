@@ -345,6 +345,31 @@ fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
         bundle_dir.display()
     );
 
+    let verify_status = Command::new("codesign")
+        .arg("--verify")
+        .arg("--deep")
+        .arg("--strict")
+        .arg(&bundle_dir)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!("failed to verify temp app bundle {}: {err}", bundle_dir.display())
+        });
+    assert!(
+        verify_status.success(),
+        "codesign verification failed for {} with status {verify_status}",
+        bundle_dir.display()
+    );
+
+    let describe_status =
+        Command::new("codesign").arg("-dvv").arg(&bundle_dir).status().unwrap_or_else(|err| {
+            panic!("failed to inspect temp app bundle {}: {err}", bundle_dir.display())
+        });
+    assert!(
+        describe_status.success(),
+        "codesign inspection failed for {} with status {describe_status}",
+        bundle_dir.display()
+    );
+
     TempAppBundle { bundle_dir, executable: bundled_bin, bundle_id }
 }
 
@@ -765,6 +790,108 @@ fn accelerated_web_multi_column_stays_gpu_backed_after_resize_and_scroll() {
                 > 0,
         "accelerated surface dimensions disappeared after resize+scroll: {final_layout}"
     );
+}
+
+#[test]
+fn native_multi_column_click_focuses_lower_input() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let _ = harness.run_ok(["msg", "config", "browser.multi_column.target_width_px=150"]);
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    let tab_id_arg = tab_id_arg(&reply);
+    ensure_active_web_tab(&harness, 4);
+    let _ = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        layout.get("mode").and_then(Value::as_str) == Some("normal")
+            && layout
+                .get("acceleration")
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                == Some("ready")
+    })
+    .unwrap_or_else(|| panic!("timed out waiting for initial browser layout"));
+
+    let toggle_reply =
+        harness.run_json(["msg", "dispatch-action", "--action", "ToggleMultiColumnTerminal"]);
+    assert_eq!(toggle_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let layout = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        layout.get("mode").and_then(Value::as_str) == Some("multi_column")
+            && layout.get("column_count").and_then(Value::as_u64).unwrap_or(0) >= 2
+    })
+    .unwrap_or_else(|| panic!("timed out waiting for multi-column browser layout"));
+
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+    let center_json = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("lower-input");
+            if (!el) throw new Error("lower-input missing");
+            const rect = el.getBoundingClientRect();
+            return JSON.stringify({
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2)
+            });
+        })()"#,
+    );
+    let center: Value = serde_json::from_str(&center_json)
+        .unwrap_or_else(|err| panic!("invalid lower-input center json: {err}; raw={center_json}"));
+    let logical_x = center
+        .get("x")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing lower-input center.x: {center}"));
+    let logical_y = center
+        .get("y")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing lower-input center.y: {center}"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    let viewport_height = layout
+        .get("viewport")
+        .and_then(|value| value.get("height"))
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing browser viewport height: {layout}"));
+    assert!(
+        logical_y >= viewport_height,
+        "expected lower input to render in a folded column below the first viewport: center_y={logical_y}, viewport_height={viewport_height}, layout={layout}"
+    );
+
+    let (visual_x, visual_y) = browser_visual_point(&layout, logical_x, logical_y);
+    native_window_click(&harness, visual_x, visual_y);
+    let active_id = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => document.activeElement ? document.activeElement.id || "" : "")()"#,
+    );
+    assert_eq!(active_id, "lower-input", "native folded click focused the wrong element");
+
+    let input_text = "native multi column click";
+    let type_actions = json!([{ "type": "type", "text": input_text }]).to_string();
+    let type_reply = harness.run_json(["agent", "act", type_actions.as_str()]);
+    assert!(agent_action_results_all_ok(&type_reply), "agent type failed: {type_reply}");
+    let typed_value = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => document.getElementById("lower-input")?.value || "")()"#,
+    );
+    assert_eq!(typed_value, input_text);
+
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "detach",
+        "--session-id",
+        inspector_session.as_str(),
+    ]);
 }
 
 #[test]
@@ -1591,6 +1718,57 @@ fn window_debug_snapshot(harness: &TaborHarness) -> WindowDebugSnapshot {
         .unwrap_or_else(|err| panic!("invalid window debug snapshot reply: {err}; reply={reply}"))
 }
 
+fn browser_visual_point(layout: &Value, logical_x: i64, logical_y: i64) -> (f64, f64) {
+    let viewport =
+        layout.get("viewport").unwrap_or_else(|| panic!("missing browser viewport: {layout}"));
+    let viewport_y = viewport
+        .get("y")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing browser viewport.y: {layout}"));
+    let viewport_height = viewport
+        .get("height")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing browser viewport.height: {layout}"));
+    assert!(viewport_height > 0, "invalid browser viewport height: {layout}");
+
+    let column_index = logical_y.div_euclid(viewport_height) as usize;
+    let column_y = logical_y.rem_euclid(viewport_height);
+    let column = layout
+        .get("columns")
+        .and_then(Value::as_array)
+        .and_then(|columns| columns.get(column_index))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing browser column for logical point ({logical_x}, {logical_y}) in layout: {layout}"
+            )
+        });
+    let column_x = column
+        .get("x")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing browser column.x: {layout}"));
+
+    ((column_x + logical_x) as f64, (viewport_y + column_y) as f64)
+}
+
+fn native_window_click(harness: &TaborHarness, x: f64, y: f64) {
+    let scale_factor = window_debug_state(harness).scale_factor;
+    let physical_x = x * scale_factor;
+    let physical_y = y * scale_factor;
+    let reply = harness.send_raw_request(json!({
+        "type": "window_debug_mouse_drag",
+        "x0": physical_x,
+        "y0": physical_y,
+        "x1": physical_x,
+        "y1": physical_y,
+        "steps": 1
+    }));
+    assert_eq!(
+        reply.get("type").and_then(Value::as_str),
+        Some("ok"),
+        "native window click failed: {reply}"
+    );
+}
+
 #[allow(clippy::result_large_err)]
 fn wait_for_fullscreen_window_state(
     harness: &TaborHarness,
@@ -2203,6 +2381,33 @@ fn attach_inspector(harness: &TaborHarness, tab_id_arg: &str) -> String {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| panic!("missing inspector session_id: {reply}"))
+}
+
+fn inspector_eval_string(
+    harness: &TaborHarness,
+    session_id: &str,
+    command_id: &mut i64,
+    expression: &str,
+) -> String {
+    let response = inspector_command(
+        harness,
+        session_id,
+        *command_id,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": true
+        }),
+    );
+    *command_id += 1;
+    response
+        .get("result")
+        .and_then(|value| value.get("result"))
+        .and_then(|value| value.get("value"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| panic!("missing Runtime.evaluate string result: {response}"))
 }
 
 fn trusted_click(harness: &TaborHarness, session_id: &str, command_id: &mut i64, element_id: &str) {

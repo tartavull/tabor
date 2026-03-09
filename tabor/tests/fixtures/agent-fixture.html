@@ -33,6 +33,9 @@
       #spacer {
         height: 1200px;
       }
+      #mid-spacer {
+        height: 160px;
+      }
       #bottom-target {
         padding: 8px;
         background: #ffe9c6;
@@ -133,6 +136,13 @@
     <div class="row">
       <button id="frame-launch">Frame Ready</button>
       <iframe id="inner-frame" srcdoc="<html><body><button id='frame-btn'>Frame Button</button><div id='frame-text'>Frame text</div></body></html>"></iframe>
+    </div>
+
+    <div id="mid-spacer"></div>
+
+    <div class="row">
+      <label for="lower-input">Lower Input</label>
+      <input id="lower-input" type="text" placeholder="Lower Input" aria-label="Lower Input">
     </div>
 
     <div id="spacer"></div>

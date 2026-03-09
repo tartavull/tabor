@@ -123,6 +123,35 @@ const SHORTENER: char = '…';
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FooterBarViewportBand {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl FooterBarViewportBand {
+    fn new(size_info: &SizeInfo<f32>, line: usize, offset_y: f32, height: f32) -> Self {
+        let y = size_info.cell_height().mul_add(line as f32, size_info.padding_y()) + offset_y;
+        let x = size_info.padding_x();
+        let width = (size_info.width() - size_info.padding_x() - size_info.padding_right()).max(0.);
+
+        Self { x, y, width, height }
+    }
+
+    fn damage_rect(self) -> (i32, i32, i32, i32) {
+        (self.x as i32, self.y as i32, self.width as i32, self.height as i32)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DisplayUpdateOptions {
+    pub(crate) web_status_bar: bool,
+    pub(crate) terminal_view_mode: Option<TerminalViewMode>,
+    pub(crate) exact_multi_column_count: Option<usize>,
+}
+
 #[derive(Debug)]
 pub enum Error {
     /// Error with window management.
@@ -861,8 +890,7 @@ impl Display {
         terminal: &mut Term<T>,
         pty_resize_handle: &mut dyn OnResize,
         search_state: &mut SearchState,
-        web_status_bar: bool,
-        terminal_view_mode: Option<TerminalViewMode>,
+        options: DisplayUpdateOptions,
         config: &UiConfig,
     ) where
         T: EventListener,
@@ -935,7 +963,7 @@ impl Display {
         // Update number of column/lines in the viewport.
         //
         // Message bar is rendered inline with the footer bar, so it doesn't reserve extra lines.
-        let status_lines = usize::from(web_status_bar);
+        let status_lines = usize::from(options.web_status_bar);
         new_size.reserve_lines(status_lines);
         self.active_status_lines = status_lines;
 
@@ -944,9 +972,16 @@ impl Display {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
-        self.terminal_viewport = terminal_view_mode.map_or_else(
+        self.terminal_viewport = options.terminal_view_mode.map_or_else(
             || TerminalViewportLayout::normal(new_size),
-            |mode| TerminalViewportLayout::new(&new_size, mode, &config.terminal.multi_column),
+            |mode| {
+                TerminalViewportLayout::new(
+                    &new_size,
+                    mode,
+                    &config.terminal.multi_column,
+                    options.exact_multi_column_count,
+                )
+            },
         );
         let logical_size = self.terminal_viewport.logical_size(&new_size);
 
@@ -1309,16 +1344,15 @@ impl Display {
                 };
                 let line = size_info.screen_lines().saturating_sub(1);
                 let message_offset = self.footer_offset();
-                let y = size_info.cell_height().mul_add(line as f32, size_info.padding_y())
-                    + message_offset;
-                let width = size_info.width() as i32;
-                let height = size_info.cell_height() as i32;
-                self.damage_tracker
-                    .frame()
-                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
-                self.damage_tracker
-                    .next_frame()
-                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
+                let band = FooterBarViewportBand::new(
+                    &size_info,
+                    line,
+                    message_offset,
+                    size_info.cell_height(),
+                );
+                let (x, y, width, height) = band.damage_rect();
+                self.damage_tracker.frame().add_viewport_rect(&size_info, x, y, width, height);
+                self.damage_tracker.next_frame().add_viewport_rect(&size_info, x, y, width, height);
 
                 self.draw_footer_bar_line(&message_text, fg, bg, line, message_offset);
             }
@@ -1492,16 +1526,15 @@ impl Display {
                     MessageType::Warning => config.colors.normal.yellow,
                 };
                 let line = size_info.screen_lines().saturating_sub(1);
-                let y = size_info.cell_height().mul_add(line as f32, size_info.padding_y())
-                    + footer_offset;
-                let width = size_info.width() as i32;
-                let height = size_info.cell_height() as i32;
-                self.damage_tracker
-                    .frame()
-                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
-                self.damage_tracker
-                    .next_frame()
-                    .add_viewport_rect(&size_info, 0, y as i32, width, height);
+                let band = FooterBarViewportBand::new(
+                    &size_info,
+                    line,
+                    footer_offset,
+                    size_info.cell_height(),
+                );
+                let (x, y, width, height) = band.damage_rect();
+                self.damage_tracker.frame().add_viewport_rect(&size_info, x, y, width, height);
+                self.damage_tracker.next_frame().add_viewport_rect(&size_info, x, y, width, height);
 
                 self.draw_footer_bar_line(&message_text, fg, bg, line, footer_offset);
             }
@@ -1875,9 +1908,8 @@ impl Display {
         offset_y: f32,
         height: f32,
     ) {
-        let y = self.size_info.cell_height().mul_add(line as f32, self.size_info.padding_y())
-            + offset_y;
-        let rect = RenderRect::new(0., y, self.size_info.width(), height, bg, 1.);
+        let band = FooterBarViewportBand::new(&self.size_info, line, offset_y, height);
+        let rect = RenderRect::new(band.x, band.y, band.width, band.height, bg, 1.);
         let metrics = self.glyph_cache.font_metrics();
         self.renderer.draw_rects(&self.size_info, &metrics, vec![rect]);
     }
@@ -2396,6 +2428,35 @@ mod tests {
         assert_eq!(top_inset, measured_inset);
     }
 
+    #[test]
+    fn footer_bar_band_uses_full_width_without_padding() {
+        let size = SizeInfo::new(120., 40., 1., 1., 0., 0., 0., false);
+
+        assert_eq!(
+            FooterBarViewportBand::new(&size, 39, 0., 1.),
+            FooterBarViewportBand { x: 0., y: 39., width: 120., height: 1. }
+        );
+    }
+
+    #[test]
+    fn footer_bar_band_starts_at_content_origin_and_excludes_right_padding() {
+        let size = SizeInfo::new(300., 60., 1., 1., 120., 8., 0., false);
+
+        assert_eq!(
+            FooterBarViewportBand::new(&size, 59, 0., 1.),
+            FooterBarViewportBand { x: 120., y: 59., width: 172., height: 1. }
+        );
+    }
+
+    #[test]
+    fn footer_bar_band_preserves_vertical_offset_and_damage_rect() {
+        let size = SizeInfo::new(300., 120., 10., 20., 130., 8., 5., false);
+        let band = FooterBarViewportBand::new(&size, 4, 6., 24.);
+
+        assert_eq!(band, FooterBarViewportBand { x: 130., y: 91., width: 162., height: 24. });
+        assert_eq!(band.damage_rect(), (130, 91, 162, 24));
+    }
+
     #[cfg(target_os = "macos")]
     fn browser_layout(width: usize, height: usize) -> BrowserViewportLayout {
         let size = SizeInfo::new(width as f32, height as f32, 1., 1., 0., 0., 0., false);
@@ -2404,6 +2465,7 @@ mod tests {
             1.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
         )
     }
 

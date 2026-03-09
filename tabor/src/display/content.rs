@@ -599,6 +599,7 @@ mod tests {
             &size_info,
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
         let cursor_point = Point::new(Line(0), Column(0));
         let display_offset = layout.logical_size(&size_info).screen_lines();
@@ -613,6 +614,7 @@ mod tests {
             &size_info,
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
         let cursor_point = Point::new(Line(0), Column(0));
 

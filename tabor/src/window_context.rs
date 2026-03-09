@@ -60,18 +60,19 @@ use crate::config::Action;
 use crate::config::UiConfig;
 #[cfg(not(windows))]
 use crate::daemon::foreground_process_name;
-use crate::display::Display;
 use crate::display::browser_layout::{BrowserViewMode, BrowserViewportLayout};
 use crate::display::color::Rgb;
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
+use crate::display::{Display, DisplayUpdateOptions};
 #[cfg(target_os = "macos")]
 use crate::display::{TabPanelEditOutcome, TabPanelEditTarget};
 #[cfg(target_os = "macos")]
 use crate::event::WebCommand;
 use crate::event::{
     ActionContext, CommandHistory, CommandState, Event, EventProxy, EventType, InlineSearchState,
-    Mouse, SearchState, TouchPurpose, request_web_cursor_update,
+    Mouse, MultiColumnCommand, MultiColumnCommandScope, SearchState, TouchPurpose,
+    request_web_cursor_update,
 };
 #[cfg(unix)]
 use crate::input::ActionContext as _;
@@ -123,7 +124,9 @@ struct TabState {
     inline_search_state: InlineSearchState,
     command_state: CommandState,
     terminal_view_mode: TerminalViewMode,
+    terminal_multi_column_count_override: Option<usize>,
     browser_view_mode: BrowserViewMode,
+    browser_multi_column_count_override: Option<usize>,
     mouse: Mouse,
     touch: TouchPurpose,
     cursor_blink_timed_out: bool,
@@ -148,6 +151,27 @@ struct TabState {
 struct ClosedTab {
     kind: WindowKind,
     browser_view_mode: BrowserViewMode,
+    browser_multi_column_count_override: Option<usize>,
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+struct MultiColumnDefaults {
+    terminal: Option<usize>,
+    browser: Option<usize>,
+}
+
+fn terminal_view_mode_for_count(count: Option<usize>) -> TerminalViewMode {
+    match count {
+        Some(count) if count > 1 => TerminalViewMode::MultiColumn,
+        _ => TerminalViewMode::Normal,
+    }
+}
+
+fn browser_view_mode_for_count(count: Option<usize>) -> BrowserViewMode {
+    match count {
+        Some(count) if count > 1 => BrowserViewMode::MultiColumn,
+        _ => BrowserViewMode::Normal,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1477,6 +1501,8 @@ pub struct WindowContext {
     window_focused: bool,
     preserve_title: bool,
     window_config: ParsedOptions,
+    default_terminal_multi_column_count: Option<usize>,
+    default_browser_multi_column_count: Option<usize>,
     config: Rc<UiConfig>,
 }
 
@@ -1599,6 +1625,7 @@ impl WindowContext {
             &mut tabs,
             &display,
             &config,
+            MultiColumnDefaults::default(),
             pty_config,
             &proxy,
             options.window_kind,
@@ -1637,6 +1664,8 @@ impl WindowContext {
             web_close_metrics: WebCloseMetrics::default(),
             #[cfg(target_os = "macos")]
             macos_fullscreen_or_simple_fullscreen,
+            default_terminal_multi_column_count: Default::default(),
+            default_browser_multi_column_count: Default::default(),
             dirty: Default::default(),
         };
 
@@ -1651,6 +1680,7 @@ impl WindowContext {
         tabs: &mut TabManager,
         display: &Display,
         config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
         pty_config: tty::Options,
         proxy: &EventLoopProxy<Event>,
         window_kind: WindowKind,
@@ -1696,7 +1726,10 @@ impl WindowContext {
         }
 
         #[cfg(target_os = "macos")]
-        let browser_view_mode = BrowserViewMode::default();
+        let browser_view_mode = match &window_kind {
+            WindowKind::Web { .. } => browser_view_mode_for_count(multi_column_defaults.browser),
+            WindowKind::Terminal => BrowserViewMode::default(),
+        };
 
         #[cfg(target_os = "macos")]
         let web_view = match &window_kind {
@@ -1706,6 +1739,7 @@ impl WindowContext {
                     config,
                     &window_kind,
                     browser_view_mode,
+                    multi_column_defaults.browser,
                 );
                 Some(WebView::new(&display.window, &size_info, layout, tab_id, url, proxy)?)
             },
@@ -1722,6 +1756,10 @@ impl WindowContext {
                 }
             },
         };
+        let terminal_view_mode = match &window_kind {
+            WindowKind::Terminal => terminal_view_mode_for_count(multi_column_defaults.terminal),
+            WindowKind::Web { .. } => TerminalViewMode::default(),
+        };
 
         let tab = TabState {
             id: tab_id,
@@ -1735,11 +1773,13 @@ impl WindowContext {
             search_state: Default::default(),
             inline_search_state: Default::default(),
             command_state: Default::default(),
-            terminal_view_mode: Default::default(),
+            terminal_view_mode,
+            terminal_multi_column_count_override: None,
             #[cfg(target_os = "macos")]
             browser_view_mode,
             #[cfg(not(target_os = "macos"))]
             browser_view_mode: Default::default(),
+            browser_multi_column_count_override: None,
             mouse: Default::default(),
             touch: Default::default(),
             cursor_blink_timed_out: Default::default(),
@@ -1937,9 +1977,15 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         {
             let active_id = self.tabs.active_id();
+            let multi_column_defaults = self.multi_column_defaults();
 
             for tab in self.tabs.iter_mut() {
-                let layout = Self::browser_viewport_for_tab(&self.display, &self.config, tab);
+                let layout = Self::browser_viewport_for_tab(
+                    &self.display,
+                    &self.config,
+                    multi_column_defaults,
+                    tab,
+                );
                 let Some(web_view) = tab.web_view.as_mut() else {
                     continue;
                 };
@@ -2148,6 +2194,8 @@ impl WindowContext {
             return;
         };
         let browser_view_mode = tab.browser_view_mode;
+        let browser_multi_column_count =
+            tab.browser_multi_column_count_override.or(self.default_browser_multi_column_count);
         let Some(web_view) = tab.web_view.as_mut() else {
             return;
         };
@@ -2158,6 +2206,7 @@ impl WindowContext {
             &self.display,
             &self.config,
             browser_view_mode,
+            browser_multi_column_count,
             position,
             event_proxy,
             scheduler,
@@ -2271,10 +2320,12 @@ impl WindowContext {
         let mut pty_config = self.config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
         let command_input = options.command_input.clone();
+        let multi_column_defaults = self.multi_column_defaults();
         let tab_id = Self::spawn_tab(
             &mut self.tabs,
             &self.display,
             &self.config,
+            multi_column_defaults,
             pty_config,
             proxy,
             options.window_kind,
@@ -2302,6 +2353,13 @@ impl WindowContext {
         Ok(tab_id)
     }
 
+    fn multi_column_defaults(&self) -> MultiColumnDefaults {
+        MultiColumnDefaults {
+            terminal: self.default_terminal_multi_column_count,
+            browser: self.default_browser_multi_column_count,
+        }
+    }
+
     fn send_startup_input(&mut self, tab_id: TabId, input: Option<String>) {
         let Some(mut input) = input else {
             return;
@@ -2326,6 +2384,62 @@ impl WindowContext {
         if let Some(tab_id) = target {
             self.set_active_tab(tab_id);
         }
+    }
+
+    pub(crate) fn set_multi_column_count(&mut self, tab_id: TabId, command: MultiColumnCommand) {
+        let Some(tab_kind_is_web) = self.tabs.get(tab_id).map(|tab| tab.kind.is_web()) else {
+            return;
+        };
+
+        match command.scope {
+            MultiColumnCommandScope::Local => {
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return;
+                };
+                if tab_kind_is_web {
+                    tab.browser_multi_column_count_override = Some(command.count);
+                    tab.browser_view_mode = browser_view_mode_for_count(Some(command.count));
+                } else {
+                    tab.terminal_multi_column_count_override = Some(command.count);
+                    tab.terminal_view_mode = terminal_view_mode_for_count(Some(command.count));
+                }
+            },
+            MultiColumnCommandScope::Global => {
+                if tab_kind_is_web {
+                    self.default_browser_multi_column_count = Some(command.count);
+                    for tab in self.tabs.iter_mut() {
+                        if !tab.kind.is_web() {
+                            continue;
+                        }
+                        if tab.id == tab_id {
+                            tab.browser_multi_column_count_override = None;
+                        }
+                        if tab.browser_multi_column_count_override.is_none() {
+                            tab.browser_view_mode =
+                                browser_view_mode_for_count(Some(command.count));
+                        }
+                    }
+                } else {
+                    self.default_terminal_multi_column_count = Some(command.count);
+                    for tab in self.tabs.iter_mut() {
+                        if tab.kind.is_web() {
+                            continue;
+                        }
+                        if tab.id == tab_id {
+                            tab.terminal_multi_column_count_override = None;
+                        }
+                        if tab.terminal_multi_column_count_override.is_none() {
+                            tab.terminal_view_mode =
+                                terminal_view_mode_for_count(Some(command.count));
+                        }
+                    }
+                }
+            },
+        }
+
+        let old_is_searching = self.active_is_searching();
+        self.display.pending_update.dirty = true;
+        self.apply_pending_display_update(old_is_searching);
     }
 
     pub(crate) fn active_tab_id(&self) -> Option<TabId> {
@@ -2362,6 +2476,7 @@ impl WindowContext {
             self.closed_tabs.push(ClosedTab {
                 kind: tab.kind.clone(),
                 browser_view_mode: tab.browser_view_mode,
+                browser_multi_column_count_override: tab.browser_multi_column_count_override,
             });
             const MAX_CLOSED_TABS: usize = 10;
             if self.closed_tabs.len() > MAX_CLOSED_TABS {
@@ -2407,6 +2522,7 @@ impl WindowContext {
         let tab_id = self.create_tab(options, proxy)?;
         if let Some(tab) = self.tabs.get_mut(tab_id) {
             tab.browser_view_mode = closed.browser_view_mode;
+            tab.browser_multi_column_count_override = closed.browser_multi_column_count_override;
         }
         Ok(())
     }
@@ -2458,6 +2574,7 @@ impl WindowContext {
     #[cfg(unix)]
     pub(crate) fn ipc_tab_groups(&self, now: Instant) -> Vec<IpcTabGroup> {
         let active = self.tabs.active_id();
+        let multi_column_defaults = self.multi_column_defaults();
         self.tabs
             .groups
             .iter()
@@ -2486,11 +2603,13 @@ impl WindowContext {
                             terminal_layout: Self::ipc_terminal_layout(
                                 &self.display,
                                 &self.config,
+                                multi_column_defaults,
                                 tab,
                             ),
                             browser_layout: Self::ipc_browser_layout(
                                 &self.display,
                                 &self.config,
+                                multi_column_defaults,
                                 tab,
                             ),
                         })
@@ -2506,6 +2625,7 @@ impl WindowContext {
     pub(crate) fn ipc_tab_state(&self, tab_id: TabId, now: Instant) -> Option<IpcTabState> {
         let tab = self.tabs.get(tab_id)?;
         let (group_id, index) = self.tabs.group_for_tab(tab_id)?;
+        let multi_column_defaults = self.multi_column_defaults();
         let activity =
             if tab.kind.is_web() { None } else { Some(Self::ipc_activity(&tab.activity, now)) };
         Some(IpcTabState {
@@ -2518,8 +2638,18 @@ impl WindowContext {
             program_name: tab.program_name.clone(),
             kind: IpcTabKind::from(&tab.kind),
             activity,
-            terminal_layout: Self::ipc_terminal_layout(&self.display, &self.config, tab),
-            browser_layout: Self::ipc_browser_layout(&self.display, &self.config, tab),
+            terminal_layout: Self::ipc_terminal_layout(
+                &self.display,
+                &self.config,
+                multi_column_defaults,
+                tab,
+            ),
+            browser_layout: Self::ipc_browser_layout(
+                &self.display,
+                &self.config,
+                multi_column_defaults,
+                tab,
+            ),
         })
     }
 
@@ -2765,10 +2895,9 @@ impl WindowContext {
         }
 
         let parsed = ParsedOptions::from_options(&options);
-        let old_is_searching =
-            self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some());
+        let old_is_searching = self.active_is_searching();
         self.add_window_config(self.config.clone(), &parsed);
-        self.apply_ipc_display_update(old_is_searching);
+        self.apply_pending_display_update(old_is_searching);
         Ok(())
     }
 
@@ -3984,8 +4113,7 @@ impl WindowContext {
             self.set_active_tab(tab_id);
         }
 
-        let old_is_searching =
-            self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some());
+        let old_is_searching = self.active_is_searching();
 
         {
             let Some(active_tab) = self.tabs.active_mut() else {
@@ -4006,6 +4134,10 @@ impl WindowContext {
                 terminal_view_mode: &mut active_tab.terminal_view_mode,
                 #[cfg(target_os = "macos")]
                 browser_view_mode: &mut active_tab.browser_view_mode,
+                #[cfg(target_os = "macos")]
+                browser_multi_column_count: active_tab
+                    .browser_multi_column_count_override
+                    .or(self.default_browser_multi_column_count),
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
@@ -4034,7 +4166,7 @@ impl WindowContext {
             f(&mut context);
         }
 
-        self.apply_ipc_display_update(old_is_searching);
+        self.apply_pending_display_update(old_is_searching);
         Ok(())
     }
 
@@ -4050,19 +4182,26 @@ impl WindowContext {
         TabId::new(index, generation)
     }
 
-    #[cfg(unix)]
-    fn apply_ipc_display_update(&mut self, old_is_searching: bool) {
-        if self.display.pending_update.dirty {
-            if let Some(active_id) = self.tabs.active_id() {
-                Self::submit_display_update(
-                    active_id,
-                    &mut self.tabs,
-                    &mut self.display,
-                    old_is_searching,
-                    &self.config,
-                );
-                self.dirty = true;
-            }
+    fn active_is_searching(&self) -> bool {
+        self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some())
+    }
+
+    fn apply_pending_display_update(&mut self, old_is_searching: bool) {
+        if !self.display.pending_update.dirty {
+            return;
+        }
+
+        if let Some(active_id) = self.tabs.active_id() {
+            let multi_column_defaults = self.multi_column_defaults();
+            Self::submit_display_update(
+                active_id,
+                &mut self.tabs,
+                &mut self.display,
+                old_is_searching,
+                &self.config,
+                multi_column_defaults,
+            );
+            self.dirty = true;
         }
     }
 
@@ -4081,6 +4220,7 @@ impl WindowContext {
         config: &UiConfig,
         kind: &WindowKind,
         terminal_view_mode: TerminalViewMode,
+        exact_multi_column_count: Option<usize>,
     ) -> TerminalViewportLayout {
         let size_info = display.size_info_for_status_lines(usize::from(kind.is_web()));
         if kind.is_web() {
@@ -4090,6 +4230,7 @@ impl WindowContext {
                 &size_info,
                 terminal_view_mode,
                 &config.terminal.multi_column,
+                exact_multi_column_count,
             )
         }
     }
@@ -4097,9 +4238,16 @@ impl WindowContext {
     fn terminal_viewport_for_tab(
         display: &Display,
         config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
         tab: &TabState,
     ) -> TerminalViewportLayout {
-        Self::terminal_viewport_for_kind(display, config, &tab.kind, tab.terminal_view_mode)
+        Self::terminal_viewport_for_kind(
+            display,
+            config,
+            &tab.kind,
+            tab.terminal_view_mode,
+            tab.terminal_multi_column_count_override.or(multi_column_defaults.terminal),
+        )
     }
 
     fn browser_viewport_for_kind(
@@ -4107,6 +4255,7 @@ impl WindowContext {
         config: &UiConfig,
         kind: &WindowKind,
         browser_view_mode: BrowserViewMode,
+        exact_column_count: Option<usize>,
     ) -> BrowserViewportLayout {
         let size_info = display.size_info_for_status_lines(usize::from(kind.is_web()));
         BrowserViewportLayout::new(
@@ -4114,28 +4263,37 @@ impl WindowContext {
             display.window.scale_factor,
             browser_view_mode,
             &config.browser.multi_column,
+            exact_column_count,
         )
     }
 
     fn browser_viewport_for_tab(
         display: &Display,
         config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
         tab: &TabState,
     ) -> BrowserViewportLayout {
-        Self::browser_viewport_for_kind(display, config, &tab.kind, tab.browser_view_mode)
+        Self::browser_viewport_for_kind(
+            display,
+            config,
+            &tab.kind,
+            tab.browser_view_mode,
+            tab.browser_multi_column_count_override.or(multi_column_defaults.browser),
+        )
     }
 
     #[cfg(unix)]
     fn ipc_terminal_layout(
         display: &Display,
         config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
         tab: &TabState,
     ) -> Option<IpcTerminalLayoutState> {
         if tab.kind.is_web() {
             return None;
         }
 
-        let layout = Self::terminal_viewport_for_tab(display, config, tab);
+        let layout = Self::terminal_viewport_for_tab(display, config, multi_column_defaults, tab);
         Some(IpcTerminalLayoutState {
             mode: tab.terminal_view_mode,
             target_columns: layout.target_columns(),
@@ -4147,13 +4305,14 @@ impl WindowContext {
     fn ipc_browser_layout(
         display: &Display,
         config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
         tab: &TabState,
     ) -> Option<IpcBrowserLayoutState> {
         if !tab.kind.is_web() {
             return None;
         }
 
-        let layout = Self::browser_viewport_for_tab(display, config, tab);
+        let layout = Self::browser_viewport_for_tab(display, config, multi_column_defaults, tab);
         let columns = (0..layout.column_count())
             .filter_map(|column_index| layout.column_rect(column_index))
             .collect();
@@ -4431,6 +4590,7 @@ impl WindowContext {
         }
 
         // Redraw the window.
+        let multi_column_defaults = self.multi_column_defaults();
         let Some(tab) = self.tabs.active_mut() else {
             return;
         };
@@ -4441,8 +4601,12 @@ impl WindowContext {
                     WindowKind::Web { url } => url.as_str(),
                     WindowKind::Terminal => "",
                 };
-                let browser_layout =
-                    Self::browser_viewport_for_tab(&self.display, &self.config, tab);
+                let browser_layout = Self::browser_viewport_for_tab(
+                    &self.display,
+                    &self.config,
+                    multi_column_defaults,
+                    tab,
+                );
                 self.display.draw_web(
                     scheduler,
                     &self.message_buffer,
@@ -4495,6 +4659,8 @@ impl WindowContext {
         self.sync_macos_fullscreen_transition();
         #[cfg(target_os = "macos")]
         if self.handle_tab_panel_event(&event, event_proxy) {
+            let old_is_searching = self.active_is_searching();
+            self.apply_pending_display_update(old_is_searching);
             return;
         }
 
@@ -4610,8 +4776,7 @@ impl WindowContext {
             pending_events.push(event);
         }
 
-        let old_is_searching =
-            self.tabs.active().is_some_and(|tab| tab.search_state.history_index.is_some());
+        let old_is_searching = self.active_is_searching();
 
         {
             let Some(active_tab) = self.tabs.active_mut() else {
@@ -4632,6 +4797,10 @@ impl WindowContext {
                 terminal_view_mode: &mut active_tab.terminal_view_mode,
                 #[cfg(target_os = "macos")]
                 browser_view_mode: &mut active_tab.browser_view_mode,
+                #[cfg(target_os = "macos")]
+                browser_multi_column_count: active_tab
+                    .browser_multi_column_count_override
+                    .or(self.default_browser_multi_column_count),
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
@@ -4663,19 +4832,7 @@ impl WindowContext {
             }
         }
 
-        // Process DisplayUpdate events.
-        if self.display.pending_update.dirty {
-            if let Some(active_id) = self.tabs.active_id() {
-                Self::submit_display_update(
-                    active_id,
-                    &mut self.tabs,
-                    &mut self.display,
-                    old_is_searching,
-                    &self.config,
-                );
-                self.dirty = true;
-            }
-        }
+        self.apply_pending_display_update(old_is_searching);
 
         let Some(active_tab) = self.tabs.active_mut() else {
             return;
@@ -4926,6 +5083,7 @@ impl WindowContext {
         event: &TerminalEvent,
         clipboard: &mut Clipboard,
     ) {
+        let multi_column_defaults = self.multi_column_defaults();
         let Some(tab) = self.tabs.get_mut(tab_id) else {
             return;
         };
@@ -4956,9 +5114,13 @@ impl WindowContext {
                 tab.notifier.notify(format(color.0).into_bytes());
             },
             TerminalEvent::TextAreaSizeRequest(format) => {
-                let logical_size =
-                    Self::terminal_viewport_for_tab(&self.display, &self.config, tab)
-                        .logical_size(&self.display.size_info);
+                let logical_size = Self::terminal_viewport_for_tab(
+                    &self.display,
+                    &self.config,
+                    multi_column_defaults,
+                    tab,
+                )
+                .logical_size(&self.display.size_info);
                 let text = format(logical_size.into());
                 tab.notifier.notify(text.into_bytes());
             },
@@ -4987,8 +5149,13 @@ impl WindowContext {
 
         let serialized_grid = json::to_string(&grid).expect("serialize grid");
 
-        let logical_size = Self::terminal_viewport_for_tab(&self.display, &self.config, tab)
-            .logical_size(&self.display.size_info);
+        let logical_size = Self::terminal_viewport_for_tab(
+            &self.display,
+            &self.config,
+            self.multi_column_defaults(),
+            tab,
+        )
+        .logical_size(&self.display.size_info);
         let size = TermSize::new(logical_size.columns(), logical_size.screen_lines());
         let serialized_size = json::to_string(&size).expect("serialize size");
 
@@ -5014,6 +5181,7 @@ impl WindowContext {
         display: &mut Display,
         old_is_searching: bool,
         config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
     ) {
         {
             let Some(active_tab) = tabs.get_mut(active_id) else {
@@ -5036,8 +5204,13 @@ impl WindowContext {
                 &mut terminal,
                 &mut active_tab.notifier,
                 &mut active_tab.search_state,
-                web_status_bar,
-                Some(active_tab.terminal_view_mode),
+                DisplayUpdateOptions {
+                    web_status_bar,
+                    terminal_view_mode: Some(active_tab.terminal_view_mode),
+                    exact_multi_column_count: active_tab
+                        .terminal_multi_column_count_override
+                        .or(multi_column_defaults.terminal),
+                },
                 config,
             );
 
@@ -5055,7 +5228,8 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         for tab in tabs.iter_mut() {
-            let layout = Self::browser_viewport_for_tab(display, config, tab);
+            let layout =
+                Self::browser_viewport_for_tab(display, config, multi_column_defaults, tab);
             if let Some(web_view) = tab.web_view.as_mut() {
                 web_view.update_frame(&display.window, &display.size_info, layout);
             }
@@ -5066,7 +5240,8 @@ impl WindowContext {
                 continue;
             }
 
-            let layout = Self::terminal_viewport_for_tab(display, config, tab);
+            let layout =
+                Self::terminal_viewport_for_tab(display, config, multi_column_defaults, tab);
             let new_size = layout.logical_size(&display.size_info);
             let mut tab_terminal = tab.terminal.lock();
             if tab_terminal.screen_lines() != new_size.screen_lines()

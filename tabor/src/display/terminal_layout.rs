@@ -97,12 +97,42 @@ impl TerminalViewportLayout {
         size_info: &SizeInfo,
         mode: TerminalViewMode,
         config: &MultiColumnTerminalConfig,
+        exact_strip_count: Option<usize>,
     ) -> Self {
         let visual_columns = size_info.columns();
         let visual_lines = size_info.screen_lines();
 
         if mode != TerminalViewMode::MultiColumn {
             return Self::normal(*size_info);
+        }
+
+        if let Some(exact_strip_count) = exact_strip_count {
+            let strip_count = exact_strip_count.max(1).min(max(visual_columns, 1));
+            let logical_columns = max(visual_columns / strip_count, 1);
+            let used_columns = strip_count * logical_columns;
+            let leftover_columns = visual_columns.saturating_sub(used_columns);
+            let gutter_slots = strip_count.saturating_sub(1);
+            let gutter_columns =
+                if gutter_slots == 0 { 0 } else { leftover_columns / gutter_slots };
+            let extra_gutter_columns =
+                if gutter_slots == 0 { 0 } else { leftover_columns % gutter_slots };
+            let logical_lines = visual_lines * strip_count;
+
+            return Self {
+                mode,
+                order: config.order,
+                content_line_offset: 0,
+                target_columns: logical_columns,
+                visual_columns,
+                visual_lines,
+                logical_columns,
+                logical_lines,
+                strip_count,
+                gutter_columns,
+                extra_gutter_columns,
+                left_padding_columns: 0,
+                right_padding_columns: 0,
+            };
         }
 
         let target_columns = max(config.target_columns, 1);
@@ -392,6 +422,7 @@ mod tests {
             &size(300, 40),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
 
         assert_eq!(layout.strip_count(), 3);
@@ -406,6 +437,7 @@ mod tests {
             &size(250, 40),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
 
         assert_eq!(layout.strip_count(), 2);
@@ -416,11 +448,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_strip_count_preserves_requested_column_count() {
+        let layout = TerminalViewportLayout::new(
+            &size(251, 40),
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+            Some(3),
+        );
+
+        assert_eq!(layout.strip_count(), 3);
+        assert_eq!(layout.target_columns(), 83);
+        assert_eq!(layout.logical_size(&size(251, 40)).screen_lines(), 120);
+    }
+
+    #[test]
     fn logical_visual_roundtrip() {
         let layout = TerminalViewportLayout::new(
             &size(250, 10),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
         let logical = Point::new(13, Column(7));
         let visual = layout.visual_point_for_logical_viewport(logical).unwrap();
@@ -435,6 +482,7 @@ mod tests {
             &size(333, 10),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
 
         assert_eq!(layout.strip_count(), 3);
@@ -451,6 +499,7 @@ mod tests {
             &size(300, 4),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
         let eof = Point::new(11, Column(0));
 
@@ -463,6 +512,7 @@ mod tests {
             &size(300, 4),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
 
         assert_eq!(
@@ -482,6 +532,7 @@ mod tests {
             &size_info,
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
 
         assert_eq!(
@@ -499,6 +550,7 @@ mod tests {
                 order: MultiColumnOrder::EndLeft,
                 ..MultiColumnTerminalConfig::default()
             },
+            None,
         );
         let eof = Point::new(11, Column(0));
 
@@ -511,6 +563,7 @@ mod tests {
             &size(205, 10),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
         );
         let gutter = Point::new(0, Column(102));
 
