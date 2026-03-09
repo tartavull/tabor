@@ -104,6 +104,14 @@ impl WebCommandState {
         self.set_mode(WebMode::Normal);
     }
 
+    pub(crate) fn sync_editable_focus(&mut self, editable: bool) {
+        if editable {
+            self.set_mode(WebMode::Insert);
+        } else if self.mode == WebMode::Insert {
+            self.set_mode(WebMode::Normal);
+        }
+    }
+
     pub(crate) fn status_label(&self) -> &'static str {
         match self.mode {
             WebMode::Normal => "NORMAL",
@@ -1057,6 +1065,29 @@ mod tests {
         press(&mut state, &mut actions, 'z');
         press(&mut state, &mut actions, 'L');
         assert_eq!(actions.last_call(), Some(&ActionCall::ScrollFarRight));
+    }
+
+    #[test]
+    fn sync_editable_focus_switches_insert_mode() {
+        let mut state = WebCommandState::default();
+
+        state.sync_editable_focus(true);
+        assert_eq!(state.mode, WebMode::Insert);
+
+        state.sync_editable_focus(false);
+        assert_eq!(state.mode, WebMode::Normal);
+    }
+
+    #[test]
+    fn sync_editable_focus_preserves_non_insert_modes_when_focus_is_not_editable() {
+        let mut state = WebCommandState::default();
+        let mut actions = MockActions::default();
+
+        press(&mut state, &mut actions, 'f');
+        assert_eq!(state.mode, WebMode::Hint);
+
+        state.sync_editable_focus(false);
+        assert_eq!(state.mode, WebMode::Hint);
     }
 
     #[test]

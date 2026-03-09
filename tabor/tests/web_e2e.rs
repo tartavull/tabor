@@ -793,6 +793,95 @@ fn accelerated_web_multi_column_stays_gpu_backed_after_resize_and_scroll() {
 }
 
 #[test]
+fn native_click_on_editable_switches_web_tab_into_insert_mode() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    let tab_id_arg = tab_id_arg(&reply);
+    ensure_active_web_tab(&harness, 4);
+    let layout = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        layout.get("mode").and_then(Value::as_str) == Some("normal")
+            && layout
+                .get("acceleration")
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                == Some("ready")
+    })
+    .unwrap_or_else(|| panic!("timed out waiting for initial browser layout"));
+
+    let initial_state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+    assert_eq!(
+        tab_web_mode(&initial_state),
+        Some("normal"),
+        "expected web tab to start in normal mode: {initial_state}"
+    );
+
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+    let center_json = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("email-input");
+            if (!el) throw new Error("email-input missing");
+            const rect = el.getBoundingClientRect();
+            return JSON.stringify({
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2)
+            });
+        })()"#,
+    );
+    let center: Value = serde_json::from_str(&center_json)
+        .unwrap_or_else(|err| panic!("invalid email-input center json: {err}; raw={center_json}"));
+    let logical_x = center
+        .get("x")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing email-input center.x: {center}"));
+    let logical_y = center
+        .get("y")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing email-input center.y: {center}"));
+    let (visual_x, visual_y) = browser_visual_point(&layout, logical_x, logical_y);
+
+    native_window_click(&harness, visual_x, visual_y);
+
+    let active_id = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => document.activeElement ? document.activeElement.id || "" : "")()"#,
+    );
+    assert_eq!(active_id, "email-input", "native click focused the wrong element");
+
+    let mode_state =
+        wait_for_tab_web_mode_value(&harness, tab_id_arg.as_str(), "insert", Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                let latest_state =
+                    harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+                panic!(
+                    "timed out waiting for insert mode after clicking an editable element; last_state={latest_state}; harness_log_tail:\n{}",
+                    harness.log_tail(),
+                )
+            });
+    assert_eq!(
+        tab_web_mode(&mode_state),
+        Some("insert"),
+        "expected native click on editable element to switch into insert mode: {mode_state}"
+    );
+
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "detach",
+        "--session-id",
+        inspector_session.as_str(),
+    ]);
+}
+
+#[test]
 fn native_multi_column_click_focuses_lower_input() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
@@ -2183,6 +2272,25 @@ where
     None
 }
 
+fn wait_for_tab_web_mode_value(
+    harness: &TaborHarness,
+    tab_id_arg: &str,
+    expected_mode: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg]);
+        if tab_web_mode(&state) == Some(expected_mode) {
+            return Some(state);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
 fn ensure_active_web_tab(harness: &TaborHarness, max_switches: usize) {
     for _ in 0..max_switches {
         let tabs = harness.run_json(["msg", "list-tabs"]);
@@ -2216,6 +2324,10 @@ fn tab_kind_is(tab: &Value, kind: &str) -> bool {
         Some(Value::Object(tab_kind)) => tab_kind.contains_key(kind),
         _ => false,
     }
+}
+
+fn tab_web_mode(state: &Value) -> Option<&str> {
+    state.get("tab").and_then(|tab| tab.get("web_mode")).and_then(Value::as_str)
 }
 
 fn send_terminal_key(harness: &TaborHarness, tab_id: (u64, u64), key: &str, text: Option<&str>) {

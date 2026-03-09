@@ -85,9 +85,9 @@ use crate::ipc::{
     IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
     IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
     IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
-    IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebViewMetrics, IpcWindowDebugButton,
-    IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
-    TerminalKeyInput,
+    IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
+    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
+    SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -2174,6 +2174,31 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
+    fn handle_web_editable_focus(&mut self, tab_id: TabId, editable: bool) {
+        let is_active = Some(tab_id) == self.tabs.active_id();
+        let Some(tab) = self.tabs.get_mut(tab_id) else {
+            return;
+        };
+        if !tab.kind.is_web() {
+            return;
+        }
+
+        let before = tab.web_command_state.mode();
+        tab.web_command_state.sync_editable_focus(editable);
+        if tab.web_command_state.mode() == before {
+            return;
+        }
+
+        self.display.pending_update.dirty = true;
+        if is_active {
+            self.dirty = true;
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn handle_web_cursor_request(
         &mut self,
         tab_id: TabId,
@@ -2601,6 +2626,7 @@ impl WindowContext {
                             program_name: tab.program_name.clone(),
                             kind: IpcTabKind::from(&tab.kind),
                             activity,
+                            web_mode: Self::ipc_web_mode(tab),
                             terminal_layout: Self::ipc_terminal_layout(
                                 &self.display,
                                 &self.config,
@@ -2639,6 +2665,7 @@ impl WindowContext {
             program_name: tab.program_name.clone(),
             kind: IpcTabKind::from(&tab.kind),
             activity,
+            web_mode: Self::ipc_web_mode(tab),
             terminal_layout: Self::ipc_terminal_layout(
                 &self.display,
                 &self.config,
@@ -4284,6 +4311,15 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
+    fn ipc_web_mode(tab: &TabState) -> Option<IpcWebMode> {
+        if !tab.kind.is_web() {
+            return None;
+        }
+
+        Some(IpcWebMode::from(tab.web_command_state.mode()))
+    }
+
+    #[cfg(unix)]
     fn ipc_terminal_layout(
         display: &Display,
         config: &UiConfig,
@@ -4712,6 +4748,14 @@ impl WindowContext {
                             continue;
                         };
                         self.handle_web_cursor(tab_id, *cursor);
+                        continue;
+                    },
+                    #[cfg(target_os = "macos")]
+                    EventType::WebEditableFocus { editable } => {
+                        let Some(tab_id) = event.tab_id() else {
+                            continue;
+                        };
+                        self.handle_web_editable_focus(tab_id, *editable);
                         continue;
                     },
                     #[cfg(target_os = "macos")]

@@ -23,6 +23,8 @@ use crate::config::{Action, MouseAction, SearchAction, ViAction};
 use crate::display::browser_layout::{BrowserViewMode, BrowserViewportRect};
 use crate::display::terminal_layout::TerminalViewMode;
 use crate::event::{Event, EventType};
+#[cfg(target_os = "macos")]
+use crate::macos::web_commands::WebMode;
 use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
 
@@ -118,6 +120,33 @@ pub struct IpcBrowserLayoutState {
     pub acceleration: IpcBrowserAccelerationInfo,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcWebMode {
+    Normal,
+    Insert,
+    Visual,
+    VisualLine,
+    Hint,
+    MarkSet,
+    MarkJump,
+}
+
+#[cfg(target_os = "macos")]
+impl From<WebMode> for IpcWebMode {
+    fn from(mode: WebMode) -> Self {
+        match mode {
+            WebMode::Normal => Self::Normal,
+            WebMode::Insert => Self::Insert,
+            WebMode::Visual => Self::Visual,
+            WebMode::VisualLine => Self::VisualLine,
+            WebMode::Hint => Self::Hint,
+            WebMode::MarkSet => Self::MarkSet,
+            WebMode::MarkJump => Self::MarkJump,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcTabState {
     pub tab_id: IpcTabId,
@@ -129,6 +158,8 @@ pub struct IpcTabState {
     pub program_name: String,
     pub kind: IpcTabKind,
     pub activity: Option<IpcTabActivity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_mode: Option<IpcWebMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_layout: Option<IpcTerminalLayoutState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1946,6 +1977,7 @@ mod tests {
                                 program_name: tab.program_name.clone(),
                                 kind: tab.kind.clone(),
                                 activity: None,
+                                web_mode: None,
                                 terminal_layout: None,
                                 browser_layout: tab.browser_layout.clone(),
                             })
@@ -1969,6 +2001,7 @@ mod tests {
                 program_name: tab.program_name.clone(),
                 kind: tab.kind.clone(),
                 activity: None,
+                web_mode: None,
                 terminal_layout: None,
                 browser_layout: tab.browser_layout.clone(),
             })
