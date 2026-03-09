@@ -234,8 +234,12 @@ pub struct SizeInfo<T = f32> {
     /// Right window padding.
     padding_right: T,
 
-    /// Vertical window padding.
+    /// Top window padding.
     padding_y: T,
+
+    /// Bottom window padding.
+    #[serde(default)]
+    padding_bottom: T,
 
     /// Number of lines in the viewport.
     screen_lines: usize,
@@ -254,6 +258,7 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
             padding_x: size_info.padding_x as u32,
             padding_right: size_info.padding_right as u32,
             padding_y: size_info.padding_y as u32,
+            padding_bottom: size_info.padding_bottom as u32,
             screen_lines: size_info.screen_lines,
             columns: size_info.screen_lines,
         }
@@ -306,6 +311,11 @@ impl<T: Clone + Copy> SizeInfo<T> {
     pub fn padding_y(&self) -> T {
         self.padding_y
     }
+
+    #[inline]
+    pub fn padding_bottom(&self) -> T {
+        self.padding_bottom
+    }
 }
 
 impl SizeInfo<f32> {
@@ -315,18 +325,47 @@ impl SizeInfo<f32> {
         height: f32,
         cell_width: f32,
         cell_height: f32,
+        padding_x: f32,
+        padding_right: f32,
+        padding_y: f32,
+        dynamic_padding: bool,
+    ) -> SizeInfo {
+        Self::new_with_vertical_padding(
+            width,
+            height,
+            cell_width,
+            cell_height,
+            padding_x,
+            padding_right,
+            padding_y,
+            padding_y,
+            dynamic_padding,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_vertical_padding(
+        width: f32,
+        height: f32,
+        cell_width: f32,
+        cell_height: f32,
         mut padding_x: f32,
         mut padding_right: f32,
         mut padding_y: f32,
+        mut padding_bottom: f32,
         dynamic_padding: bool,
     ) -> SizeInfo {
         if dynamic_padding {
             padding_x = Self::dynamic_padding(padding_x.floor(), width, cell_width);
             padding_right = padding_x;
-            padding_y = Self::dynamic_padding(padding_y.floor(), height, cell_height);
+            let padding_top = padding_y.floor();
+            let padding_bottom_floor = padding_bottom.floor();
+            let extra = ((height - padding_top - padding_bottom_floor) % cell_height) / 2.;
+            padding_y = padding_top + extra;
+            padding_bottom = padding_bottom_floor + extra;
         }
 
-        let lines = (height - 2. * padding_y) / cell_height;
+        let lines = (height - padding_y - padding_bottom) / cell_height;
         let screen_lines = cmp::max(lines as usize, MIN_SCREEN_LINES);
 
         let columns = (width - padding_x - padding_right) / cell_width;
@@ -340,9 +379,21 @@ impl SizeInfo<f32> {
             padding_x: padding_x.floor(),
             padding_right: padding_right.floor(),
             padding_y: padding_y.floor(),
+            padding_bottom: padding_bottom.floor(),
             screen_lines,
             columns,
         }
+    }
+
+    #[inline]
+    pub fn viewport_height(&self) -> f32 {
+        (self.height - self.padding_y - self.padding_bottom).max(0.)
+    }
+
+    #[inline]
+    pub fn footer_offset(&self) -> f32 {
+        let grid_bottom = self.padding_y + self.screen_lines as f32 * self.cell_height;
+        (self.height - grid_bottom).max(0.)
     }
 
     #[inline]
@@ -660,7 +711,7 @@ impl Display {
             && config.window.dimensions().is_none()
             && panel_dimensions.columns == 0;
         // Create new size with at least one column and row.
-        let size_info = SizeInfo::new(
+        let size_info = SizeInfo::new_with_vertical_padding(
             viewport_size.width as f32,
             viewport_size.height as f32,
             cell_width,
@@ -668,6 +719,7 @@ impl Display {
             padding.0 + panel_padding,
             padding.0,
             padding.1 + fullscreen_top_padding,
+            padding.1,
             dynamic_padding,
         );
 
@@ -949,7 +1001,7 @@ impl Display {
         let fullscreen_top_padding = 0.0;
         let panel_padding = panel_dimensions.width;
         let dynamic_padding = config.window.dynamic_padding && panel_dimensions.columns == 0;
-        let mut new_size = SizeInfo::new(
+        let mut new_size = SizeInfo::new_with_vertical_padding(
             width,
             height,
             cell_width,
@@ -957,6 +1009,7 @@ impl Display {
             padding.0 + panel_padding,
             padding.0,
             padding.1 + fullscreen_top_padding,
+            padding.1,
             dynamic_padding,
         );
 
@@ -1896,9 +1949,7 @@ impl Display {
 
     fn footer_offset(&self) -> f32 {
         let size_info = self.size_info;
-        let grid_bottom =
-            size_info.padding_y() + size_info.screen_lines() as f32 * size_info.cell_height();
-        (size_info.height() - grid_bottom).max(0.)
+        size_info.footer_offset()
     }
 
     fn draw_footer_bar_background_with_height(
@@ -2426,6 +2477,17 @@ mod tests {
         let show_controls = Display::macos_show_semaphore_controls(true, Decorations::Full, false);
         let top_inset = if show_controls { measured_inset } else { 0.0 };
         assert_eq!(top_inset, measured_inset);
+    }
+
+    #[test]
+    fn asymmetric_vertical_padding_preserves_footer_status_space() {
+        let mut size =
+            SizeInfo::new_with_vertical_padding(200., 100., 1., 1., 0., 0., 20., 4., false);
+        size.reserve_lines(1);
+
+        assert_eq!(size.viewport_height(), 76.);
+        assert_eq!(size.screen_lines(), 75);
+        assert_eq!(size.footer_offset(), 5.);
     }
 
     #[test]

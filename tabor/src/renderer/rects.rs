@@ -465,9 +465,7 @@ impl RectShaderProgram {
         let position = (0.5 * metrics.descent).abs();
         let underline_position = metrics.descent.abs() - metrics.underline_position.abs();
 
-        let viewport_height = size_info.height() - size_info.padding_y();
-        let padding_y = viewport_height
-            - (viewport_height / size_info.cell_height()).floor() * size_info.cell_height();
+        let padding_y = size_info.footer_offset();
 
         unsafe {
             if let Some(u_cell_width) = self.u_cell_width {

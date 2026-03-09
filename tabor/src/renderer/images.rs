@@ -332,11 +332,11 @@ mod macos {
                 gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
                 gl::Viewport(
                     size_info.padding_x() as i32,
-                    size_info.padding_y() as i32,
+                    size_info.padding_bottom() as i32,
                     size_info.width() as i32
                         - size_info.padding_x() as i32
                         - size_info.padding_right() as i32,
-                    size_info.height() as i32 - 2 * size_info.padding_y() as i32,
+                    size_info.viewport_height() as i32,
                 );
             }
         }

@@ -23,7 +23,7 @@ use crate::renderer::{GlyphCache, Renderer};
 use crate::tab_panel::{TabPanelCommand, TabPanelGroup, TabPanelTab};
 use crate::tab_panel_icons::{
     TAB_PANEL_ACTIVITY_FILLED_CHAR, TAB_PANEL_ACTIVITY_OUTLINE_CHAR, TAB_PANEL_CLOSE_CHAR,
-    TAB_PANEL_WEB_GLOBE_CHAR,
+    TAB_PANEL_WEB_GLOBE_CHAR, tab_panel_icon_slot_layout,
 };
 #[cfg(target_os = "macos")]
 use crate::tab_panel_icons::{TabPanelIconKind, rasterized_tab_panel_icon_glyph};
@@ -35,7 +35,7 @@ const PANEL_ICON_SCALE: f32 = 2.0;
 const PANEL_ROW_PADDING_PX: f32 = 4.0;
 const GROUP_HEADER_INDENT_COLS: usize = 1;
 const TAB_INDENT_COLS: usize = 1;
-const ACTIVITY_INDICATOR_COLS: usize = 2;
+const ACTIVITY_INDICATOR_COLS: usize = 3;
 const WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
 const WINDOW_CONTROL_MARGIN_X_PX: f64 = 12.0;
 const WINDOW_CONTROL_SPACING_PX: f64 = 8.0;
@@ -762,9 +762,7 @@ impl TabPanel {
                 PanelItemKind::Tab { tab } => {
                     let is_ghost = item.style == RenderStyle::Ghost;
                     let indent = TAB_INDENT_COLS;
-                    let indicator_cols =
-                        if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
-                    let text_col = indent + indicator_cols;
+                    let text_col = tab_text_col(tab);
                     let close_col = self.width_cols.saturating_sub(1);
                     let max_cols = self.width_cols.saturating_sub(text_col + 1);
                     let title = match &self.edit {
@@ -852,9 +850,7 @@ impl TabPanel {
                 if let Some(position) = self.last_mouse_pos {
                     if let Some(line) = self.drag_ghost_line(position, &panel_size_info, &layout) {
                         let indent = TAB_INDENT_COLS;
-                        let indicator_cols =
-                            if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
-                        let text_col = indent + indicator_cols;
+                        let text_col = tab_text_col(&tab);
                         let max_cols = self.width_cols.saturating_sub(text_col + 1);
                         let title = tab.title.clone();
                         let label = if let Some(icon) = tab_panel_icon_char(&tab) {
@@ -943,7 +939,7 @@ impl TabPanel {
         let top_inset =
             self.window_controls.panel_content_inset_px(self.panel_cell_height(size_info));
 
-        SizeInfo::new(
+        SizeInfo::new_with_vertical_padding(
             self.width_px,
             size_info.height(),
             size_info.cell_width(),
@@ -951,6 +947,7 @@ impl TabPanel {
             0.,
             0.,
             size_info.padding_y() + top_inset,
+            size_info.padding_bottom(),
             false,
         )
     }
@@ -1003,8 +1000,8 @@ impl TabPanel {
         }
 
         let col = (position.x / cell_width).floor() as usize;
-        if let Some(inline_col) = self.inline_close_col(tab_id) {
-            return col == inline_col;
+        if let Some((start_col, end_col)) = self.inline_close_hit_cols(tab_id, size_info) {
+            return (start_col..=end_col).contains(&col);
         }
 
         let close_col = self.width_cols.saturating_sub(1);
@@ -1023,8 +1020,7 @@ impl TabPanel {
         let (tab, _, _) = self.find_tab(tab_id)?;
 
         if tab_panel_icon_char(&tab).is_some() {
-            let indicator_cols = if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 };
-            return Some(TAB_INDENT_COLS + indicator_cols);
+            return Some(tab_text_col(&tab));
         }
 
         if tab.activity.is_some() {
@@ -1032,6 +1028,13 @@ impl TabPanel {
         }
 
         None
+    }
+
+    fn inline_close_hit_cols(&self, tab_id: TabId, size_info: &SizeInfo) -> Option<(usize, usize)> {
+        let start_col = self.inline_close_col(tab_id)?;
+        let layout = tab_panel_icon_slot_layout(size_info, self.panel_text_offset_y(size_info));
+        let end_col = start_col + layout.slot_width_cols().saturating_sub(1);
+        Some((start_col, end_col))
     }
 
     fn is_inside_panel(&self, position: PhysicalPosition<f64>) -> bool {
@@ -1966,6 +1969,14 @@ fn truncate_to_columns(text: &str, max_cols: usize) -> String {
     output
 }
 
+fn tab_indicator_cols(tab: &TabPanelTab) -> usize {
+    if tab.activity.is_some() { ACTIVITY_INDICATOR_COLS } else { 0 }
+}
+
+fn tab_text_col(tab: &TabPanelTab) -> usize {
+    TAB_INDENT_COLS + tab_indicator_cols(tab)
+}
+
 struct ActivityIndicator {
     glyph: char,
     color: Rgb,
@@ -2183,6 +2194,7 @@ mod tests {
     use winit::event::{ElementState, MouseButton};
 
     use crate::display::SizeInfo;
+    use crate::tab_panel::TabActivity;
     use crate::window_kind::TabKind;
 
     fn panel_tab(tab_id: TabId, is_active: bool) -> TabPanelTab {
@@ -2227,7 +2239,7 @@ mod tests {
         let _ = panel
             .set_groups(vec![group_with_tabs(&[(first_tab, true), (second_tab, false)])], None);
 
-        let first_tab_pos = PhysicalPosition::new(20.0, 30.0);
+        let first_tab_pos = PhysicalPosition::new(45.0, 30.0);
         let first_hover = panel.cursor_moved(first_tab_pos, &size_info);
         assert!(first_hover.capture);
 
@@ -2236,7 +2248,7 @@ mod tests {
 
         let _ = panel.set_groups(vec![group_with_tabs(&[(second_tab, true)])], None);
 
-        let second_tab_pos = PhysicalPosition::new(20.0, 40.0);
+        let second_tab_pos = PhysicalPosition::new(45.0, 40.0);
         let drag_move = panel.cursor_moved(second_tab_pos, &size_info);
         assert!(drag_move.capture);
 
@@ -2257,14 +2269,14 @@ mod tests {
         let _ = panel
             .set_groups(vec![group_with_tabs(&[(first_tab, true), (second_tab, false)])], None);
 
-        let first_tab_pos = PhysicalPosition::new(20.0, 30.0);
+        let first_tab_pos = PhysicalPosition::new(45.0, 30.0);
         let first_hover = panel.cursor_moved(first_tab_pos, &size_info);
         assert!(first_hover.capture);
 
         let press = panel.mouse_input(ElementState::Pressed, MouseButton::Left, &size_info);
         assert!(press.capture);
 
-        let target_pos = PhysicalPosition::new(20.0, 52.0);
+        let target_pos = PhysicalPosition::new(45.0, 52.0);
         let drag_move = panel.cursor_moved(target_pos, &size_info);
         assert!(drag_move.capture);
 
@@ -2343,5 +2355,30 @@ mod tests {
         assert_eq!(panel.inline_close_col(tab_id), Some(TAB_INDENT_COLS));
         assert!(panel.is_close_hit(PhysicalPosition::new(15.0, 30.0), &size_info, tab_id));
         assert!(!panel.is_close_hit(PhysicalPosition::new(195.0, 30.0), &size_info, tab_id));
+    }
+
+    #[test]
+    fn clicking_right_half_of_web_tab_icon_slot_closes_tab() {
+        let tab_id = TabId::new(1, 0);
+        let (mut panel, size_info) = panel_and_size();
+        let _ = panel.set_groups(vec![group_with_tabs(&[(tab_id, true)])], None);
+
+        let hover = panel.cursor_moved(PhysicalPosition::new(25.0, 30.0), &size_info);
+        assert!(hover.capture);
+
+        let press = panel.mouse_input(ElementState::Pressed, MouseButton::Left, &size_info);
+        assert!(press.capture);
+
+        let release = panel.mouse_input(ElementState::Released, MouseButton::Left, &size_info);
+        assert_eq!(release.command, Some(TabPanelCommand::Close(tab_id)));
+    }
+
+    #[test]
+    fn activity_tabs_leave_a_gap_between_indicator_and_title() {
+        let mut tab = panel_tab(TabId::new(1, 0), true);
+        tab.kind = TabKind::Terminal;
+        tab.activity = Some(TabActivity::default());
+
+        assert_eq!(tab_text_col(&tab), 4);
     }
 }

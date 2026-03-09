@@ -1384,6 +1384,95 @@ fn macos_standard_zoom_button_enters_real_ear_fullscreen() {
 }
 
 #[test]
+fn macos_real_ear_fullscreen_resizes_active_web_viewport() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let initial_state = window_debug_state(&harness);
+
+    if rect_is_empty(&initial_state.auxiliary_top_left_screen_points)
+        && rect_is_empty(&initial_state.auxiliary_top_right_screen_points)
+    {
+        eprintln!(
+            "skipping fullscreen web-resize test on a display without auxiliary notch regions"
+        );
+        return;
+    }
+
+    let fixture = fixture_url();
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    let tab_id_arg = tab_id_arg(&reply);
+
+    let initial_tab_state =
+        harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+    let initial_layout = initial_tab_state
+        .get("tab")
+        .and_then(|tab| tab.get("browser_layout"))
+        .unwrap_or_else(|| panic!("missing initial browser_layout: {initial_tab_state}"));
+    let initial_width =
+        initial_layout.get("logical_width").and_then(Value::as_u64).unwrap_or_else(|| {
+            panic!("missing initial browser_layout.logical_width: {initial_tab_state}")
+        });
+    let initial_height =
+        initial_layout.get("logical_height").and_then(Value::as_u64).unwrap_or_else(|| {
+            panic!("missing initial browser_layout.logical_height: {initial_tab_state}")
+        });
+
+    let zoom_reply = harness.run_json([
+        "msg",
+        "send",
+        r#"{"type":"window_debug_press_standard_button","button":"zoom"}"#,
+    ]);
+    assert_eq!(zoom_reply.get("type").and_then(Value::as_str), Some("ok"));
+
+    let fullscreen_state = wait_for_fullscreen_window_state(&harness, Duration::from_secs(12))
+        .unwrap_or_else(|state| {
+            panic!(
+                "timed out waiting for real-ear fullscreen before resize check; last_state={state:?}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert!(
+        fullscreen_state.simple_fullscreen && fullscreen_state.real_ear_fullscreen_active,
+        "expected real-ear fullscreen to be active before resize check: {fullscreen_state:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut final_tab_state = initial_tab_state;
+    let mut final_width = initial_width;
+    let mut final_height = initial_height;
+    while Instant::now() < deadline {
+        final_tab_state =
+            harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+        let layout = final_tab_state
+            .get("tab")
+            .and_then(|tab| tab.get("browser_layout"))
+            .unwrap_or_else(|| panic!("missing fullscreen browser_layout: {final_tab_state}"));
+        final_width = layout.get("logical_width").and_then(Value::as_u64).unwrap_or_else(|| {
+            panic!("missing fullscreen browser_layout.logical_width: {final_tab_state}")
+        });
+        final_height = layout.get("logical_height").and_then(Value::as_u64).unwrap_or_else(|| {
+            panic!("missing fullscreen browser_layout.logical_height: {final_tab_state}")
+        });
+
+        if final_width > initial_width && final_height > initial_height {
+            break;
+        }
+
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    assert!(
+        final_width > initial_width,
+        "expected fullscreen browser width to grow beyond {initial_width}, got {final_width}; tab_state={final_tab_state}; harness_log_tail:\n{}",
+        harness.log_tail(),
+    );
+    assert!(
+        final_height > initial_height,
+        "expected fullscreen browser height to grow beyond {initial_height}, got {final_height}; tab_state={final_tab_state}; harness_log_tail:\n{}",
+        harness.log_tail(),
+    );
+}
+
+#[test]
 fn macos_toggle_fullscreen_action_exits_real_ear_fullscreen() {
     let harness = TaborHarness::start_foreground_app_bundle(false);
     let initial_state = window_debug_state(&harness);

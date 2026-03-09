@@ -1874,6 +1874,7 @@ impl WindowContext {
         if !native_fullscreen {
             self.display.window.clear_macos_notch_ear_windows();
         }
+        self.display.pending_update.set_dimensions(self.display.window.inner_size());
         self.display.pending_update.dirty = true;
         self.display.damage_tracker.frame().mark_fully_damaged();
         self.dirty = true;

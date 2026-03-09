@@ -14,6 +14,7 @@ const MAX_FAVICON_BYTES: usize = 512 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const FAVICON_SIZE_SCALE: f32 = 0.8;
 
 #[derive(Clone, Debug)]
 pub struct FaviconImage {
@@ -38,7 +39,7 @@ impl FaviconImage {
         text_offset_y: f32,
     ) -> RasterizedGlyph {
         let layout = tab_panel_icon_slot_layout(size_info, text_offset_y);
-        let icon_size = layout.icon_square_px().max(1) as u32;
+        let icon_size = layout.scaled_square_px(FAVICON_SIZE_SCALE).max(1) as u32;
 
         let mut image = self.to_image();
         if image.width() != icon_size || image.height() != icon_size {
@@ -152,5 +153,40 @@ fn premultiply_rgba(buffer: &mut [u8]) {
         chunk[0] = r as u8;
         chunk[1] = g as u8;
         chunk[2] = b as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_METRICS: Metrics = Metrics {
+        average_advance: 10.0,
+        line_height: 20.0,
+        descent: 4.0,
+        underline_position: 2.0,
+        underline_thickness: 2.0,
+        strikeout_position: 2.0,
+        strikeout_thickness: 2.0,
+    };
+
+    #[test]
+    fn rasterized_favicons_leave_padding_within_the_icon_slot() {
+        let image = FaviconImage {
+            width: 2,
+            height: 2,
+            rgba: Arc::from(vec![
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            ]),
+        };
+        let size_info = SizeInfo::new(200.0, 100.0, 10.0, 24.0, 0.0, 0.0, 0.0, false);
+        let text_offset_y = -2.0;
+        let layout = tab_panel_icon_slot_layout(&size_info, text_offset_y);
+        let expected = layout.scaled_square_px(FAVICON_SIZE_SCALE);
+
+        let glyph = image.rasterized_glyph('a', &size_info, TEST_METRICS, text_offset_y);
+
+        assert_eq!(glyph.width, expected);
+        assert_eq!(glyph.height, expected);
     }
 }

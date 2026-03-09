@@ -56,8 +56,20 @@ impl TabPanelIconSlotLayout {
         self.cell_width_px
     }
 
+    pub(crate) fn slot_width_cols(self) -> usize {
+        self.slot_width_px
+            .max(1)
+            .saturating_add(self.cell_width_px.max(1) - 1)
+            .checked_div(self.cell_width_px.max(1))
+            .unwrap_or(1) as usize
+    }
+
     pub(crate) fn icon_square_px(self) -> i32 {
         self.slot_width_px.min(self.cell_height_px).max(1)
+    }
+
+    pub(crate) fn scaled_square_px(self, scale: f32) -> i32 {
+        ((self.icon_square_px() as f32) * scale).round().max(1.0) as i32
     }
 
     pub(crate) fn glyph_position(
@@ -87,8 +99,7 @@ pub fn rasterized_tab_panel_icon_glyph(
     text_offset_y: f32,
 ) -> RasterizedGlyph {
     let layout = tab_panel_icon_slot_layout(size_info, text_offset_y);
-    let icon_size_px =
-        ((layout.icon_square_px() as f32) * ICON_SIZE_SCALE).round().max(1.0) as usize;
+    let icon_size_px = layout.scaled_square_px(ICON_SIZE_SCALE) as usize;
     let stroke_px = ((icon_size_px as f32) * STROKE_RATIO).round().max(2.0);
     let mut canvas = MonochromeCanvas::new(icon_size_px, icon_size_px);
 

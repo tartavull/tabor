@@ -391,4 +391,26 @@ mod tests {
         assert_eq!(layout.logical_width(), 1770);
         assert_eq!(layout.logical_height(), 560);
     }
+
+    #[test]
+    fn viewport_matches_webview_frame_basis_with_asymmetric_vertical_padding() {
+        let mut size_info =
+            SizeInfo::new_with_vertical_padding(3600., 1200., 10., 20., 40., 20., 60., 20., false);
+        size_info.reserve_lines(1);
+
+        let layout = BrowserViewportLayout::new(
+            &size_info,
+            2.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+            None,
+        );
+
+        assert_eq!(
+            layout.viewport(),
+            BrowserViewportRect { x: 20, y: 30, width: 1770, height: 550 }
+        );
+        assert_eq!(layout.logical_width(), 1770);
+        assert_eq!(layout.logical_height(), 550);
+    }
 }

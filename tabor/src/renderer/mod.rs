@@ -420,9 +420,9 @@ impl Renderer {
         unsafe {
             gl::Viewport(
                 size.padding_x() as i32,
-                size.padding_y() as i32,
+                size.padding_bottom() as i32,
                 size.width() as i32 - size.padding_x() as i32 - padding_right,
-                size.height() as i32 - 2 * size.padding_y() as i32,
+                size.viewport_height() as i32,
             );
         }
     }
