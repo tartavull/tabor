@@ -1,7 +1,9 @@
 name: Release
 
 on:
-  create:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 env:
@@ -10,7 +12,6 @@ env:
 
 jobs:
   macos:
-    if: github.event_name != 'create' || (github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: macos-latest
 
     steps:
@@ -19,8 +20,8 @@ jobs:
           fetch-depth: 0
       - name: Resolve release tag
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "create" ]; then
-            RELEASE_TAG="$GITHUB_REF"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
           else
             RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
           fi
@@ -162,7 +163,6 @@ jobs:
           fi
 
   windows:
-    if: github.event_name != 'create' || (github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: windows-latest
 
     defaults:
@@ -175,8 +175,8 @@ jobs:
           fetch-depth: 0
       - name: Resolve release tag
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "create" ]; then
-            RELEASE_TAG="$GITHUB_REF"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
           else
             RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
           fi
@@ -217,7 +217,6 @@ jobs:
             ./Tabor-${RELEASE_TAG}-installer.msi $GITHUB_TOKEN
 
   linux:
-    if: github.event_name != 'create' || (github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: ubuntu-latest
 
     steps:
@@ -226,8 +225,8 @@ jobs:
           fetch-depth: 0
       - name: Resolve release tag
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "create" ]; then
-            RELEASE_TAG="$GITHUB_REF"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
           else
             RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
           fi
