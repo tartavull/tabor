@@ -40,6 +40,11 @@
         padding: 8px;
         background: #ffe9c6;
       }
+      #editable-frame {
+        width: 360px;
+        height: 120px;
+        border: 1px solid #888;
+      }
     </style>
   </head>
   <body>
@@ -136,6 +141,11 @@
     <div class="row">
       <button id="frame-launch">Frame Ready</button>
       <iframe id="inner-frame" srcdoc="<html><body><button id='frame-btn'>Frame Button</button><div id='frame-text'>Frame text</div></body></html>"></iframe>
+    </div>
+
+    <div class="row">
+      <label for="editable-frame">Iframe Editor</label>
+      <iframe id="editable-frame" srcdoc="<html><body style='margin:0;padding:8px;font-family:Arial,sans-serif'><div id='iframe-editor' contenteditable='true' style='min-height:48px;padding:8px;border:1px solid #888'>Iframe editable</div></body></html>"></iframe>
     </div>
 
     <div id="mid-spacer"></div>

@@ -16,10 +16,10 @@ use cef::{
     ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
     ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplDownloadHandler,
     ImplDownloadItem, ImplFrame, ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler,
-    ImplPermissionPromptCallback, ImplRenderHandler, ImplTask, PermissionHandler,
-    PermissionRequestResult, RenderHandler, Task, WrapClient, WrapDevToolsMessageObserver,
-    WrapDisplayHandler, WrapDownloadHandler, WrapPermissionHandler, WrapRenderHandler, WrapTask,
-    rc::Rc,
+    ImplPermissionPromptCallback, ImplProcessMessage, ImplRenderHandler, ImplTask,
+    PermissionHandler, PermissionRequestResult, RenderHandler, Task, WrapClient,
+    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler, WrapPermissionHandler,
+    WrapRenderHandler, WrapTask, rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
@@ -291,6 +291,28 @@ impl WebViewDirtyNotifier {
     }
 }
 
+#[derive(Clone)]
+struct WebEditableFocusNotifier {
+    window_id: WindowId,
+    tab_id: TabId,
+    proxy: EventLoopProxy<Event>,
+}
+
+impl WebEditableFocusNotifier {
+    fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: TabId) -> Self {
+        Self { window_id, tab_id, proxy }
+    }
+
+    fn send(&self, editable: bool) {
+        let event = Event::for_tab(
+            crate::event::EventType::WebEditableFocus { editable },
+            self.window_id,
+            self.tab_id,
+        );
+        let _ = self.proxy.send_event(event);
+    }
+}
+
 fn handle_ime_composition_range_change(
     dirty_notifier: &WebViewDirtyNotifier,
     _selected_range: Option<&cef::Range>,
@@ -305,6 +327,54 @@ fn handle_text_selection_change(
     _selected_range: Option<&cef::Range>,
 ) {
     dirty_notifier.send();
+}
+
+fn web_editable_focus_arg(args: Option<cef::ListValue>) -> Option<bool> {
+    let args = args?;
+    let index = super::cef::WEB_EDITABLE_FOCUS_EDITABLE_ARG_INDEX;
+    if args.size() <= index || args.get_type(index) != cef::ValueType::BOOL {
+        return None;
+    }
+    Some(args.bool(index) != 0)
+}
+
+fn parse_web_editable_focus_message(
+    source_process: cef::ProcessId,
+    message_name: &str,
+    editable: Option<bool>,
+) -> Option<bool> {
+    if source_process != cef::ProcessId::RENDERER {
+        return None;
+    }
+    if message_name != super::cef::WEB_EDITABLE_FOCUS_MESSAGE_NAME {
+        return None;
+    }
+    editable
+}
+
+fn handle_client_process_message(
+    editable_focus_notifier: &WebEditableFocusNotifier,
+    source_process: cef::ProcessId,
+    message: Option<&mut cef::ProcessMessage>,
+) -> ::std::os::raw::c_int {
+    let Some(message) = message else {
+        return 0;
+    };
+    let message_name = {
+        let name = message.name();
+        CefString::from(&name).to_string()
+    };
+    let editable = parse_web_editable_focus_message(
+        source_process,
+        message_name.as_str(),
+        web_editable_focus_arg(message.argument_list()),
+    );
+    let Some(editable) = editable else {
+        return 0;
+    };
+
+    editable_focus_notifier.send(editable);
+    1
 }
 
 fn browser_device_scale_factor(scale_factor: f64) -> f32 {
@@ -1077,6 +1147,7 @@ cef::wrap_client! {
         display_handler: cef::DisplayHandler,
         render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
+        editable_focus_notifier: WebEditableFocusNotifier,
         permission_handler: cef::PermissionHandler,
     }
 
@@ -1093,6 +1164,16 @@ cef::wrap_client! {
             Some(self.download_handler.clone())
         }
 
+        fn on_process_message_received(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            source_process: cef::ProcessId,
+            message: Option<&mut cef::ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            handle_client_process_message(&self.editable_focus_notifier, source_process, message)
+        }
+
         fn permission_handler(&self) -> Option<cef::PermissionHandler> {
             Some(self.permission_handler.clone())
         }
@@ -1105,6 +1186,7 @@ cef::wrap_client! {
         display_handler: cef::DisplayHandler,
         render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
+        editable_focus_notifier: WebEditableFocusNotifier,
     }
 
     impl Client {
@@ -1118,6 +1200,16 @@ cef::wrap_client! {
 
         fn download_handler(&self) -> Option<cef::DownloadHandler> {
             Some(self.download_handler.clone())
+        }
+
+        fn on_process_message_received(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            source_process: cef::ProcessId,
+            message: Option<&mut cef::ProcessMessage>,
+        ) -> ::std::os::raw::c_int {
+            handle_client_process_message(&self.editable_focus_notifier, source_process, message)
         }
     }
 }
@@ -1244,6 +1336,8 @@ impl WebView {
             let automation_state = StdRc::new(RefCell::new(AutomationState::new()));
             let display_handler = TaborDisplayHandler::new(title_state.clone());
             let download_handler = TaborDownloadHandler::new(automation_state.clone());
+            let editable_focus_notifier =
+                WebEditableFocusNotifier::new(proxy.clone(), window.id(), tab_id);
             #[cfg(not(feature = "passkey-webauthn"))]
             let mut client = {
                 let permission_handler = TaborPermissionHandler::new();
@@ -1251,11 +1345,17 @@ impl WebView {
                     display_handler,
                     render_handler,
                     download_handler,
+                    editable_focus_notifier,
                     permission_handler,
                 )
             };
             #[cfg(feature = "passkey-webauthn")]
-            let mut client = TaborClient::new(display_handler, render_handler, download_handler);
+            let mut client = TaborClient::new(
+                display_handler,
+                render_handler,
+                download_handler,
+                editable_focus_notifier,
+            );
 
             let browser_settings = browser_settings();
             let initial_url = if url.is_empty() { "about:blank" } else { url };
@@ -2660,8 +2760,9 @@ mod tests {
         PaintState, WebViewDirtyNotifier, browser_device_scale_factor, browser_screen_point,
         browser_settings, cef_mouse_button_flag, cef_mouse_event_flags,
         handle_ime_composition_range_change, handle_text_selection_change,
-        scaled_browser_wheel_delta_y, should_invalidate_after_frame_edit,
-        should_invalidate_after_key_input, should_run_frame_edit_inline,
+        parse_web_editable_focus_message, scaled_browser_wheel_delta_y,
+        should_invalidate_after_frame_edit, should_invalidate_after_key_input,
+        should_run_frame_edit_inline,
     };
     #[cfg(not(feature = "passkey-webauthn"))]
     use super::{
@@ -2846,6 +2947,42 @@ mod tests {
         assert_eq!(events[0].window_id(), Some(window_id));
         assert_eq!(events[0].tab_id(), Some(tab_id));
         assert!(matches!(events[0].payload(), crate::event::EventType::WebViewDirty));
+    }
+
+    #[test]
+    fn web_editable_focus_message_accepts_renderer_bool_payload() {
+        assert_eq!(
+            parse_web_editable_focus_message(
+                cef::ProcessId::RENDERER,
+                super::super::cef::WEB_EDITABLE_FOCUS_MESSAGE_NAME,
+                Some(true),
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn web_editable_focus_message_ignores_wrong_source_name_and_payload() {
+        assert_eq!(
+            parse_web_editable_focus_message(
+                cef::ProcessId::BROWSER,
+                super::super::cef::WEB_EDITABLE_FOCUS_MESSAGE_NAME,
+                Some(true),
+            ),
+            None
+        );
+        assert_eq!(
+            parse_web_editable_focus_message(cef::ProcessId::RENDERER, "other.message", Some(true)),
+            None
+        );
+        assert_eq!(
+            parse_web_editable_focus_message(
+                cef::ProcessId::RENDERER,
+                super::super::cef::WEB_EDITABLE_FOCUS_MESSAGE_NAME,
+                None,
+            ),
+            None
+        );
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]

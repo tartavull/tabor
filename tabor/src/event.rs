@@ -238,27 +238,6 @@ Misc:
 const WEB_CURSOR_THROTTLE: Duration = Duration::from_millis(100);
 #[cfg(target_os = "macos")]
 const CEF_WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
-#[cfg(target_os = "macos")]
-const WEB_EDITABLE_FOCUS_SCRIPT: &str = r#"
-(() => {
-  const el = document.activeElement;
-  if (!el) return "false";
-  if (el.isContentEditable) return "true";
-  if (el.getAttribute && el.getAttribute("role") === "textbox") return "true";
-  const tag = el.tagName;
-  if (tag === "TEXTAREA") {
-    return el.disabled || el.readOnly ? "false" : "true";
-  }
-  if (tag === "INPUT") {
-    if (el.disabled || el.readOnly) return "false";
-    const type = String(el.getAttribute("type") || "").toLowerCase();
-    return ["", "text", "search", "url", "email", "password", "tel", "number"].includes(type)
-      ? "true"
-      : "false";
-  }
-  return "false";
-})()
-"#;
 
 #[cfg(target_os = "macos")]
 const CEF_HIDDEN_WEB_MIN_DELAY: Duration = Duration::from_millis(40);
@@ -2008,21 +1987,6 @@ pub(crate) fn request_web_cursor_update(
     });
 }
 
-#[cfg(target_os = "macos")]
-fn request_web_editable_focus_update(
-    web_view: &mut WebView,
-    event_proxy: &EventLoopProxy<Event>,
-    window_id: WindowId,
-    tab_id: TabId,
-) {
-    let proxy = event_proxy.clone();
-    web_view.eval_js_string(WEB_EDITABLE_FOCUS_SCRIPT, move |result| {
-        let editable = result.as_deref() == Some("true");
-        let event = Event::for_tab(EventType::WebEditableFocus { editable }, window_id, tab_id);
-        let _ = proxy.send_event(event);
-    });
-}
-
 fn terminal_text_area_size(size_info: SizeInfo, layout: TerminalViewportLayout) -> WindowSize {
     layout.logical_size(&size_info).into()
 }
@@ -3217,16 +3181,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let Some(web_view) = self.web_view.as_mut() else {
             return;
         };
-        let handled =
-            web_view.handle_mouse_input(&self.display.window, position, state, button, modifiers);
-        if handled && button == MouseButton::Left && state == ElementState::Released {
-            request_web_editable_focus_update(
-                web_view,
-                self.event_proxy,
-                self.display.window.id(),
-                self.tab_id,
-            );
-        }
+        web_view.handle_mouse_input(&self.display.window, position, state, button, modifiers);
     }
 
     #[cfg(target_os = "macos")]

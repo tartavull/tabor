@@ -17,8 +17,10 @@ use objc2::{MainThreadMarker, msg_send, sel};
 use objc2_app_kit::NSApplication;
 
 use cef::{
-    self, App, BrowserProcessHandler, CefString, ImplApp, ImplBrowserProcessHandler,
-    ImplCommandLine, LogSeverity, Settings, WrapApp, WrapBrowserProcessHandler, args::Args, rc::Rc,
+    self, App, BrowserProcessHandler, CefString, ImplApp, ImplBrowser, ImplBrowserProcessHandler,
+    ImplCommandLine, ImplDomnode, ImplFrame, ImplListValue, ImplProcessMessage,
+    ImplRenderProcessHandler, LogSeverity, RenderProcessHandler, Settings, WrapApp,
+    WrapBrowserProcessHandler, WrapRenderProcessHandler, args::Args, rc::Rc,
 };
 
 #[cfg(feature = "passkey-webauthn")]
@@ -29,6 +31,9 @@ const DISABLE_FEATURES: &str = "CalculateNativeWinOcclusion,WebAuthentication,We
 
 #[cfg(not(feature = "passkey-webauthn"))]
 const DISABLE_BLINK_FEATURES: &str = "WebAuthentication,WebBluetooth";
+
+pub(super) const WEB_EDITABLE_FOCUS_MESSAGE_NAME: &str = "tabor.web_editable_focus";
+pub(super) const WEB_EDITABLE_FOCUS_EDITABLE_ARG_INDEX: usize = 0;
 
 type MessagePumpNotifier = Arc<dyn Fn(Duration) + Send + Sync + 'static>;
 
@@ -74,12 +79,60 @@ fn schedule_message_pump_work(delay_ms: i64) {
     }
 }
 
+fn send_web_editable_focus_message(
+    browser: Option<&mut cef::Browser>,
+    frame: Option<&mut cef::Frame>,
+    editable: bool,
+) {
+    let Some(mut message) =
+        cef::process_message_create(Some(&CefString::from(WEB_EDITABLE_FOCUS_MESSAGE_NAME)))
+    else {
+        return;
+    };
+    let Some(args) = message.argument_list() else {
+        return;
+    };
+    if args.set_size(WEB_EDITABLE_FOCUS_EDITABLE_ARG_INDEX + 1) == 0 {
+        return;
+    }
+    if args.set_bool(WEB_EDITABLE_FOCUS_EDITABLE_ARG_INDEX, if editable { 1 } else { 0 }) == 0 {
+        return;
+    }
+
+    if let Some(frame) = frame {
+        frame.send_process_message(cef::ProcessId::BROWSER, Some(&mut message));
+        return;
+    }
+
+    if let Some(browser) = browser {
+        if let Some(frame) = browser.main_frame() {
+            frame.send_process_message(cef::ProcessId::BROWSER, Some(&mut message));
+        }
+    }
+}
+
 cef::wrap_browser_process_handler! {
     struct TaborBrowserProcessHandler {}
 
     impl BrowserProcessHandler {
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
             schedule_message_pump_work(delay_ms);
+        }
+    }
+}
+
+cef::wrap_render_process_handler! {
+    struct TaborRenderProcessHandler {}
+
+    impl RenderProcessHandler {
+        fn on_focused_node_changed(
+            &self,
+            browser: Option<&mut cef::Browser>,
+            frame: Option<&mut cef::Frame>,
+            node: Option<&mut cef::Domnode>,
+        ) {
+            let editable = node.map(|node| node.is_editable() != 0).unwrap_or(false);
+            send_web_editable_focus_message(browser, frame, editable);
         }
     }
 }
@@ -135,6 +188,10 @@ cef::wrap_app! {
 
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
             Some(TaborBrowserProcessHandler::new())
+        }
+
+        fn render_process_handler(&self) -> Option<cef::RenderProcessHandler> {
+            Some(TaborRenderProcessHandler::new())
         }
     }
 }

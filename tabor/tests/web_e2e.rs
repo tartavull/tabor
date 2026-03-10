@@ -820,7 +820,7 @@ fn native_click_on_editable_switches_web_tab_into_insert_mode() {
 
     let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
     let mut inspector_command_id = 1_i64;
-    let center_json = inspector_eval_string(
+    let (logical_x, logical_y) = inspector_eval_point(
         &harness,
         inspector_session.as_str(),
         &mut inspector_command_id,
@@ -834,16 +834,6 @@ fn native_click_on_editable_switches_web_tab_into_insert_mode() {
             });
         })()"#,
     );
-    let center: Value = serde_json::from_str(&center_json)
-        .unwrap_or_else(|err| panic!("invalid email-input center json: {err}; raw={center_json}"));
-    let logical_x = center
-        .get("x")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("missing email-input center.x: {center}"));
-    let logical_y = center
-        .get("y")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("missing email-input center.y: {center}"));
     let (visual_x, visual_y) = browser_visual_point(&layout, logical_x, logical_y);
 
     native_window_click(&harness, visual_x, visual_y);
@@ -870,6 +860,153 @@ fn native_click_on_editable_switches_web_tab_into_insert_mode() {
         tab_web_mode(&mode_state),
         Some("insert"),
         "expected native click on editable element to switch into insert mode: {mode_state}"
+    );
+
+    let (button_x, button_y) = inspector_eval_point(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("frame-launch");
+            if (!el) throw new Error("frame-launch missing");
+            const rect = el.getBoundingClientRect();
+            return JSON.stringify({
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2)
+            });
+        })()"#,
+    );
+    let (button_visual_x, button_visual_y) = browser_visual_point(&layout, button_x, button_y);
+    native_window_click(&harness, button_visual_x, button_visual_y);
+
+    let blurred_active_id = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => document.activeElement ? document.activeElement.id || "" : "")()"#,
+    );
+    assert_ne!(blurred_active_id, "email-input", "native click left focus on the editable element");
+
+    let normal_state =
+        wait_for_tab_web_mode_value(&harness, tab_id_arg.as_str(), "normal", Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                let latest_state =
+                    harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+                panic!(
+                    "timed out waiting for normal mode after clicking a non-editable element; last_state={latest_state}; harness_log_tail:\n{}",
+                    harness.log_tail(),
+                )
+            });
+    assert_eq!(
+        tab_web_mode(&normal_state),
+        Some("normal"),
+        "expected native click on non-editable element to leave insert mode: {normal_state}"
+    );
+
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "detach",
+        "--session-id",
+        inspector_session.as_str(),
+    ]);
+}
+
+#[test]
+fn native_click_on_iframe_editable_switches_web_tab_into_insert_mode() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    let tab_id_arg = tab_id_arg(&reply);
+    ensure_active_web_tab(&harness, 4);
+    let layout = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        layout.get("mode").and_then(Value::as_str) == Some("normal")
+            && layout
+                .get("acceleration")
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                == Some("ready")
+    })
+    .unwrap_or_else(|| panic!("timed out waiting for initial browser layout"));
+
+    let initial_state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+    assert_eq!(
+        tab_web_mode(&initial_state),
+        Some("normal"),
+        "expected web tab to start in normal mode: {initial_state}"
+    );
+
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+    let scrolled = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const frame = document.getElementById("editable-frame");
+            if (!frame) throw new Error("editable-frame missing");
+            frame.scrollIntoView({ block: "center", inline: "center" });
+            return "ok";
+        })()"#,
+    );
+    assert_eq!(scrolled, "ok", "failed to scroll iframe editor into view");
+    thread::sleep(Duration::from_millis(100));
+
+    let (logical_x, logical_y) = inspector_eval_point(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const frame = document.getElementById("editable-frame");
+            if (!frame) throw new Error("editable-frame missing");
+            const doc = frame.contentDocument;
+            if (!doc) throw new Error("editable-frame document missing");
+            const el = doc.getElementById("iframe-editor");
+            if (!el) throw new Error("iframe-editor missing");
+            const frameRect = frame.getBoundingClientRect();
+            const rect = el.getBoundingClientRect();
+            return JSON.stringify({
+                x: Math.round(frameRect.left + rect.left + rect.width / 2),
+                y: Math.round(frameRect.top + rect.top + rect.height / 2)
+            });
+        })()"#,
+    );
+    let (visual_x, visual_y) = browser_visual_point(&layout, logical_x, logical_y);
+    native_window_click(&harness, visual_x, visual_y);
+
+    let mode_state =
+        wait_for_tab_web_mode_value(&harness, tab_id_arg.as_str(), "insert", Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                let outer_active_id = inspector_eval_string(
+                    &harness,
+                    inspector_session.as_str(),
+                    &mut inspector_command_id,
+                    r#"(() => document.activeElement ? document.activeElement.id || document.activeElement.tagName || "" : "")()"#,
+                );
+                let inner_active_id = inspector_eval_string(
+                    &harness,
+                    inspector_session.as_str(),
+                    &mut inspector_command_id,
+                    r#"(() => {
+                        const frame = document.getElementById("editable-frame");
+                        if (!frame || !frame.contentDocument) return "";
+                        const active = frame.contentDocument.activeElement;
+                        return active ? active.id || active.tagName || "" : "";
+                    })()"#,
+                );
+                let latest_state =
+                    harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+                panic!(
+                    "timed out waiting for insert mode after clicking an iframe editable element; outer_active={outer_active_id}; inner_active={inner_active_id}; last_state={latest_state}; harness_log_tail:\n{}",
+                    harness.log_tail()
+                )
+            });
+    assert_eq!(
+        tab_web_mode(&mode_state),
+        Some("insert"),
+        "expected native click on iframe editable element to switch into insert mode: {mode_state}"
     );
 
     let _ = harness.run_json([
@@ -914,7 +1051,7 @@ fn native_multi_column_click_focuses_lower_input() {
 
     let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
     let mut inspector_command_id = 1_i64;
-    let center_json = inspector_eval_string(
+    let (logical_x, logical_y) = inspector_eval_point(
         &harness,
         inspector_session.as_str(),
         &mut inspector_command_id,
@@ -928,16 +1065,6 @@ fn native_multi_column_click_focuses_lower_input() {
             });
         })()"#,
     );
-    let center: Value = serde_json::from_str(&center_json)
-        .unwrap_or_else(|err| panic!("invalid lower-input center json: {err}; raw={center_json}"));
-    let logical_x = center
-        .get("x")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("missing lower-input center.x: {center}"));
-    let logical_y = center
-        .get("y")
-        .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("missing lower-input center.y: {center}"));
 
     harness.run_json(["agent", "attach"]);
     harness.run_json(["agent", "use", "--active"]);
@@ -1897,6 +2024,38 @@ fn window_debug_snapshot(harness: &TaborHarness) -> WindowDebugSnapshot {
 }
 
 fn browser_visual_point(layout: &Value, logical_x: i64, logical_y: i64) -> (f64, f64) {
+    let layout_logical_width = layout
+        .get("logical_width")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing browser logical_width: {layout}"));
+    let layout_logical_height = layout
+        .get("logical_height")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing browser logical_height: {layout}"));
+    let surface_width = layout
+        .get("acceleration")
+        .and_then(|value| value.get("main_surface_width"))
+        .and_then(Value::as_i64)
+        .filter(|width| *width > 0)
+        .unwrap_or(layout_logical_width);
+    let surface_height = layout
+        .get("acceleration")
+        .and_then(|value| value.get("main_surface_height"))
+        .and_then(Value::as_i64)
+        .filter(|height| *height > 0)
+        .unwrap_or(layout_logical_height);
+    let logical_x = if logical_x <= layout_logical_width || surface_width == layout_logical_width {
+        logical_x
+    } else {
+        ((logical_x as f64) * (layout_logical_width as f64) / (surface_width as f64)).round() as i64
+    };
+    let logical_y = if logical_y <= layout_logical_height || surface_height == layout_logical_height
+    {
+        logical_y
+    } else {
+        ((logical_y as f64) * (layout_logical_height as f64) / (surface_height as f64)).round()
+            as i64
+    };
     let viewport =
         layout.get("viewport").unwrap_or_else(|| panic!("missing browser viewport: {layout}"));
     let viewport_y = viewport
@@ -2609,6 +2768,36 @@ fn inspector_eval_string(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| panic!("missing Runtime.evaluate string result: {response}"))
+}
+
+fn inspector_eval_json(
+    harness: &TaborHarness,
+    session_id: &str,
+    command_id: &mut i64,
+    expression: &str,
+) -> Value {
+    let raw = inspector_eval_string(harness, session_id, command_id, expression);
+    serde_json::from_str(&raw).unwrap_or_else(|err| {
+        panic!("invalid Runtime.evaluate json result: {err}; raw={raw}; expression={expression}")
+    })
+}
+
+fn inspector_eval_point(
+    harness: &TaborHarness,
+    session_id: &str,
+    command_id: &mut i64,
+    expression: &str,
+) -> (i64, i64) {
+    let point = inspector_eval_json(harness, session_id, command_id, expression);
+    let x = point
+        .get("x")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing point.x: {point}"));
+    let y = point
+        .get("y")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("missing point.y: {point}"));
+    (x, y)
 }
 
 fn trusted_click(harness: &TaborHarness, session_id: &str, command_id: &mut i64, element_id: &str) {
