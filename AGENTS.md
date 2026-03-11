@@ -6,3 +6,4 @@
 - Before any Tabor GUI launch, verify the bundle with `codesign --verify --deep --strict <path-to-Tabor.app>` and inspect `codesign -dvv <path-to-Tabor.app>`. If either command fails, stop.
 - Prefer the canonical signed app path in `/Applications/Tabor.app`. Do not launch stray copies from `target/`, temporary staging directories, or other non-canonical locations.
 - If a task does not require launching Tabor, do not launch it.
+- When the user asks to tag a new Tabor version without specifying semver details, increment the minor version (the middle number), not the patch version, and keep the git tag plus repo/package metadata aligned to that version.

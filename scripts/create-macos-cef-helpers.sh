@@ -88,12 +88,12 @@ fi
 
 short_version="$(read_optional_plist_string 'CFBundleShortVersionString')"
 if [[ -z "$short_version" ]]; then
-  short_version="0.8.1"
+  short_version="0.9.0"
 fi
 
 bundle_version="$(read_optional_plist_string 'CFBundleVersion')"
 if [[ -z "$bundle_version" ]]; then
-  bundle_version="0.8.1"
+  bundle_version="0.9.0"
 fi
 
 supports_automatic_graphics_switching="$(
