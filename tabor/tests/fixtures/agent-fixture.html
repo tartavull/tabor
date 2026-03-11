@@ -45,6 +45,15 @@
         height: 120px;
         border: 1px solid #888;
       }
+      #caret-input {
+        width: 280px;
+        padding: 12px 16px;
+        border: 2px solid #111;
+        background: #fff;
+        color: #111;
+        caret-color: rgb(255, 0, 0);
+        font: 28px/1.2 Menlo, Monaco, monospace;
+      }
     </style>
   </head>
   <body>
@@ -146,6 +155,11 @@
     <div class="row">
       <label for="editable-frame">Iframe Editor</label>
       <iframe id="editable-frame" srcdoc="<html><body style='margin:0;padding:8px;font-family:Arial,sans-serif'><div id='iframe-editor' contenteditable='true' style='min-height:48px;padding:8px;border:1px solid #888'>Iframe editable</div></body></html>"></iframe>
+    </div>
+
+    <div class="row">
+      <label for="caret-input">Caret Probe</label>
+      <input id="caret-input" type="text" aria-label="Caret Probe">
     </div>
 
     <div id="mid-spacer"></div>

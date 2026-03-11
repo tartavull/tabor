@@ -79,6 +79,14 @@ impl WebView {
         self.inner.set_focus(focus);
     }
 
+    pub fn sync_editable_focus(&mut self, editable: bool) {
+        self.inner.sync_editable_focus(editable);
+    }
+
+    pub fn restore_native_focus(&mut self, window: &crate::display::window::Window) -> bool {
+        self.inner.restore_native_focus(window)
+    }
+
     pub fn update_frame(
         &mut self,
         window: &crate::display::window::Window,

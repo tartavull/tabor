@@ -2618,8 +2618,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             if self.tab_kind.is_web() {
                 if let Some(web_view) = self.web_view.as_mut() {
                     web_view.set_focus(true);
+                    if !web_view.restore_native_focus(&self.display.window) {
+                        self.display.window.focus_content_view();
+                    }
+                } else {
+                    self.display.window.focus_content_view();
                 }
-                self.display.window.focus_content_view();
             }
         } else {
             if self.search_active() {
@@ -2665,8 +2669,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         if self.tab_kind.is_web() {
             if let Some(web_view) = self.web_view.as_mut() {
                 web_view.set_focus(true);
+                if !web_view.restore_native_focus(&self.display.window) {
+                    self.display.window.focus_content_view();
+                }
+            } else {
+                self.display.window.focus_content_view();
             }
-            self.display.window.focus_content_view();
         }
     }
 
@@ -2680,8 +2688,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         if self.tab_kind.is_web() {
             if let Some(web_view) = self.web_view.as_mut() {
                 web_view.set_focus(true);
+                if !web_view.restore_native_focus(&self.display.window) {
+                    self.display.window.focus_content_view();
+                }
+            } else {
+                self.display.window.focus_content_view();
             }
-            self.display.window.focus_content_view();
         }
 
         self.display.pending_update.dirty = true;

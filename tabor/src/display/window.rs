@@ -25,6 +25,7 @@ use std::fmt::{self, Display, Formatter};
 #[cfg(target_os = "macos")]
 use {
     objc2::rc::Retained,
+    objc2::runtime::AnyObject,
     objc2::{MainThreadMarker, MainThreadOnly, msg_send, sel},
     objc2_app_kit::{
         NSBackingStoreType, NSButton, NSColor, NSColorSpace, NSScreen, NSView,
@@ -350,15 +351,27 @@ impl Window {
         let _mtm = MainThreadMarker::new().expect("focus_content_view requires main thread");
 
         let view = match self.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
+            RawWindowHandle::AppKit(handle) => handle.ns_view.cast::<AnyObject>(),
             _ => return,
         };
 
+        let _ = self.focus_native_view(view.as_ptr());
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn focus_native_view(&self, view: *mut AnyObject) -> bool {
+        let _mtm = MainThreadMarker::new().expect("focus_native_view requires main thread");
+        let Some(view) = (unsafe { view.cast::<NSView>().as_ref() }) else {
+            return false;
+        };
         let Some(window) = view.window() else {
-            return;
+            return false;
         };
 
-        let _ = window.makeFirstResponder(Some(view));
+        restore_first_responder_with_retry(
+            || window.makeFirstResponder(None),
+            || window.makeFirstResponder(Some(view)),
+        )
     }
 
     /// Set the window title.
@@ -1492,5 +1505,66 @@ fn ns_edge_insets_to_ipc(insets: NSEdgeInsets) -> IpcWindowDebugInsets {
         left: insets.left,
         bottom: insets.bottom,
         right: insets.right,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_first_responder_with_retry<F, G>(mut clear_first_responder: F, mut focus_view: G) -> bool
+where
+    F: FnMut() -> bool,
+    G: FnMut() -> bool,
+{
+    if focus_view() {
+        return true;
+    }
+
+    let _ = clear_first_responder();
+    focus_view()
+}
+
+#[cfg(all(target_os = "macos", test))]
+mod tests {
+    use super::restore_first_responder_with_retry;
+
+    #[test]
+    fn restore_first_responder_returns_immediately_on_success() {
+        let mut clear_calls = 0;
+        let mut focus_calls = 0;
+
+        let restored = restore_first_responder_with_retry(
+            || {
+                clear_calls += 1;
+                true
+            },
+            || {
+                focus_calls += 1;
+                true
+            },
+        );
+
+        assert!(restored);
+        assert_eq!(focus_calls, 1);
+        assert_eq!(clear_calls, 0);
+    }
+
+    #[test]
+    fn restore_first_responder_retries_after_clearing_stale_responder() {
+        let mut clear_calls = 0;
+        let mut focus_calls = 0;
+
+        let restored = restore_first_responder_with_retry(
+            || {
+                clear_calls += 1;
+                true
+            },
+            || {
+                focus_calls += 1;
+                focus_calls == 2
+            },
+        );
+
+        assert!(restored);
+        assert_eq!(focus_calls, 2);
+        assert_eq!(clear_calls, 1);
     }
 }

@@ -1997,7 +1997,14 @@ impl WindowContext {
                 web_view.update_frame(&self.display.window, &self.display.size_info, layout);
             }
 
-            if active_id.is_some() {
+            let restored_web_focus =
+                active_id.and_then(|tab_id| self.tabs.get_mut(tab_id)).and_then(|tab| {
+                    tab.web_view
+                        .as_mut()
+                        .map(|web_view| web_view.restore_native_focus(&self.display.window))
+                }) == Some(true);
+
+            if active_id.is_some() && !restored_web_focus {
                 self.display.window.focus_content_view();
             }
         }
@@ -2185,6 +2192,12 @@ impl WindowContext {
 
         let before = tab.web_command_state.mode();
         tab.web_command_state.sync_editable_focus(editable);
+        if let Some(web_view) = tab.web_view.as_mut() {
+            web_view.sync_editable_focus(editable);
+            if is_active && !web_view.restore_native_focus(&self.display.window) {
+                self.display.window.focus_content_view();
+            }
+        }
         if tab.web_command_state.mode() == before {
             return;
         }

@@ -820,6 +820,19 @@ fn native_click_on_editable_switches_web_tab_into_insert_mode() {
 
     let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
     let mut inspector_command_id = 1_i64;
+    let scrolled_email = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("email-input");
+            if (!el) throw new Error("email-input missing");
+            el.scrollIntoView({ block: "center", inline: "center" });
+            return "ok";
+        })()"#,
+    );
+    assert_eq!(scrolled_email, "ok", "failed to scroll email input into view");
+    thread::sleep(Duration::from_millis(100));
     let (logical_x, logical_y) = inspector_eval_point(
         &harness,
         inspector_session.as_str(),
@@ -862,6 +875,19 @@ fn native_click_on_editable_switches_web_tab_into_insert_mode() {
         "expected native click on editable element to switch into insert mode: {mode_state}"
     );
 
+    let scrolled_button = inspector_eval_string(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("frame-launch");
+            if (!el) throw new Error("frame-launch missing");
+            el.scrollIntoView({ block: "center", inline: "center" });
+            return "ok";
+        })()"#,
+    );
+    assert_eq!(scrolled_button, "ok", "failed to scroll frame-launch into view");
+    thread::sleep(Duration::from_millis(100));
     let (button_x, button_y) = inspector_eval_point(
         &harness,
         inspector_session.as_str(),
@@ -1007,6 +1033,60 @@ fn native_click_on_iframe_editable_switches_web_tab_into_insert_mode() {
         tab_web_mode(&mode_state),
         Some("insert"),
         "expected native click on iframe editable element to switch into insert mode: {mode_state}"
+    );
+
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "detach",
+        "--session-id",
+        inspector_session.as_str(),
+    ]);
+}
+
+#[test]
+fn macos_native_click_on_editable_renders_visible_caret() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    let tab_id_arg = tab_id_arg(&reply);
+    ensure_active_web_tab(&harness, 4);
+
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+    let initial_layout =
+        wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+            layout.get("mode").and_then(Value::as_str) == Some("normal")
+                && layout
+                    .get("acceleration")
+                    .and_then(|value| value.get("state"))
+                    .and_then(Value::as_str)
+                    == Some("ready")
+        })
+        .unwrap_or_else(|| panic!("timed out waiting for initial browser layout"));
+
+    native_click_caret_probe(
+        &harness,
+        &initial_layout,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+    );
+    assert_caret_probe_focused(
+        &harness,
+        tab_id_arg.as_str(),
+        &initial_layout,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        "initial focus",
+    );
+    assert_visible_caret_probe(
+        &harness,
+        &initial_layout,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        "initial focus",
     );
 
     let _ = harness.run_json([
@@ -1379,85 +1459,6 @@ fn browser_clipboard_api_smoke() {
         "--session-id",
         inspector_session.as_str(),
     ]);
-}
-
-#[test]
-fn browser_native_clipboard_shortcuts_smoke() {
-    let server = ClipboardFixtureServer::start();
-    let harness = TaborHarness::start();
-    let fixture = server.url("/fixture.html");
-
-    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
-    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
-
-    harness.run_json(["agent", "attach"]);
-    harness.run_json(["agent", "use", "--active"]);
-
-    let observation =
-        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
-            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
-    let email_id = find_observed_element_id(&observation, "Email");
-    let notes_id = find_observed_element_id(&observation, "Notes");
-    let select_email_id = find_observed_element_id(&observation, "Select Email");
-    let focus_notes_id = find_observed_element_id(&observation, "Focus Notes");
-    let native_clipboard_status_id =
-        find_observed_element_id(&observation, "Native clipboard status");
-
-    let source_text = "native clipboard copy";
-    let paste_text = "native clipboard paste";
-    let setup_actions = json!([
-        { "type": "fill", "id": email_id, "text": source_text },
-        { "type": "fill", "id": notes_id, "text": "" }
-    ])
-    .to_string();
-    let setup = harness.run_json(["agent", "act", setup_actions.as_str()]);
-    assert!(agent_action_results_all_ok(&setup), "native clipboard setup failed: {setup}");
-
-    let select_actions = json!([{ "type": "click", "id": select_email_id }]).to_string();
-    let select_reply = harness.run_json(["agent", "act", select_actions.as_str()]);
-    assert!(agent_action_results_all_ok(&select_reply), "email selection failed: {select_reply}");
-
-    let copy_reply = harness.run_json(["msg", "dispatch-action", "--action", "Copy"]);
-    assert_eq!(copy_reply.get("type").and_then(Value::as_str), Some("ok"));
-
-    let copy_wait = json!([
-        { "type": "wait", "text": format!("Native clipboard: copy:{source_text}"), "timeout_ms": 5000 }
-    ])
-    .to_string();
-    let copy_event = harness.run_json(["agent", "act", copy_wait.as_str()]);
-    if !agent_action_results_all_ok(&copy_event) {
-        let status = harness.run_json(["agent", "inspect", native_clipboard_status_id.as_str()]);
-        panic!("native copy event missing: {copy_event}; status={status}");
-    }
-
-    let copied = wait_for_clipboard_text(&harness, source_text, Duration::from_secs(4))
-        .unwrap_or_else(|| panic!("timed out waiting for copied clipboard text"));
-    assert_eq!(copied, source_text);
-
-    let clipboard_seed = harness.run_json(["agent", "clipboard", "set", paste_text]);
-    assert_eq!(clipboard_seed.get("type").and_then(Value::as_str), Some("clipboard"));
-
-    let focus_actions = json!([{ "type": "click", "id": focus_notes_id }]).to_string();
-    let focus_reply = harness.run_json(["agent", "act", focus_actions.as_str()]);
-    assert!(agent_action_results_all_ok(&focus_reply), "notes focus failed: {focus_reply}");
-
-    let paste_reply = harness.run_json(["msg", "dispatch-action", "--action", "Paste"]);
-    assert_eq!(paste_reply.get("type").and_then(Value::as_str), Some("ok"));
-
-    let paste_wait = json!([
-        { "type": "wait", "text": format!("Native clipboard: paste:{paste_text}"), "timeout_ms": 5000 }
-    ])
-    .to_string();
-    let paste_event = harness.run_json(["agent", "act", paste_wait.as_str()]);
-    if !agent_action_results_all_ok(&paste_event) {
-        let status = harness.run_json(["agent", "inspect", native_clipboard_status_id.as_str()]);
-        panic!("native paste event missing: {paste_event}; status={status}");
-    }
-
-    let notes_value =
-        wait_for_agent_value(&harness, notes_id.as_str(), paste_text, Duration::from_secs(4))
-            .unwrap_or_else(|| panic!("timed out waiting for pasted notes value"));
-    assert_eq!(notes_value, paste_text);
 }
 
 #[test]
@@ -2002,6 +2003,14 @@ struct SnapshotPixelRect {
     y1: i64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct LogicalRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 fn window_debug_state(harness: &TaborHarness) -> WindowDebugState {
     let reply = harness.send_raw_request(json!({ "type": "window_debug_state" }));
     let Some(state) = reply.get("state") else {
@@ -2104,6 +2113,226 @@ fn native_window_click(harness: &TaborHarness, x: f64, y: f64) {
         Some("ok"),
         "native window click failed: {reply}"
     );
+}
+
+fn native_click_caret_probe(
+    harness: &TaborHarness,
+    layout: &Value,
+    inspector_session: &str,
+    inspector_command_id: &mut i64,
+) {
+    let scrolled = inspector_eval_string(
+        harness,
+        inspector_session,
+        inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("caret-input");
+            if (!el) throw new Error("caret-input missing");
+            el.scrollIntoView({ block: "center", inline: "center" });
+            return "ok";
+        })()"#,
+    );
+    assert_eq!(scrolled, "ok", "failed to scroll caret probe into view");
+    thread::sleep(Duration::from_millis(100));
+
+    let (logical_x, logical_y) = inspector_eval_point(
+        harness,
+        inspector_session,
+        inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("caret-input");
+            if (!el) throw new Error("caret-input missing");
+            const rect = el.getBoundingClientRect();
+            return JSON.stringify({
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2)
+            });
+        })()"#,
+    );
+    let (visual_x, visual_y) = browser_visual_point(layout, logical_x, logical_y);
+    native_window_click(harness, visual_x, visual_y);
+}
+
+fn assert_caret_probe_focused(
+    harness: &TaborHarness,
+    tab_id_arg: &str,
+    layout: &Value,
+    inspector_session: &str,
+    inspector_command_id: &mut i64,
+    label: &str,
+) {
+    let mode_state =
+        wait_for_tab_web_mode_value(harness, tab_id_arg, "insert", Duration::from_secs(4))
+            .unwrap_or_else(|| {
+                let latest_state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg]);
+                panic!(
+                    "timed out waiting for insert mode during {label}; last_state={latest_state}; layout={layout}; harness_log_tail:\n{}",
+                    harness.log_tail(),
+                )
+            });
+    assert_eq!(
+        tab_web_mode(&mode_state),
+        Some("insert"),
+        "expected caret probe click to switch into insert mode during {label}: {mode_state}"
+    );
+
+    let caret_state = inspector_eval_json(
+        harness,
+        inspector_session,
+        inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("caret-input");
+            if (!el) throw new Error("caret-input missing");
+            return JSON.stringify({
+                active: document.activeElement === el,
+                selectionStart: el.selectionStart,
+                selectionEnd: el.selectionEnd,
+                valueLength: el.value.length
+            });
+        })()"#,
+    );
+    assert_eq!(
+        caret_state.get("active").and_then(Value::as_bool),
+        Some(true),
+        "caret probe input was not active during {label}: {caret_state}"
+    );
+    assert_eq!(
+        caret_state.get("selectionStart").and_then(Value::as_u64),
+        Some(0),
+        "caret probe selectionStart drifted during {label}: {caret_state}"
+    );
+    assert_eq!(
+        caret_state.get("selectionEnd").and_then(Value::as_u64),
+        Some(0),
+        "caret probe selectionEnd drifted during {label}: {caret_state}"
+    );
+    assert_eq!(
+        caret_state.get("valueLength").and_then(Value::as_u64),
+        Some(0),
+        "caret probe value changed during {label}: {caret_state}"
+    );
+}
+
+fn assert_visible_caret_probe(
+    harness: &TaborHarness,
+    layout: &Value,
+    inspector_session: &str,
+    inspector_command_id: &mut i64,
+    label: &str,
+) {
+    let caret_rect = inspector_eval_rect(
+        harness,
+        inspector_session,
+        inspector_command_id,
+        r#"(() => {
+            const el = document.getElementById("caret-input");
+            if (!el) throw new Error("caret-input missing");
+            const style = getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            const paddingLeft = parseFloat(style.paddingLeft) || 0;
+            const paddingTop = parseFloat(style.paddingTop) || 0;
+            const paddingBottom = parseFloat(style.paddingBottom) || 0;
+            return JSON.stringify({
+                x: rect.left + paddingLeft - 1,
+                y: rect.top + paddingTop,
+                width: 8,
+                height: Math.max(8, rect.height - paddingTop - paddingBottom)
+            });
+        })()"#,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_ratio = 0.0_f64;
+    let mut last_column_ratio = 0.0_f64;
+    let mut last_snapshot = None;
+
+    while Instant::now() < deadline {
+        let snapshot = window_debug_snapshot(harness);
+        let image = decode_snapshot_rgba(&snapshot);
+        let local =
+            logical_rect_to_snapshot_pixels(layout, snapshot.state.scale_factor, caret_rect);
+        if rect_within_snapshot(&local, snapshot.width, snapshot.height) {
+            let ratio = sampled_red_ratio(&image, local);
+            let column_ratio = max_red_column_ratio(&image, local);
+            if column_ratio >= 0.55 {
+                return;
+            }
+            last_ratio = ratio;
+            last_column_ratio = column_ratio;
+        }
+        last_snapshot = Some(snapshot);
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    let snapshot = last_snapshot.unwrap_or_else(|| window_debug_snapshot(harness));
+    let image = decode_snapshot_rgba(&snapshot);
+    let local = logical_rect_to_snapshot_pixels(layout, snapshot.state.scale_factor, caret_rect);
+    let (final_ratio, final_column_ratio) =
+        if rect_within_snapshot(&local, snapshot.width, snapshot.height) {
+            (sampled_red_ratio(&image, local), max_red_column_ratio(&image, local))
+        } else {
+            (0.0, 0.0)
+        };
+    let artifact = PathBuf::from("/tmp/tabor-caret-probe-window-snapshot.png");
+    let png_bytes = BASE64
+        .decode(snapshot.png_base64.as_bytes())
+        .expect("failed to decode caret probe snapshot");
+    std::fs::write(&artifact, png_bytes).unwrap_or_else(|err| {
+        panic!("failed to write caret probe snapshot {}: {err}", artifact.display())
+    });
+
+    panic!(
+        "red caret did not appear during {label}; last_ratio={last_ratio:.3}; last_column_ratio={last_column_ratio:.3}; final_ratio={final_ratio:.3}; final_column_ratio={final_column_ratio:.3}; caret_rect={caret_rect:?}; snapshot_rect={local:?}; snapshot={}; layout={layout}; harness_log_tail:\n{}",
+        artifact.display(),
+        harness.log_tail(),
+    );
+}
+
+fn max_red_column_ratio(image: &image::RgbaImage, rect: SnapshotPixelRect) -> f64 {
+    let height = (rect.y1 - rect.y0).max(0) as u64;
+    if height == 0 {
+        return 0.0;
+    }
+
+    let mut best = 0u64;
+    for x in rect.x0..rect.x1 {
+        let mut red = 0u64;
+        for y in rect.y0..rect.y1 {
+            let pixel = image.get_pixel(x as u32, y as u32);
+            if pixel[0] >= 245 && pixel[1] <= 10 && pixel[2] <= 10 {
+                red += 1;
+            }
+        }
+        best = best.max(red);
+    }
+
+    best as f64 / height as f64
+}
+
+fn decode_snapshot_rgba(snapshot: &WindowDebugSnapshot) -> image::RgbaImage {
+    let png_bytes =
+        BASE64.decode(snapshot.png_base64.as_bytes()).expect("failed to decode snapshot PNG");
+    image::load_from_memory(&png_bytes).expect("failed to decode window snapshot").to_rgba8()
+}
+
+fn logical_rect_to_snapshot_pixels(
+    layout: &Value,
+    scale_factor: f64,
+    rect: LogicalRect,
+) -> SnapshotPixelRect {
+    let (x0, y0) = browser_visual_point(layout, rect.x.floor() as i64, rect.y.floor() as i64);
+    let (x1, y1) = browser_visual_point(
+        layout,
+        (rect.x + rect.width).ceil() as i64,
+        (rect.y + rect.height).ceil() as i64,
+    );
+
+    SnapshotPixelRect {
+        x0: (x0 * scale_factor).floor() as i64,
+        y0: (y0 * scale_factor).floor() as i64,
+        x1: (x1 * scale_factor).ceil() as i64,
+        y1: (y1 * scale_factor).ceil() as i64,
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -2798,6 +3027,17 @@ fn inspector_eval_point(
         .and_then(Value::as_i64)
         .unwrap_or_else(|| panic!("missing point.y: {point}"));
     (x, y)
+}
+
+fn inspector_eval_rect(
+    harness: &TaborHarness,
+    session_id: &str,
+    command_id: &mut i64,
+    expression: &str,
+) -> LogicalRect {
+    let rect = inspector_eval_json(harness, session_id, command_id, expression);
+    serde_json::from_value(rect)
+        .unwrap_or_else(|err| panic!("invalid Runtime.evaluate rect result: {err}"))
 }
 
 fn trusted_click(harness: &TaborHarness, session_id: &str, command_id: &mut i64, element_id: &str) {

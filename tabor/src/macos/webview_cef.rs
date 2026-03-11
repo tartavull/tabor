@@ -314,18 +314,26 @@ impl WebEditableFocusNotifier {
 }
 
 fn handle_ime_composition_range_change(
+    browser: Option<&cef::Browser>,
     dirty_notifier: &WebViewDirtyNotifier,
     _selected_range: Option<&cef::Range>,
     _character_bounds: Option<&[cef::Rect]>,
 ) {
+    if let Some(browser) = browser {
+        invalidate_browser_surfaces(browser);
+    }
     dirty_notifier.send();
 }
 
 fn handle_text_selection_change(
+    browser: Option<&cef::Browser>,
     dirty_notifier: &WebViewDirtyNotifier,
     _selected_text: Option<&cef::CefString>,
     _selected_range: Option<&cef::Range>,
 ) {
+    if let Some(browser) = browser {
+        invalidate_browser_surfaces(browser);
+    }
     dirty_notifier.send();
 }
 
@@ -878,11 +886,12 @@ cef::wrap_render_handler! {
 
         fn on_ime_composition_range_changed(
             &self,
-            _browser: Option<&mut cef::Browser>,
+            browser: Option<&mut cef::Browser>,
             selected_range: Option<&cef::Range>,
             character_bounds: Option<&[cef::Rect]>,
         ) {
             handle_ime_composition_range_change(
+                browser.as_deref(),
                 &self.dirty_notifier,
                 selected_range,
                 character_bounds,
@@ -891,11 +900,16 @@ cef::wrap_render_handler! {
 
         fn on_text_selection_changed(
             &self,
-            _browser: Option<&mut cef::Browser>,
+            browser: Option<&mut cef::Browser>,
             selected_text: Option<&cef::CefString>,
             selected_range: Option<&cef::Range>,
         ) {
-            handle_text_selection_change(&self.dirty_notifier, selected_text, selected_range);
+            handle_text_selection_change(
+                browser.as_deref(),
+                &self.dirty_notifier,
+                selected_text,
+                selected_range,
+            );
         }
     }
 }
@@ -1285,6 +1299,8 @@ pub struct WebView {
     browser: cef::Browser,
     last_title: Option<String>,
     last_url: Option<String>,
+    host_focused: bool,
+    editable_focused: bool,
     title_state: StdRc<RefCell<Option<String>>>,
     paint_state: StdRc<RefCell<PaintState>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
@@ -1390,6 +1406,8 @@ impl WebView {
                 browser,
                 last_title: None,
                 last_url: None,
+                host_focused: false,
+                editable_focused: false,
                 title_state,
                 paint_state,
                 devtools_state,
@@ -1424,9 +1442,37 @@ impl WebView {
     }
 
     pub fn set_focus(&mut self, focus: bool) {
+        self.host_focused = focus;
         if let Some(host) = self.browser.host() {
             host.set_focus(if focus { 1 } else { 0 });
         }
+    }
+
+    pub fn sync_editable_focus(&mut self, editable: bool) {
+        self.editable_focused = editable;
+        invalidate_browser_surfaces(&self.browser);
+    }
+
+    pub fn restore_native_focus(&mut self, window: &Window) -> bool {
+        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        let Some(view) = browser_view(&self.browser) else {
+            return false;
+        };
+
+        if self.host_focused && self.editable_focused {
+            enable_cef_view_first_responder(view);
+            let restored = window.focus_native_view(view);
+            if restored {
+                if let Some(host) = self.browser.host() {
+                    host.set_focus(1);
+                }
+                invalidate_browser_surfaces(&self.browser);
+            }
+            return restored;
+        }
+
+        disable_cef_view_first_responder(view);
+        false
     }
 
     pub fn update_frame(
@@ -1514,6 +1560,9 @@ impl WebView {
         modifiers: objc2_app_kit::NSEventModifierFlags,
     ) -> bool {
         let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
+        if matches!((state, button), (ElementState::Pressed, MouseButton::Left)) {
+            self.prepare_native_focus_for_mouse_input(window);
+        }
         let button_flag = cef_mouse_button_flag(button);
         let event_button_flags = match state {
             ElementState::Pressed => self.mouse_button_flags | button_flag,
@@ -1549,6 +1598,25 @@ impl WebView {
 
         invalidate_browser_surfaces(&self.browser);
         true
+    }
+
+    fn prepare_native_focus_for_mouse_input(&mut self, window: &Window) {
+        if !self.host_focused {
+            return;
+        }
+
+        let Some(view) = browser_view(&self.browser) else {
+            return;
+        };
+
+        enable_cef_view_first_responder(view);
+        if window.focus_native_view(view) {
+            if let Some(host) = self.browser.host() {
+                host.set_focus(1);
+            }
+        } else {
+            disable_cef_view_first_responder(view);
+        }
     }
 
     pub fn handle_mouse_move(
@@ -2659,6 +2727,8 @@ fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
     if view.is_null() { None } else { Some(view) }
 }
 
+const NO_FIRST_RESPONDER_CLASS_PREFIX: &[u8] = b"TaborNoFirstResponder_";
+
 fn close_browser_resources(browser: &cef::Browser) {
     if let Some(host) = browser.host() {
         host.close_browser(1);
@@ -2723,13 +2793,34 @@ fn disable_cef_view_first_responder(view: *mut AnyObject) {
 
     let obj = unsafe { &*view };
     let current_class = obj.class();
-    if current_class.name().to_bytes().starts_with(b"TaborNoFirstResponder_") {
+    if current_class.name().to_bytes().starts_with(NO_FIRST_RESPONDER_CLASS_PREFIX) {
         return;
     }
 
     let subclass = no_first_responder_subclass(current_class);
     unsafe {
         let old_class = AnyObject::set_class(obj, subclass);
+        debug_assert_eq!(old_class, current_class);
+    }
+}
+
+fn enable_cef_view_first_responder(view: *mut AnyObject) {
+    if view.is_null() {
+        return;
+    }
+
+    let obj = unsafe { &*view };
+    let current_class = obj.class();
+    if !current_class.name().to_bytes().starts_with(NO_FIRST_RESPONDER_CLASS_PREFIX) {
+        return;
+    }
+
+    let Some(superclass) = current_class.superclass() else {
+        return;
+    };
+
+    unsafe {
+        let old_class = AnyObject::set_class(obj, superclass);
         debug_assert_eq!(old_class, current_class);
     }
 }
@@ -2921,7 +3012,12 @@ mod tests {
         let tab_id = crate::tabs::TabId::new(7, 11);
         let (dirty_notifier, events) = test_dirty_notifier(window_id, tab_id);
 
-        handle_text_selection_change(&dirty_notifier, None, Some(&cef::Range { from: 0, to: 0 }));
+        handle_text_selection_change(
+            None,
+            &dirty_notifier,
+            None,
+            Some(&cef::Range { from: 0, to: 0 }),
+        );
 
         let events = events.borrow();
         assert_eq!(events.len(), 1, "expected a dirty event after text selection changes");
@@ -2937,6 +3033,7 @@ mod tests {
         let (dirty_notifier, events) = test_dirty_notifier(window_id, tab_id);
 
         handle_ime_composition_range_change(
+            None,
             &dirty_notifier,
             Some(&cef::Range { from: 0, to: 0 }),
             None,
