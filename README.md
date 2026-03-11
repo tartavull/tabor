@@ -14,10 +14,6 @@
   A tabbed terminal built for fast, multi-context workflows.
 </p>
 
-<p align="center">
-  <img alt="Tabor terminal preview" src="https://raw.githubusercontent.com/tartavull/tabor/master/extra/promo/tabor-readme.png">
-</p>
-
 ## About
 
 Tabor is a high-performance tabbed terminal focused on practical daily-driver
