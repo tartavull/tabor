@@ -167,6 +167,14 @@ cef::wrap_app! {
                 cef::CefString::from("disable-backgrounding-occluded-windows");
             command_line.append_switch(Some(&disable_occluded));
 
+            if fake_media_enabled() {
+                let fake_device = cef::CefString::from("use-fake-device-for-media-stream");
+                command_line.append_switch(Some(&fake_device));
+
+                let fake_ui = cef::CefString::from("use-fake-ui-for-media-stream");
+                command_line.append_switch(Some(&fake_ui));
+            }
+
             let disable_features = cef::CefString::from("disable-features");
             let disable_features_value = cef::CefString::from(DISABLE_FEATURES);
             command_line.append_switch_with_value(Some(&disable_features), Some(&disable_features_value));
@@ -208,6 +216,14 @@ thread_local! {
 }
 
 static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+fn env_flag_enabled(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| value != OsStr::new("0"))
+}
+
+fn fake_media_enabled() -> bool {
+    env_flag_enabled(env::var_os("TABOR_CEF_FAKE_MEDIA").as_deref())
+}
 
 const CEF_HELPER_NAMES: [&str; 5] = [
     "Tabor Helper",
@@ -764,5 +780,15 @@ mod tests {
     #[test]
     fn passkey_build_keeps_only_occlusion_feature_disable() {
         assert_eq!(DISABLE_FEATURES, "CalculateNativeWinOcclusion");
+    }
+
+    #[test]
+    fn fake_media_env_zero_is_disabled() {
+        assert!(!env_flag_enabled(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn fake_media_env_nonzero_is_enabled() {
+        assert!(env_flag_enabled(Some(OsStr::new("1"))));
     }
 }

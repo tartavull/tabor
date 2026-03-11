@@ -8,8 +8,6 @@ use std::mem;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc as StdRc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use cef::{
     CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler,
@@ -107,9 +105,6 @@ struct AutomationState {
     download_order: Vec<u32>,
     download_dir: PathBuf,
 }
-
-const ACCELERATED_BROWSER_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
-const ACCELERATED_BROWSER_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -224,14 +219,13 @@ impl PaintState {
     }
 
     fn fail(&mut self, reason: impl Into<String>) {
+        if self.acceleration_state == WebAccelerationState::Pending {
+            super::record_accelerated_startup_failure();
+        }
         self.acceleration_state = WebAccelerationState::Failed;
         self.failure_reason = Some(reason.into());
         self.main = None;
         self.popup.surface = None;
-    }
-
-    fn startup_status(&self) -> (WebAccelerationState, Option<String>) {
-        (self.acceleration_state, self.failure_reason.clone())
     }
 
     fn acceleration_info(&self) -> WebAccelerationInfo {
@@ -1061,6 +1055,15 @@ fn blocked_permission_mask() -> u32 {
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
+fn logged_allowed_permission_mask() -> u32 {
+    use cef::PermissionRequestTypes as Permission;
+
+    Permission::CAMERA_PAN_TILT_ZOOM.get_raw()
+        | Permission::CAMERA_STREAM.get_raw()
+        | Permission::MIC_STREAM.get_raw()
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
 fn permission_decision(requested_permissions: u32) -> PermissionDecision {
     if requested_permissions == 0 {
         return PermissionDecision::Deny;
@@ -1079,6 +1082,23 @@ fn permission_decision(requested_permissions: u32) -> PermissionDecision {
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
+fn media_access_decision(requested_permissions: u32) -> PermissionDecision {
+    use cef::MediaAccessPermissionTypes as Permission;
+
+    if requested_permissions == 0 {
+        return PermissionDecision::Deny;
+    }
+
+    let allowed_media_permissions =
+        Permission::DEVICE_AUDIO_CAPTURE.get_raw() | Permission::DEVICE_VIDEO_CAPTURE.get_raw();
+    if requested_permissions & !allowed_media_permissions != 0 {
+        return PermissionDecision::Deny;
+    }
+
+    PermissionDecision::Allow
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
 fn permission_request_result(requested_permissions: u32) -> PermissionRequestResult {
     match permission_decision(requested_permissions) {
         PermissionDecision::Allow => PermissionRequestResult::ACCEPT,
@@ -1087,12 +1107,18 @@ fn permission_request_result(requested_permissions: u32) -> PermissionRequestRes
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
-fn should_block_permission_request(requested_permissions: u32) -> bool {
-    matches!(permission_decision(requested_permissions), PermissionDecision::Deny)
+fn should_block_media_access_request(requested_permissions: u32) -> bool {
+    matches!(media_access_decision(requested_permissions), PermissionDecision::Deny)
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
-fn log_blocked_permission_request(
+fn should_log_allowed_permission_request(requested_permissions: u32) -> bool {
+    requested_permissions & logged_allowed_permission_mask() != 0
+}
+
+#[cfg(not(feature = "passkey-webauthn"))]
+fn log_permission_request(
+    decision: PermissionDecision,
     source: &str,
     requesting_origin: Option<&cef::CefString>,
     requested_permissions: u32,
@@ -1100,8 +1126,12 @@ fn log_blocked_permission_request(
     let origin = requesting_origin
         .map(|origin| origin.to_string())
         .unwrap_or_else(|| String::from("<unknown>"));
+    let decision = match decision {
+        PermissionDecision::Allow => "Accepted",
+        PermissionDecision::Deny => "Denied",
+    };
     debug!(
-        "Denied CEF permission request (source={source}, origin={origin}, mask=0x{requested_permissions:08x})"
+        "{decision} CEF permission request (source={source}, origin={origin}, mask=0x{requested_permissions:08x})"
     );
 }
 
@@ -1118,11 +1148,12 @@ cef::wrap_permission_handler! {
             requested_permissions: u32,
             callback: Option<&mut cef::MediaAccessCallback>,
         ) -> ::std::os::raw::c_int {
-            if should_block_permission_request(requested_permissions) {
+            if should_block_media_access_request(requested_permissions) {
                 if let Some(callback) = callback {
                     callback.cancel();
                 }
-                log_blocked_permission_request(
+                log_permission_request(
+                    PermissionDecision::Deny,
                     "media_access",
                     requesting_origin,
                     requested_permissions,
@@ -1133,6 +1164,12 @@ cef::wrap_permission_handler! {
             if let Some(callback) = callback {
                 callback.cont(requested_permissions);
             }
+            log_permission_request(
+                PermissionDecision::Allow,
+                "media_access",
+                requesting_origin,
+                requested_permissions,
+            );
             1
         }
 
@@ -1148,8 +1185,26 @@ cef::wrap_permission_handler! {
             if let Some(callback) = callback {
                 callback.cont(result);
             }
-            if matches!(result, PermissionRequestResult::DENY) {
-                log_blocked_permission_request("prompt", requesting_origin, requested_permissions);
+            match result {
+                PermissionRequestResult::ACCEPT
+                    if should_log_allowed_permission_request(requested_permissions) =>
+                {
+                    log_permission_request(
+                        PermissionDecision::Allow,
+                        "prompt",
+                        requesting_origin,
+                        requested_permissions,
+                    );
+                },
+                PermissionRequestResult::DENY => {
+                    log_permission_request(
+                        PermissionDecision::Deny,
+                        "prompt",
+                        requesting_origin,
+                        requested_permissions,
+                    );
+                },
+                _ => (),
             }
             1
         }
@@ -1335,6 +1390,7 @@ impl WebView {
 
         crate::macos::cef::ensure_initialized()?;
         super::register_webview();
+        let mut web_view_constructed = false;
 
         let result = (|| {
             let parent = ns_view(window)?;
@@ -1418,14 +1474,15 @@ impl WebView {
                 _devtools_registration: registration,
                 _client: client,
             };
+            web_view_constructed = true;
 
             web_view.enable_devtools_domains();
-            web_view.wait_for_accelerated_surface()?;
 
             Ok(web_view)
         })();
 
-        if result.is_err() {
+        // Startup failures before `Self` is constructed still need to roll back the counter.
+        if result.is_err() && !web_view_constructed {
             super::unregister_webview();
         }
 
@@ -1495,37 +1552,6 @@ impl WebView {
 
     pub fn acceleration_info(&self) -> WebAccelerationInfo {
         self.paint_state.borrow().acceleration_info()
-    }
-
-    fn wait_for_accelerated_surface(&self) -> Result<(), Box<dyn Error>> {
-        let deadline = Instant::now() + ACCELERATED_BROWSER_STARTUP_TIMEOUT;
-
-        loop {
-            let (state, failure_reason) = self.paint_state.borrow().startup_status();
-            match state {
-                WebAccelerationState::Ready => return Ok(()),
-                WebAccelerationState::Failed => {
-                    super::record_accelerated_startup_failure();
-                    return Err(std::io::Error::other(
-                        failure_reason
-                            .unwrap_or_else(|| String::from("Accelerated browser startup failed")),
-                    )
-                    .into());
-                },
-                WebAccelerationState::Pending => (),
-            }
-
-            if Instant::now() >= deadline {
-                super::record_accelerated_startup_failure();
-                return Err(std::io::Error::other(
-                    "Timed out waiting for accelerated browser surface",
-                )
-                .into());
-            }
-
-            crate::macos::cef::do_message_loop_work();
-            thread::sleep(ACCELERATED_BROWSER_STARTUP_POLL_INTERVAL);
-        }
     }
 
     pub fn load_url(&mut self, url: &str) -> bool {
@@ -2857,12 +2883,15 @@ mod tests {
     };
     #[cfg(not(feature = "passkey-webauthn"))]
     use super::{
-        PermissionDecision, permission_decision, permission_request_result,
-        should_block_permission_request,
+        PermissionDecision, media_access_decision, permission_decision, permission_request_result,
+        should_block_media_access_request, should_log_allowed_permission_request,
     };
     use cef::sys::cef_event_flags_t;
     #[cfg(not(feature = "passkey-webauthn"))]
-    use cef::{PermissionRequestResult, PermissionRequestTypes as Permission};
+    use cef::{
+        MediaAccessPermissionTypes as MediaPermission, PermissionRequestResult,
+        PermissionRequestTypes as Permission,
+    };
     use objc2_app_kit::NSEventModifierFlags;
     use std::cell::RefCell;
     use winit::event::{ElementState, MouseButton};
@@ -3087,8 +3116,26 @@ mod tests {
     fn permission_policy_allows_known_safe_permissions() {
         let permissions = Permission::CAMERA_STREAM.get_raw() | Permission::MIC_STREAM.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
-        assert!(!should_block_permission_request(permissions));
+        assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
+        assert!(should_log_allowed_permission_request(permissions));
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn media_access_policy_allows_device_audio_capture() {
+        let permissions = MediaPermission::DEVICE_AUDIO_CAPTURE.get_raw();
+        assert_eq!(media_access_decision(permissions), PermissionDecision::Allow);
+        assert!(!should_block_media_access_request(permissions));
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn media_access_policy_allows_combined_device_capture() {
+        let permissions = MediaPermission::DEVICE_AUDIO_CAPTURE.get_raw()
+            | MediaPermission::DEVICE_VIDEO_CAPTURE.get_raw();
+        assert_eq!(media_access_decision(permissions), PermissionDecision::Allow);
+        assert!(!should_block_media_access_request(permissions));
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
@@ -3096,7 +3143,7 @@ mod tests {
     fn permission_policy_denies_blocked_permissions() {
         let permissions = Permission::AR_SESSION.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Deny);
-        assert!(should_block_permission_request(permissions));
+        assert_eq!(permission_decision(permissions), PermissionDecision::Deny);
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::DENY);
     }
 
@@ -3105,15 +3152,23 @@ mod tests {
     fn permission_policy_denies_unknown_permissions() {
         let unknown_bit = 1_u32 << 30;
         assert_eq!(permission_decision(unknown_bit), PermissionDecision::Deny);
-        assert!(should_block_permission_request(unknown_bit));
+        assert_eq!(permission_decision(unknown_bit), PermissionDecision::Deny);
         assert_eq!(permission_request_result(unknown_bit), PermissionRequestResult::DENY);
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn media_access_policy_denies_desktop_capture() {
+        let permissions = MediaPermission::DESKTOP_AUDIO_CAPTURE.get_raw();
+        assert_eq!(media_access_decision(permissions), PermissionDecision::Deny);
+        assert!(should_block_media_access_request(permissions));
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]
     #[test]
     fn permission_policy_denies_empty_permissions() {
         assert_eq!(permission_decision(0), PermissionDecision::Deny);
-        assert!(should_block_permission_request(0));
+        assert_eq!(permission_decision(0), PermissionDecision::Deny);
         assert_eq!(permission_request_result(0), PermissionRequestResult::DENY);
     }
 
@@ -3122,7 +3177,7 @@ mod tests {
     fn permission_policy_allows_local_network_permission() {
         let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
-        assert!(!should_block_permission_request(permissions));
+        assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
     }
 
@@ -3131,7 +3186,8 @@ mod tests {
     fn permission_policy_allows_clipboard_permission() {
         let permissions = Permission::CLIPBOARD.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
-        assert!(!should_block_permission_request(permissions));
+        assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
+        assert!(!should_log_allowed_permission_request(permissions));
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
     }
 }

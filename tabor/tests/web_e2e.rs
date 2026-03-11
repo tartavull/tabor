@@ -34,6 +34,14 @@ struct TempAppBundle {
     bundle_id: String,
 }
 
+const CEF_HELPER_NAMES: [&str; 5] = [
+    "Tabor Helper",
+    "Tabor Helper (Renderer)",
+    "Tabor Helper (GPU)",
+    "Tabor Helper (Plugin)",
+    "Tabor Helper (Alerts)",
+];
+
 struct TaborHarness {
     client_bin: PathBuf,
     socket: PathBuf,
@@ -46,16 +54,24 @@ struct TaborHarness {
 
 impl TaborHarness {
     fn start() -> Self {
-        Self::start_with_mode(HarnessLaunchMode::BackgroundBinary)
+        Self::start_with_mode_and_env(HarnessLaunchMode::BackgroundBinary, &[])
+    }
+
+    fn start_fake_media() -> Self {
+        Self::start_with_mode_and_env(
+            HarnessLaunchMode::BackgroundBinary,
+            &[("TABOR_CEF_FAKE_MEDIA", "1"), ("TABOR_CEF_LOG_PATH", "1")],
+        )
     }
 
     fn start_foreground_app_bundle(debug_notch_ears: bool) -> Self {
-        Self::start_with_mode(HarnessLaunchMode::ForegroundAppBundle {
-            _debug_notch_ears: debug_notch_ears,
-        })
+        Self::start_with_mode_and_env(
+            HarnessLaunchMode::ForegroundAppBundle { _debug_notch_ears: debug_notch_ears },
+            &[],
+        )
     }
 
-    fn start_with_mode(mode: HarnessLaunchMode) -> Self {
+    fn start_with_mode_and_env(mode: HarnessLaunchMode, extra_env: &[(&str, &str)]) -> Self {
         let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let bundle = create_temp_app_bundle(&tmp, &built_bin);
@@ -82,6 +98,9 @@ impl TaborHarness {
             .arg(&socket)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
 
         match mode {
             HarnessLaunchMode::BackgroundBinary => {
@@ -373,6 +392,31 @@ fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
     TempAppBundle { bundle_dir, executable: bundled_bin, bundle_id }
 }
 
+fn helper_info_plist(bundle_dir: &Path, helper_name: &str) -> PathBuf {
+    bundle_dir
+        .join("Contents")
+        .join("Frameworks")
+        .join(format!("{helper_name}.app"))
+        .join("Contents")
+        .join("Info.plist")
+}
+
+fn plist_string(path: &Path, key_path: &str) -> Option<String> {
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .arg("-c")
+        .arg(format!("Print :{key_path}"))
+        .arg(path)
+        .output()
+        .unwrap_or_else(|err| {
+            panic!("failed to read plist key {key_path} from {}: {err}", path.display())
+        });
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 struct PopupServer {
     port: u16,
     hits: Arc<Mutex<Vec<String>>>,
@@ -488,6 +532,60 @@ impl Drop for ClipboardFixtureServer {
     }
 }
 
+struct MediaFixtureServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MediaFixtureServer {
+    fn start() -> Self {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind media fixture server");
+        listener
+            .set_nonblocking(true)
+            .expect("failed to set media fixture server nonblocking mode");
+
+        let port = listener.local_addr().expect("failed to read media fixture server addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let fixture_html = include_str!("fixtures/media-fixture.html").to_string();
+
+        let handle = thread::spawn(move || {
+            loop {
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        handle_media_fixture_connection(&mut stream, fixture_html.as_bytes());
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self { port, stop, handle: Some(handle) }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+}
+
+impl Drop for MediaFixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct WindowDebugRect {
     x: f64,
@@ -534,6 +632,157 @@ struct WindowDebugSnapshot {
 }
 
 #[test]
+fn temp_app_bundle_helpers_inherit_media_usage_strings() {
+    let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let bundle = create_temp_app_bundle(&tmp, &built_bin);
+    let main_info = bundle.bundle_dir.join("Contents").join("Info.plist");
+
+    let expected_camera = plist_string(&main_info, "NSCameraUsageDescription")
+        .unwrap_or_else(|| panic!("missing NSCameraUsageDescription in {}", main_info.display()));
+    let expected_microphone = plist_string(&main_info, "NSMicrophoneUsageDescription")
+        .unwrap_or_else(|| {
+            panic!("missing NSMicrophoneUsageDescription in {}", main_info.display())
+        });
+
+    for helper_name in CEF_HELPER_NAMES {
+        let helper_info = helper_info_plist(&bundle.bundle_dir, helper_name);
+        assert_eq!(
+            plist_string(&helper_info, "NSCameraUsageDescription").as_deref(),
+            Some(expected_camera.as_str()),
+            "helper camera usage mismatch for {}",
+            helper_info.display()
+        );
+        assert_eq!(
+            plist_string(&helper_info, "NSMicrophoneUsageDescription").as_deref(),
+            Some(expected_microphone.as_str()),
+            "helper microphone usage mismatch for {}",
+            helper_info.display()
+        );
+        assert_eq!(
+            plist_string(&helper_info, "NSSupportsAutomaticGraphicsSwitching").as_deref(),
+            Some("true"),
+            "helper graphics switching flag mismatch for {}",
+            helper_info.display()
+        );
+        assert_eq!(
+            plist_string(&helper_info, "LSEnvironment:MallocNanoZone").as_deref(),
+            Some("0"),
+            "helper MallocNanoZone mismatch for {}",
+            helper_info.display()
+        );
+    }
+}
+
+#[test]
+fn fake_media_webrtc_probe_succeeds_in_signed_bundle() {
+    let server = MediaFixtureServer::start();
+    let harness = TaborHarness::start_fake_media();
+    let fixture = server.url("/fixture.html");
+
+    let initial_metrics = runtime_metrics(&harness);
+    let (baseline_live, baseline_created, baseline_dropped) = webview_counts(&initial_metrics);
+    let baseline_startup_failures =
+        webview_metric(&initial_metrics, "accelerated_startup_failures");
+    let baseline_cpu_paints = webview_metric(&initial_metrics, "unexpected_cpu_paints");
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    let tab_id_arg = tab_id_arg(&reply);
+    let settled_layout = wait_for_tab_acceleration_settled(
+        &harness,
+        tab_id_arg.as_str(),
+        Duration::from_secs(8),
+    )
+    .unwrap_or_else(|| {
+        let latest_state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+        panic!(
+            "timed out waiting for fake media tab acceleration to settle; last_state={latest_state}; harness_log_tail:\n{}",
+            harness.log_tail(),
+        )
+    });
+    assert_eq!(
+        browser_layout_acceleration_state(&settled_layout),
+        Some("ready"),
+        "fake media tab acceleration failed: {settled_layout}"
+    );
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+    wait_for_agent_observation(&harness, "Media Fixture", Duration::from_secs(6))
+        .unwrap_or_else(|| panic!("timed out waiting for media fixture title"));
+
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+    let probe = inspector_eval_json(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        "(async () => JSON.stringify(await window.__taborMediaProbe.run()))()",
+    );
+
+    assert_eq!(probe.get("secureContext").and_then(Value::as_bool), Some(true));
+    assert_eq!(probe.get("enumerateOk").and_then(Value::as_bool), Some(true));
+    assert_eq!(probe.get("gumOk").and_then(Value::as_bool), Some(true));
+
+    let device_kinds = probe
+        .get("deviceKinds")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing deviceKinds in probe result: {probe}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        device_kinds.contains(&"audioinput"),
+        "expected audioinput device in fake media probe: {probe}"
+    );
+    assert!(
+        device_kinds.contains(&"videoinput"),
+        "expected videoinput device in fake media probe: {probe}"
+    );
+
+    let track_kinds = probe
+        .get("trackKinds")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing trackKinds in probe result: {probe}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(track_kinds.contains(&"audio"), "expected audio track in fake media probe: {probe}");
+    assert!(track_kinds.contains(&"video"), "expected video track in fake media probe: {probe}");
+
+    let settled_metrics = runtime_metrics(&harness);
+    assert_eq!(
+        webview_metric(&settled_metrics, "accelerated_startup_failures"),
+        baseline_startup_failures,
+        "accelerated startup failures changed during fake media probe: {settled_metrics}"
+    );
+    assert_eq!(
+        webview_metric(&settled_metrics, "unexpected_cpu_paints"),
+        baseline_cpu_paints,
+        "unexpected CPU paints changed during fake media probe: {settled_metrics}"
+    );
+    assert!(
+        webview_metric(&settled_metrics, "live_accelerated_surfaces") >= 1,
+        "expected at least one live accelerated surface during fake media probe: {settled_metrics}"
+    );
+
+    let _ = inspector_eval_json(
+        &harness,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        "Promise.resolve().then(() => { window.__taborMediaProbe.stop(); return JSON.stringify({\"stopped\":true}); })",
+    );
+    harness.run_ok(["msg", "close-tab"]);
+
+    let expected = (baseline_live, baseline_created + 1, baseline_dropped + 1);
+    wait_for_webview_counts(&harness, expected, Duration::from_secs(4)).unwrap_or_else(|| {
+        panic!("timed out waiting for fake media webview teardown: {expected:?}")
+    });
+}
+
+#[test]
 fn agent_fixture_smoke() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
@@ -544,7 +793,9 @@ fn agent_fixture_smoke() {
     harness.run_json(["agent", "attach"]);
     harness.run_json(["agent", "use", "--active"]);
 
-    let observation = harness.run_json(["agent", "observe"]);
+    let observation =
+        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
     let email_id = find_observed_element_id(&observation, "Email");
     let notes_id = find_observed_element_id(&observation, "Notes");
     let checkbox_id = find_observed_element_id(&observation, "check-me");
@@ -1123,11 +1374,22 @@ fn native_multi_column_click_focuses_lower_input() {
         harness.run_json(["msg", "dispatch-action", "--action", "ToggleMultiColumnTerminal"]);
     assert_eq!(toggle_reply.get("type").and_then(Value::as_str), Some("ok"));
 
-    let layout = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+    let _ = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
         layout.get("mode").and_then(Value::as_str) == Some("multi_column")
             && layout.get("column_count").and_then(Value::as_u64).unwrap_or(0) >= 2
     })
     .unwrap_or_else(|| panic!("timed out waiting for multi-column browser layout"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+    let _ = wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+        .unwrap_or_else(|| {
+            panic!("timed out waiting for browser observation before multi-column click")
+        });
+
+    let scroll = json!([{ "type": "scroll", "dy": 960 }]).to_string();
+    let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
+    assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
 
     let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
     let mut inspector_command_id = 1_i64;
@@ -1146,8 +1408,32 @@ fn native_multi_column_click_focuses_lower_input() {
         })()"#,
     );
 
-    harness.run_json(["agent", "attach"]);
-    harness.run_json(["agent", "use", "--active"]);
+    let layout = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        if layout.get("mode").and_then(Value::as_str) != Some("multi_column") {
+            return false;
+        }
+        let viewport_height = layout
+            .get("viewport")
+            .and_then(|value| value.get("height"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if viewport_height <= 0 {
+            return false;
+        }
+        let column_index = logical_y.div_euclid(viewport_height) as usize;
+        layout
+            .get("columns")
+            .and_then(Value::as_array)
+            .and_then(|columns| columns.get(column_index))
+            .is_some()
+    })
+    .unwrap_or_else(|| {
+        let latest_state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg.as_str()]);
+        panic!(
+            "timed out waiting for multi-column browser layout to cover lower input; logical_point=({logical_x}, {logical_y}); last_state={latest_state}; harness_log_tail:\n{}",
+            harness.log_tail()
+        )
+    });
 
     let viewport_height = layout
         .get("viewport")
@@ -1200,9 +1486,15 @@ fn agent_wait_smoke() {
 
     harness.run_json(["agent", "attach"]);
     harness.run_json(["agent", "use", "--active"]);
+    let _ = wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+        .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
+
+    let scroll = json!([{ "type": "scroll", "dy": 320 }]).to_string();
+    let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
+    assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
+
     let observation = harness.run_json(["agent", "observe"]);
     let fetch_id = find_observed_element_id(&observation, "Fetch data");
-
     let actions = json!([
         { "type": "click", "id": fetch_id },
         { "type": "wait", "text": "Fetch output: error", "timeout_ms": 5000 }
@@ -1228,13 +1520,13 @@ fn agent_artifacts_smoke() {
         wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
             .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
     let email_id = find_observed_element_id(&first_observation, "Email");
-    let file_input_id = find_observed_element_id(&first_observation, "file-input");
 
     let scroll = json!([{ "type": "scroll", "dy": 320 }]).to_string();
     let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
     assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
 
     let second_observation = harness.run_json(["agent", "observe"]);
+    let file_input_id = find_observed_element_id(&second_observation, "file-input");
     let download_id = find_observed_element_id(&second_observation, "Download file");
 
     let screenshot_path = harness.tmp_path("agent-screenshot.png");
@@ -1317,16 +1609,15 @@ fn agent_events_smoke() {
     let baseline = harness.run_json(["agent", "events", "--max", "1"]);
     let since = baseline.get("last_event_id").and_then(Value::as_u64).unwrap_or(0).to_string();
 
-    let first_observation =
-        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
-            .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
-    let fetch_id = find_observed_element_id(&first_observation, "Fetch data");
+    let _ = wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+        .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
 
     let scroll = json!([{ "type": "scroll", "dy": 320 }]).to_string();
     let scroll_reply = harness.run_json(["agent", "act", scroll.as_str()]);
     assert!(agent_action_results_all_ok(&scroll_reply), "agent scroll failed: {scroll_reply}");
 
     let second_observation = harness.run_json(["agent", "observe"]);
+    let fetch_id = find_observed_element_id(&second_observation, "Fetch data");
     let console_id = find_observed_element_id(&second_observation, "Console log");
 
     let actions = json!([
@@ -2660,6 +2951,46 @@ where
     None
 }
 
+fn tab_browser_layout(state: &Value) -> Option<&Value> {
+    state.get("tab").and_then(|tab| tab.get("browser_layout"))
+}
+
+fn browser_layout_acceleration_state(layout: &Value) -> Option<&str> {
+    layout.get("acceleration").and_then(|value| value.get("state")).and_then(Value::as_str)
+}
+
+fn wait_for_tab_browser_layout_where<F>(
+    harness: &TaborHarness,
+    tab_id_arg: &str,
+    timeout: Duration,
+    predicate: F,
+) -> Option<Value>
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg]);
+        if let Some(layout) = tab_browser_layout(&state).filter(|layout| predicate(layout)) {
+            return Some(layout.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_tab_acceleration_settled(
+    harness: &TaborHarness,
+    tab_id_arg: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    wait_for_tab_browser_layout_where(harness, tab_id_arg, timeout, |layout| {
+        matches!(browser_layout_acceleration_state(layout), Some("ready" | "failed"))
+    })
+}
+
 fn wait_for_tab_web_mode_value(
     harness: &TaborHarness,
     tab_id_arg: &str,
@@ -3363,6 +3694,36 @@ fn handle_popup_connection(
 }
 
 fn handle_clipboard_fixture_connection(stream: &mut TcpStream, fixture_html: &[u8]) {
+    let mut buf = [0u8; 4096];
+    let read = match stream.read(&mut buf) {
+        Ok(size) => size,
+        Err(_) => return,
+    };
+
+    if read == 0 {
+        return;
+    }
+
+    let request = String::from_utf8_lossy(&buf[..read]);
+    let path =
+        request.lines().next().and_then(|line| line.split_whitespace().nth(1)).unwrap_or("/");
+
+    let (status_line, content_type, body): (&str, &str, &[u8]) = match path {
+        "/" | "/fixture.html" => ("HTTP/1.1 200 OK", "text/html; charset=utf-8", fixture_html),
+        _ => ("HTTP/1.1 404 Not Found", "text/plain; charset=utf-8", b"not found"),
+    };
+
+    let header = format!(
+        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+fn handle_media_fixture_connection(stream: &mut TcpStream, fixture_html: &[u8]) {
     let mut buf = [0u8; 4096];
     let read = match stream.read(&mut buf) {
         Ok(size) => size,

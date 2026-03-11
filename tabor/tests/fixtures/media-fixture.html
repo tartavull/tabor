@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Media Fixture</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        padding: 24px;
+        line-height: 1.4;
+      }
+
+      #preview {
+        width: 320px;
+        height: 180px;
+        background: #111;
+        display: block;
+        margin-top: 16px;
+      }
+
+      .status {
+        margin-top: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Media Fixture</h1>
+    <button id="start-probe" type="button">Start Media Probe</button>
+    <div id="probe-status" class="status" role="status" aria-label="Media probe status">
+      idle
+    </div>
+    <div id="device-status" class="status" role="status" aria-label="Media device status">
+      no devices
+    </div>
+    <video id="preview" autoplay muted playsinline></video>
+
+    <script>
+      const preview = document.getElementById('preview');
+      const probeStatus = document.getElementById('probe-status');
+      const deviceStatus = document.getElementById('device-status');
+      const startButton = document.getElementById('start-probe');
+      let activeStream = null;
+      let lastProbe = null;
+
+      function stopTracks() {
+        if (!activeStream) {
+          preview.srcObject = null;
+          return;
+        }
+
+        for (const track of activeStream.getTracks()) {
+          track.stop();
+        }
+        activeStream = null;
+        preview.srcObject = null;
+      }
+
+      async function permissionState(name) {
+        if (!navigator.permissions?.query) {
+          return 'unsupported';
+        }
+
+        try {
+          const status = await navigator.permissions.query({ name });
+          return status.state;
+        } catch (_error) {
+          return 'unsupported';
+        }
+      }
+
+      async function runProbe() {
+        stopTracks();
+        probeStatus.textContent = 'running';
+        deviceStatus.textContent = 'querying devices';
+
+        const result = {
+          secureContext: window.isSecureContext,
+          hasMediaDevices: Boolean(navigator.mediaDevices),
+          enumerateOk: false,
+          gumOk: false,
+          deviceKinds: [],
+          trackKinds: [],
+          permissions: {
+            camera: await permissionState('camera'),
+            microphone: await permissionState('microphone'),
+          },
+        };
+
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          result.enumerateOk = true;
+          result.deviceKinds = devices.map((device) => device.kind);
+          deviceStatus.textContent = result.deviceKinds.join(',') || 'no devices';
+
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+          activeStream = stream;
+          preview.srcObject = stream;
+          result.gumOk = true;
+          result.trackKinds = stream.getTracks().map((track) => track.kind);
+          probeStatus.textContent = 'success';
+        } catch (error) {
+          result.error = {
+            name: error?.name || 'Error',
+            message: error?.message || String(error),
+          };
+          probeStatus.textContent = `error:${result.error.name}`;
+        }
+
+        lastProbe = result;
+        return result;
+      }
+
+      window.__taborMediaProbe = {
+        run: runProbe,
+        stop: () => {
+          stopTracks();
+          probeStatus.textContent = 'stopped';
+          return lastProbe;
+        },
+        last: () => lastProbe,
+      };
+
+      startButton.addEventListener('click', () => {
+        void runProbe();
+      });
+
+      window.addEventListener('beforeunload', stopTracks);
+    </script>
+  </body>
+</html>

@@ -35,6 +35,80 @@ if [[ -z "$main_identifier" ]]; then
   exit 1
 fi
 
+read_optional_plist_string() {
+  local key_path="$1"
+  /usr/libexec/PlistBuddy -c "Print :$key_path" "$info_plist" 2>/dev/null || true
+}
+
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+  value="${value//\'/&apos;}"
+  printf '%s' "$value"
+}
+
+print_string_key() {
+  local key="$1"
+  local value="$2"
+  printf '  <key>%s</key>\n' "$key"
+  printf '  <string>%s</string>\n' "$(xml_escape "$value")"
+}
+
+print_optional_string_key() {
+  local key="$1"
+  local value="$2"
+  if [[ -n "$value" ]]; then
+    print_string_key "$key" "$value"
+  fi
+}
+
+print_bool_key() {
+  local key="$1"
+  local value="$2"
+  printf '  <key>%s</key>\n' "$key"
+  if [[ "$value" == "false" || "$value" == "0" ]]; then
+    printf '  <false/>\n'
+  else
+    printf '  <true/>\n'
+  fi
+}
+
+development_region="$(read_optional_plist_string 'CFBundleDevelopmentRegion')"
+if [[ -z "$development_region" ]]; then
+  development_region="en"
+fi
+
+bundle_info_dictionary_version="$(read_optional_plist_string 'CFBundleInfoDictionaryVersion')"
+if [[ -z "$bundle_info_dictionary_version" ]]; then
+  bundle_info_dictionary_version="6.0"
+fi
+
+short_version="$(read_optional_plist_string 'CFBundleShortVersionString')"
+if [[ -z "$short_version" ]]; then
+  short_version="0.8.1"
+fi
+
+bundle_version="$(read_optional_plist_string 'CFBundleVersion')"
+if [[ -z "$bundle_version" ]]; then
+  bundle_version="0.8.1"
+fi
+
+supports_automatic_graphics_switching="$(
+  read_optional_plist_string 'NSSupportsAutomaticGraphicsSwitching'
+)"
+if [[ -z "$supports_automatic_graphics_switching" ]]; then
+  supports_automatic_graphics_switching="true"
+fi
+
+camera_usage_description="$(read_optional_plist_string 'NSCameraUsageDescription')"
+microphone_usage_description="$(read_optional_plist_string 'NSMicrophoneUsageDescription')"
+public_key_credential_usage_description="$(
+  read_optional_plist_string 'NSWebBrowserPublicKeyCredentialUsageDescription'
+)"
+
 helper_prefix="${TABOR_CEF_HELPER_PREFIX:-Tabor}"
 helpers=(
   "$helper_prefix Helper"
@@ -72,32 +146,48 @@ for helper_name in "${helpers[@]}"; do
     ln -sfn "../Frameworks/$lib" "$helper_macos/$lib"
   done
 
-  cat > "$helper_info" <<PLIST
+  {
+    cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key>
-  <string>en</string>
+  <string>$(xml_escape "$development_region")</string>
+  <key>CFBundleDisplayName</key>
+  <string>$(xml_escape "$helper_name")</string>
   <key>CFBundleExecutable</key>
-  <string>$helper_name</string>
+  <string>$(xml_escape "$helper_name")</string>
   <key>CFBundleIdentifier</key>
-  <string>$helper_identifier</string>
+  <string>$(xml_escape "$helper_identifier")</string>
   <key>CFBundleInfoDictionaryVersion</key>
-  <string>6.0</string>
+  <string>$(xml_escape "$bundle_info_dictionary_version")</string>
   <key>CFBundleName</key>
-  <string>$helper_name</string>
+  <string>$(xml_escape "$helper_name")</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.4.0</string>
+  <string>$(xml_escape "$short_version")</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>$(xml_escape "$bundle_version")</string>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>MallocNanoZone</key>
+    <string>0</string>
+  </dict>
   <key>LSUIElement</key>
   <true/>
+PLIST
+    print_bool_key "NSSupportsAutomaticGraphicsSwitching" "$supports_automatic_graphics_switching"
+    print_optional_string_key "NSWebBrowserPublicKeyCredentialUsageDescription" \
+      "$public_key_credential_usage_description"
+    print_optional_string_key "NSCameraUsageDescription" "$camera_usage_description"
+    print_optional_string_key "NSMicrophoneUsageDescription" "$microphone_usage_description"
+    cat <<PLIST
 </dict>
 </plist>
 PLIST
+  } > "$helper_info"
 
 done
 

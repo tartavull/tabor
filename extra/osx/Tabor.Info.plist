@@ -15,13 +15,13 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.4.0</string>
+  <string>0.8.1</string>
   <key>CFBundleSupportedPlatforms</key>
   <array>
     <string>MacOSX</string>
   </array>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>0.8.1</string>
   <key>CFBundleIconFile</key>
   <string>tabor.icns</string>
   <key>NSHighResolutionCapable</key>

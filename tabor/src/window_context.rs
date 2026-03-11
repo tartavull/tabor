@@ -2273,6 +2273,14 @@ impl WindowContext {
 
         if changed {
             self.update_tab_program_name(tab_id);
+            if self.tabs.get(tab_id).is_some_and(|tab| !tab.kind.is_web()) {
+                let refresh = Event::for_tab(
+                    EventType::UpdateTabProgramName,
+                    self.display.window.id(),
+                    tab_id,
+                );
+                self.event_queue.push(refresh.into());
+            }
         }
 
         if changed {
