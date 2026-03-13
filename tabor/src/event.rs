@@ -83,7 +83,7 @@ use crate::macos::web_commands::{
 use crate::macos::web_cursor::{WEB_CURSOR_BOOTSTRAP, web_cursor_from_css, web_cursor_script};
 #[cfg(target_os = "macos")]
 use crate::macos::webview::WebView;
-use crate::message_bar::{Message, MessageBuffer};
+use crate::message_bar::{Message, MessageBuffer, MessageType};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::tab_panel::TAB_ACTIVITY_TICK_INTERVAL;
 use crate::tabs::{TabCommand, TabId};
@@ -1794,6 +1794,71 @@ impl Default for CommandState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFooterMessage {
+    text: String,
+    ty: MessageType,
+}
+
+impl CommandFooterMessage {
+    fn new(text: String, ty: MessageType) -> Self {
+        Self { text, ty }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn ty(&self) -> MessageType {
+        self.ty
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CommandFooterFeedback {
+    message: Option<CommandFooterMessage>,
+}
+
+impl CommandFooterFeedback {
+    pub fn message(&self) -> Option<&CommandFooterMessage> {
+        self.message.as_ref()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.message.is_some()
+    }
+
+    fn show_error(&mut self, text: String) {
+        self.message = Some(CommandFooterMessage::new(text, MessageType::Error));
+    }
+
+    fn clear(&mut self) {
+        self.message = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandError {
+    UnknownCommand(String),
+    ArgumentRequired,
+    InvalidArgument(String),
+    Message(String),
+}
+
+impl CommandError {
+    fn footer_text(&self) -> String {
+        match self {
+            Self::UnknownCommand(command) => format!("E492: Not an editor command: {command}"),
+            Self::ArgumentRequired => String::from("E471: Argument required"),
+            Self::InvalidArgument(argument) if argument.is_empty() => {
+                String::from("E474: Invalid argument")
+            },
+            Self::InvalidArgument(argument) => format!("E474: Invalid argument: {argument}"),
+            Self::Message(message) => message.clone(),
+        }
+    }
+}
+
 /// URL history for command bar completions.
 #[derive(Default)]
 pub struct CommandHistory {
@@ -1876,6 +1941,7 @@ pub struct ActionContext<'a, N, T> {
     pub modifiers: &'a mut Modifiers,
     pub display: &'a mut Display,
     pub message_buffer: &'a mut MessageBuffer,
+    pub command_footer_feedback: &'a mut CommandFooterFeedback,
     pub config: &'a UiConfig,
     pub cursor_blink_timed_out: &'a mut bool,
     pub prev_bell_cmd: &'a mut Option<Instant>,
@@ -2357,6 +2423,10 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         }
     }
 
+    fn clear_command_feedback(&mut self) {
+        self.clear_command_footer_feedback();
+    }
+
     #[inline]
     fn start_search(&mut self, direction: Direction) {
         // Only create new history entry if the previous regex wasn't empty.
@@ -2629,6 +2699,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             if self.search_active() {
                 self.cancel_search();
             }
+            self.clear_command_footer_feedback();
             #[cfg(target_os = "macos")]
             if self.modifiers.state().super_key() {
                 let mut options = WindowOptions::default();
@@ -3399,6 +3470,27 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         *self.dirty = true;
     }
 
+    fn mark_command_footer_feedback_dirty(&mut self) {
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.display.damage_tracker.next_frame().mark_fully_damaged();
+        *self.dirty = true;
+    }
+
+    fn clear_command_footer_feedback(&mut self) {
+        if !self.command_footer_feedback.is_active() {
+            return;
+        }
+
+        self.command_footer_feedback.clear();
+        self.mark_command_footer_feedback_dirty();
+    }
+
+    fn show_command_footer_feedback(&mut self, error: &CommandError) {
+        self.command_footer_feedback.show_error(error.footer_text());
+        self.mark_command_footer_feedback_dirty();
+    }
+
     /// Reset terminal to the state before search was started.
     fn search_reset_state(&mut self) {
         // Unschedule pending timers.
@@ -3579,6 +3671,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     }
 
     pub(crate) fn run_command(&mut self, input: String) {
+        self.clear_command_footer_feedback();
+
         if let Some(find_query) = input.strip_prefix('/') {
             let query = find_query.trim();
             if query.is_empty() {
@@ -3593,7 +3687,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 return;
             }
 
-            self.push_command_error(String::from("Find is only available in web tabs"));
+            self.push_command_error(CommandError::Message(String::from(
+                "Find is only available in web tabs",
+            )));
             return;
         }
 
@@ -3611,14 +3707,14 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             "o" | "O" | "b" | "B" | "t" => {
                 let target = parts.collect::<Vec<_>>().join(" ");
                 if target.is_empty() {
-                    self.push_command_error(format!("Missing target for :{command}"));
+                    self.push_command_error(CommandError::ArgumentRequired);
                     return;
                 }
 
                 let target = match parse_command_target(&target) {
                     Ok(target) => target,
-                    Err(message) => {
-                        self.push_command_error(message);
+                    Err(error) => {
+                        self.push_command_error(error);
                         return;
                     },
                 };
@@ -3649,8 +3745,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 let args = parts.collect::<Vec<_>>();
                 let command = match parse_multi_column_command(command, &args) {
                     Ok(command) => command,
-                    Err(message) => {
-                        self.push_command_error(message);
+                    Err(error) => {
+                        self.push_command_error(error);
                         return;
                     },
                 };
@@ -3664,7 +3760,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             "T" => {
                 let query = parts.collect::<Vec<_>>().join(" ");
                 if query.is_empty() {
-                    self.push_command_error(String::from("Missing tab query for :T"));
+                    self.push_command_error(CommandError::ArgumentRequired);
                     return;
                 }
                 #[cfg(target_os = "macos")]
@@ -3675,7 +3771,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 #[cfg(not(target_os = "macos"))]
                 {
                     let _ = query;
-                    self.push_command_error(String::from("Tab search is only available on macOS"));
+                    self.push_command_error(CommandError::Message(String::from(
+                        "Tab search is only available on macOS",
+                    )));
                 }
             },
             "r" => {
@@ -3685,7 +3783,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 self.open_web_inspector();
             },
             _ => {
-                self.push_command_error(format!("Unknown command: {command}"));
+                self.push_command_error(CommandError::UnknownCommand(trimmed.to_string()));
             },
         }
     }
@@ -3702,7 +3800,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     }
                 }
 
-                self.push_command_error(String::from("Failed to load URL"));
+                self.push_command_error(CommandError::Message(String::from("Failed to load URL")));
             },
             WindowKind::Terminal => {
                 let mut options = WindowOptions::default();
@@ -3785,10 +3883,14 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     return;
                 }
 
-                self.push_command_error(String::from("Web view is unavailable"));
+                self.push_command_error(CommandError::Message(String::from(
+                    "Web view is unavailable",
+                )));
             },
             WindowKind::Terminal => {
-                self.push_command_error(String::from("No active web tab to reload"));
+                self.push_command_error(CommandError::Message(String::from(
+                    "No active web tab to reload",
+                )));
             },
         }
     }
@@ -3803,16 +3905,25 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     }
                 }
 
-                self.push_command_error(String::from("Web inspector is unavailable"));
+                self.push_command_error(CommandError::Message(String::from(
+                    "Web inspector is unavailable",
+                )));
             },
             WindowKind::Terminal => {
-                self.push_command_error(String::from("No active web tab to inspect"));
+                self.push_command_error(CommandError::Message(String::from(
+                    "No active web tab to inspect",
+                )));
             },
         }
     }
 
-    fn push_command_error(&mut self, message: String) {
-        self.message_buffer.push(Message::new(message, crate::message_bar::MessageType::Error));
+    fn push_command_error(&mut self, error: CommandError) {
+        if matches!(self.tab_kind, WindowKind::Terminal) {
+            self.show_command_footer_feedback(&error);
+            return;
+        }
+
+        self.message_buffer.push(Message::new(error.footer_text(), MessageType::Error));
         self.display.pending_update.dirty = true;
     }
 }
@@ -3830,6 +3941,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         if self.search_active() {
             self.cancel_search();
         }
+        self.clear_command_footer_feedback();
 
         self.command_state.start_with_input(prompt, input);
         if let Some(web_view) = self.web_view.as_mut() {
@@ -4063,7 +4175,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
     fn web_view_source(&mut self) {
         let Some(current) = self.current_web_url() else {
-            self.push_command_error(String::from("No active URL"));
+            self.push_command_error(CommandError::Message(String::from("No active URL")));
             return;
         };
         let url = if current.starts_with("view-source:") {
@@ -4099,7 +4211,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
     fn web_copy_url(&mut self) {
         let Some(url) = self.current_web_url() else {
-            self.push_command_error(String::from("No active URL"));
+            self.push_command_error(CommandError::Message(String::from("No active URL")));
             return;
         };
         self.clipboard.store(ClipboardType::Clipboard, url);
@@ -4109,7 +4221,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let raw = self.clipboard.load(ClipboardType::Clipboard);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            self.push_command_error(String::from("Clipboard is empty"));
+            self.push_command_error(CommandError::Message(String::from("Clipboard is empty")));
             return;
         }
 
@@ -4170,18 +4282,18 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
     fn web_up_url(&mut self, root: bool) {
         let Some(current) = self.current_web_url() else {
-            self.push_command_error(String::from("No active URL"));
+            self.push_command_error(CommandError::Message(String::from("No active URL")));
             return;
         };
 
         let current = current.strip_prefix("view-source:").unwrap_or(&current);
         let Ok(mut parsed) = Url::parse(current) else {
-            self.push_command_error(String::from("Invalid URL"));
+            self.push_command_error(CommandError::Message(String::from("Invalid URL")));
             return;
         };
 
         if parsed.cannot_be_a_base() {
-            self.push_command_error(String::from("Unsupported URL"));
+            self.push_command_error(CommandError::Message(String::from("Unsupported URL")));
             return;
         }
 
@@ -4394,7 +4506,7 @@ impl<'a, N: Notify + 'a, T: EventListener> WebActions for ActionContext<'a, N, T
     }
 
     fn push_error(&mut self, message: String) {
-        self.push_command_error(message);
+        self.push_command_error(CommandError::Message(message));
     }
 }
 
@@ -4403,33 +4515,37 @@ enum CommandTarget {
     TerminalDir(PathBuf),
 }
 
-fn parse_multi_column_command(command: &str, args: &[&str]) -> Result<MultiColumnCommand, String> {
+fn parse_multi_column_command(
+    command: &str,
+    args: &[&str],
+) -> Result<MultiColumnCommand, CommandError> {
     let scope = match command {
         "c" => MultiColumnCommandScope::Local,
         "c!" => MultiColumnCommandScope::Global,
-        _ => return Err(format!("Unknown command: {command}")),
+        _ => return Err(CommandError::UnknownCommand(command.to_string())),
     };
 
     let [count] = args else {
         return if args.is_empty() {
-            Err(format!("Missing column count for :{command}"))
+            Err(CommandError::ArgumentRequired)
         } else {
-            Err(format!("Expected a single column count for :{command}"))
+            Err(CommandError::InvalidArgument(args.join(" ")))
         };
     };
 
-    let count = count.parse::<usize>().map_err(|_| format!("Invalid column count `{count}`"))?;
+    let count =
+        count.parse::<usize>().map_err(|_| CommandError::InvalidArgument((*count).to_string()))?;
     if count == 0 {
-        return Err(String::from("Column count must be at least 1"));
+        return Err(CommandError::InvalidArgument(count.to_string()));
     }
 
     Ok(MultiColumnCommand { scope, count })
 }
 
-fn parse_command_target(input: &str) -> Result<CommandTarget, String> {
+fn parse_command_target(input: &str) -> Result<CommandTarget, CommandError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Err(String::from("Missing target"));
+        return Err(CommandError::ArgumentRequired);
     }
 
     if looks_like_explicit_url(trimmed) {
@@ -4445,7 +4561,7 @@ fn parse_command_target(input: &str) -> Result<CommandTarget, String> {
             let url = file_url_from_path(&path)?;
             return Ok(CommandTarget::WebUrl(url));
         }
-        return Err(format!("Invalid path: {trimmed}"));
+        return Err(CommandError::InvalidArgument(trimmed.to_string()));
     }
 
     Ok(CommandTarget::WebUrl(normalize_web_url(trimmed)))
@@ -4520,17 +4636,18 @@ fn home_dir_from_env() -> Option<PathBuf> {
     None
 }
 
-fn file_url_from_path(path: &Path) -> Result<String, String> {
+fn file_url_from_path(path: &Path) -> Result<String, CommandError> {
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        let cwd = env::current_dir().map_err(|_| String::from("Invalid path"))?;
+        let cwd = env::current_dir()
+            .map_err(|_| CommandError::InvalidArgument(path.display().to_string()))?;
         cwd.join(path)
     };
 
     Url::from_file_path(&abs_path)
         .map(|url| url.to_string())
-        .map_err(|_| format!("Invalid file path: {}", abs_path.display()))
+        .map_err(|_| CommandError::InvalidArgument(abs_path.display().to_string()))
 }
 
 fn command_url_prefix(input: &str) -> Option<(usize, &str)> {
@@ -4567,7 +4684,7 @@ mod tests {
     use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 
     use super::{
-        CommandHistory, CommandTarget, MultiColumnCommand, MultiColumnCommandScope,
+        CommandError, CommandHistory, CommandTarget, MultiColumnCommand, MultiColumnCommandScope,
         command_url_prefix, parse_command_target, parse_multi_column_command,
         terminal_text_area_size,
     };
@@ -4610,7 +4727,7 @@ mod tests {
     fn parse_multi_column_command_rejects_missing_count() {
         assert_eq!(
             parse_multi_column_command("c", &[]).unwrap_err(),
-            "Missing column count for :c"
+            CommandError::ArgumentRequired
         );
     }
 
@@ -4618,7 +4735,28 @@ mod tests {
     fn parse_multi_column_command_rejects_zero() {
         assert_eq!(
             parse_multi_column_command("c!", &["0"]).unwrap_err(),
-            "Column count must be at least 1"
+            CommandError::InvalidArgument(String::from("0"))
+        );
+    }
+
+    #[test]
+    fn command_error_formats_unknown_command_like_vim() {
+        assert_eq!(
+            CommandError::UnknownCommand(String::from("Bogus 123")).footer_text(),
+            "E492: Not an editor command: Bogus 123"
+        );
+    }
+
+    #[test]
+    fn command_error_formats_missing_argument_like_vim() {
+        assert_eq!(CommandError::ArgumentRequired.footer_text(), "E471: Argument required");
+    }
+
+    #[test]
+    fn command_error_formats_invalid_argument_like_vim() {
+        assert_eq!(
+            CommandError::InvalidArgument(String::from("0")).footer_text(),
+            "E474: Invalid argument: 0"
         );
     }
 

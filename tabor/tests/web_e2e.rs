@@ -612,6 +612,12 @@ struct WindowDebugState {
     is_miniaturized: bool,
     notch_ears_active: bool,
     scale_factor: f64,
+    #[serde(default)]
+    is_key_window: bool,
+    #[serde(default)]
+    first_responder_class: Option<String>,
+    #[serde(default)]
+    content_view_class: Option<String>,
     window_number: Option<i64>,
     left_ear_window_number: Option<i64>,
     right_ear_window_number: Option<i64>,
@@ -1347,6 +1353,92 @@ fn macos_native_click_on_editable_renders_visible_caret() {
         "--session-id",
         inspector_session.as_str(),
     ]);
+}
+
+#[test]
+fn macos_close_active_web_tab_restores_focusable_content_view() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    let tab_id_arg = tab_id_arg(&reply);
+    ensure_active_web_tab(&harness, 4);
+
+    let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
+    let mut inspector_command_id = 1_i64;
+    let layout = wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        layout.get("mode").and_then(Value::as_str) == Some("normal")
+            && layout
+                .get("acceleration")
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                == Some("ready")
+    })
+    .unwrap_or_else(|| panic!("timed out waiting for initial browser layout"));
+
+    native_click_caret_probe(
+        &harness,
+        &layout,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+    );
+    assert_caret_probe_focused(
+        &harness,
+        tab_id_arg.as_str(),
+        &layout,
+        inspector_session.as_str(),
+        &mut inspector_command_id,
+        "focus handoff",
+    );
+
+    let focused_state = wait_for_window_debug_state_where(&harness, Duration::from_secs(4), |state| {
+        state.is_key_window
+            && state.first_responder_class.is_some()
+            && state.content_view_class.is_some()
+    })
+    .unwrap_or_else(|| {
+        let latest_state = window_debug_state(&harness);
+        panic!(
+            "timed out waiting for responder debug state after focusing editable content: {latest_state:?}; harness_log_tail:\n{}",
+            harness.log_tail()
+        )
+    });
+    assert_window_responder_classes_stable(&focused_state, "after focusing editable content");
+
+    let _ = harness.run_json([
+        "msg",
+        "inspector",
+        "detach",
+        "--session-id",
+        inspector_session.as_str(),
+    ]);
+
+    harness.run_ok(["msg", "close-tab"]);
+
+    let restored_state =
+        wait_for_window_debug_state_where(&harness, Duration::from_secs(4), |state| {
+            let Some(first_responder_class) = state.first_responder_class.as_deref() else {
+                return false;
+            };
+            let Some(content_view_class) = state.content_view_class.as_deref() else {
+                return false;
+            };
+            state.is_key_window && first_responder_class == content_view_class
+        })
+        .unwrap_or_else(|| {
+            let latest_state = window_debug_state(&harness);
+            panic!(
+                "timed out waiting for content view to regain first responder after closing web tab: {latest_state:?}; harness_log_tail:\n{}",
+                harness.log_tail()
+            )
+        });
+    assert_window_responder_classes_stable(&restored_state, "after closing active web tab");
+    assert_eq!(
+        restored_state.first_responder_class.as_deref(),
+        restored_state.content_view_class.as_deref(),
+        "expected the content view to regain first responder after closing the active web tab: {restored_state:?}"
+    );
 }
 
 #[test]
@@ -2321,6 +2413,43 @@ fn window_debug_snapshot(harness: &TaborHarness) -> WindowDebugSnapshot {
     };
     serde_json::from_value(snapshot.clone())
         .unwrap_or_else(|err| panic!("invalid window debug snapshot reply: {err}; reply={reply}"))
+}
+
+fn wait_for_window_debug_state_where<F>(
+    harness: &TaborHarness,
+    timeout: Duration,
+    mut predicate: F,
+) -> Option<WindowDebugState>
+where
+    F: FnMut(&WindowDebugState) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let state = window_debug_state(harness);
+        if predicate(&state) {
+            return Some(state);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    None
+}
+
+fn assert_window_responder_classes_stable(state: &WindowDebugState, label: &str) {
+    let first_responder_class = state.first_responder_class.as_deref().unwrap_or_else(|| {
+        panic!("missing first_responder_class during {label}: {state:?}");
+    });
+    let content_view_class = state.content_view_class.as_deref().unwrap_or_else(|| {
+        panic!("missing content_view_class during {label}: {state:?}");
+    });
+
+    assert!(
+        !first_responder_class.starts_with("TaborNoFirstResponder_"),
+        "first responder leaked the no-first-responder override during {label}: {state:?}"
+    );
+    assert!(
+        !content_view_class.starts_with("TaborNoFirstResponder_"),
+        "content view leaked the no-first-responder override during {label}: {state:?}"
+    );
 }
 
 fn browser_visual_point(layout: &Value, logical_x: i64, logical_y: i64) -> (f64, f64) {

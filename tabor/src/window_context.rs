@@ -70,9 +70,9 @@ use crate::display::{TabPanelEditOutcome, TabPanelEditTarget};
 #[cfg(target_os = "macos")]
 use crate::event::WebCommand;
 use crate::event::{
-    ActionContext, CommandHistory, CommandState, Event, EventProxy, EventType, InlineSearchState,
-    Mouse, MultiColumnCommand, MultiColumnCommandScope, SearchState, TouchPurpose,
-    request_web_cursor_update,
+    ActionContext, CommandFooterFeedback, CommandHistory, CommandState, Event, EventProxy,
+    EventType, InlineSearchState, Mouse, MultiColumnCommand, MultiColumnCommandScope, SearchState,
+    TouchPurpose, request_web_cursor_update,
 };
 #[cfg(unix)]
 use crate::input::ActionContext as _;
@@ -123,6 +123,7 @@ struct TabState {
     search_state: SearchState,
     inline_search_state: InlineSearchState,
     command_state: CommandState,
+    command_footer_feedback: CommandFooterFeedback,
     terminal_view_mode: TerminalViewMode,
     terminal_multi_column_count_override: Option<usize>,
     browser_view_mode: BrowserViewMode,
@@ -1773,6 +1774,7 @@ impl WindowContext {
             search_state: Default::default(),
             inline_search_state: Default::default(),
             command_state: Default::default(),
+            command_footer_feedback: Default::default(),
             terminal_view_mode,
             terminal_multi_column_count_override: None,
             #[cfg(target_os = "macos")]
@@ -4174,6 +4176,7 @@ impl WindowContext {
                 cursor_blink_timed_out: &mut active_tab.cursor_blink_timed_out,
                 prev_bell_cmd: &mut active_tab.prev_bell_cmd,
                 message_buffer: &mut self.message_buffer,
+                command_footer_feedback: &mut active_tab.command_footer_feedback,
                 inline_search_state: &mut active_tab.inline_search_state,
                 search_state: &mut active_tab.search_state,
                 command_state: &mut active_tab.command_state,
@@ -4216,6 +4219,9 @@ impl WindowContext {
         }
 
         self.apply_pending_display_update(old_is_searching);
+        if self.dirty && self.display.window.has_frame && !self.occluded {
+            self.display.window.request_redraw();
+        }
         Ok(())
     }
 
@@ -4688,6 +4694,7 @@ impl WindowContext {
                     &self.config,
                     &mut tab.search_state,
                     &tab.command_state,
+                    tab.command_footer_feedback.message(),
                     #[cfg(target_os = "macos")]
                     highlight_notch_ears,
                 );
@@ -4854,6 +4861,7 @@ impl WindowContext {
                 cursor_blink_timed_out: &mut active_tab.cursor_blink_timed_out,
                 prev_bell_cmd: &mut active_tab.prev_bell_cmd,
                 message_buffer: &mut self.message_buffer,
+                command_footer_feedback: &mut active_tab.command_footer_feedback,
                 inline_search_state: &mut active_tab.inline_search_state,
                 search_state: &mut active_tab.search_state,
                 command_state: &mut active_tab.command_state,

@@ -247,6 +247,12 @@ pub struct IpcWindowDebugState {
     pub is_miniaturized: bool,
     pub notch_ears_active: bool,
     pub scale_factor: f64,
+    #[serde(default)]
+    pub is_key_window: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_responder_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_view_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_number: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1743,6 +1749,9 @@ mod tests {
                     is_miniaturized: false,
                     notch_ears_active: true,
                     scale_factor: 2.0,
+                    is_key_window: true,
+                    first_responder_class: Some(String::from("WinitView")),
+                    content_view_class: Some(String::from("WinitView")),
                     window_number: Some(17),
                     left_ear_window_number: Some(18),
                     right_ear_window_number: Some(19),
@@ -1795,6 +1804,9 @@ mod tests {
                         is_miniaturized: false,
                         notch_ears_active: true,
                         scale_factor: 2.0,
+                        is_key_window: true,
+                        first_responder_class: Some(String::from("WinitView")),
+                        content_view_class: Some(String::from("WinitView")),
                         window_number: Some(17),
                         left_ear_window_number: Some(18),
                         right_ear_window_number: Some(19),

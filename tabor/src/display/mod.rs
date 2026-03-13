@@ -56,7 +56,7 @@ use crate::display::meter::Meter;
 use crate::display::tab_panel::{PanelDimensions, TabPanel, compute_panel_dimensions};
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
-use crate::event::{CommandState, Event, EventType, Mouse, SearchState};
+use crate::event::{CommandFooterMessage, CommandState, Event, EventType, Mouse, SearchState};
 #[cfg(target_os = "macos")]
 use crate::macos::webview::{WebPopupSurfaceRef, WebView};
 use crate::message_bar::{MessageBuffer, MessageType};
@@ -130,6 +130,58 @@ const SHORTENER: char = '…';
 
 /// Color which is used to highlight damaged rects when debugging.
 const DAMAGE_RECT_COLOR: Rgb = Rgb::new(255, 0, 255);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalFooterBarMode {
+    None,
+    ViIndicator,
+    CommandFeedback,
+    Search,
+    Command,
+}
+
+fn terminal_footer_bar_mode(
+    command_active: bool,
+    search_active: bool,
+    command_feedback_active: bool,
+    vi_mode: bool,
+) -> TerminalFooterBarMode {
+    if command_active {
+        TerminalFooterBarMode::Command
+    } else if search_active {
+        TerminalFooterBarMode::Search
+    } else if command_feedback_active {
+        TerminalFooterBarMode::CommandFeedback
+    } else if vi_mode {
+        TerminalFooterBarMode::ViIndicator
+    } else {
+        TerminalFooterBarMode::None
+    }
+}
+
+fn line_indicator_text(line: usize, total_lines: usize) -> String {
+    format!("[{}/{}]", line, total_lines.saturating_sub(1))
+}
+
+fn vi_mode_line_indicator_line(
+    layout: TerminalViewportLayout,
+    size_info: &SizeInfo,
+    cursor_point: Point,
+) -> usize {
+    let logical_bottom = layout.logical_size(size_info).bottommost_line().0;
+    usize::try_from(logical_bottom - cursor_point.line.0)
+        .expect("vi mode cursor should stay within the logical viewport")
+}
+
+fn footer_text_max_width(total_columns: usize, right_text: Option<&str>) -> usize {
+    let reserved_columns = right_text
+        .map(|text| {
+            let text_width = text.chars().count();
+            if text_width >= total_columns { text_width } else { text_width + 1 }
+        })
+        .unwrap_or(0);
+    total_columns.saturating_sub(reserved_columns)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct FooterBarViewportBand {
@@ -1140,6 +1192,7 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
         command_state: &CommandState,
+        command_footer_message: Option<&CommandFooterMessage>,
         #[cfg(target_os = "macos")] force_notch_ears: bool,
     ) {
         #[cfg(target_os = "macos")]
@@ -1164,10 +1217,17 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
         let command_active = command_state.is_active();
-        let message_visible =
-            message_buffer.message().is_some() && !command_active && search_state.regex().is_none();
-
         let vi_mode = terminal.mode().contains(TermMode::VI);
+        let search_active = search_state.regex().is_some();
+        let command_feedback_active = command_footer_message.is_some();
+        let footer_bar_mode = terminal_footer_bar_mode(
+            command_active,
+            search_active,
+            command_feedback_active,
+            vi_mode,
+        );
+        let message_visible =
+            message_buffer.message().is_some() && footer_bar_mode == TerminalFooterBarMode::None;
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
 
         let folded_terminal = terminal_viewport.is_multi_column();
@@ -1200,7 +1260,8 @@ impl Display {
             || self.visual_bell.intensity() != 0.
             || self.hint_state.active()
             || search_state.regex().is_some()
-            || command_active;
+            || command_active
+            || command_feedback_active;
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -1209,6 +1270,18 @@ impl Display {
         let vi_cursor_viewport_point = vi_cursor_point
             .and_then(|cursor| term::point_to_viewport(display_offset, cursor))
             .and_then(|point| terminal_viewport.visual_point_for_logical_viewport(point));
+        let vi_line_indicator = if footer_bar_mode == TerminalFooterBarMode::CommandFeedback {
+            None
+        } else {
+            vi_cursor_point.map(|cursor| {
+                line_indicator_text(
+                    vi_mode_line_indicator_line(terminal_viewport, &size_info, cursor),
+                    total_lines,
+                )
+            })
+        };
+        let footer_text_max_width =
+            footer_text_max_width(size_info.columns(), vi_line_indicator.as_deref());
         self.damage_tracker.damage_vi_cursor(vi_cursor_viewport_point);
         if !folded_terminal {
             self.damage_tracker.damage_selection(selection_range, display_offset);
@@ -1262,15 +1335,8 @@ impl Display {
 
         let mut rects = lines.rects(&metrics, &size_info);
 
-        if let Some(vi_cursor_point) = vi_cursor_point {
-            // Indicate vi mode by showing the cursor's position in the top right corner.
-            let line = (-vi_cursor_point.line.0 + size_info.bottommost_line().0) as usize;
-            let obstructed_column = Some(vi_cursor_point)
-                .and_then(|point| term::point_to_viewport(display_offset, point))
-                .and_then(|point| terminal_viewport.visual_point_for_logical_viewport(point))
-                .filter(|point| point.line == 0)
-                .map(|point| point.column);
-            self.draw_line_indicator(config, total_lines, obstructed_column, line);
+        if vi_mode {
+            // Vi mode reuses the footer bar as its status indicator.
         } else if search_state.regex().is_some() {
             // Show current display offset in vi-less search to indicate match position.
             self.draw_line_indicator(config, total_lines, None, display_offset);
@@ -1306,98 +1372,103 @@ impl Display {
         }
 
         // Handle IME positioning and command/search bar rendering.
-        let footer_offset = if command_active || search_state.regex().is_some() {
-            self.footer_offset()
-        } else {
-            0.
-        };
+        let footer_offset =
+            if footer_bar_mode == TerminalFooterBarMode::None { 0. } else { self.footer_offset() };
 
-        let ime_position = if command_active {
-            let command_text = Self::format_command(command_state.text(), size_info.columns());
+        let ime_position = match footer_bar_mode {
+            TerminalFooterBarMode::Command => {
+                let command_text =
+                    Self::format_command(command_state.text(), footer_text_max_width);
 
-            self.draw_command_bar(config, &command_text, footer_offset);
+                self.draw_command_bar(config, &command_text, footer_offset);
 
-            let line = size_info.screen_lines().saturating_sub(1);
-            let column = Column(command_text.chars().count() - 1);
+                let line = size_info.screen_lines().saturating_sub(1);
+                let column = Column(command_text.chars().count() - 1);
 
-            if self.ime.preedit().is_none() {
-                let fg = config.colors.footer_bar_foreground();
-                let shape = CursorShape::Underline;
-                let cursor_width = NonZeroU32::new(1).unwrap();
-                let cursor =
-                    RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
-                let mut cursor_rects: Vec<_> =
-                    cursor.rects(&size_info, config.cursor.thickness()).collect();
-                for rect in &mut cursor_rects {
-                    rect.y += footer_offset;
+                if self.ime.preedit().is_none() {
+                    let fg = config.colors.footer_bar_foreground();
+                    let shape = CursorShape::Underline;
+                    let cursor_width = NonZeroU32::new(1).unwrap();
+                    let cursor =
+                        RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
+                    let mut cursor_rects: Vec<_> =
+                        cursor.rects(&size_info, config.cursor.thickness()).collect();
+                    for rect in &mut cursor_rects {
+                        rect.y += footer_offset;
+                    }
+                    rects.extend(cursor_rects);
                 }
-                rects.extend(cursor_rects);
-            }
 
-            Some(Point::new(line, column))
-        } else {
-            match search_state.regex() {
-                Some(regex) => {
-                    let search_label = match search_state.direction() {
-                        Direction::Right => FORWARD_SEARCH_LABEL,
-                        Direction::Left => BACKWARD_SEARCH_LABEL,
-                    };
+                Some(Point::new(line, column))
+            },
+            TerminalFooterBarMode::Search => {
+                let regex = search_state.regex().expect("search footer mode requires regex");
+                let search_label = match search_state.direction() {
+                    Direction::Right => FORWARD_SEARCH_LABEL,
+                    Direction::Left => BACKWARD_SEARCH_LABEL,
+                };
 
-                    let search_text = Self::format_search(regex, search_label, size_info.columns());
+                let search_text = Self::format_search(regex, search_label, footer_text_max_width);
 
-                    // Render the search bar.
-                    self.draw_search(config, &search_text, footer_offset);
+                self.draw_search(config, &search_text, footer_offset);
 
-                    // Draw search bar cursor.
-                    let line = size_info.screen_lines().saturating_sub(1);
-                    let column = Column(search_text.chars().count() - 1);
+                let line = size_info.screen_lines().saturating_sub(1);
+                let column = Column(search_text.chars().count() - 1);
 
-                    // Add cursor to search bar if IME is not active.
-                    if self.ime.preedit().is_none() {
-                        let fg = config.colors.footer_bar_foreground();
-                        let shape = CursorShape::Underline;
-                        let cursor_width = NonZeroU32::new(1).unwrap();
-                        let cursor = RenderableCursor::new(
-                            Point::new(line, column),
-                            shape,
-                            fg,
-                            cursor_width,
-                        );
-                        let mut cursor_rects: Vec<_> =
-                            cursor.rects(&size_info, config.cursor.thickness()).collect();
-                        for rect in &mut cursor_rects {
-                            rect.y += footer_offset;
-                        }
-                        rects.extend(cursor_rects);
+                if self.ime.preedit().is_none() {
+                    let fg = config.colors.footer_bar_foreground();
+                    let shape = CursorShape::Underline;
+                    let cursor_width = NonZeroU32::new(1).unwrap();
+                    let cursor =
+                        RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
+                    let mut cursor_rects: Vec<_> =
+                        cursor.rects(&size_info, config.cursor.thickness()).collect();
+                    for rect in &mut cursor_rects {
+                        rect.y += footer_offset;
                     }
+                    rects.extend(cursor_rects);
+                }
 
-                    Some(Point::new(line, column))
-                },
-                None => {
-                    let num_lines = self.size_info.screen_lines();
-                    match vi_cursor_viewport_point {
-                        None => term::point_to_viewport(display_offset, cursor_point)
-                            .and_then(|point| {
-                                terminal_viewport.visual_point_for_logical_viewport(point)
-                            })
-                            .filter(|point| point.line < num_lines),
-                        point => point,
-                    }
-                },
-            }
+                Some(Point::new(line, column))
+            },
+            TerminalFooterBarMode::CommandFeedback => {
+                let message =
+                    command_footer_message.expect("command feedback footer mode requires message");
+                self.draw_command_feedback(config, message, footer_offset);
+                None
+            },
+            TerminalFooterBarMode::ViIndicator => {
+                self.draw_command_bar(config, "", footer_offset);
+                None
+            },
+            TerminalFooterBarMode::None => {
+                let num_lines = self.size_info.screen_lines();
+                match vi_cursor_viewport_point {
+                    None => term::point_to_viewport(display_offset, cursor_point)
+                        .and_then(|point| {
+                            terminal_viewport.visual_point_for_logical_viewport(point)
+                        })
+                        .filter(|point| point.line < num_lines),
+                    point => point,
+                }
+            },
         };
 
         // Handle IME.
         if self.ime.is_enabled() {
             if let Some(point) = ime_position {
-                let (fg, bg) = if command_active || search_state.regex().is_some() {
-                    (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
-                } else {
+                let (fg, bg) = if footer_bar_mode == TerminalFooterBarMode::None {
                     (foreground_color, background_color)
+                } else {
+                    (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
                 };
 
                 self.draw_ime_preview(point, fg, bg, &mut rects, config, footer_offset);
             }
+        }
+
+        if let Some(indicator_text) = vi_line_indicator.as_deref() {
+            self.draw_footer_line_indicator(config, indicator_text, footer_offset);
         }
 
         // Draw rectangles.
@@ -1896,6 +1967,14 @@ impl Display {
         bar_text
     }
 
+    fn format_footer_feedback(text: &str, max_width: usize) -> String {
+        if max_width == 0 {
+            return String::new();
+        }
+
+        StrShortener::new(text, max_width, ShortenDirection::Right, Some(SHORTENER)).collect()
+    }
+
     /// Draw preview for the currently highlighted `Hyperlink`.
     #[inline(never)]
     fn draw_hyperlink_preview(
@@ -2004,9 +2083,14 @@ impl Display {
         let extra_height = if text_offset_y < 0. { -text_offset_y } else { 0. };
         let background_offset =
             if text_offset_y < 0. { offset_y + text_offset_y } else { offset_y };
-        let height = self.size_info.cell_height() + extra_height;
+        let background_height = self.size_info.cell_height() + extra_height;
+        let band =
+            FooterBarViewportBand::new(&self.size_info, line, background_offset, background_height);
+        let (x, y, width, height) = band.damage_rect();
+        self.damage_tracker.frame().add_viewport_rect(&self.size_info, x, y, width, height);
+        self.damage_tracker.next_frame().add_viewport_rect(&self.size_info, x, y, width, height);
 
-        self.draw_footer_bar_background_with_height(bg, line, background_offset, height);
+        self.draw_footer_bar_background_with_height(bg, line, background_offset, background_height);
 
         let text_offset = offset_y + text_offset_y;
         self.renderer.set_text_projection_with_offset(&self.size_info, (0., text_offset));
@@ -2043,6 +2127,62 @@ impl Display {
         self.draw_footer_bar_line(text, fg, bg, line, offset_y);
     }
 
+    fn draw_command_feedback(
+        &mut self,
+        config: &UiConfig,
+        message: &CommandFooterMessage,
+        offset_y: f32,
+    ) {
+        let text = Self::format_footer_feedback(message.text(), self.size_info.columns());
+        let fg = config.colors.primary.background;
+        let bg = match message.ty() {
+            MessageType::Error => config.colors.normal.red,
+            MessageType::Warning => config.colors.normal.yellow,
+        };
+        let line = self.size_info.screen_lines().saturating_sub(1);
+
+        self.draw_footer_bar_line(&text, fg, bg, line, offset_y);
+    }
+
+    fn draw_footer_right_aligned_text(
+        &mut self,
+        text: &str,
+        fg: Rgb,
+        bg: Rgb,
+        line: usize,
+        offset_y: f32,
+    ) {
+        let columns = self.size_info.columns();
+        if columns == 0 {
+            return;
+        }
+
+        let text: String =
+            StrShortener::new(text, columns, ShortenDirection::Left, Some(SHORTENER)).collect();
+        let column = Column(columns.saturating_sub(text.chars().count()));
+        let point = Point::new(line, column);
+
+        self.renderer.set_text_projection_with_offset(&self.size_info, (0., offset_y));
+        self.renderer.draw_string(
+            point,
+            fg,
+            bg,
+            text.chars(),
+            &self.size_info,
+            &mut self.glyph_cache,
+        );
+        self.renderer.set_text_projection(&self.size_info);
+    }
+
+    fn draw_footer_line_indicator(&mut self, config: &UiConfig, text: &str, offset_y: f32) {
+        let colors = &config.colors;
+        let fg = colors.line_indicator.foreground.unwrap_or(colors.primary.background);
+        let bg = colors.line_indicator.background.unwrap_or(colors.primary.foreground);
+        let line = self.size_info.screen_lines().saturating_sub(1);
+
+        self.draw_footer_right_aligned_text(text, fg, bg, line, offset_y);
+    }
+
     /// Draw render timer.
     #[inline(never)]
     fn draw_render_timer(&mut self, config: &UiConfig) {
@@ -2074,7 +2214,7 @@ impl Display {
         line: usize,
     ) {
         let columns = self.size_info.columns();
-        let text = format!("[{}/{}]", line, total_lines - 1);
+        let text = line_indicator_text(line, total_lines);
         let column = Column(self.size_info.columns().saturating_sub(text.len()));
         let point = Point::new(0, column);
 
@@ -2471,6 +2611,7 @@ fn window_size(
 mod tests {
     use super::*;
     use crate::config::browser::MultiColumnBrowserConfig;
+    use crate::config::terminal::MultiColumnTerminalConfig;
     use crate::display::browser_layout::BrowserViewMode;
 
     #[test]
@@ -2576,6 +2717,52 @@ mod tests {
 
         assert_eq!(band, FooterBarViewportBand { x: 130., y: 91., width: 162., height: 24. });
         assert_eq!(band.damage_rect(), (130, 91, 162, 24));
+    }
+
+    #[test]
+    fn terminal_footer_bar_mode_shows_vi_indicator_only_when_idle_in_vi_mode() {
+        assert_eq!(
+            terminal_footer_bar_mode(false, false, false, false),
+            TerminalFooterBarMode::None
+        );
+        assert_eq!(
+            terminal_footer_bar_mode(false, false, false, true),
+            TerminalFooterBarMode::ViIndicator
+        );
+        assert_eq!(
+            terminal_footer_bar_mode(false, true, false, true),
+            TerminalFooterBarMode::Search
+        );
+        assert_eq!(
+            terminal_footer_bar_mode(true, false, false, true),
+            TerminalFooterBarMode::Command
+        );
+        assert_eq!(
+            terminal_footer_bar_mode(false, false, true, true),
+            TerminalFooterBarMode::CommandFeedback
+        );
+        assert_eq!(
+            terminal_footer_bar_mode(false, true, true, true),
+            TerminalFooterBarMode::Search
+        );
+        assert_eq!(
+            terminal_footer_bar_mode(true, false, true, true),
+            TerminalFooterBarMode::Command
+        );
+    }
+
+    #[test]
+    fn vi_mode_line_indicator_uses_logical_multi_column_height() {
+        let size = SizeInfo::new(300., 4., 1., 1., 0., 0., 0., false);
+        let layout = TerminalViewportLayout::new(
+            &size,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+            None,
+        );
+
+        assert_eq!(vi_mode_line_indicator_line(layout, &size, Point::new(Line(11), Column(0))), 0);
+        assert_eq!(vi_mode_line_indicator_line(layout, &size, Point::new(Line(0), Column(0))), 11);
     }
 
     #[cfg(target_os = "macos")]

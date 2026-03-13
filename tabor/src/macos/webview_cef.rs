@@ -1,29 +1,26 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::ffi::{CString, c_void};
-use std::fmt::Write;
+use std::ffi::c_void;
 use std::fs;
-use std::mem;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc as StdRc;
 
 use cef::{
-    CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler,
+    CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler, FocusHandler,
     ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
     ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplDownloadHandler,
-    ImplDownloadItem, ImplFrame, ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler,
-    ImplPermissionPromptCallback, ImplProcessMessage, ImplRenderHandler, ImplTask,
-    PermissionHandler, PermissionRequestResult, RenderHandler, Task, WrapClient,
-    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler, WrapPermissionHandler,
-    WrapRenderHandler, WrapTask, rc::Rc,
+    ImplDownloadItem, ImplFocusHandler, ImplFrame, ImplListValue, ImplMediaAccessCallback,
+    ImplPermissionHandler, ImplPermissionPromptCallback, ImplProcessMessage, ImplRenderHandler,
+    ImplTask, PermissionHandler, PermissionRequestResult, RenderHandler, Task, WrapClient,
+    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler, WrapFocusHandler,
+    WrapPermissionHandler, WrapRenderHandler, WrapTask, rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
-use objc2::ffi;
-use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
-use objc2::{MainThreadMarker, msg_send, sel};
+use objc2::runtime::AnyObject;
+use objc2::{MainThreadMarker, msg_send};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, MouseButton};
@@ -377,6 +374,85 @@ fn handle_client_process_message(
 
     editable_focus_notifier.send(editable);
     1
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WebFocusPolicyState {
+    host_focused: bool,
+    editable_focused: bool,
+    native_focus_armed: bool,
+}
+
+#[derive(Clone, Default)]
+struct WebFocusPolicy {
+    state: StdRc<RefCell<WebFocusPolicyState>>,
+}
+
+impl WebFocusPolicy {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_host_focused(&self, host_focused: bool) {
+        let mut state = self.state.borrow_mut();
+        state.host_focused = host_focused;
+        if !host_focused {
+            state.native_focus_armed = false;
+        }
+    }
+
+    fn set_editable_focused(&self, editable_focused: bool) {
+        let mut state = self.state.borrow_mut();
+        state.editable_focused = editable_focused;
+        if !editable_focused {
+            state.native_focus_armed = false;
+        }
+    }
+
+    fn host_focused(&self) -> bool {
+        self.state.borrow().host_focused
+    }
+
+    fn editable_focused(&self) -> bool {
+        self.state.borrow().editable_focused
+    }
+
+    fn arm_native_focus(&self) {
+        self.state.borrow_mut().native_focus_armed = true;
+    }
+
+    fn disarm_native_focus(&self) {
+        self.state.borrow_mut().native_focus_armed = false;
+    }
+
+    fn allows_browser_focus(&self) -> bool {
+        let state = self.state.borrow();
+        state.host_focused && (state.editable_focused || state.native_focus_armed)
+    }
+}
+
+cef::wrap_focus_handler! {
+    struct TaborFocusHandler {
+        focus_policy: WebFocusPolicy,
+    }
+
+    impl FocusHandler {
+        fn on_take_focus(&self, _browser: Option<&mut cef::Browser>, _next: ::std::os::raw::c_int) {
+            self.focus_policy.disarm_native_focus();
+        }
+
+        fn on_set_focus(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _source: cef::FocusSource,
+        ) -> ::std::os::raw::c_int {
+            if self.focus_policy.allows_browser_focus() { 0 } else { 1 }
+        }
+
+        fn on_got_focus(&self, _browser: Option<&mut cef::Browser>) {
+            self.focus_policy.disarm_native_focus();
+        }
+    }
 }
 
 fn browser_device_scale_factor(scale_factor: f64) -> f32 {
@@ -1216,6 +1292,7 @@ cef::wrap_client! {
         display_handler: cef::DisplayHandler,
         render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
+        focus_handler: cef::FocusHandler,
         editable_focus_notifier: WebEditableFocusNotifier,
         permission_handler: cef::PermissionHandler,
     }
@@ -1231,6 +1308,10 @@ cef::wrap_client! {
 
         fn download_handler(&self) -> Option<cef::DownloadHandler> {
             Some(self.download_handler.clone())
+        }
+
+        fn focus_handler(&self) -> Option<cef::FocusHandler> {
+            Some(self.focus_handler.clone())
         }
 
         fn on_process_message_received(
@@ -1255,6 +1336,7 @@ cef::wrap_client! {
         display_handler: cef::DisplayHandler,
         render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
+        focus_handler: cef::FocusHandler,
         editable_focus_notifier: WebEditableFocusNotifier,
     }
 
@@ -1269,6 +1351,10 @@ cef::wrap_client! {
 
         fn download_handler(&self) -> Option<cef::DownloadHandler> {
             Some(self.download_handler.clone())
+        }
+
+        fn focus_handler(&self) -> Option<cef::FocusHandler> {
+            Some(self.focus_handler.clone())
         }
 
         fn on_process_message_received(
@@ -1354,8 +1440,7 @@ pub struct WebView {
     browser: cef::Browser,
     last_title: Option<String>,
     last_url: Option<String>,
-    host_focused: bool,
-    editable_focused: bool,
+    focus_policy: WebFocusPolicy,
     title_state: StdRc<RefCell<Option<String>>>,
     paint_state: StdRc<RefCell<PaintState>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
@@ -1408,6 +1493,8 @@ impl WebView {
             let automation_state = StdRc::new(RefCell::new(AutomationState::new()));
             let display_handler = TaborDisplayHandler::new(title_state.clone());
             let download_handler = TaborDownloadHandler::new(automation_state.clone());
+            let focus_policy = WebFocusPolicy::new();
+            let focus_handler = TaborFocusHandler::new(focus_policy.clone());
             let editable_focus_notifier =
                 WebEditableFocusNotifier::new(proxy.clone(), window.id(), tab_id);
             #[cfg(not(feature = "passkey-webauthn"))]
@@ -1417,6 +1504,7 @@ impl WebView {
                     display_handler,
                     render_handler,
                     download_handler,
+                    focus_handler,
                     editable_focus_notifier,
                     permission_handler,
                 )
@@ -1426,6 +1514,7 @@ impl WebView {
                 display_handler,
                 render_handler,
                 download_handler,
+                focus_handler,
                 editable_focus_notifier,
             );
 
@@ -1441,9 +1530,6 @@ impl WebView {
             )
             .ok_or_else(|| std::io::Error::other("Failed to create CEF browser"))?;
 
-            if let Some(view) = browser_view(&browser) {
-                disable_cef_view_first_responder(view);
-            }
             if let Some(host) = browser.host() {
                 host.set_windowless_frame_rate(60);
                 host.notify_screen_info_changed();
@@ -1462,8 +1548,7 @@ impl WebView {
                 browser,
                 last_title: None,
                 last_url: None,
-                host_focused: false,
-                editable_focused: false,
+                focus_policy,
                 title_state,
                 paint_state,
                 devtools_state,
@@ -1499,14 +1584,14 @@ impl WebView {
     }
 
     pub fn set_focus(&mut self, focus: bool) {
-        self.host_focused = focus;
+        self.focus_policy.set_host_focused(focus);
         if let Some(host) = self.browser.host() {
             host.set_focus(if focus { 1 } else { 0 });
         }
     }
 
     pub fn sync_editable_focus(&mut self, editable: bool) {
-        self.editable_focused = editable;
+        self.focus_policy.set_editable_focused(editable);
         invalidate_browser_surfaces(&self.browser);
     }
 
@@ -1516,20 +1601,21 @@ impl WebView {
             return false;
         };
 
-        if self.host_focused && self.editable_focused {
-            enable_cef_view_first_responder(view);
-            let restored = window.focus_native_view(view);
-            if restored {
-                if let Some(host) = self.browser.host() {
-                    host.set_focus(1);
-                }
-                invalidate_browser_surfaces(&self.browser);
-            }
-            return restored;
+        if !self.focus_policy.host_focused() || !self.focus_policy.editable_focused() {
+            return false;
         }
 
-        disable_cef_view_first_responder(view);
-        false
+        self.focus_policy.arm_native_focus();
+        let restored = window.focus_native_view(view);
+        if restored {
+            if let Some(host) = self.browser.host() {
+                host.set_focus(1);
+            }
+            invalidate_browser_surfaces(&self.browser);
+        } else {
+            self.focus_policy.disarm_native_focus();
+        }
+        restored
     }
 
     pub fn update_frame(
@@ -1627,7 +1713,7 @@ impl WebView {
     }
 
     fn prepare_native_focus_for_mouse_input(&mut self, window: &Window) {
-        if !self.host_focused {
+        if !self.focus_policy.host_focused() {
             return;
         }
 
@@ -1635,13 +1721,13 @@ impl WebView {
             return;
         };
 
-        enable_cef_view_first_responder(view);
+        self.focus_policy.arm_native_focus();
         if window.focus_native_view(view) {
             if let Some(host) = self.browser.host() {
                 host.set_focus(1);
             }
         } else {
-            disable_cef_view_first_responder(view);
+            self.focus_policy.disarm_native_focus();
         }
     }
 
@@ -2753,129 +2839,17 @@ fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
     if view.is_null() { None } else { Some(view) }
 }
 
-const NO_FIRST_RESPONDER_CLASS_PREFIX: &[u8] = b"TaborNoFirstResponder_";
-
 fn close_browser_resources(browser: &cef::Browser) {
     if let Some(host) = browser.host() {
         host.close_browser(1);
     }
 }
 
-// Keep the embedded CEF view from stealing keyboard focus.
-//
-// Tabor routes keyboard events through winit even for web tabs (command bar, vi-like bindings,
-// web automation), so the CEF view must not become the NSWindow first responder.
-unsafe extern "C-unwind" fn cef_view_accepts_first_responder(_this: &AnyObject, _sel: Sel) -> Bool {
-    Bool::NO
-}
-
-unsafe extern "C-unwind" fn cef_view_become_first_responder(_this: &AnyObject, _sel: Sel) -> Bool {
-    Bool::NO
-}
-
-fn no_first_responder_subclass(superclass: &AnyClass) -> &'static AnyClass {
-    let super_name = superclass.name().to_str().unwrap_or("Unknown");
-    let name = CString::new(format!("TaborNoFirstResponder_{super_name}"))
-        .expect("no-first-responder subclass name");
-
-    if let Some(existing) = AnyClass::get(name.as_c_str()) {
-        return existing;
-    }
-
-    let super_ptr = superclass as *const AnyClass;
-    let cls = unsafe { ffi::objc_allocateClassPair(super_ptr, name.as_ptr(), 0) };
-    let cls =
-        std::ptr::NonNull::new(cls).expect("failed to allocate no-first-responder override class");
-
-    unsafe {
-        add_method_raw(
-            cls.as_ptr(),
-            sel!(acceptsFirstResponder),
-            mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
-                cef_view_accepts_first_responder,
-            ),
-            Bool::ENCODING,
-            &[],
-        );
-        add_method_raw(
-            cls.as_ptr(),
-            sel!(becomeFirstResponder),
-            mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
-                cef_view_become_first_responder,
-            ),
-            Bool::ENCODING,
-            &[],
-        );
-
-        ffi::objc_registerClassPair(cls.as_ptr());
-        cls.as_ref()
-    }
-}
-
-fn disable_cef_view_first_responder(view: *mut AnyObject) {
-    if view.is_null() {
-        return;
-    }
-
-    let obj = unsafe { &*view };
-    let current_class = obj.class();
-    if current_class.name().to_bytes().starts_with(NO_FIRST_RESPONDER_CLASS_PREFIX) {
-        return;
-    }
-
-    let subclass = no_first_responder_subclass(current_class);
-    unsafe {
-        let old_class = AnyObject::set_class(obj, subclass);
-        debug_assert_eq!(old_class, current_class);
-    }
-}
-
-fn enable_cef_view_first_responder(view: *mut AnyObject) {
-    if view.is_null() {
-        return;
-    }
-
-    let obj = unsafe { &*view };
-    let current_class = obj.class();
-    if !current_class.name().to_bytes().starts_with(NO_FIRST_RESPONDER_CLASS_PREFIX) {
-        return;
-    }
-
-    let Some(superclass) = current_class.superclass() else {
-        return;
-    };
-
-    unsafe {
-        let old_class = AnyObject::set_class(obj, superclass);
-        debug_assert_eq!(old_class, current_class);
-    }
-}
-
-unsafe fn add_method_raw(
-    cls: *mut AnyClass,
-    selector: Sel,
-    imp: Imp,
-    ret: Encoding,
-    args: &[Encoding],
-) {
-    let encoding = method_type_encoding(ret, args);
-    let success = unsafe { ffi::class_addMethod(cls, selector, imp, encoding.as_ptr()) };
-    assert!(success.as_bool(), "failed to add no-first-responder override method");
-}
-
-fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
-    let mut types = format!("{ret}{}{}", Encoding::Object, Encoding::Sel);
-    for enc in args {
-        let _ = write!(&mut types, "{enc}");
-    }
-    CString::new(types).expect("method type encoding")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        PaintState, WebViewDirtyNotifier, browser_device_scale_factor, browser_screen_point,
-        browser_settings, cef_mouse_button_flag, cef_mouse_event_flags,
+        PaintState, WebFocusPolicy, WebViewDirtyNotifier, browser_device_scale_factor,
+        browser_screen_point, browser_settings, cef_mouse_button_flag, cef_mouse_event_flags,
         handle_ime_composition_range_change, handle_text_selection_change,
         parse_web_editable_focus_message, scaled_browser_wheel_delta_y,
         should_invalidate_after_frame_edit, should_invalidate_after_key_input,
@@ -2922,6 +2896,40 @@ mod tests {
         assert!(!should_invalidate_after_frame_edit(super::FrameEditCommand::Copy));
         assert!(should_invalidate_after_frame_edit(super::FrameEditCommand::Cut));
         assert!(should_invalidate_after_frame_edit(super::FrameEditCommand::Paste));
+    }
+
+    #[test]
+    fn web_focus_policy_blocks_unfocused_and_unarmed_browser_focus() {
+        let policy = WebFocusPolicy::new();
+        assert!(!policy.allows_browser_focus());
+
+        policy.set_host_focused(true);
+        assert!(!policy.allows_browser_focus());
+    }
+
+    #[test]
+    fn web_focus_policy_allows_armed_focus_before_editable_sync() {
+        let policy = WebFocusPolicy::new();
+        policy.set_host_focused(true);
+        policy.arm_native_focus();
+        assert!(policy.allows_browser_focus());
+
+        policy.disarm_native_focus();
+        assert!(!policy.allows_browser_focus());
+    }
+
+    #[test]
+    fn web_focus_policy_allows_editable_focus_until_blur() {
+        let policy = WebFocusPolicy::new();
+        policy.set_host_focused(true);
+        policy.set_editable_focused(true);
+        assert!(policy.allows_browser_focus());
+
+        policy.disarm_native_focus();
+        assert!(policy.allows_browser_focus());
+
+        policy.set_editable_focused(false);
+        assert!(!policy.allows_browser_focus());
     }
 
     #[test]

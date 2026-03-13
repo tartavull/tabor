@@ -750,6 +750,13 @@ impl Window {
             is_miniaturized: window.isMiniaturized(),
             notch_ears_active: notch_ears.is_active() || real_ear_fullscreen_active,
             scale_factor: self.scale_factor,
+            is_key_window: window.isKeyWindow(),
+            first_responder_class: window
+                .firstResponder()
+                .map(|responder| ns_object_class_name(Retained::as_ptr(&responder).cast())),
+            content_view_class: window
+                .contentView()
+                .map(|content_view| ns_object_class_name(Retained::as_ptr(&content_view).cast())),
             window_number: Some(window.windowNumber() as i64),
             left_ear_window_number,
             right_ear_window_number,
@@ -1506,6 +1513,14 @@ fn ns_edge_insets_to_ipc(insets: NSEdgeInsets) -> IpcWindowDebugInsets {
         bottom: insets.bottom,
         right: insets.right,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ns_object_class_name(object: *const AnyObject) -> String {
+    let Some(object) = (unsafe { object.as_ref() }) else {
+        return String::from("Unknown");
+    };
+    object.class().name().to_string_lossy().into_owned()
 }
 
 #[cfg(target_os = "macos")]

@@ -41,6 +41,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             text = "\r";
         }
 
+        if !Self::is_modifier_key(&key) {
+            self.ctx.clear_command_feedback();
+        }
+
         // All key bindings are disabled while a hint is being selected.
         if self.ctx.display().hint_state.active() {
             for character in text.chars() {

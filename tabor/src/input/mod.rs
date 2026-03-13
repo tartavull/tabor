@@ -112,6 +112,7 @@ pub trait ActionContext<T: EventListener> {
     fn reset_font_size(&mut self) {}
     fn toggle_multi_column_terminal(&mut self) {}
     fn pop_message(&mut self) {}
+    fn clear_command_feedback(&mut self) {}
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
     #[cfg(target_os = "macos")]
