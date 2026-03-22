@@ -31,7 +31,6 @@ enum HarnessLaunchMode {
 struct TempAppBundle {
     bundle_dir: PathBuf,
     executable: PathBuf,
-    bundle_id: String,
 }
 
 const CEF_HELPER_NAMES: [&str; 5] = [
@@ -44,11 +43,11 @@ const CEF_HELPER_NAMES: [&str; 5] = [
 
 struct TaborHarness {
     client_bin: PathBuf,
+    bundle_dir: PathBuf,
     socket: PathBuf,
     _tmp: TempDir,
     log_path: PathBuf,
     child: Child,
-    activation_bundle_id: Option<String>,
     kill_path: Option<PathBuf>,
 }
 
@@ -82,12 +81,10 @@ impl TaborHarness {
         let stdout = File::create(&log_path).expect("failed to create harness log file");
         let stderr = stdout.try_clone().expect("failed to clone harness log file");
 
-        let mut activation_bundle_id = None;
         let kill_path = Some(bundle.executable.clone());
         let mut command = match mode {
             HarnessLaunchMode::BackgroundBinary => Command::new(&bundle.executable),
             HarnessLaunchMode::ForegroundAppBundle { .. } => {
-                activation_bundle_id = Some(bundle.bundle_id);
                 let mut command = Command::new("open");
                 command.arg("-n").arg(&bundle.bundle_dir).arg("--args");
                 command
@@ -115,19 +112,19 @@ impl TaborHarness {
 
         let harness = Self {
             client_bin,
+            bundle_dir: bundle.bundle_dir,
             socket,
             _tmp: tmp,
             log_path: log_path.clone(),
             child,
-            activation_bundle_id,
             kill_path,
         };
 
         let start = Instant::now();
         while start.elapsed() < START_TIMEOUT {
             if harness.socket.exists() && harness.run_checked(["msg", "ping"]).is_ok() {
-                if let Some(bundle_id) = harness.activation_bundle_id.as_deref() {
-                    harness.activate_bundle(bundle_id);
+                if matches!(mode, HarnessLaunchMode::ForegroundAppBundle { .. }) {
+                    harness.activate_bundle();
                 }
                 return harness;
             }
@@ -252,22 +249,42 @@ impl TaborHarness {
         self._tmp.path().join(name)
     }
 
-    fn send_raw_request(&self, request: Value) -> Value {
-        let request = request.to_string();
-        self.run_json(["msg", "send", request.as_str()])
+    fn open_file_with_app_bundle(&self, path: &Path) {
+        let output =
+            Command::new("open").arg("-a").arg(&self.bundle_dir).arg(path).output().unwrap_or_else(
+                |err| {
+                    panic!(
+                        "failed to open {} with {}: {err}",
+                        path.display(),
+                        self.bundle_dir.display()
+                    )
+                },
+            );
+        assert!(
+            output.status.success(),
+            "open -a {} {} failed: {}",
+            self.bundle_dir.display(),
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    fn activate_bundle(&self, bundle_id: &str) {
-        let script = format!("tell application id \"{bundle_id}\" to activate");
+    fn activate_bundle(&self) {
         let output =
-            Command::new("osascript").arg("-e").arg(&script).output().unwrap_or_else(|err| {
-                panic!("failed to run osascript activate for {bundle_id}: {err}")
+            Command::new("open").arg("-a").arg(&self.bundle_dir).output().unwrap_or_else(|err| {
+                panic!("failed to activate app bundle {}: {err}", self.bundle_dir.display())
             });
         assert!(
             output.status.success(),
-            "failed to activate bundle {bundle_id}: {}",
+            "failed to activate bundle {}: {}",
+            self.bundle_dir.display(),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn send_raw_request(&self, request: Value) -> Value {
+        let request = request.to_string();
+        self.run_json(["msg", "send", request.as_str()])
     }
 }
 
@@ -297,10 +314,7 @@ fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
             info_plist_dst.display()
         )
     });
-    let bundle_id = format!(
-        "com.pinkbot.tabor.test.{}",
-        tmp.path().file_name().and_then(|name| name.to_str()).unwrap_or("bundle").replace('.', "-")
-    );
+    let bundle_id = format!("com.pinkbot.tabor.test.{}", sanitized_bundle_id_suffix(tmp.path()));
     let plist_status = Command::new("/usr/libexec/PlistBuddy")
         .arg("-c")
         .arg(format!("Set :CFBundleIdentifier {bundle_id}"))
@@ -389,7 +403,15 @@ fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
         bundle_dir.display()
     );
 
-    TempAppBundle { bundle_dir, executable: bundled_bin, bundle_id }
+    TempAppBundle { bundle_dir, executable: bundled_bin }
+}
+
+fn sanitized_bundle_id_suffix(path: &Path) -> String {
+    let raw = path.file_name().and_then(|name| name.to_str()).unwrap_or("bundle");
+    let sanitized =
+        raw.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' }).collect::<String>();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() { String::from("bundle") } else { sanitized.to_string() }
 }
 
 fn helper_info_plist(bundle_dir: &Path, helper_name: &str) -> PathBuf {
@@ -638,7 +660,7 @@ struct WindowDebugSnapshot {
 }
 
 #[test]
-fn temp_app_bundle_helpers_inherit_media_usage_strings() {
+fn temp_app_bundle_helpers_inherit_browser_usage_strings() {
     let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let bundle = create_temp_app_bundle(&tmp, &built_bin);
@@ -650,6 +672,15 @@ fn temp_app_bundle_helpers_inherit_media_usage_strings() {
         .unwrap_or_else(|| {
             panic!("missing NSMicrophoneUsageDescription in {}", main_info.display())
         });
+    let expected_distribution = plist_string(&main_info, "TABORDistributionChannel")
+        .unwrap_or_else(|| panic!("missing TABORDistributionChannel in {}", main_info.display()));
+    let expected_passkey_usage = plist_string(
+        &main_info,
+        "NSWebBrowserPublicKeyCredentialUsageDescription",
+    )
+    .unwrap_or_else(|| {
+        panic!("missing NSWebBrowserPublicKeyCredentialUsageDescription in {}", main_info.display())
+    });
 
     for helper_name in CEF_HELPER_NAMES {
         let helper_info = helper_info_plist(&bundle.bundle_dir, helper_name);
@@ -663,6 +694,19 @@ fn temp_app_bundle_helpers_inherit_media_usage_strings() {
             plist_string(&helper_info, "NSMicrophoneUsageDescription").as_deref(),
             Some(expected_microphone.as_str()),
             "helper microphone usage mismatch for {}",
+            helper_info.display()
+        );
+        assert_eq!(
+            plist_string(&helper_info, "TABORDistributionChannel").as_deref(),
+            Some(expected_distribution.as_str()),
+            "helper distribution marker mismatch for {}",
+            helper_info.display()
+        );
+        assert_eq!(
+            plist_string(&helper_info, "NSWebBrowserPublicKeyCredentialUsageDescription")
+                .as_deref(),
+            Some(expected_passkey_usage.as_str()),
+            "helper passkey usage mismatch for {}",
             helper_info.display()
         );
         assert_eq!(
@@ -1685,6 +1729,59 @@ fn agent_artifacts_smoke() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("download missing full_path: {download}"));
     assert!(Path::new(download_path).exists(), "downloaded file missing: {download}");
+}
+
+#[test]
+fn macos_opened_pdf_document_appears_as_web_tab_without_download() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let fixture = fixture_url();
+
+    let reply = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+    let _ = wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+        .unwrap_or_else(|| panic!("timed out waiting for initial agent observation"));
+
+    let pdf_path = harness.tmp_path("opened-document.pdf");
+    let pdf_path_str = pdf_path.to_str().expect("pdf path is not valid utf-8");
+    let pdf = harness.run_json(["agent", "pdf", "--path", pdf_path_str]);
+    assert_eq!(pdf.get("type").and_then(Value::as_str), Some("pdf"));
+    let pdf_bytes = std::fs::read(&pdf_path).expect("failed to read generated pdf");
+    assert!(pdf_bytes.starts_with(b"%PDF"), "generated PDF missing header");
+
+    let expected_pdf_path = pdf_path.canonicalize().unwrap_or_else(|err| {
+        panic!("failed to canonicalize generated pdf path {}: {err}", pdf_path.display())
+    });
+    let expected_url = Url::from_file_path(&expected_pdf_path)
+        .expect("failed to build file URL for generated pdf")
+        .to_string();
+    harness.open_file_with_app_bundle(&pdf_path);
+
+    let active_pdf_tab =
+        wait_for_active_web_url_value(&harness, expected_url.as_str(), Duration::from_secs(8))
+            .unwrap_or_else(|| panic!("timed out waiting for active PDF tab at {expected_url}"));
+    let pdf_tab_id = tab_id_pair(&active_pdf_tab)
+        .unwrap_or_else(|| panic!("missing tab id for active PDF tab: {active_pdf_tab}"));
+    let pdf_tab_id_arg = format!("{}:{}", pdf_tab_id.0, pdf_tab_id.1);
+    let _ = wait_for_tab_acceleration_settled(
+        &harness,
+        pdf_tab_id_arg.as_str(),
+        Duration::from_secs(8),
+    )
+    .unwrap_or_else(|| panic!("timed out waiting for PDF tab acceleration to settle"));
+
+    harness.run_json(["agent", "use", "--active"]);
+    let downloads = harness.run_json(["agent", "downloads"]);
+    let download_entries = downloads
+        .get("downloads")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing downloads array: {downloads}"));
+    assert!(
+        download_entries.is_empty(),
+        "expected opened PDF tab to avoid tracked downloads: {downloads}"
+    );
 }
 
 #[test]
@@ -3053,6 +3150,33 @@ fn active_tab(response: &Value) -> Option<&Value> {
     flatten_tabs(response)
         .into_iter()
         .find(|tab| tab.get("is_active").and_then(Value::as_bool) == Some(true))
+}
+
+fn tab_web_url(tab: &Value) -> Option<&str> {
+    tab.get("kind")
+        .and_then(|value| value.get("web"))
+        .and_then(|value| value.get("url"))
+        .and_then(Value::as_str)
+}
+
+fn wait_for_active_web_url_value(
+    harness: &TaborHarness,
+    expected: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        if let Some(active) = active_tab(&tabs)
+            .filter(|tab| tab_kind_is(tab, "web") && tab_web_url(tab) == Some(expected))
+        {
+            return Some(active.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
 }
 
 fn wait_for_active_browser_layout_where<F>(
