@@ -42,6 +42,7 @@ complete -c tabor -n "__fish_tabor_needs_command" -s h -l help -d 'Print help'
 complete -c tabor -n "__fish_tabor_needs_command" -s V -l version -d 'Print version'
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "msg" -d 'Send a message to the Tabor socket'
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "agent" -d 'Stateful agent control for an attached Tabor instance'
+complete -c tabor -n "__fish_tabor_needs_command" -f -a "workspace"
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "migrate" -d 'Migrate the configuration file'
 complete -c tabor -n "__fish_tabor_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c tabor -n "__fish_tabor_using_subcommand msg; and not __fish_seen_subcommand_from config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests help" -s s -l socket -d 'IPC socket connection path override' -r -F
@@ -236,16 +237,30 @@ complete -c tabor -n "__fish_tabor_using_subcommand agent; and __fish_seen_subco
 complete -c tabor -n "__fish_tabor_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "clipboard" -d 'Read or update the system clipboard'
 complete -c tabor -n "__fish_tabor_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "close" -d 'Stop the local controller for this Tabor socket'
 complete -c tabor -n "__fish_tabor_using_subcommand agent; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and not __fish_seen_subcommand_from status stop restart-terminal help" -s h -l help -d 'Print help'
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and not __fish_seen_subcommand_from status stop restart-terminal help" -f -a "status"
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and not __fish_seen_subcommand_from status stop restart-terminal help" -f -a "stop"
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and not __fish_seen_subcommand_from status stop restart-terminal help" -f -a "restart-terminal"
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and not __fish_seen_subcommand_from status stop restart-terminal help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from status" -s h -l help -d 'Print help'
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from stop" -s h -l help -d 'Print help'
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from restart-terminal" -l id -r
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from restart-terminal" -s h -l help -d 'Print help'
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from help" -f -a "status"
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from help" -f -a "stop"
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from help" -f -a "restart-terminal"
+complete -c tabor -n "__fish_tabor_using_subcommand workspace; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c tabor -n "__fish_tabor_using_subcommand migrate" -s c -l config-file -d 'Path to the configuration file' -r -F
 complete -c tabor -n "__fish_tabor_using_subcommand migrate" -s d -l dry-run -d 'Only output TOML config to STDOUT'
 complete -c tabor -n "__fish_tabor_using_subcommand migrate" -s i -l skip-imports -d 'Do not recurse over imports'
 complete -c tabor -n "__fish_tabor_using_subcommand migrate" -l skip-renames -d 'Do not move renamed fields to their new location'
 complete -c tabor -n "__fish_tabor_using_subcommand migrate" -s s -l silent -d 'Do not output to STDOUT'
 complete -c tabor -n "__fish_tabor_using_subcommand migrate" -s h -l help -d 'Print help'
-complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent migrate help" -f -a "msg" -d 'Send a message to the Tabor socket'
-complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent migrate help" -f -a "agent" -d 'Stateful agent control for an attached Tabor instance'
-complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent migrate help" -f -a "migrate" -d 'Migrate the configuration file'
-complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent migrate help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent workspace migrate help" -f -a "msg" -d 'Send a message to the Tabor socket'
+complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent workspace migrate help" -f -a "agent" -d 'Stateful agent control for an attached Tabor instance'
+complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent workspace migrate help" -f -a "workspace"
+complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent workspace migrate help" -f -a "migrate" -d 'Migrate the configuration file'
+complete -c tabor -n "__fish_tabor_using_subcommand help; and not __fish_seen_subcommand_from msg agent workspace migrate help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "config" -d 'Update the Tabor configuration'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "get-config" -d 'Read runtime Tabor configuration'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from msg" -f -a "ping" -d 'Ping the IPC socket'
@@ -285,3 +300,6 @@ complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcom
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "act" -d 'Execute batched actions encoded as JSON'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "clipboard" -d 'Read or update the system clipboard'
 complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from agent" -f -a "close" -d 'Stop the local controller for this Tabor socket'
+complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from workspace" -f -a "status"
+complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from workspace" -f -a "stop"
+complete -c tabor -n "__fish_tabor_using_subcommand help; and __fish_seen_subcommand_from workspace" -f -a "restart-terminal"

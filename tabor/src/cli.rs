@@ -319,6 +319,8 @@ pub enum Subcommands {
     Msg(MessageOptions),
     #[cfg(unix)]
     Agent(AgentOptions),
+    #[cfg(unix)]
+    Workspace(WorkspaceOptions),
     Migrate(MigrateOptions),
 }
 
@@ -346,6 +348,24 @@ pub struct AgentOptions {
     /// Agent command.
     #[clap(subcommand)]
     pub command: AgentCommand,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone)]
+pub struct WorkspaceOptions {
+    #[clap(subcommand)]
+    pub command: WorkspaceCommand,
+}
+
+#[cfg(unix)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceCommand {
+    Status,
+    Stop,
+    RestartTerminal {
+        #[clap(long)]
+        id: u64,
+    },
 }
 
 #[cfg(unix)]

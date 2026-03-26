@@ -28,6 +28,9 @@ _tabor() {
             tabor,msg)
                 cmd="tabor__msg"
                 ;;
+            tabor,workspace)
+                cmd="tabor__workspace"
+                ;;
             tabor__agent,act)
                 cmd="tabor__agent__act"
                 ;;
@@ -147,6 +150,9 @@ _tabor() {
                 ;;
             tabor__help,msg)
                 cmd="tabor__help__msg"
+                ;;
+            tabor__help,workspace)
+                cmd="tabor__help__workspace"
                 ;;
             tabor__help__agent,act)
                 cmd="tabor__help__agent__act"
@@ -285,6 +291,15 @@ _tabor() {
                 ;;
             tabor__help__msg__inspector,send)
                 cmd="tabor__help__msg__inspector__send"
+                ;;
+            tabor__help__workspace,restart-terminal)
+                cmd="tabor__help__workspace__restart__terminal"
+                ;;
+            tabor__help__workspace,status)
+                cmd="tabor__help__workspace__status"
+                ;;
+            tabor__help__workspace,stop)
+                cmd="tabor__help__workspace__stop"
                 ;;
             tabor__msg,close-tab)
                 cmd="tabor__msg__close__tab"
@@ -499,6 +514,30 @@ _tabor() {
             tabor__msg__inspector__help,send)
                 cmd="tabor__msg__inspector__help__send"
                 ;;
+            tabor__workspace,help)
+                cmd="tabor__workspace__help"
+                ;;
+            tabor__workspace,restart-terminal)
+                cmd="tabor__workspace__restart__terminal"
+                ;;
+            tabor__workspace,status)
+                cmd="tabor__workspace__status"
+                ;;
+            tabor__workspace,stop)
+                cmd="tabor__workspace__stop"
+                ;;
+            tabor__workspace__help,help)
+                cmd="tabor__workspace__help__help"
+                ;;
+            tabor__workspace__help,restart-terminal)
+                cmd="tabor__workspace__help__restart__terminal"
+                ;;
+            tabor__workspace__help,status)
+                cmd="tabor__workspace__help__status"
+                ;;
+            tabor__workspace__help,stop)
+                cmd="tabor__workspace__help__stop"
+                ;;
             *)
                 ;;
         esac
@@ -506,7 +545,7 @@ _tabor() {
 
     case "${cmd}" in
         tabor)
-            opts="-q -v -e -T -o -h -V --print-events --ref-test --embed --config-file --socket --daemon --working-directory --hold --command --title --class --option --help --version msg agent migrate help"
+            opts="-q -v -e -T -o -h -V --print-events --ref-test --embed --config-file --socket --daemon --working-directory --hold --command --title --class --option --help --version msg agent workspace migrate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1199,7 +1238,7 @@ _tabor() {
             return 0
             ;;
         tabor__help)
-            opts="msg agent migrate help"
+            opts="msg agent workspace migrate help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1899,6 +1938,62 @@ _tabor() {
             return 0
             ;;
         tabor__help__msg__set__web__url)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__workspace)
+            opts="status stop restart-terminal"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__workspace__restart__terminal)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__workspace__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__workspace__stop)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3186,6 +3281,136 @@ _tabor() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace)
+            opts="-h --help status stop restart-terminal help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__help)
+            opts="status stop restart-terminal help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__help__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__help__restart__terminal)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__help__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__help__stop)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__restart__terminal)
+            opts="-h --id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__status)
+            opts="-h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__workspace__stop)
+            opts="-h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 *)
                     COMPREPLY=()
                     ;;

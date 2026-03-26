@@ -80,6 +80,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             }
             return;
         }
+        if self.ctx.window_kind().is_image() {
+            return;
+        }
 
         if self.ctx.search_active() {
             for character in text.chars() {
@@ -247,7 +250,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// The provided mode, mods, and key must match what is allowed by a binding
     /// for its action to be executed.
     fn process_key_bindings(&mut self, key: &KeyEvent) -> bool {
-        let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+        let mode = BindingMode::new(
+            self.ctx.terminal().mode(),
+            self.ctx.search_active(),
+            self.ctx.window_kind().is_image(),
+        );
         let mods = self.ctx.modifiers().state();
 
         // Don't suppress char if no bindings were triggered.
@@ -326,7 +333,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Handle key release.
     fn key_release(&mut self, key: KeyEvent, mode: TermMode, mods: ModifiersState) {
-        if self.ctx.window_kind().is_web() {
+        if !self.ctx.window_kind().is_terminal() {
             #[cfg(target_os = "macos")]
             {
                 let mut text = key.text_with_all_modifiers().unwrap_or_default();

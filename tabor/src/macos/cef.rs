@@ -12,10 +12,6 @@ use std::time::{Duration, Instant};
 
 use log::debug;
 
-use objc2::runtime::Bool;
-use objc2::{MainThreadMarker, msg_send, sel};
-use objc2_app_kit::NSApplication;
-
 use cef::{
     self, App, BrowserProcessHandler, CefString, ImplApp, ImplBrowser, ImplBrowserProcessHandler,
     ImplCommandLine, ImplDomnode, ImplFrame, ImplListValue, ImplProcessMessage,
@@ -208,6 +204,7 @@ struct CefRuntime {
     _args: Args,
     _framework_dir: PathBuf,
     _app: cef::App,
+    _sandbox: Option<cef::sandbox::Sandbox>,
 }
 
 thread_local! {
@@ -225,6 +222,14 @@ fn fake_media_enabled() -> bool {
     env_flag_enabled(env::var_os("TABOR_CEF_FAKE_MEDIA").as_deref())
 }
 
+fn configured_cache_root() -> PathBuf {
+    env::var("TABOR_CEF_CACHE_PATH").map(PathBuf::from).unwrap_or_else(|_| super::cef_cache_dir())
+}
+
+fn cef_no_sandbox_setting() -> i32 {
+    if super::distribution_channel().is_mac_app_store() { 0 } else { 1 }
+}
+
 const CEF_HELPER_NAMES: [&str; 5] = [
     "Tabor Helper",
     "Tabor Helper (Renderer)",
@@ -239,24 +244,7 @@ struct BundlePaths {
 }
 
 fn ensure_application_selector_contract() -> Result<(), Box<dyn Error>> {
-    let mtm = MainThreadMarker::new().ok_or_else(|| {
-        io::Error::other("CEF application contract check must run on the main thread")
-    })?;
-
-    let app = NSApplication::sharedApplication(mtm);
-    let responds_is: Bool =
-        unsafe { msg_send![&*app, respondsToSelector: sel!(isHandlingSendEvent)] };
-    let responds_set: Bool =
-        unsafe { msg_send![&*app, respondsToSelector: sel!(setHandlingSendEvent:)] };
-
-    if responds_is.as_bool() && responds_set.as_bool() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "CEF macOS app contract violated: NSApplication must implement isHandlingSendEvent/setHandlingSendEvent:",
-        )
-        .into())
-    }
+    super::ensure_cef_application()
 }
 
 pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
@@ -270,9 +258,11 @@ pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
     ensure_cef_sidecar_libs(&framework_dir)?;
 
     let args = Args::new();
+    let sandbox = maybe_initialize_sandbox(&args);
     let mut app = TaborCefApp::new();
     let exit_code =
         cef::execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+    let _ = sandbox;
 
     if exit_code >= 0 {
         return Ok(Some(exit_code));
@@ -295,23 +285,22 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     ensure_cef_sidecar_libs(&framework_dir)?;
 
     let args = Args::new();
+    let sandbox = maybe_initialize_sandbox(&args);
     let mut app = TaborCefApp::new();
     let mut settings = Settings {
-        no_sandbox: 1,
+        no_sandbox: cef_no_sandbox_setting(),
         external_message_pump: 1,
         windowless_rendering_enabled: 1,
         remote_debugging_port: remote_debugging_port(),
         ..Settings::default()
     };
 
-    let cache_root = env::var("TABOR_CEF_CACHE_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| env::temp_dir().join(format!("tabor-cef-{}", std::process::id())));
+    let cache_root = configured_cache_root();
     settings.cache_path = CefString::from(cache_root.to_string_lossy().as_ref());
     settings.root_cache_path = settings.cache_path.clone();
     if let Ok(path) = env::var("TABOR_CEF_LOG_PATH") {
         let log_path = if path.is_empty() || path == "1" {
-            env::temp_dir().join(format!("tabor-cef-{}.log", std::process::id()))
+            super::logs_dir().join(format!("tabor-cef-{}.log", std::process::id()))
         } else {
             PathBuf::from(path)
         };
@@ -355,8 +344,12 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     }
 
     CEF_RUNTIME.with(|cell| {
-        *cell.borrow_mut() =
-            Some(CefRuntime { _args: args, _framework_dir: framework_dir, _app: app });
+        *cell.borrow_mut() = Some(CefRuntime {
+            _args: args,
+            _framework_dir: framework_dir,
+            _app: app,
+            _sandbox: sandbox,
+        });
     });
     CEF_INITIALIZED.store(true, Ordering::Relaxed);
 
@@ -391,6 +384,16 @@ pub fn record_message_pump_schedule(
     if coalesced {
         CEF_PUMP_COALESCED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn maybe_initialize_sandbox(args: &Args) -> Option<cef::sandbox::Sandbox> {
+    if !super::distribution_channel().is_mac_app_store() {
+        return None;
+    }
+
+    let mut sandbox = cef::sandbox::Sandbox::new();
+    sandbox.initialize(args.as_main_args());
+    Some(sandbox)
 }
 
 pub fn cef_pump_metrics() -> CefPumpMetrics {
@@ -751,6 +754,7 @@ fn remote_debugging_port() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macos::test_support::{EnvVarGuard, env_lock};
 
     #[cfg(not(feature = "passkey-webauthn"))]
     #[test]
@@ -790,5 +794,36 @@ mod tests {
     #[test]
     fn fake_media_env_nonzero_is_enabled() {
         assert!(env_flag_enabled(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn mac_app_store_distribution_enables_cef_sandbox() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "mac_app_store");
+        assert_eq!(cef_no_sandbox_setting(), 0);
+    }
+
+    #[test]
+    fn configured_cache_root_prefers_explicit_env_override() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let custom_root = "/tmp/custom-cef-profile";
+        let _cache_path = EnvVarGuard::set("TABOR_CEF_CACHE_PATH", custom_root);
+
+        assert_eq!(configured_cache_root(), PathBuf::from(custom_root));
+    }
+
+    #[test]
+    fn configured_cache_root_defaults_to_stable_direct_profile_dir() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let home_dir = temp_dir.path().join("home");
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+        let _cache_override = EnvVarGuard::unset("TABOR_CEF_CACHE_PATH");
+
+        assert_eq!(
+            configured_cache_root(),
+            home_dir.join("Library").join("Application Support").join("Tabor").join("cef")
+        );
     }
 }

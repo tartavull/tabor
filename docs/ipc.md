@@ -4,6 +4,12 @@ Tabor exposes a local Unix socket for app control and stateful web automation.
 Use `tabor msg` for one-shot app and inspector requests. Use `tabor agent` for
 live tab takeover and repeated web actions against a running Tabor instance.
 
+On macOS, launch the GUI app through LaunchServices, for example
+`open -a /Applications/Tabor.app`. Direct execution of
+`/Applications/Tabor.app/Contents/MacOS/tabor` is supported for CLI commands
+such as `tabor msg`, `tabor agent`, and `tabor workspace`, but not for GUI
+startup.
+
 ## Transport
 
 - Socket discovery:

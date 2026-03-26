@@ -75,6 +75,29 @@ TABOR_CODESIGN_PROVISIONING_PROFILE=/path/to/profile.mobileprovision cargo xtask
 
 Without `TABOR_CODESIGN_PROVISIONING_PROFILE`, passkey signing fails fast by design.
 
+## Mac App Store Build Mode
+
+Mac App Store builds use a separate sandboxed distribution lane. They are staged under `target/<profile>/mas/Tabor.app` and are never installed to `/Applications` by `cargo xtask`.
+
+Stage the review build:
+
+```sh
+TABOR_MAC_APP_STORE_CODESIGN_IDENTITY="3rd Party Mac Developer Application: Tiny Mile US, Corp (TEAMID)" \
+TABOR_CODESIGN_PROVISIONING_PROFILE=/path/to/Tabor-mas.provisionprofile \
+cargo xtask app --mac-app-store --release
+```
+
+Package the App Store submission artifact:
+
+```sh
+TABOR_MAC_APP_STORE_CODESIGN_IDENTITY="3rd Party Mac Developer Application: Tiny Mile US, Corp (TEAMID)" \
+TABOR_MAC_APP_STORE_INSTALLER_IDENTITY="3rd Party Mac Developer Installer: Tiny Mile US, Corp (TEAMID)" \
+TABOR_CODESIGN_PROVISIONING_PROFILE=/path/to/Tabor-mas.provisionprofile \
+cargo xtask package --mac-app-store --release
+```
+
+The stage-1 Mac App Store lane intentionally rejects `--passkey`. Passkey/WebAuthn work stays in the direct-distribution lane until Apple approves the restricted browser credential entitlement for the store build.
+
 ## Notarized macOS Release
 
 For outside-App-Store distribution, use Developer ID signing with hardened runtime + timestamp, then notarize and staple.

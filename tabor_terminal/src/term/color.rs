@@ -1,5 +1,8 @@
 use std::ops::{Index, IndexMut};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::vte::ansi::{NamedColor, Rgb};
 
 /// Number of terminal colors.
@@ -18,8 +21,33 @@ pub const COUNT: usize = 269;
 /// | 259..267 | Dim colors        |
 /// | 267      | Bright foreground |
 /// | 268      | Dim background    |
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Colors([Option<Rgb>; COUNT]);
+
+#[cfg(feature = "serde")]
+impl Serialize for Colors {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for Colors {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<Option<Rgb>>::deserialize(deserializer)?;
+        let mut colors = [None; COUNT];
+        for (index, value) in values.into_iter().take(COUNT).enumerate() {
+            colors[index] = value;
+        }
+        Ok(Self(colors))
+    }
+}
 
 impl Default for Colors {
     fn default() -> Self {

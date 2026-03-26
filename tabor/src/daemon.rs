@@ -6,8 +6,6 @@ use std::ffi::OsStr;
 #[cfg(not(any(target_os = "macos", windows)))]
 use std::fs;
 use std::io;
-#[cfg(not(windows))]
-use std::os::unix::ffi::OsStringExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -20,7 +18,7 @@ use {
     std::error::Error,
     std::os::unix::process::CommandExt,
     std::os::unix::io::RawFd,
-    std::path::PathBuf,
+    std::path::{Path, PathBuf},
 };
 
 #[cfg(not(windows))]
@@ -33,9 +31,10 @@ use crate::macos;
 
 /// Start a new process in the background.
 #[cfg(windows)]
-pub fn spawn_daemon<I, S>(program: &str, args: I) -> io::Result<()>
+pub fn spawn_daemon<P, I, S>(program: P, args: I) -> io::Result<()>
 where
-    I: IntoIterator<Item = S> + Copy,
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     // Setting all the I/O handles to null and setting the
@@ -54,22 +53,38 @@ where
 
 /// Start a new process in the background.
 #[cfg(not(windows))]
-pub fn spawn_daemon<I, S>(
-    program: &str,
+pub fn spawn_daemon<P, I, S>(
+    program: P,
     args: I,
     master_fd: RawFd,
     shell_pid: u32,
 ) -> io::Result<()>
 where
-    I: IntoIterator<Item = S> + Copy,
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let working_directory = foreground_process_path(master_fd, shell_pid).ok();
+
+    spawn_daemon_from_dir(program, args, working_directory.as_deref())
+}
+
+#[cfg(not(windows))]
+pub fn spawn_daemon_from_dir<P, I, S>(
+    program: P,
+    args: I,
+    working_directory: Option<&Path>,
+) -> io::Result<()>
+where
+    P: AsRef<OsStr>,
+    I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
-    let working_directory = foreground_process_path(master_fd, shell_pid)
-        .ok()
-        .and_then(|path| CString::new(path.into_os_string().into_vec()).ok());
+    let working_directory = working_directory
+        .and_then(|path| CString::new(path.as_os_str().as_encoded_bytes().to_vec()).ok());
 
     unsafe {
         command
@@ -175,6 +190,18 @@ pub fn foreground_process_name(master_fd: RawFd, shell_pid: u32) -> Result<Strin
 
     #[cfg(target_os = "macos")]
     {
+        if let Ok(name) = macos::proc::command_name(pid) {
+            if !name.is_empty() {
+                return Ok(name);
+            }
+        }
+
+        if let Ok(name) = macos::proc::process_name(pid) {
+            if !name.is_empty() {
+                return Ok(name);
+            }
+        }
+
         let path = macos::proc::executable_path(pid)?;
         let name = path
             .file_name()

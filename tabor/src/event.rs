@@ -40,8 +40,7 @@ use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::CursorIcon;
 use winit::window::WindowId;
 
-use tabor_terminal::event::{Event as TerminalEvent, EventListener, Notify, WindowSize};
-use tabor_terminal::event_loop::Notifier;
+use tabor_terminal::event::{Event as TerminalEvent, EventListener, Notify, OnResize, WindowSize};
 use tabor_terminal::grid::{BidirectionalIterator, Dimensions, Scroll};
 use tabor_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use tabor_terminal::selection::{Selection, SelectionType};
@@ -76,6 +75,10 @@ use crate::macos::cef;
 #[cfg(target_os = "macos")]
 use crate::macos::favicon::FaviconImage;
 #[cfg(target_os = "macos")]
+use crate::macos::image_view::{
+    ImageViewState, LoadedImage, OpenUrlKind, classify_open_url, load_image_source,
+};
+#[cfg(target_os = "macos")]
 use crate::macos::web_commands::{
     self, WebActions, WebCommandState, WebHintAction, WebKey, WebMode,
 };
@@ -92,6 +95,8 @@ use crate::window_context::WindowContext;
 #[cfg(unix)]
 use crate::window_context::{IpcEventContext, WindowDebugMouseDrag};
 use crate::window_kind::WindowKind;
+#[cfg(unix)]
+use crate::workspace;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSEventModifierFlags;
 use url::Url;
@@ -253,6 +258,10 @@ const TOUCH_ZOOM_FACTOR: f32 = 0.01;
 
 /// Cooldown between invocations of the bell command.
 const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
+#[cfg(unix)]
+const WORKSPACE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The event processor.
 ///
@@ -589,6 +598,8 @@ impl Processor {
         self.gl_config = Some(window_context.display.gl_context().config());
         let window_id = window_context.id();
         self.windows.insert(window_id, window_context);
+        #[cfg(unix)]
+        self.ensure_workspace_timers(window_id);
 
         Ok(())
     }
@@ -619,6 +630,8 @@ impl Processor {
 
         let window_id = window_context.id();
         self.windows.insert(window_id, window_context);
+        #[cfg(unix)]
+        self.ensure_workspace_timers(window_id);
         Ok(())
     }
 
@@ -655,7 +668,7 @@ impl Processor {
 
         if let Some(window_context) = self.windows.get_mut(&window_id) {
             for url in urls {
-                if let Err(err) = window_context.open_web_url_new_tab(url, &self.proxy) {
+                if let Err(err) = window_context.open_url_new_tab(url, &self.proxy) {
                     error!("Could not open URL: {err:?}");
                 }
             }
@@ -683,9 +696,63 @@ impl Processor {
                 continue;
             }
 
-            if let Err(err) = window_context.open_web_url_new_tab(url, &self.proxy) {
+            if let Err(err) = window_context.open_url_new_tab(url, &self.proxy) {
                 error!("Could not open URL: {err:?}");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn ensure_workspace_timers(&mut self, window_id: WindowId) {
+        let poll_timer = TimerId::new(Topic::WorkspacePoll, window_id);
+        if !self.scheduler.scheduled(poll_timer) {
+            let event = Event::new(EventType::WorkspacePoll, Some(window_id));
+            self.scheduler.schedule(event, WORKSPACE_POLL_INTERVAL, true, poll_timer);
+        }
+
+        let autosave_timer = TimerId::new(Topic::WorkspaceAutosave, window_id);
+        if !self.scheduler.scheduled(autosave_timer) {
+            let event = Event::new(EventType::WorkspaceAutosave, Some(window_id));
+            self.scheduler.schedule(event, WORKSPACE_AUTOSAVE_INTERVAL, true, autosave_timer);
+        }
+    }
+
+    #[cfg(unix)]
+    fn persist_workspace_snapshot(&mut self) {
+        let Some(window_context) = self.windows.values().next() else {
+            return;
+        };
+        let layout = window_context.workspace_layout();
+        if let Err(err) = workspace::save_workspace_layout(&layout) {
+            error!("Could not save workspace layout: {err}");
+        }
+        if let Err(err) =
+            workspace::save_persisted_terminals(window_context.persisted_terminal_states())
+        {
+            error!("Could not save workspace terminals: {err}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn restore_workspace_if_present(&mut self) {
+        let layout = match workspace::load_workspace_layout() {
+            Ok(Some(layout)) => layout,
+            Ok(None) => return,
+            Err(err) => {
+                error!("Could not load workspace layout: {err}");
+                return;
+            },
+        };
+
+        let persisted_terminals = workspace::load_persisted_terminals().unwrap_or_default();
+
+        let Some(window_context) = self.windows.values_mut().next() else {
+            return;
+        };
+        if let Err(err) =
+            window_context.restore_workspace_layout(&layout, &persisted_terminals, &self.proxy)
+        {
+            error!("Could not restore workspace layout: {err}");
         }
     }
 
@@ -1024,6 +1091,19 @@ impl Processor {
             _ => return,
         };
 
+        #[cfg(unix)]
+        {
+            let layout = window_context.workspace_layout();
+            if let Err(err) = workspace::save_workspace_layout(&layout) {
+                error!("Could not save workspace layout during window close: {err}");
+            }
+            if let Err(err) =
+                workspace::save_persisted_terminals(window_context.persisted_terminal_states())
+            {
+                error!("Could not save workspace terminals during window close: {err}");
+            }
+        }
+
         self.scheduler.unschedule_window(window_context.id());
 
         #[cfg(target_os = "macos")]
@@ -1090,6 +1170,8 @@ impl ApplicationHandler<Event> for Processor {
                 event_loop.exit();
                 return;
             }
+            #[cfg(unix)]
+            self.restore_workspace_if_present();
             #[cfg(target_os = "macos")]
             self.open_pending_urls();
         }
@@ -1441,6 +1523,37 @@ impl ApplicationHandler<Event> for Processor {
                     window_context.display.window.request_redraw();
                 }
             },
+            #[cfg(unix)]
+            (EventType::WorkspacePoll, Some(window_id)) => {
+                let timer_id = TimerId::new(Topic::WorkspacePoll, window_id);
+                let Some(window_context) = self.windows.get_mut(&window_id) else {
+                    self.scheduler.unschedule(timer_id);
+                    return;
+                };
+                if !window_context.has_workspace_terminals() {
+                    self.scheduler.unschedule(timer_id);
+                    return;
+                }
+                let live_terminals = workspace::broker_status()
+                    .map(|status| {
+                        status
+                            .terminals
+                            .into_iter()
+                            .map(|terminal| (terminal.id, terminal))
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                let persisted_terminals = workspace::load_persisted_terminals().unwrap_or_default();
+                if let Err(err) = window_context
+                    .refresh_workspace_terminals(&live_terminals, &persisted_terminals)
+                {
+                    error!("Could not refresh workspace terminals: {err}");
+                }
+            },
+            #[cfg(unix)]
+            (EventType::WorkspaceAutosave, Some(_window_id)) => {
+                self.persist_workspace_snapshot();
+            },
             // NOTE: This event bypasses batching to minimize input latency.
             (EventType::Frame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(&window_id) {
@@ -1502,6 +1615,9 @@ impl ApplicationHandler<Event> for Processor {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
+
+        #[cfg(unix)]
+        self.persist_workspace_snapshot();
 
         #[cfg(target_os = "macos")]
         cef::shutdown();
@@ -1620,6 +1736,10 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     WebViewDirty,
     #[cfg(target_os = "macos")]
+    ImageLoaded {
+        image: Result<LoadedImage, String>,
+    },
+    #[cfg(target_os = "macos")]
     CefSchedule(Duration),
     #[cfg(target_os = "macos")]
     CefTick,
@@ -1633,6 +1753,10 @@ pub enum EventType {
     TabSearch(String),
     #[cfg(target_os = "macos")]
     OpenUrls(Vec<String>),
+    #[cfg(unix)]
+    WorkspacePoll,
+    #[cfg(unix)]
+    WorkspaceAutosave,
     #[cfg(unix)]
     IpcRequest(IpcRequest, Arc<UnixStream>),
     BlinkCursor,
@@ -1957,6 +2081,8 @@ pub struct ActionContext<'a, N, T> {
     #[cfg(target_os = "macos")]
     pub web_view: Option<&'a mut WebView>,
     #[cfg(target_os = "macos")]
+    pub image_view: Option<&'a mut ImageViewState>,
+    #[cfg(target_os = "macos")]
     pub web_command_state: &'a mut WebCommandState,
     #[cfg(target_os = "macos")]
     pub event_loop: &'a ActiveEventLoop,
@@ -1968,9 +2094,9 @@ pub struct ActionContext<'a, N, T> {
     pub occluded: &'a mut bool,
     pub preserve_title: bool,
     #[cfg(not(windows))]
-    pub master_fd: RawFd,
+    pub foreground_process: Option<(RawFd, u32)>,
     #[cfg(not(windows))]
-    pub shell_pid: u32,
+    pub working_directory_hint: Option<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2055,6 +2181,29 @@ pub(crate) fn request_web_cursor_update(
 
 fn terminal_text_area_size(size_info: SizeInfo, layout: TerminalViewportLayout) -> WindowSize {
     layout.logical_size(&size_info).into()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_image_load(
+    event_proxy: &EventLoopProxy<Event>,
+    window_id: WindowId,
+    tab_id: TabId,
+    source: String,
+) {
+    let proxy = event_proxy.clone();
+    std::thread::spawn(move || {
+        let image = load_image_source(&source);
+        let event = Event::for_tab(EventType::ImageLoaded { image }, window_id, tab_id);
+        let _ = proxy.send_event(event);
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn image_viewport_size(display: &Display) -> winit::dpi::PhysicalSize<u32> {
+    winit::dpi::PhysicalSize::new(
+        display.size_info.width() as u32,
+        display.size_info.height() as u32,
+    )
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -2179,6 +2328,10 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 BrowserViewMode::Normal => BrowserViewMode::MultiColumn,
                 BrowserViewMode::MultiColumn => BrowserViewMode::Normal,
             };
+        }
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_image() {
+            return;
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -2327,8 +2480,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[cfg(not(windows))]
     fn create_new_window(&mut self) {
         let mut options = WindowOptions::default();
-        options.terminal_options.working_directory =
-            foreground_process_path(self.master_fd, self.shell_pid).ok();
+        options.terminal_options.working_directory = self.current_working_directory();
         let _ = self.event_proxy.send_event(Event::new(EventType::CreateWindow(options), None));
     }
 
@@ -2343,8 +2495,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let mut options = WindowOptions::default();
         #[cfg(not(windows))]
         {
-            options.terminal_options.working_directory =
-                foreground_process_path(self.master_fd, self.shell_pid).ok();
+            options.terminal_options.working_directory = self.current_working_directory();
         }
 
         let event = Event::new(EventType::CreateTab(options), self.display.window.id());
@@ -2387,7 +2538,14 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         S: AsRef<OsStr>,
     {
         #[cfg(not(windows))]
-        let result = spawn_daemon(program, args, self.master_fd, self.shell_pid);
+        let result = match self.foreground_process {
+            Some((master_fd, shell_pid)) => spawn_daemon(program, args, master_fd, shell_pid),
+            None => crate::daemon::spawn_daemon_from_dir(
+                program,
+                args,
+                self.working_directory_hint.as_deref(),
+            ),
+        };
         #[cfg(windows)]
         let result = spawn_daemon(program, args);
 
@@ -2707,8 +2865,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 options.command_input = Some(String::from("o "));
                 #[cfg(not(windows))]
                 {
-                    options.terminal_options.working_directory =
-                        foreground_process_path(self.master_fd, self.shell_pid).ok();
+                    options.terminal_options.working_directory = self.current_working_directory();
                 }
 
                 let event = Event::new(EventType::CreateTab(options), self.display.window.id());
@@ -3085,7 +3242,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[inline]
     fn toggle_vi_mode(&mut self) {
         #[cfg(target_os = "macos")]
-        if self.tab_kind.is_web() {
+        if !self.tab_kind.is_terminal() {
             if self.command_state.is_active() {
                 self.cancel_command();
             } else {
@@ -3348,6 +3505,157 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             return;
         };
         web_view.paste();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        match button {
+            MouseButton::Left => self.mouse.left_button_state = state,
+            MouseButton::Middle => self.mouse.middle_button_state = state,
+            MouseButton::Right => self.mouse.right_button_state = state,
+            _ => (),
+        }
+
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+
+        if button == MouseButton::Left {
+            match state {
+                ElementState::Pressed => {
+                    let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+                    if image_view.begin_pan(cursor) {
+                        self.display.window.set_mouse_cursor(CursorIcon::Grabbing);
+                    }
+                },
+                ElementState::Released => {
+                    image_view.end_pan();
+                    self.display.window.set_mouse_cursor(CursorIcon::Default);
+                },
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_mouse_move(&mut self, position: PhysicalPosition<f64>) {
+        let x = position.x.clamp(0.0, self.display.size_info.width() as f64 - 1.0) as usize;
+        let y = position.y.clamp(0.0, self.display.size_info.height() as f64 - 1.0) as usize;
+        self.mouse.x = x;
+        self.mouse.y = y;
+        self.mouse.inside_text_area = true;
+
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+        if self.mouse.left_button_state == ElementState::Pressed && image_view.is_panning() {
+            image_view.pan_to(position, image_viewport_size(self.display));
+            self.display.window.set_mouse_cursor(CursorIcon::Grabbing);
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        } else {
+            self.display.window.set_mouse_cursor(CursorIcon::Default);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_mouse_wheel(
+        &mut self,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+    ) {
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+
+        let step = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, lines) => f64::from(lines),
+            winit::event::MouseScrollDelta::PixelDelta(delta) => match phase {
+                winit::event::TouchPhase::Started => 0.0,
+                _ => delta.y / 120.0,
+            },
+        };
+        if step == 0.0 {
+            return;
+        }
+
+        let factor = 1.15_f64.powf(step.abs());
+        let factor = if step.is_sign_positive() { factor } else { 1.0 / factor };
+        let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+        image_view.zoom_by(factor, cursor, image_viewport_size(self.display));
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        *self.dirty = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_zoom_in(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.zoom_in(image_viewport_size(self.display));
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_zoom_out(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.zoom_out(image_viewport_size(self.display));
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_zoom_fit(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.zoom_fit(image_viewport_size(self.display));
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_zoom_fill(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.zoom_fill(image_viewport_size(self.display));
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_zoom_actual(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.zoom_actual(image_viewport_size(self.display));
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_rotate_clockwise(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.rotate_clockwise(image_viewport_size(self.display));
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_reset_view(&mut self) {
+        if let Some(image_view) = self.image_view.as_mut() {
+            image_view.reset_view();
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            *self.dirty = true;
+        }
+    }
+}
+
+impl<'a, N, T> ActionContext<'a, N, T> {
+    #[cfg(not(windows))]
+    fn current_working_directory(&self) -> Option<PathBuf> {
+        self.foreground_process
+            .and_then(|(master_fd, shell_pid)| foreground_process_path(master_fd, shell_pid).ok())
+            .or_else(|| self.working_directory_hint.clone())
     }
 }
 
@@ -3724,12 +4032,8 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     CommandTarget::WebUrl(url) => {
                         if new_tab {
                             self.open_web_url_new_tab(url);
-                        } else if self.tab_kind.is_web() {
-                            self.open_web_url(url);
                         } else {
-                            // Replace semantics: only close the current tab if the new tab is
-                            // created successfully.
-                            self.open_web_url_new_tab_replace_current(url);
+                            self.open_web_url(url);
                         }
                     },
                     CommandTarget::TerminalDir(path) => {
@@ -3789,17 +4093,55 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     }
 
     fn open_web_url(&mut self, url: String) {
+        #[cfg(target_os = "macos")]
+        match classify_open_url(&url) {
+            OpenUrlKind::Web => match &mut *self.tab_kind {
+                WindowKind::Web { url: current_url } => {
+                    *current_url = url.clone();
+                    if let Some(web_view) = self.web_view.as_mut() {
+                        if web_view.load_url(&url) {
+                            self.command_history.record_url(url);
+                            return;
+                        }
+                    }
+
+                    self.push_command_error(CommandError::Message(String::from(
+                        "Failed to load URL",
+                    )));
+                },
+                WindowKind::Terminal => self.open_web_url_new_tab(url),
+                WindowKind::Image { .. } => self.open_web_url_new_tab_replace_current(url),
+            },
+            OpenUrlKind::Image => match &mut *self.tab_kind {
+                WindowKind::Image { source } => {
+                    *source = url.clone();
+                    let Some(image_view) = self.image_view.as_mut() else {
+                        self.push_command_error(CommandError::Message(String::from(
+                            "Image view is unavailable",
+                        )));
+                        return;
+                    };
+                    image_view.reset_source(url.clone());
+                    request_image_load(
+                        self.event_proxy,
+                        self.display.window.id(),
+                        self.tab_id,
+                        url.clone(),
+                    );
+                    self.command_history.record_url(url);
+                    self.display.pending_update.dirty = true;
+                    self.display.damage_tracker.frame().mark_fully_damaged();
+                    *self.dirty = true;
+                },
+                WindowKind::Terminal => self.open_web_url_new_tab(url),
+                WindowKind::Web { .. } => self.open_web_url_new_tab_replace_current(url),
+            },
+        }
+
+        #[cfg(not(target_os = "macos"))]
         match &mut *self.tab_kind {
             WindowKind::Web { url: current_url } => {
                 *current_url = url.clone();
-                #[cfg(target_os = "macos")]
-                if let Some(web_view) = self.web_view.as_mut() {
-                    if web_view.load_url(&url) {
-                        self.command_history.record_url(url);
-                        return;
-                    }
-                }
-
                 self.push_command_error(CommandError::Message(String::from("Failed to load URL")));
             },
             WindowKind::Terminal => {
@@ -3807,29 +4149,31 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 options.window_kind = WindowKind::Web { url };
                 #[cfg(not(windows))]
                 {
-                    options.terminal_options.working_directory =
-                        foreground_process_path(self.master_fd, self.shell_pid).ok();
+                    options.terminal_options.working_directory = self.current_working_directory();
                 }
-                let record_url = match &options.window_kind {
-                    WindowKind::Web { url } => Some(url.clone()),
-                    WindowKind::Terminal => None,
-                };
                 let event = Event::new(EventType::CreateTab(options), self.display.window.id());
-                if let Some(url) = record_url {
-                    self.command_history.record_url(url);
-                }
                 let _ = self.event_proxy.send_event(event);
             },
+            WindowKind::Image { .. } => unreachable!("image tabs are macOS-only"),
         }
     }
 
     fn open_web_url_new_tab(&mut self, url: String) {
         let mut options = WindowOptions::default();
-        options.window_kind = WindowKind::Web { url: url.clone() };
+        #[cfg(target_os = "macos")]
+        {
+            options.window_kind = match classify_open_url(&url) {
+                OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
+                OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            options.window_kind = WindowKind::Web { url: url.clone() };
+        }
         #[cfg(not(windows))]
         {
-            options.terminal_options.working_directory =
-                foreground_process_path(self.master_fd, self.shell_pid).ok();
+            options.terminal_options.working_directory = self.current_working_directory();
         }
 
         let event = Event::new(EventType::CreateTab(options), self.display.window.id());
@@ -3839,12 +4183,21 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
 
     fn open_web_url_new_tab_replace_current(&mut self, url: String) {
         let mut options = WindowOptions::default();
-        options.window_kind = WindowKind::Web { url: url.clone() };
+        #[cfg(target_os = "macos")]
+        {
+            options.window_kind = match classify_open_url(&url) {
+                OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
+                OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
+            };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            options.window_kind = WindowKind::Web { url: url.clone() };
+        }
         options.close_tab_on_success = Some(self.tab_id);
         #[cfg(not(windows))]
         {
-            options.terminal_options.working_directory =
-                foreground_process_path(self.master_fd, self.shell_pid).ok();
+            options.terminal_options.working_directory = self.current_working_directory();
         }
 
         let event = Event::new(EventType::CreateTab(options), self.display.window.id());
@@ -3892,6 +4245,11 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     "No active web tab to reload",
                 )));
             },
+            WindowKind::Image { .. } => {
+                self.push_command_error(CommandError::Message(String::from(
+                    "Reload is only available in web tabs",
+                )));
+            },
         }
     }
 
@@ -3912,6 +4270,11 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             WindowKind::Terminal => {
                 self.push_command_error(CommandError::Message(String::from(
                     "No active web tab to inspect",
+                )));
+            },
+            WindowKind::Image { .. } => {
+                self.push_command_error(CommandError::Message(String::from(
+                    "Inspector is only available in web tabs",
                 )));
             },
         }
@@ -5045,7 +5408,7 @@ pub struct AccumulatedScroll {
     pub y: f64,
 }
 
-impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, EventProxy>> {
     /// Handle events from winit.
     pub fn handle_event(&mut self, event: WinitEvent<Event>) {
         match event {
@@ -5162,11 +5525,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::WebEditableFocus { .. }
                 | EventType::WebCursorRequest
                 | EventType::WebViewDirty
+                | EventType::ImageLoaded { .. }
                 | EventType::CefSchedule(_)
                 | EventType::CefTick
                 | EventType::CefWatchdog
                 | EventType::TabSearch(_)
                 | EventType::OpenUrls(_)
+                | EventType::WorkspacePoll
+                | EventType::WorkspaceAutosave
                 | EventType::Frame => (),
                 #[cfg(not(target_os = "macos"))]
                 EventType::Message(_)
@@ -5177,6 +5543,8 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::SetMultiColumnCount(_)
                 | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
+                | EventType::WorkspacePoll
+                | EventType::WorkspaceAutosave
                 | EventType::Frame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
@@ -5185,14 +5553,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // User asked to close the window, so no need to hold it.
                         self.ctx.window().hold = false;
                         #[cfg(target_os = "macos")]
-                        if self.ctx.window_kind().is_web() {
+                        if self.ctx.window_kind().is_terminal() {
+                            self.ctx.terminal.exit();
+                        } else {
                             let event = Event::new(
                                 EventType::CloseTab(self.ctx.tab_id),
                                 self.ctx.display.window.id(),
                             );
                             let _ = self.ctx.event_proxy.send_event(event);
-                        } else {
-                            self.ctx.terminal.exit();
                         }
                         #[cfg(not(target_os = "macos"))]
                         self.ctx.terminal.exit();
@@ -5277,7 +5645,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::Ime(ime) => match ime {
                         Ime::Commit(text) => {
                             #[cfg(target_os = "macos")]
-                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                            if !self.ctx.window_kind().is_terminal() && !self.ctx.command_active() {
                                 if let Some(web_view) = self.ctx.web_view.as_mut() {
                                     web_view.handle_ime_commit(&text);
                                 }
@@ -5293,7 +5661,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         },
                         Ime::Preedit(text, cursor_offset) => {
                             #[cfg(target_os = "macos")]
-                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                            if !self.ctx.window_kind().is_terminal() && !self.ctx.command_active() {
                                 if let Some(web_view) = self.ctx.web_view.as_mut() {
                                     web_view.handle_ime_preedit(&text, cursor_offset);
                                 }
@@ -5313,7 +5681,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         },
                         Ime::Enabled => {
                             #[cfg(target_os = "macos")]
-                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                            if !self.ctx.window_kind().is_terminal() && !self.ctx.command_active() {
                                 self.ctx.display.ime.set_preedit(None);
                                 *self.ctx.dirty = true;
                                 return;
@@ -5324,7 +5692,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         },
                         Ime::Disabled => {
                             #[cfg(target_os = "macos")]
-                            if self.ctx.window_kind().is_web() && !self.ctx.command_active() {
+                            if !self.ctx.window_kind().is_terminal() && !self.ctx.command_active() {
                                 if let Some(web_view) = self.ctx.web_view.as_mut() {
                                     web_view.cancel_ime_composition();
                                 }

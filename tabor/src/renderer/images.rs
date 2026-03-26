@@ -1,6 +1,8 @@
 use glutin::context::PossiblyCurrentContext;
 
 use crate::display::SizeInfo;
+#[cfg(target_os = "macos")]
+use crate::macos::image_view::ImageRenderQuad;
 use crate::renderer::shader::ShaderVersion;
 use crate::renderer::{self};
 
@@ -166,11 +168,84 @@ mod macos {
     }
 
     #[derive(Debug)]
+    struct BitmapTexture {
+        texture: GLuint,
+        dimensions: Option<(usize, usize)>,
+    }
+
+    impl BitmapTexture {
+        fn new() -> Self {
+            let mut texture = 0;
+            unsafe {
+                gl::GenTextures(1, &mut texture);
+                gl::BindTexture(gl::TEXTURE_RECTANGLE, texture);
+                gl::TexParameteri(
+                    gl::TEXTURE_RECTANGLE,
+                    gl::TEXTURE_WRAP_S,
+                    gl::CLAMP_TO_EDGE as i32,
+                );
+                gl::TexParameteri(
+                    gl::TEXTURE_RECTANGLE,
+                    gl::TEXTURE_WRAP_T,
+                    gl::CLAMP_TO_EDGE as i32,
+                );
+                gl::TexParameteri(gl::TEXTURE_RECTANGLE, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+                gl::TexParameteri(gl::TEXTURE_RECTANGLE, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+                gl::BindTexture(gl::TEXTURE_RECTANGLE, 0);
+            }
+
+            Self { texture, dimensions: None }
+        }
+
+        fn upload(&mut self, width: usize, height: usize, rgba: &[u8]) {
+            unsafe {
+                gl::BindTexture(gl::TEXTURE_RECTANGLE, self.texture);
+                if self.dimensions == Some((width, height)) {
+                    gl::TexSubImage2D(
+                        gl::TEXTURE_RECTANGLE,
+                        0,
+                        0,
+                        0,
+                        width as i32,
+                        height as i32,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        rgba.as_ptr().cast(),
+                    );
+                } else {
+                    gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+                    gl::TexImage2D(
+                        gl::TEXTURE_RECTANGLE,
+                        0,
+                        gl::RGBA8 as i32,
+                        width as i32,
+                        height as i32,
+                        0,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        rgba.as_ptr().cast(),
+                    );
+                    self.dimensions = Some((width, height));
+                }
+            }
+        }
+    }
+
+    impl Drop for BitmapTexture {
+        fn drop(&mut self) {
+            unsafe {
+                gl::DeleteTextures(1, &self.texture);
+            }
+        }
+    }
+
+    #[derive(Debug)]
     pub struct ImageRenderer {
         vao: GLuint,
         vbo: GLuint,
         main_texture: SurfaceTexture,
         popup_texture: SurfaceTexture,
+        bitmap_texture: BitmapTexture,
         program: ImageShaderProgram,
         vertices: Vec<Vertex>,
         cgl_context: CGLContextObj,
@@ -224,6 +299,7 @@ mod macos {
                 vbo,
                 main_texture: SurfaceTexture::new(),
                 popup_texture: SurfaceTexture::new(),
+                bitmap_texture: BitmapTexture::new(),
                 program,
                 vertices: Vec::new(),
                 cgl_context,
@@ -253,6 +329,7 @@ mod macos {
                 SurfaceSlot::Main => &mut self.main_texture,
                 SurfaceSlot::Popup => &mut self.popup_texture,
             };
+            let texture_id = texture.texture;
 
             if let Err(err) = texture.bind_surface(
                 self.cgl_context,
@@ -304,6 +381,78 @@ mod macos {
                 return;
             }
 
+            self.draw_vertices(size_info, texture_id);
+        }
+
+        pub fn draw_bitmap(
+            &mut self,
+            size_info: &SizeInfo,
+            width: usize,
+            height: usize,
+            rgba: &[u8],
+            quad: ImageRenderQuad,
+        ) {
+            if width == 0
+                || height == 0
+                || rgba.is_empty()
+                || quad.dest_width_px <= 0.0
+                || quad.dest_height_px <= 0.0
+            {
+                return;
+            }
+
+            self.bitmap_texture.upload(width, height, rgba);
+            self.vertices.clear();
+            self.vertices.extend_from_slice(&[
+                Vertex {
+                    x: quad.dest_x_px,
+                    y: quad.dest_y_px,
+                    u: quad.uv_top_left.0,
+                    v: quad.uv_top_left.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px + quad.dest_width_px,
+                    y: quad.dest_y_px,
+                    u: quad.uv_top_right.0,
+                    v: quad.uv_top_right.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px,
+                    y: quad.dest_y_px + quad.dest_height_px,
+                    u: quad.uv_bottom_left.0,
+                    v: quad.uv_bottom_left.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px,
+                    y: quad.dest_y_px + quad.dest_height_px,
+                    u: quad.uv_bottom_left.0,
+                    v: quad.uv_bottom_left.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px + quad.dest_width_px,
+                    y: quad.dest_y_px,
+                    u: quad.uv_top_right.0,
+                    v: quad.uv_top_right.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px + quad.dest_width_px,
+                    y: quad.dest_y_px + quad.dest_height_px,
+                    u: quad.uv_bottom_right.0,
+                    v: quad.uv_bottom_right.1,
+                },
+            ]);
+
+            self.draw_vertices(size_info, self.bitmap_texture.texture);
+        }
+
+        fn draw_vertices(&mut self, size_info: &SizeInfo, texture: GLuint) {
+            if self.vertices.is_empty() {
+                unsafe {
+                    gl::BindTexture(gl::TEXTURE_RECTANGLE, 0);
+                }
+                return;
+            }
+
             unsafe {
                 gl::Viewport(0, 0, size_info.width() as i32, size_info.height() as i32);
                 gl::BlendFunc(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
@@ -313,6 +462,7 @@ mod macos {
                 gl::Uniform1i(self.program.texture_uniform, 0);
 
                 gl::ActiveTexture(gl::TEXTURE0);
+                gl::BindTexture(gl::TEXTURE_RECTANGLE, texture);
                 gl::BindVertexArray(self.vao);
                 gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
                 gl::BufferData(

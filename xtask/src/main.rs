@@ -278,9 +278,9 @@ Usage:
   cargo xtask run-raw [--release] [--passkey] [-- <tabor args>]
 
 Commands:
-  app      Build/package and install Tabor.app to /Applications and set it as the default PDF opener, or stage a Mac App Store app
-  run      Build/package/install Tabor.app to /Applications, set it as the default PDF opener, then launch
-  install  Build/package and install Tabor.app to /Applications and set it as the default PDF opener
+  app      Build/package and install Tabor.app to /Applications and set it as the default PDF and image opener, or stage a Mac App Store app
+  run      Build/package/install Tabor.app to /Applications, set it as the default PDF and image opener, then launch
+  install  Build/package and install Tabor.app to /Applications and set it as the default PDF and image opener
   package  Build and sign a Mac App Store `.pkg` submission artifact
   run-raw  Build and run the raw tabor binary directly (disabled on macOS)
 
@@ -472,7 +472,7 @@ fn install_app_bundle(root: &Path, options: BuildOptions) -> Result<PathBuf, Box
     }
 
     remove_legacy_target_app_bundles(root)?;
-    ensure_default_pdf_handler(&install_path, options.distribution)?;
+    ensure_default_document_handlers(&install_path, options.distribution)?;
 
     Ok(install_path)
 }
@@ -688,13 +688,21 @@ fn verify_mac_app_store_package_signature(package_path: &Path) -> Result<(), Box
 }
 
 const PDF_CONTENT_TYPE: &str = "com.adobe.pdf";
+const IMAGE_CONTENT_TYPES: &[&str] = &[
+    "public.png",
+    "public.jpeg",
+    "com.compuserve.gif",
+    "com.microsoft.bmp",
+    "public.tiff",
+    "org.webmproject.webp",
+];
 const LAUNCH_SERVICES_ROLE_VIEWER: u32 = 0x0000_0002;
 const LAUNCH_SERVICES_RETRY_ATTEMPTS: usize = 4;
 const LAUNCH_SERVICES_RETRY_DELAY: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
-fn ensure_default_pdf_handler(
+fn ensure_default_document_handlers(
     app_dir: &Path,
     distribution: DistributionChannel,
 ) -> Result<(), Box<dyn Error>> {
@@ -703,9 +711,15 @@ fn ensure_default_pdf_handler(
     }
 
     let bundle_id = read_bundle_identifier(app_dir)?;
-    set_default_pdf_handler_for_bundle(&bundle_id)?;
-    println!("Set {} as the default viewer for {}", bundle_id, PDF_CONTENT_TYPE);
+    for content_type in default_viewer_content_types() {
+        set_default_content_type_handler_for_bundle(content_type, &bundle_id)?;
+        println!("Set {} as the default viewer for {}", bundle_id, content_type);
+    }
     Ok(())
+}
+
+fn default_viewer_content_types() -> impl Iterator<Item = &'static str> {
+    std::iter::once(PDF_CONTENT_TYPE).chain(IMAGE_CONTENT_TYPES.iter().copied())
 }
 
 fn read_bundle_identifier(app_dir: &Path) -> Result<String, Box<dyn Error>> {
@@ -727,16 +741,19 @@ fn read_bundle_identifier(app_dir: &Path) -> Result<String, Box<dyn Error>> {
     Ok(bundle_id)
 }
 
-fn set_default_pdf_handler_for_bundle(bundle_id: &str) -> Result<(), Box<dyn Error>> {
+fn set_default_content_type_handler_for_bundle(
+    content_type: &str,
+    bundle_id: &str,
+) -> Result<(), Box<dyn Error>> {
     let mut last_failure = String::from("unknown LaunchServices failure");
     for attempt in 1..=LAUNCH_SERVICES_RETRY_ATTEMPTS {
         let status = launch_services_set_default_role_handler(
-            PDF_CONTENT_TYPE,
+            content_type,
             LAUNCH_SERVICES_ROLE_VIEWER,
             bundle_id,
         )?;
         if status == 0 {
-            match verify_default_pdf_handler_for_bundle(bundle_id) {
+            match verify_default_content_type_handler_for_bundle(content_type, bundle_id) {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     last_failure = err.to_string();
@@ -751,22 +768,27 @@ fn set_default_pdf_handler_for_bundle(bundle_id: &str) -> Result<(), Box<dyn Err
     }
 
     Err(format!(
-        "failed to set default PDF handler to `{bundle_id}` after {} attempts: {}",
+        "failed to set default handler for `{content_type}` to `{bundle_id}` after {} attempts: {}",
         LAUNCH_SERVICES_RETRY_ATTEMPTS, last_failure
     )
     .into())
 }
 
-fn verify_default_pdf_handler_for_bundle(bundle_id: &str) -> Result<(), Box<dyn Error>> {
+fn verify_default_content_type_handler_for_bundle(
+    content_type: &str,
+    bundle_id: &str,
+) -> Result<(), Box<dyn Error>> {
     let handler =
-        launch_services_copy_default_role_handler(PDF_CONTENT_TYPE, LAUNCH_SERVICES_ROLE_VIEWER)?;
+        launch_services_copy_default_role_handler(content_type, LAUNCH_SERVICES_ROLE_VIEWER)?;
     match handler {
         Some(handler) if handler == bundle_id => Ok(()),
-        Some(handler) => {
-            Err(format!("default PDF handler mismatch: expected `{bundle_id}`, got `{handler}`")
-                .into())
+        Some(handler) => Err(format!(
+            "default handler mismatch for `{content_type}`: expected `{bundle_id}`, got `{handler}`"
+        )
+        .into()),
+        None => {
+            Err(format!("LaunchServices returned no default handler for `{content_type}`").into())
         },
-        None => Err("LaunchServices returned no default PDF handler".into()),
     }
 }
 
@@ -1043,18 +1065,25 @@ mod tests {
     }
 
     #[test]
-    fn help_text_mentions_default_pdf_opener() {
+    fn help_text_mentions_default_pdf_and_image_opener() {
         let help = help_text();
-        assert!(help.contains("default PDF opener"));
+        assert!(help.contains("default PDF and image opener"));
     }
 
     #[test]
-    fn ensure_default_pdf_handler_is_noop_for_mac_app_store_distribution() {
-        let result = ensure_default_pdf_handler(
+    fn ensure_default_document_handlers_is_noop_for_mac_app_store_distribution() {
+        let result = ensure_default_document_handlers(
             Path::new("/Applications/Tabor.app"),
             DistributionChannel::MacAppStore,
         );
-        assert!(result.is_ok(), "mac app store installs should skip PDF default changes");
+        assert!(result.is_ok(), "mac app store installs should skip PDF and image default changes");
+    }
+
+    #[test]
+    fn default_viewer_content_types_include_supported_images() {
+        let content_types = default_viewer_content_types().collect::<Vec<_>>();
+        assert_eq!(content_types[0], PDF_CONTENT_TYPE);
+        assert_eq!(&content_types[1..], IMAGE_CONTENT_TYPES);
     }
 
     #[test]

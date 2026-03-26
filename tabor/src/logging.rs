@@ -17,6 +17,8 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::cli::Options;
 use crate::event::{Event, EventType};
+#[cfg(target_os = "macos")]
+use crate::macos;
 use crate::message_bar::{Message, MessageType};
 
 /// Logging target for IPC config error messages.
@@ -197,6 +199,9 @@ struct OnDemandLogFile {
 
 impl OnDemandLogFile {
     fn new() -> Self {
+        #[cfg(target_os = "macos")]
+        let mut path = macos::logs_dir();
+        #[cfg(not(target_os = "macos"))]
         let mut path = env::temp_dir();
         path.push(format!("Tabor-{}.log", process::id()));
 

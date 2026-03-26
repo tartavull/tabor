@@ -184,7 +184,10 @@ impl TerminalViewportLayout {
         self.mode == TerminalViewMode::MultiColumn
     }
 
-    pub fn with_terminal_content<T>(mut self, _term: &Term<T>) -> Self {
+    pub fn with_terminal_content<T>(mut self, term: &Term<T>) -> Self {
+        self.logical_columns = min(self.logical_columns, term.columns());
+        self.logical_lines = min(self.logical_lines, term.screen_lines());
+        self.target_columns = min(self.target_columns, self.logical_columns);
         self.content_line_offset = 0;
         self
     }
@@ -212,6 +215,10 @@ impl TerminalViewportLayout {
         let logical_strip_index = self.logical_strip_index_for_visual(visual_strip_index);
         let line = logical_strip_index * self.visual_lines + point.line;
         let line = line.checked_sub(self.content_line_offset)?;
+        if line >= self.logical_lines || strip_column >= self.logical_columns {
+            return None;
+        }
+
         Some(Point::new(line, Column(strip_column)))
     }
 
@@ -410,7 +417,9 @@ impl TerminalViewportLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tabor_terminal::event::VoidListener;
     use tabor_terminal::index::Line;
+    use tabor_terminal::term::{Config as TermConfig, Term};
 
     fn size(columns: usize, lines: usize) -> SizeInfo {
         SizeInfo::new(columns as f32, lines as f32, 1., 1., 0., 0., 0., false)
@@ -538,6 +547,27 @@ mod tests {
         assert_eq!(
             layout.logical_terminal_point_from_pixels_clamped(&size_info, 0, 0, 0),
             Point::new(Line(0), Column(0)),
+        );
+    }
+
+    #[test]
+    fn with_terminal_content_clamps_resize_race_to_live_term_dimensions() {
+        let size_info = size(120, 40);
+        let term_size = size(80, 24);
+        let term = Term::new(TermConfig::default(), &term_size, VoidListener);
+        let layout = TerminalViewportLayout::new(
+            &size_info,
+            TerminalViewMode::Normal,
+            &MultiColumnTerminalConfig::default(),
+            None,
+        )
+        .with_terminal_content(&term);
+
+        assert_eq!(layout.logical_size(&size_info).columns(), 80);
+        assert_eq!(layout.logical_size(&size_info).screen_lines(), 24);
+        assert_eq!(
+            layout.logical_terminal_point_from_pixels_clamped(&size_info, 119, 39, 0),
+            Point::new(Line(23), Column(79)),
         );
     }
 

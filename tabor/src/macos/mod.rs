@@ -1,11 +1,17 @@
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::env;
 use std::error::Error;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::fmt::Write;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io;
 use std::mem;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(feature = "passkey-webauthn")]
@@ -23,6 +29,7 @@ use objc2_foundation::{
     NSActivityOptions, NSDictionary, NSObjectProtocol, NSProcessInfo, NSString, NSUserDefaults,
     ns_string,
 };
+use plist::Value;
 
 #[cfg(feature = "passkey-webauthn")]
 #[link(name = "AuthenticationServices", kind = "framework")]
@@ -30,6 +37,7 @@ unsafe extern "C" {}
 
 pub mod cef;
 pub mod favicon;
+pub mod image_view;
 pub(crate) mod keycodes;
 pub mod locale;
 pub mod open_documents;
@@ -41,6 +49,14 @@ mod webview_cef;
 
 pub(crate) use open_documents::register_open_documents_handler;
 use webview::WebFrameDeliveryMode;
+
+const DEFAULT_BUNDLE_IDENTIFIER: &str = "com.pinkbot.tabor";
+const DISTRIBUTION_CHANNEL_KEY: &str = "TABORDistributionChannel";
+const DISTRIBUTION_CHANNEL_ENV: &str = "TABOR_DISTRIBUTION_CHANNEL";
+const BUNDLE_IDENTIFIER_ENV: &str = "TABOR_BUNDLE_IDENTIFIER";
+const CONTAINER_DATA_DIR_ENV: &str = "TABOR_CONTAINER_DATA_DIR";
+const APP_SUPPORT_DIR_NAME: &str = "Tabor";
+const ALLOW_UNSUPPORTED_GUI_LAUNCH_ENV: &str = "TABOR_ALLOW_UNSUPPORTED_GUI_LAUNCH";
 
 static WEBVIEW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WEBVIEW_CREATED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +88,202 @@ pub(crate) struct WebViewMetrics {
     pub live_accelerated_surfaces: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DistributionChannel {
+    #[default]
+    Direct,
+    MacAppStore,
+}
+
+impl DistributionChannel {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "direct" => Some(Self::Direct),
+            "mac_app_store" => Some(Self::MacAppStore),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_mac_app_store(self) -> bool {
+        matches!(self, Self::MacAppStore)
+    }
+}
+
+pub(crate) fn distribution_channel() -> DistributionChannel {
+    env::var(DISTRIBUTION_CHANNEL_ENV)
+        .ok()
+        .and_then(|value| DistributionChannel::from_str(value.trim()))
+        .or_else(|| {
+            info_plist_string(DISTRIBUTION_CHANNEL_KEY)
+                .as_deref()
+                .and_then(DistributionChannel::from_str)
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn bundle_identifier() -> String {
+    env::var(BUNDLE_IDENTIFIER_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| info_plist_string("CFBundleIdentifier"))
+        .unwrap_or_else(|| String::from(DEFAULT_BUNDLE_IDENTIFIER))
+}
+
+pub(crate) fn container_data_dir() -> PathBuf {
+    if let Ok(path) = env::var(CONTAINER_DATA_DIR_ENV) {
+        return ensure_directory(PathBuf::from(path), "app container override");
+    }
+
+    let home_dir = home::home_dir().unwrap_or_else(|| {
+        panic!("unable to resolve home directory for bundle {}", bundle_identifier())
+    });
+    ensure_directory(
+        home_dir.join("Library").join("Containers").join(bundle_identifier()).join("Data"),
+        "app container data directory",
+    )
+}
+fn direct_runtime_tmp_root() -> PathBuf {
+    darwin_user_temp_dir().unwrap_or_else(env::temp_dir)
+}
+
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    unsafe {
+        let len = libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0);
+        if len == 0 {
+            return None;
+        }
+
+        let mut buffer = vec![0u8; len as usize];
+        let written =
+            libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buffer.as_mut_ptr().cast(), len);
+        if written == 0 {
+            return None;
+        }
+
+        let path = CStr::from_ptr(buffer.as_ptr().cast());
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+    }
+}
+
+pub(crate) fn runtime_tmp_dir() -> PathBuf {
+    if let Some(path) = test_bundle_root() {
+        return ensure_directory(path.join("tmp"), "test bundle runtime temporary directory");
+    }
+
+    if distribution_channel().is_mac_app_store() {
+        ensure_directory(container_data_dir().join("tmp"), "runtime temporary directory")
+    } else {
+        ensure_directory(direct_runtime_tmp_root(), "runtime temporary directory")
+    }
+}
+
+pub(crate) fn logs_dir() -> PathBuf {
+    if let Some(path) = test_bundle_root() {
+        return ensure_directory(path.join("logs"), "test bundle log directory");
+    }
+
+    if distribution_channel().is_mac_app_store() {
+        ensure_directory(
+            container_data_dir().join("Library").join("Logs").join("Tabor"),
+            "log directory",
+        )
+    } else {
+        ensure_directory(direct_runtime_tmp_root(), "log directory")
+    }
+}
+
+pub(crate) fn direct_app_support_dir() -> PathBuf {
+    if let Some(path) = test_bundle_root() {
+        return ensure_directory(path.join("app-support"), "test bundle app support directory");
+    }
+
+    let home_dir = home::home_dir().unwrap_or_else(|| {
+        panic!("unable to resolve home directory for bundle {}", bundle_identifier())
+    });
+    ensure_directory(
+        home_dir.join("Library").join("Application Support").join(APP_SUPPORT_DIR_NAME),
+        "app support directory",
+    )
+}
+
+pub(crate) fn cef_cache_dir() -> PathBuf {
+    if distribution_channel().is_mac_app_store() {
+        ensure_directory(
+            container_data_dir().join("Library").join("Caches").join("Tabor").join("cef"),
+            "CEF cache directory",
+        )
+    } else {
+        ensure_directory(direct_app_support_dir().join("cef"), "CEF cache directory")
+    }
+}
+
+fn test_bundle_root() -> Option<PathBuf> {
+    let bundle_id = bundle_identifier();
+    if !bundle_id.starts_with("com.pinkbot.tabor.test.") {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    bundle_id.hash(&mut hasher);
+    Some(env::temp_dir().join(format!("tabor-test-{:016x}", hasher.finish())))
+}
+
+pub(crate) fn default_download_dir() -> PathBuf {
+    let base_dir = home::home_dir()
+        .map(|path| path.join("Downloads"))
+        .unwrap_or_else(|| runtime_tmp_dir().join("Downloads"));
+    ensure_directory(base_dir.join("Tabor"), "download directory")
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::env;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    pub(crate) fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(crate) struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            unsafe { env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        pub(crate) fn unset(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            unsafe { env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe { env::set_var(self.key, previous) };
+            } else {
+                unsafe { env::remove_var(self.key) };
+            }
+        }
+    }
+}
+
+pub(crate) fn preferred_working_dir() -> PathBuf {
+    if distribution_channel().is_mac_app_store() {
+        container_data_dir()
+    } else {
+        home::home_dir().expect("unable to resolve home directory for Tabor")
+    }
+}
+
 pub(crate) fn webview_metrics() -> WebViewMetrics {
     WebViewMetrics {
         live: WEBVIEW_COUNT.load(Ordering::SeqCst),
@@ -88,32 +300,32 @@ pub(crate) fn webview_metrics() -> WebViewMetrics {
 }
 
 static CEF_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
-const CEF_APPLICATION_CLASS_NAME: &[u8] = b"TaborCefApplication\0";
+const SUPPORTED_GUI_PARENT_PROCESSES: &[&str] =
+    &["launchd", "xpcproxy", "open", "loginwindow", "dock", "finder"];
 
 pub(crate) fn cef_handling_send_event() -> bool {
     CEF_HANDLING_SEND_EVENT.load(Ordering::Relaxed)
 }
 
-pub fn ensure_cef_application() {
-    let mtm = MainThreadMarker::new().expect("CEF application setup must run on main thread");
-    let class = cef_application_class();
-
-    let app: *mut AnyObject = unsafe { msg_send![class, sharedApplication] };
-    let Some(app) = (unsafe { Retained::from_raw(app) }) else {
-        panic!("failed to initialize NSApplication singleton for CEF");
-    };
+pub fn ensure_cef_application() -> Result<(), Box<dyn Error>> {
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| io::Error::other("CEF application setup must run on main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    install_cef_application_contract(app.class());
 
     let responds_is: Bool =
         unsafe { msg_send![&*app, respondsToSelector: sel!(isHandlingSendEvent)] };
     let responds_set: Bool =
         unsafe { msg_send![&*app, respondsToSelector: sel!(setHandlingSendEvent:)] };
 
-    assert!(
-        responds_is.as_bool() && responds_set.as_bool(),
-        "CEF application contract not satisfied: NSApplication missing isHandlingSendEvent/setHandlingSendEvent:"
-    );
-
-    let _ = mtm;
+    if responds_is.as_bool() && responds_set.as_bool() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "CEF application contract not satisfied: NSApplication missing isHandlingSendEvent/setHandlingSendEvent:",
+        )
+        .into())
+    }
 }
 
 pub fn enforce_signed_app_launch() -> Result<(), Box<dyn Error>> {
@@ -151,10 +363,60 @@ pub fn enforce_signed_app_launch() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub fn enforce_supported_gui_launch_context() -> Result<(), Box<dyn Error>> {
+    let parent_pid = unsafe { libc::getppid() };
+    if parent_pid <= 1 {
+        return Ok(());
+    }
+
+    let parent_path = proc::executable_path(parent_pid)?;
+    let parent_name = parent_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("unable to resolve macOS GUI parent process name"))?;
+
+    if is_supported_gui_parent_process(parent_name) {
+        return Ok(());
+    }
+
+    if env::var_os(ALLOW_UNSUPPORTED_GUI_LAUNCH_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        && bundle_identifier().starts_with("com.pinkbot.tabor.test.")
+    {
+        return Ok(());
+    }
+
+    let current_executable = env::current_exe()?;
+    Err(format!(
+        "Unsupported macOS GUI launch context: {} was executed directly by {}. Launch Tabor via LaunchServices instead, for example `open -a /Applications/Tabor.app`. Direct execution remains supported for CLI commands such as `tabor msg`, `tabor agent`, and `tabor workspace`.",
+        current_executable.display(),
+        parent_path.display(),
+    )
+    .into())
+}
+
 fn enclosing_app_bundle(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
         .map(Path::to_path_buf)
+}
+
+fn current_info_plist() -> Option<PathBuf> {
+    let current_executable = env::current_exe().ok()?;
+    enclosing_app_bundle(&current_executable)
+        .map(|bundle| bundle.join("Contents").join("Info.plist"))
+}
+
+fn info_plist_string(key: &str) -> Option<String> {
+    let info_plist = current_info_plist()?;
+    let plist = Value::from_file(&info_plist).ok()?;
+    let dict = plist.as_dictionary()?;
+    dict.get(key)?.as_string().map(ToOwned::to_owned)
+}
+
+fn ensure_directory(path: PathBuf, label: &str) -> PathBuf {
+    fs::create_dir_all(&path)
+        .unwrap_or_else(|err| panic!("unable to create {label} {}: {err}", path.display()));
+    path
 }
 
 unsafe extern "C-unwind" fn cef_app_is_handling_send_event(_this: &AnyObject, _sel: Sel) -> Bool {
@@ -169,67 +431,50 @@ unsafe extern "C-unwind" fn cef_app_set_handling_send_event(
     CEF_HANDLING_SEND_EVENT.store(handling_send_event.as_bool(), Ordering::Relaxed);
 }
 
-fn cef_application_class() -> &'static AnyClass {
-    static REGISTER: Once = Once::new();
-    static mut CLASS: *const AnyClass = std::ptr::null();
-
-    REGISTER.call_once(|| {
-        let name = CStr::from_bytes_with_nul(CEF_APPLICATION_CLASS_NAME)
-            .expect("static CEF application class name");
-        let cls = if let Some(existing) = AnyClass::get(name) {
-            existing
-        } else {
-            let superclass_name = c"NSApplication";
-            let superclass =
-                AnyClass::get(superclass_name).expect("NSApplication class unavailable");
-
-            let super_ptr = superclass as *const AnyClass;
-            let cls = unsafe { ffi::objc_allocateClassPair(super_ptr, name.as_ptr(), 0) };
-            let cls = std::ptr::NonNull::new(cls).expect("failed to allocate CEF app class");
-
-            unsafe {
-                add_cef_method_raw(
-                    cls.as_ptr(),
-                    sel!(isHandlingSendEvent),
-                    mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
-                        cef_app_is_handling_send_event,
-                    ),
-                    Bool::ENCODING,
-                    &[],
-                );
-                add_cef_method_raw(
-                    cls.as_ptr(),
-                    sel!(setHandlingSendEvent:),
-                    mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel, Bool), Imp>(
-                        cef_app_set_handling_send_event,
-                    ),
-                    Encoding::Void,
-                    &[Bool::ENCODING],
-                );
-
-                ffi::objc_registerClassPair(cls.as_ptr());
-                cls.as_ref()
-            }
-        };
-
-        unsafe {
-            CLASS = cls as *const AnyClass;
-        }
-    });
-
-    unsafe { &*CLASS }
+fn install_cef_application_contract(class: &AnyClass) {
+    unsafe {
+        add_cef_method_if_missing(
+            class,
+            sel!(isHandlingSendEvent),
+            mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(
+                cef_app_is_handling_send_event,
+            ),
+            Bool::ENCODING,
+            &[],
+        );
+        add_cef_method_if_missing(
+            class,
+            sel!(setHandlingSendEvent:),
+            mem::transmute::<unsafe extern "C-unwind" fn(&AnyObject, Sel, Bool), Imp>(
+                cef_app_set_handling_send_event,
+            ),
+            Encoding::Void,
+            &[Bool::ENCODING],
+        );
+    }
 }
 
-unsafe fn add_cef_method_raw(
-    cls: *mut AnyClass,
+unsafe fn add_cef_method_if_missing(
+    class: &AnyClass,
     selector: Sel,
     imp: Imp,
     ret: Encoding,
     args: &[Encoding],
 ) {
+    if class.instance_method(selector).is_some() {
+        return;
+    }
+
     let encoding = method_type_encoding(ret, args);
-    let success = unsafe { ffi::class_addMethod(cls, selector, imp, encoding.as_ptr()) };
+    let class_ptr = class as *const AnyClass as *mut AnyClass;
+    let success = unsafe { ffi::class_addMethod(class_ptr, selector, imp, encoding.as_ptr()) };
     assert!(success.as_bool(), "failed to add CEF application method");
+}
+
+fn is_supported_gui_parent_process(parent_name: &str) -> bool {
+    SUPPORTED_GUI_PARENT_PROCESSES
+        .iter()
+        .any(|candidate| parent_name.eq_ignore_ascii_case(candidate))
 }
 
 fn method_type_encoding(ret: Encoding, args: &[Encoding]) -> CString {
@@ -387,5 +632,100 @@ fn request_passkey_authorization() {
 
     unsafe {
         let _: () = msg_send![&*manager, requestAuthorizationForPublicKeyCredentials: &*block];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::test_support::{EnvVarGuard, env_lock};
+    use super::*;
+
+    #[test]
+    fn mac_app_store_path_helpers_use_container_override() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let container = temp_dir.path().join("container-data");
+
+        let _distribution = EnvVarGuard::set(DISTRIBUTION_CHANNEL_ENV, "mac_app_store");
+        let _container = EnvVarGuard::set(CONTAINER_DATA_DIR_ENV, &container.display().to_string());
+        let _bundle_id = EnvVarGuard::set(BUNDLE_IDENTIFIER_ENV, "com.pinkbot.tabor.test");
+
+        assert_eq!(distribution_channel(), DistributionChannel::MacAppStore);
+        assert_eq!(bundle_identifier(), "com.pinkbot.tabor.test");
+        assert_eq!(container_data_dir(), container);
+        assert_eq!(preferred_working_dir(), container);
+        assert_eq!(runtime_tmp_dir(), container.join("tmp"));
+        assert_eq!(logs_dir(), container.join("Library").join("Logs").join("Tabor"));
+        assert_eq!(
+            cef_cache_dir(),
+            container.join("Library").join("Caches").join("Tabor").join("cef")
+        );
+    }
+
+    #[test]
+    fn direct_path_helpers_use_application_support_for_cef_profile_storage() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let home_dir = temp_dir.path().join("home");
+
+        let _distribution = EnvVarGuard::set(DISTRIBUTION_CHANNEL_ENV, "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+
+        let app_support_dir = home_dir.join("Library").join("Application Support").join("Tabor");
+        assert_eq!(distribution_channel(), DistributionChannel::Direct);
+        assert_eq!(direct_app_support_dir(), app_support_dir);
+        assert_eq!(cef_cache_dir(), app_support_dir.join("cef"));
+    }
+
+    #[test]
+    fn direct_runtime_paths_ignore_tmpdir_override() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let home_dir = temp_dir.path().join("home");
+        let fake_tmpdir = temp_dir.path().join("nix-shell.fake");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+        std::fs::create_dir_all(&fake_tmpdir).expect("create tmpdir");
+
+        let _distribution = EnvVarGuard::set(DISTRIBUTION_CHANNEL_ENV, "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+        let _tmpdir = EnvVarGuard::set("TMPDIR", &fake_tmpdir.display().to_string());
+
+        let canonical_tmp = darwin_user_temp_dir().expect("darwin user temp dir");
+        assert_eq!(runtime_tmp_dir(), canonical_tmp);
+        assert_eq!(logs_dir(), canonical_tmp);
+        assert_ne!(runtime_tmp_dir(), fake_tmpdir);
+    }
+
+    #[test]
+    fn direct_test_bundle_paths_use_per_bundle_temp_root() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let home_dir = temp_dir.path().join("home");
+
+        let _distribution = EnvVarGuard::set(DISTRIBUTION_CHANNEL_ENV, "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+        let _bundle_id = EnvVarGuard::set(BUNDLE_IDENTIFIER_ENV, "com.pinkbot.tabor.test.tmpcase");
+
+        let root = test_bundle_root().expect("expected test bundle root");
+        assert_eq!(runtime_tmp_dir(), root.join("tmp"));
+        assert_eq!(logs_dir(), root.join("logs"));
+        assert_eq!(direct_app_support_dir(), root.join("app-support"));
+        assert_eq!(cef_cache_dir(), root.join("app-support").join("cef"));
+    }
+
+    #[test]
+    fn gui_parent_allowlist_accepts_launchservices_processes() {
+        assert!(is_supported_gui_parent_process("launchd"));
+        assert!(is_supported_gui_parent_process("xpcproxy"));
+        assert!(is_supported_gui_parent_process("Dock"));
+    }
+
+    #[test]
+    fn gui_parent_allowlist_rejects_direct_exec_callers() {
+        assert!(!is_supported_gui_parent_process("codex"));
+        assert!(!is_supported_gui_parent_process("zsh"));
+        assert!(!is_supported_gui_parent_process("python3"));
     }
 }

@@ -52,6 +52,7 @@ const INITIAL_TABSTOPS: usize = 8;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     pub struct TermMode: u32 {
         const NONE                    = 0;
         const SHOW_CURSOR             = 1;
@@ -391,7 +392,49 @@ pub enum Osc52 {
     CopyPaste,
 }
 
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TermSnapshot {
+    pub is_focused: bool,
+    pub vi_mode_cursor: ViModeCursor,
+    pub grid: Grid<Cell>,
+    pub inactive_grid: Grid<Cell>,
+    pub mode: TermMode,
+    pub colors: Colors,
+    pub title: Option<String>,
+}
+
 impl<T> Term<T> {
+    #[cfg(feature = "serde")]
+    pub fn export_snapshot(&self) -> TermSnapshot {
+        TermSnapshot {
+            is_focused: self.is_focused,
+            vi_mode_cursor: self.vi_mode_cursor,
+            grid: self.grid.clone(),
+            inactive_grid: self.inactive_grid.clone(),
+            mode: self.mode,
+            colors: self.colors,
+            title: self.title.clone(),
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    pub fn apply_snapshot(&mut self, snapshot: TermSnapshot) {
+        self.is_focused = snapshot.is_focused;
+        self.vi_mode_cursor = snapshot.vi_mode_cursor;
+        self.selection = None;
+        self.grid = snapshot.grid;
+        self.inactive_grid = snapshot.inactive_grid;
+        self.mode = snapshot.mode;
+        self.colors = snapshot.colors;
+        self.cursor_style = None;
+        self.title = snapshot.title;
+        self.active_charset = CharsetIndex::G0;
+        self.tabs = TabStops::new(self.columns());
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+        self.damage = TermDamageState::new(self.columns(), self.screen_lines());
+    }
+
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
@@ -2562,7 +2605,7 @@ mod tests {
     use crate::selection::{Selection, SelectionType};
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
-    use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+    use crate::vte::ansi::{self, CharsetIndex, Handler, NamedColor, Rgb, StandardCharset};
 
     #[test]
     fn scroll_display_page_up() {
@@ -2790,6 +2833,30 @@ mod tests {
         let deserialized = serde_json::from_str::<Grid<Cell>>(&serialized).expect("de");
 
         assert_eq!(deserialized, grid);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn term_snapshot_roundtrip_restores_visible_state() {
+        let size = TermSize::new(6, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.input('a');
+        term.input('b');
+        term.newline();
+        term.input('c');
+        term.vi_mode_cursor = ViModeCursor::new(Point::new(Line(1), Column(0)));
+        term.grid.cursor.point = Point::new(Line(1), Column(1));
+        term.colors[NamedColor::Foreground] = Some(Rgb { r: 1, g: 2, b: 3 });
+
+        let snapshot = term.export_snapshot();
+        let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        let decoded =
+            serde_json::from_str::<TermSnapshot>(&serialized).expect("deserialize snapshot");
+
+        let mut restored = Term::new(Config::default(), &size, VoidListener);
+        restored.apply_snapshot(decoded);
+
+        assert_eq!(restored.export_snapshot(), snapshot);
     }
 
     #[test]

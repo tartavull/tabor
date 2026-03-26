@@ -108,6 +108,7 @@ microphone_usage_description="$(read_optional_plist_string 'NSMicrophoneUsageDes
 public_key_credential_usage_description="$(
   read_optional_plist_string 'NSWebBrowserPublicKeyCredentialUsageDescription'
 )"
+distribution_channel="$(read_optional_plist_string 'TABORDistributionChannel')"
 
 helper_prefix="${TABOR_CEF_HELPER_PREFIX:-Tabor}"
 helpers=(
@@ -179,6 +180,7 @@ for helper_name in "${helpers[@]}"; do
   <true/>
 PLIST
     print_bool_key "NSSupportsAutomaticGraphicsSwitching" "$supports_automatic_graphics_switching"
+    print_optional_string_key "TABORDistributionChannel" "$distribution_channel"
     print_optional_string_key "NSWebBrowserPublicKeyCredentialUsageDescription" \
       "$public_key_credential_usage_description"
     print_optional_string_key "NSCameraUsageDescription" "$camera_usage_description"

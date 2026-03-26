@@ -13,6 +13,7 @@
 compile_error!(r#"at least one of the "x11"/"wayland" features must be enabled"#);
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -54,6 +55,8 @@ mod tabs;
 mod web_url;
 mod window_context;
 mod window_kind;
+#[cfg(unix)]
+mod workspace;
 
 mod gl {
     #![allow(clippy::all, unsafe_op_in_unsafe_fn)]
@@ -92,36 +95,70 @@ fn main() -> Result<(), Box<dyn Error>> {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
-    #[cfg(target_os = "macos")]
-    macos::ensure_cef_application();
-
-    #[cfg(target_os = "macos")]
-    if let Some(exit_code) = macos::cef::maybe_execute_subprocess()? {
-        std::process::exit(exit_code);
-    }
-
     #[cfg(unix)]
     if agent::maybe_run_internal_from_argv()? {
         return Ok(());
     }
 
-    // Load command line options.
-    let options = Options::new();
+    #[cfg(unix)]
+    if workspace::maybe_run_internal_from_argv()? {
+        return Ok(());
+    }
 
+    #[cfg(target_os = "macos")]
+    if args_indicate_cef_subprocess(std::env::args_os().skip(1)) {
+        let Some(exit_code) = macos::cef::maybe_execute_subprocess()? else {
+            return Err("CEF subprocess bootstrap returned without an exit code".into());
+        };
+        std::process::exit(exit_code);
+    }
+
+    dispatch_options(Options::new())?;
+
+    Ok(())
+}
+
+fn dispatch_options(options: Options) -> Result<(), Box<dyn Error>> {
     match options.subcommands {
         #[cfg(unix)]
         Some(Subcommands::Msg(options)) => msg(options)?,
         #[cfg(unix)]
         Some(Subcommands::Agent(options)) => agent::run(options)?,
+        #[cfg(unix)]
+        Some(Subcommands::Workspace(options)) => workspace::run(options)?,
         Some(Subcommands::Migrate(options)) => migrate::migrate(options),
         None => {
             #[cfg(target_os = "macos")]
-            macos::enforce_signed_app_launch()?;
+            {
+                macos::enforce_signed_app_launch()?;
+                macos::enforce_supported_gui_launch_context()?;
+            }
             tabor(options)?
         },
     }
 
     Ok(())
+}
+
+fn args_indicate_cef_subprocess<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return false;
+    };
+    let first = first.as_ref();
+
+    if first == OsStr::new("--type") {
+        return args.next().is_some_and(|arg| !arg.as_ref().is_empty());
+    }
+
+    first
+        .to_str()
+        .and_then(|value| value.strip_prefix("--type="))
+        .is_some_and(|value| !value.is_empty())
 }
 
 /// `msg` subcommand entrypoint.
@@ -422,9 +459,6 @@ fn tabor(mut options: Options) -> Result<(), Box<dyn Error>> {
     // Setup winit event loop.
     let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
 
-    #[cfg(target_os = "macos")]
-    macos::register_open_documents_handler(window_event_loop.create_proxy());
-
     // Initialize the logger as soon as possible as to capture output from other subsystems.
     let log_file = logging::initialize(&options, window_event_loop.create_proxy())
         .expect("Unable to initialize logger");
@@ -462,9 +496,15 @@ fn tabor(mut options: Options) -> Result<(), Box<dyn Error>> {
         unsafe { env::set_var(key, value) };
     }
 
-    // Switch to home directory.
+    // GUI launches inherit LaunchServices cwd, so normalize to the preferred working directory.
     #[cfg(target_os = "macos")]
-    env::set_current_dir(home::home_dir().unwrap()).unwrap();
+    env::set_current_dir(macos::preferred_working_dir()).unwrap();
+
+    #[cfg(target_os = "macos")]
+    macos::ensure_cef_application()?;
+
+    #[cfg(target_os = "macos")]
+    macos::register_open_documents_handler(window_event_loop.create_proxy());
 
     // Set macOS locale.
     #[cfg(target_os = "macos")]
@@ -552,4 +592,31 @@ fn log_config_path(config: &UiConfig) {
     }
 
     info!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::args_indicate_cef_subprocess;
+
+    #[test]
+    fn detects_type_equals_style_cef_arg() {
+        assert!(args_indicate_cef_subprocess(["--type=renderer"]));
+    }
+
+    #[test]
+    fn detects_split_type_cef_arg() {
+        assert!(args_indicate_cef_subprocess(["--type", "gpu-process"]));
+    }
+
+    #[test]
+    fn ignores_missing_type_value() {
+        assert!(!args_indicate_cef_subprocess(["--type"]));
+    }
+
+    #[test]
+    fn ignores_normal_cli_args() {
+        assert!(!args_indicate_cef_subprocess(["msg", "list-tabs"]));
+        assert!(!args_indicate_cef_subprocess(["--daemon"]));
+        assert!(!args_indicate_cef_subprocess(["-e", "echo", "--type=renderer"]));
+    }
 }

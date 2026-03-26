@@ -4,6 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,8 @@ use crate::config::{Action, MouseAction, SearchAction, ViAction};
 use crate::display::browser_layout::{BrowserViewMode, BrowserViewportRect};
 use crate::display::terminal_layout::TerminalViewMode;
 use crate::event::{Event, EventType};
+#[cfg(target_os = "macos")]
+use crate::macos;
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebMode;
 use crate::tabs::TabId;
@@ -56,6 +59,7 @@ impl From<IpcTabId> for TabId {
 pub enum IpcTabKind {
     Terminal,
     Web { url: String },
+    Image { source: String },
 }
 
 impl From<&WindowKind> for IpcTabKind {
@@ -63,6 +67,7 @@ impl From<&WindowKind> for IpcTabKind {
         match kind {
             WindowKind::Terminal => Self::Terminal,
             WindowKind::Web { url } => Self::Web { url: url.clone() },
+            WindowKind::Image { source } => Self::Image { source: source.clone() },
         }
     }
 }
@@ -122,6 +127,38 @@ pub struct IpcBrowserLayoutState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum IpcImageLoadState {
+    Loading,
+    Ready,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcImageScaleMode {
+    Fit,
+    Fill,
+    Actual,
+    Manual,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcImageViewState {
+    pub source: String,
+    pub state: IpcImageLoadState,
+    pub scale_mode: IpcImageScaleMode,
+    pub zoom: f64,
+    pub rotation_quarter_turns: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum IpcWebMode {
     Normal,
     Insert,
@@ -147,7 +184,7 @@ impl From<WebMode> for IpcWebMode {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcTabState {
     pub tab_id: IpcTabId,
     pub group_id: usize,
@@ -164,9 +201,11 @@ pub struct IpcTabState {
     pub terminal_layout: Option<IpcTerminalLayoutState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_layout: Option<IpcBrowserLayoutState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_view: Option<IpcImageViewState>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcTabGroup {
     pub id: usize,
     pub name: Option<String>,
@@ -1198,7 +1237,7 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
                 UrlTarget::Current => match ctx.active_tab_id() {
                     Some(tab_id) => match ctx.tab_kind(tab_id) {
-                        Some(IpcTabKind::Web { .. }) => {
+                        Some(IpcTabKind::Web { .. } | IpcTabKind::Image { .. }) => {
                             ctx.open_url_in_tab(tab_id, url).map(|_| None)
                         },
                         Some(IpcTabKind::Terminal) => ctx.open_url_new_tab(url).map(Some),
@@ -1484,6 +1523,7 @@ pub fn spawn_ipc_socket(
         path
     });
 
+    cleanup_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)?;
 
     unsafe { env::set_var(TABOR_SOCKET_ENV, socket_path.as_os_str()) };
@@ -1527,6 +1567,29 @@ pub fn spawn_ipc_socket(
     });
 
     Ok(socket_path)
+}
+
+fn cleanup_stale_socket(socket_path: &PathBuf) -> IoResult<()> {
+    let Ok(metadata) = fs::symlink_metadata(socket_path) else {
+        return Ok(());
+    };
+
+    if !metadata.file_type().is_socket() {
+        return Ok(());
+    }
+
+    match UnixStream::connect(socket_path) {
+        Ok(_) => Err(IoError::new(
+            ErrorKind::AddrInUse,
+            format!("socket path already in use: {}", socket_path.display()),
+        )),
+        Err(err) if err.kind() == ErrorKind::ConnectionRefused => {
+            fs::remove_file(socket_path)?;
+            Ok(())
+        },
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Send a message to the active Tabor socket.
@@ -1612,7 +1675,7 @@ fn socket_dir() -> PathBuf {
 /// Directory for the IPC socket file.
 #[cfg(target_os = "macos")]
 fn socket_dir() -> PathBuf {
-    env::temp_dir()
+    macos::runtime_tmp_dir()
 }
 
 /// Find the IPC socket path.
@@ -1721,6 +1784,12 @@ mod tests {
         window_debug_state: IpcWindowDebugState,
         window_debug_snapshot: IpcWindowDebugSnapshot,
         runtime_metrics: IpcRuntimeMetrics,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockOpenUrlKind {
+        Web,
+        Image,
     }
 
     impl MockContext {
@@ -1912,6 +1981,7 @@ mod tests {
                             popup_surface_height: None,
                         },
                     }),
+                    IpcTabKind::Image { .. } => None,
                 },
                 kind,
             };
@@ -1992,6 +2062,7 @@ mod tests {
                                 web_mode: None,
                                 terminal_layout: None,
                                 browser_layout: tab.browser_layout.clone(),
+                                image_view: mock_image_view(&tab.kind),
                             })
                         })
                         .collect();
@@ -2016,6 +2087,7 @@ mod tests {
                 web_mode: None,
                 terminal_layout: None,
                 browser_layout: tab.browser_layout.clone(),
+                image_view: mock_image_view(&tab.kind),
             })
         }
 
@@ -2039,6 +2111,9 @@ mod tests {
                         ));
                     }
                     self.add_tab(IpcTabKind::Web { url }, group_id, group_name)
+                },
+                WindowKind::Image { source } => {
+                    self.add_tab(IpcTabKind::Image { source }, group_id, group_name)
                 },
             }
         }
@@ -2176,12 +2251,22 @@ mod tests {
                 .tabs
                 .get_mut(&tab_id)
                 .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
-            match &mut tab.kind {
-                IpcTabKind::Web { url: tab_url } => {
+            match (&mut tab.kind, mock_open_url_kind(&url)) {
+                (IpcTabKind::Web { url: tab_url }, MockOpenUrlKind::Web) => {
                     *tab_url = url;
                     Ok(())
                 },
-                IpcTabKind::Terminal => {
+                (IpcTabKind::Image { source }, MockOpenUrlKind::Image) => {
+                    *source = url;
+                    Ok(())
+                },
+                (IpcTabKind::Terminal, _) => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web or image tab"))
+                },
+                (IpcTabKind::Web { .. }, MockOpenUrlKind::Image) => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not an image tab"))
+                },
+                (IpcTabKind::Image { .. }, MockOpenUrlKind::Web) => {
                     Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
                 },
             }
@@ -2191,7 +2276,14 @@ mod tests {
             if !self.web_supported {
                 return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
             }
-            self.add_tab(IpcTabKind::Web { url }, None, None)
+            self.add_tab(
+                match mock_open_url_kind(&url) {
+                    MockOpenUrlKind::Web => IpcTabKind::Web { url },
+                    MockOpenUrlKind::Image => IpcTabKind::Image { source: url },
+                },
+                None,
+                None,
+            )
         }
 
         fn reload_web(&mut self, tab_id: TabId) -> Result<(), IpcError> {
@@ -2201,6 +2293,9 @@ mod tests {
                 .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
             match tab.kind {
                 IpcTabKind::Web { .. } => Ok(()),
+                IpcTabKind::Image { .. } => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
+                },
                 IpcTabKind::Terminal => {
                     Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
                 },
@@ -2362,6 +2457,38 @@ mod tests {
 
         fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError> {
             Ok(self.runtime_metrics.clone())
+        }
+    }
+
+    fn mock_image_view(kind: &IpcTabKind) -> Option<IpcImageViewState> {
+        let IpcTabKind::Image { source } = kind else {
+            return None;
+        };
+        Some(IpcImageViewState {
+            source: source.clone(),
+            state: IpcImageLoadState::Loading,
+            scale_mode: IpcImageScaleMode::Fit,
+            zoom: 1.0,
+            rotation_quarter_turns: 0,
+            width: None,
+            height: None,
+            error: None,
+        })
+    }
+
+    fn mock_open_url_kind(url: &str) -> MockOpenUrlKind {
+        #[cfg(target_os = "macos")]
+        {
+            match crate::macos::image_view::classify_open_url(url) {
+                crate::macos::image_view::OpenUrlKind::Web => MockOpenUrlKind::Web,
+                crate::macos::image_view::OpenUrlKind::Image => MockOpenUrlKind::Image,
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = url;
+            MockOpenUrlKind::Web
         }
     }
 

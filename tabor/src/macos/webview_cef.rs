@@ -498,10 +498,7 @@ fn should_invalidate_after_frame_edit(command: FrameEditCommand) -> bool {
 
 impl AutomationState {
     fn new() -> Self {
-        let base_dir =
-            home::home_dir().map(|path| path.join("Downloads")).unwrap_or_else(std::env::temp_dir);
-        let download_dir = base_dir.join("Tabor");
-        let _ = fs::create_dir_all(&download_dir);
+        let download_dir = super::default_download_dir();
         Self { downloads: HashMap::new(), download_order: Vec::new(), download_dir }
     }
 
@@ -1125,9 +1122,14 @@ fn all_known_permission_mask() -> u32 {
 fn blocked_permission_mask() -> u32 {
     use cef::PermissionRequestTypes as Permission;
 
-    Permission::AR_SESSION.get_raw()
+    let mut blocked = Permission::AR_SESSION.get_raw()
         | Permission::VR_SESSION.get_raw()
-        | Permission::HAND_TRACKING.get_raw()
+        | Permission::HAND_TRACKING.get_raw();
+    if super::distribution_channel().is_mac_app_store() {
+        blocked |=
+            Permission::FILE_SYSTEM_ACCESS.get_raw() | Permission::LOCAL_NETWORK_ACCESS.get_raw();
+    }
+    blocked
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
@@ -1673,7 +1675,7 @@ impl WebView {
     ) -> bool {
         let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
         if matches!((state, button), (ElementState::Pressed, MouseButton::Left)) {
-            self.prepare_native_focus_for_mouse_input(window);
+            self.prepare_browser_focus_for_mouse_input();
         }
         let button_flag = cef_mouse_button_flag(button);
         let event_button_flags = match state {
@@ -1712,22 +1714,17 @@ impl WebView {
         true
     }
 
-    fn prepare_native_focus_for_mouse_input(&mut self, window: &Window) {
+    fn prepare_browser_focus_for_mouse_input(&mut self) {
         if !self.focus_policy.host_focused() {
             return;
         }
 
-        let Some(view) = browser_view(&self.browser) else {
-            return;
-        };
-
+        // Changing the NSWindow first responder inside the active mouse press path can desync
+        // AppKit/WindowServer button tracking. Arm browser focus here and defer native responder
+        // restoration to the explicit editable-focus handoff path.
         self.focus_policy.arm_native_focus();
-        if window.focus_native_view(view) {
-            if let Some(host) = self.browser.host() {
-                host.set_focus(1);
-            }
-        } else {
-            self.focus_policy.disarm_native_focus();
+        if let Some(host) = self.browser.host() {
+            host.set_focus(1);
         }
     }
 
@@ -2860,6 +2857,7 @@ mod tests {
         PermissionDecision, media_access_decision, permission_decision, permission_request_result,
         should_block_media_access_request, should_log_allowed_permission_request,
     };
+    use crate::macos::test_support::{EnvVarGuard, env_lock};
     use cef::sys::cef_event_flags_t;
     #[cfg(not(feature = "passkey-webauthn"))]
     use cef::{
@@ -3183,10 +3181,22 @@ mod tests {
     #[cfg(not(feature = "passkey-webauthn"))]
     #[test]
     fn permission_policy_allows_local_network_permission() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let _distribution = EnvVarGuard::unset("TABOR_DISTRIBUTION_CHANNEL");
         let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
+    }
+
+    #[cfg(not(feature = "passkey-webauthn"))]
+    #[test]
+    fn mac_app_store_permission_policy_denies_local_network_permission() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "mac_app_store");
+        let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
+        assert_eq!(permission_decision(permissions), PermissionDecision::Deny);
+        assert_eq!(permission_request_result(permissions), PermissionRequestResult::DENY);
     }
 
     #[cfg(not(feature = "passkey-webauthn"))]

@@ -4,6 +4,10 @@ use std::cmp::{max, min};
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 
 #[cfg(feature = "serde")]
+use serde::de::{self, SeqAccess, Visitor};
+#[cfg(feature = "serde")]
+use serde::ser::SerializeTuple;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::index::{Column, Line, Point};
@@ -31,6 +35,7 @@ pub trait GridCell: Sized {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Cursor<T> {
     /// The location of this cursor.
     pub point: Point,
@@ -54,6 +59,70 @@ pub struct Cursor<T> {
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct Charsets([StandardCharset; 4]);
+
+#[cfg(feature = "serde")]
+impl Serialize for Charsets {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut tuple = serializer.serialize_tuple(4)?;
+        for charset in self.0 {
+            tuple.serialize_element(&charset_tag(charset))?;
+        }
+        tuple.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for Charsets {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CharsetsVisitor;
+
+        impl<'de> Visitor<'de> for CharsetsVisitor {
+            type Value = Charsets;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a 4-element terminal charset tuple")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut charsets = [StandardCharset::Ascii; 4];
+                for charset in &mut charsets {
+                    let tag = seq
+                        .next_element::<u8>()?
+                        .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                    *charset = charset_from_tag(tag);
+                }
+                Ok(Charsets(charsets))
+            }
+        }
+
+        deserializer.deserialize_tuple(4, CharsetsVisitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+fn charset_tag(charset: StandardCharset) -> u8 {
+    match charset {
+        StandardCharset::Ascii => 0,
+        StandardCharset::SpecialCharacterAndLineDrawing => 1,
+    }
+}
+
+#[cfg(feature = "serde")]
+fn charset_from_tag(tag: u8) -> StandardCharset {
+    match tag {
+        1 => StandardCharset::SpecialCharacterAndLineDrawing,
+        _ => StandardCharset::Ascii,
+    }
+}
 
 impl Index<CharsetIndex> for Charsets {
     type Output = StandardCharset;
@@ -109,11 +178,11 @@ pub enum Scroll {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Grid<T> {
     /// Current cursor for writing data.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub cursor: Cursor<T>,
 
     /// Last saved cursor.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub saved_cursor: Cursor<T>,
 
     /// Lines in the grid. Each row holds a list of cells corresponding to the

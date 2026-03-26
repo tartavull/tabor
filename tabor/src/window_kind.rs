@@ -9,11 +9,26 @@ pub enum WindowKind {
     Web {
         url: String,
     },
+    Image {
+        source: String,
+    },
 }
 
 impl WindowKind {
     pub fn is_web(&self) -> bool {
         matches!(self, Self::Web { .. })
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+
+    pub fn has_status_bar(&self) -> bool {
+        !self.is_terminal()
     }
 }
 
@@ -21,6 +36,7 @@ impl WindowKind {
 pub enum TabKind {
     Terminal,
     Web { url: String },
+    Image { source: String },
 }
 
 impl From<&WindowKind> for TabKind {
@@ -28,6 +44,7 @@ impl From<&WindowKind> for TabKind {
         match kind {
             WindowKind::Terminal => Self::Terminal,
             WindowKind::Web { url } => Self::Web { url: url.clone() },
+            WindowKind::Image { source } => Self::Image { source: source.clone() },
         }
     }
 }

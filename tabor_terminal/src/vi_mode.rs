@@ -59,7 +59,8 @@ pub enum ViMotion {
 }
 
 /// Cursor tracking vi mode position.
-#[derive(Default, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ViModeCursor {
     pub point: Point,
 }

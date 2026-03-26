@@ -24,17 +24,29 @@ required_team_name="${TABOR_CODESIGN_TEAM_NAME:-Tiny Mile US, Corp}"
 require_team_codesign="${TABOR_REQUIRE_TEAM_CODESIGN:-1}"
 identity="${TABOR_CODESIGN_IDENTITY:-}"
 entitlements="${TABOR_CODESIGN_ENTITLEMENTS:-}"
+helper_entitlements="${TABOR_CODESIGN_HELPER_ENTITLEMENTS:-}"
 provisioning_profile="${TABOR_CODESIGN_PROVISIONING_PROFILE:-}"
 passkey_entitlement_key="com.apple.developer.web-browser.public-key-credential"
 requires_passkey_profile=0
+require_provisioning_profile="${TABOR_CODESIGN_REQUIRE_PROVISIONING_PROFILE:-0}"
+distribution="${TABOR_CODESIGN_DISTRIBUTION:-direct}"
 hardened_runtime="${TABOR_CODESIGN_HARDENED_RUNTIME:-0}"
 timestamp_signing="${TABOR_CODESIGN_TIMESTAMP:-0}"
 codesign_extra_flags=()
+helper_binaries=()
 
 if [[ "$require_team_codesign" != "1" ]]; then
   echo "TABOR_REQUIRE_TEAM_CODESIGN must remain 1. Unsigned or ad-hoc-signed macOS Tabor builds are forbidden." >&2
   exit 1
 fi
+
+case "$distribution" in
+  direct|mac_app_store) ;;
+  *)
+    echo "Unknown TABOR_CODESIGN_DISTRIBUTION value: $distribution" >&2
+    exit 1
+    ;;
+esac
 
 list_codesign_identities() {
   /usr/bin/security find-identity -v -p codesigning 2>/dev/null || true
@@ -85,6 +97,11 @@ resolve_team_identity() {
 }
 
 if [[ -z "$identity" ]]; then
+  if [[ "$distribution" == "mac_app_store" ]]; then
+    echo "TABOR_CODESIGN_IDENTITY is required for mac_app_store distribution." >&2
+    exit 1
+  fi
+
   if ! identity="$(resolve_team_identity)"; then
     echo "No codesigning identity found for ${required_team_name}${required_team_id:+ (${required_team_id})}." >&2
     echo "Import/unlock the Tiny Mile signing certificate, or set TABOR_CODESIGN_IDENTITY explicitly." >&2
@@ -115,13 +132,25 @@ if [[ -n "$entitlements" && ! -f "$entitlements" ]]; then
   echo "Entitlements file not found: $entitlements" >&2
   exit 1
 fi
+if [[ -n "$helper_entitlements" && ! -f "$helper_entitlements" ]]; then
+  echo "Helper entitlements file not found: $helper_entitlements" >&2
+  exit 1
+fi
+if [[ "$distribution" == "mac_app_store" && -z "$helper_entitlements" ]]; then
+  echo "TABOR_CODESIGN_HELPER_ENTITLEMENTS is required for mac_app_store distribution." >&2
+  exit 1
+fi
 if [[ -n "$entitlements" ]] && /usr/libexec/PlistBuddy -c "Print :$passkey_entitlement_key" "$entitlements" >/dev/null 2>&1; then
   requires_passkey_profile=1
 fi
 
-if [[ "$requires_passkey_profile" -eq 1 ]]; then
+if [[ "$distribution" == "mac_app_store" ]]; then
+  require_provisioning_profile=1
+fi
+
+if [[ "$requires_passkey_profile" -eq 1 || "$require_provisioning_profile" == "1" ]]; then
   if [[ -z "$provisioning_profile" ]]; then
-    echo "TABOR_CODESIGN_PROVISIONING_PROFILE is required when passkey entitlement is enabled." >&2
+    echo "TABOR_CODESIGN_PROVISIONING_PROFILE is required for this signing configuration." >&2
     exit 1
   fi
 
@@ -147,10 +176,29 @@ if [[ ! -f "$main_binary" ]]; then
   exit 1
 fi
 
+frameworks_dir="$contents_dir/Frameworks"
+if [[ -d "$frameworks_dir" ]]; then
+  while IFS= read -r helper_app; do
+    helper_info="$helper_app/Contents/Info.plist"
+    helper_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$helper_info" 2>/dev/null || true)"
+    if [[ -z "$helper_executable" ]]; then
+      continue
+    fi
+    helper_binary="$helper_app/Contents/MacOS/$helper_executable"
+    if [[ -f "$helper_binary" ]]; then
+      helper_binaries+=("$helper_binary")
+    fi
+  done < <(find "$frameworks_dir" -mindepth 1 -maxdepth 1 -type d -name '*.app' | sort)
+fi
+
 codesign_file() {
   local target="$1"
   shift
-  /usr/bin/codesign --force --sign "$identity" "${codesign_extra_flags[@]}" "$@" "$target"
+  if ((${#codesign_extra_flags[@]} > 0)); then
+    /usr/bin/codesign --force --sign "$identity" "${codesign_extra_flags[@]}" "$@" "$target"
+  else
+    /usr/bin/codesign --force --sign "$identity" "$@" "$target"
+  fi
 }
 
 is_macho() {
@@ -158,13 +206,39 @@ is_macho() {
   /usr/bin/file -b "$path" | /usr/bin/grep -q "Mach-O"
 }
 
+is_entitlements_target() {
+  local path="$1"
+  [[ "$path" == "$main_binary" ]] && return 0
+
+  local helper_binary
+  for helper_binary in "${helper_binaries[@]}"; do
+    [[ "$path" == "$helper_binary" ]] && return 0
+  done
+
+  return 1
+}
+
 # Sign code files first so bundle signatures can be finalized without --deep.
 while IFS= read -r candidate; do
-  [[ "$candidate" == "$main_binary" ]] && continue
+  is_entitlements_target "$candidate" && continue
   if is_macho "$candidate"; then
     codesign_file "$candidate"
   fi
 done < <(find "$contents_dir" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) | sort)
+
+for helper_binary in "${helper_binaries[@]}"; do
+  if [[ -n "$helper_entitlements" ]]; then
+    codesign_file "$helper_binary" --entitlements "$helper_entitlements"
+  else
+    codesign_file "$helper_binary"
+  fi
+done
+
+if [[ -n "$entitlements" ]]; then
+  codesign_file "$main_binary" --entitlements "$entitlements"
+else
+  codesign_file "$main_binary"
+fi
 
 # Sign nested bundles from the deepest level up.
 while IFS= read -r bundle; do
@@ -172,15 +246,7 @@ while IFS= read -r bundle; do
   codesign_file "$bundle"
 done < <(find "$contents_dir" -depth -type d \( -name '*.app' -o -name '*.appex' -o -name '*.framework' -o -name '*.xpc' \) | sort)
 
-while IFS= read -r executable; do
-  codesign_file "$executable"
-done < <(find "$macos_dir" -maxdepth 1 -type f -perm -u+x | sort)
-
 codesign_file "$app_path"
-
-if [[ -n "$entitlements" ]]; then
-  codesign_file "$main_binary" --entitlements "$entitlements"
-fi
 
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
 
@@ -201,4 +267,13 @@ if [[ -n "$entitlements" ]]; then
     echo "Entitlements were not embedded into '$main_binary'" >&2
     exit 1
   fi
+fi
+
+if [[ -n "$helper_entitlements" ]]; then
+  for helper_binary in "${helper_binaries[@]}"; do
+    if ! /usr/bin/codesign -d --entitlements :- "$helper_binary" 2>&1 | /usr/bin/grep -q "<dict>"; then
+      echo "Entitlements were not embedded into helper executable '$helper_binary'" >&2
+      exit 1
+    fi
+  done
 fi

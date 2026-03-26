@@ -24,6 +24,8 @@ use crate::ipc::{
     IpcConnection, IpcRequest, IpcTabGroup, IpcTabId, IpcTabState, SocketReply,
     resolve_socket_path,
 };
+#[cfg(target_os = "macos")]
+use crate::macos;
 
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -560,7 +562,11 @@ fn materialize_artifact(
     let path = requested_path.unwrap_or_else(|| {
         let nanos =
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        std::env::temp_dir().join(format!("tabor-agent-{prefix}-{nanos}.{extension}"))
+        #[cfg(target_os = "macos")]
+        let base_dir = macos::runtime_tmp_dir();
+        #[cfg(not(target_os = "macos"))]
+        let base_dir = std::env::temp_dir();
+        base_dir.join(format!("tabor-agent-{prefix}-{nanos}.{extension}"))
     });
     fs::write(&path, bytes)?;
     Ok(path)

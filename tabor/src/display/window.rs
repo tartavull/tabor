@@ -367,6 +367,12 @@ impl Window {
         let Some(window) = view.window() else {
             return false;
         };
+        let target_view = view as *const NSView as *const AnyObject;
+        if let Some(first_responder) = window.firstResponder() {
+            if std::ptr::eq(Retained::as_ptr(&first_responder).cast::<AnyObject>(), target_view) {
+                return true;
+            }
+        }
 
         restore_first_responder_with_retry(
             || window.makeFirstResponder(None),

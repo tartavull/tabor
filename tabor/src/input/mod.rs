@@ -117,6 +117,15 @@ pub trait ActionContext<T: EventListener> {
     fn config(&self) -> &UiConfig;
     #[cfg(target_os = "macos")]
     fn event_loop(&self) -> &ActiveEventLoop;
+    #[cfg(target_os = "macos")]
+    fn quit_application(&mut self) {
+        self.event_loop().exit();
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn quit_application(&mut self) {
+        self.window().hold = false;
+        self.terminal_mut().exit();
+    }
     fn mouse_mode(&self) -> bool;
     fn clipboard_mut(&mut self) -> &mut Clipboard;
     fn scheduler_mut(&mut self) -> &mut Scheduler;
@@ -134,6 +143,26 @@ pub trait ActionContext<T: EventListener> {
     fn web_copy_selection(&mut self) {}
     #[cfg(target_os = "macos")]
     fn web_paste_text(&mut self, _text: &str) {}
+    #[cfg(target_os = "macos")]
+    fn image_mouse_input(&mut self, _state: ElementState, _button: MouseButton) {}
+    #[cfg(target_os = "macos")]
+    fn image_mouse_move(&mut self, _position: PhysicalPosition<f64>) {}
+    #[cfg(target_os = "macos")]
+    fn image_mouse_wheel(&mut self, _delta: MouseScrollDelta, _phase: TouchPhase) {}
+    #[cfg(target_os = "macos")]
+    fn image_zoom_in(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_zoom_out(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_zoom_fit(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_zoom_fill(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_zoom_actual(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_rotate_clockwise(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_reset_view(&mut self) {}
     #[cfg(target_os = "macos")]
     fn select_next_tab(&mut self) {}
     #[cfg(target_os = "macos")]
@@ -231,6 +260,20 @@ impl<T: EventListener> Execute<T> for Action {
                 ctx.on_typing_start();
                 ctx.toggle_command_bar();
             },
+            #[cfg(target_os = "macos")]
+            Action::ImageZoomIn => ctx.image_zoom_in(),
+            #[cfg(target_os = "macos")]
+            Action::ImageZoomOut => ctx.image_zoom_out(),
+            #[cfg(target_os = "macos")]
+            Action::ImageZoomFit => ctx.image_zoom_fit(),
+            #[cfg(target_os = "macos")]
+            Action::ImageZoomFill => ctx.image_zoom_fill(),
+            #[cfg(target_os = "macos")]
+            Action::ImageZoomActual => ctx.image_zoom_actual(),
+            #[cfg(target_os = "macos")]
+            Action::ImageRotateClockwise => ctx.image_rotate_clockwise(),
+            #[cfg(target_os = "macos")]
+            Action::ImageResetView => ctx.image_reset_view(),
             action @ (Action::ViMotion(_) | Action::Vi(_))
                 if !ctx.terminal().mode().contains(TermMode::VI) =>
             {
@@ -378,6 +421,10 @@ impl<T: EventListener> Execute<T> for Action {
                     ctx.web_copy_selection();
                     return;
                 }
+                #[cfg(target_os = "macos")]
+                if ctx.window_kind().is_image() {
+                    return;
+                }
 
                 ctx.copy_selection(ClipboardType::Clipboard);
             },
@@ -389,6 +436,10 @@ impl<T: EventListener> Execute<T> for Action {
                 #[cfg(target_os = "macos")]
                 if ctx.window_kind().is_web() {
                     ctx.web_paste_text(&text);
+                    return;
+                }
+                #[cfg(target_os = "macos")]
+                if ctx.window_kind().is_image() {
                     return;
                 }
                 ctx.paste(&text, true);
@@ -414,10 +465,7 @@ impl<T: EventListener> Execute<T> for Action {
             #[cfg(not(target_os = "macos"))]
             Action::Hide => ctx.window().set_visible(false),
             Action::Minimize => ctx.window().set_minimized(true),
-            Action::Quit => {
-                ctx.window().hold = false;
-                ctx.terminal_mut().exit();
-            },
+            Action::Quit => ctx.quit_application(),
             Action::IncreaseFontSize => ctx.change_font_size(FONT_SIZE_STEP),
             Action::DecreaseFontSize => ctx.change_font_size(-FONT_SIZE_STEP),
             Action::ResetFontSize => ctx.reset_font_size(),
@@ -523,6 +571,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             self.ctx.web_mouse_move(position);
             #[cfg(target_os = "macos")]
             self.ctx.web_request_cursor_update(position);
+            return;
+        }
+        if self.ctx.window_kind().is_image() {
+            #[cfg(target_os = "macos")]
+            self.ctx.image_mouse_move(position);
             return;
         }
 
@@ -812,6 +865,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             self.ctx.web_mouse_wheel(delta, phase);
             return;
         }
+        if self.ctx.window_kind().is_image() {
+            #[cfg(target_os = "macos")]
+            self.ctx.image_mouse_wheel(delta, phase);
+            return;
+        }
 
         let multiplier = self.ctx.config().scrolling.multiplier;
         match delta {
@@ -928,7 +986,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     /// Handle touch input.
     pub fn touch(&mut self, touch: TouchEvent) {
-        if self.ctx.window_kind().is_web() {
+        if !self.ctx.window_kind().is_terminal() {
             return;
         }
 
@@ -1063,7 +1121,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// Reset mouse cursor based on modifier and terminal state.
     #[inline]
     pub fn reset_mouse_cursor(&mut self) {
-        if self.ctx.window_kind().is_web() {
+        if !self.ctx.window_kind().is_terminal() {
             return;
         }
 
@@ -1075,7 +1133,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     pub fn modifiers_input(&mut self, modifiers: Modifiers) {
         *self.ctx.modifiers() = modifiers;
 
-        if self.ctx.window_kind().is_web() {
+        if !self.ctx.window_kind().is_terminal() {
             return;
         }
 
@@ -1091,6 +1149,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         if self.ctx.window_kind().is_web() {
             #[cfg(target_os = "macos")]
             self.ctx.web_mouse_input(state, button);
+            return;
+        }
+        if self.ctx.window_kind().is_image() {
+            #[cfg(target_os = "macos")]
+            self.ctx.image_mouse_input(state, button);
             return;
         }
 
@@ -1145,7 +1208,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     /// The provided mode, mods, and key must match what is allowed by a binding
     /// for its action to be executed.
     fn process_mouse_bindings(&mut self, event: MouseEvent) -> bool {
-        let mode = BindingMode::new(self.ctx.terminal().mode(), self.ctx.search_active());
+        let mode = BindingMode::new(
+            self.ctx.terminal().mode(),
+            self.ctx.search_active(),
+            self.ctx.window_kind().is_image(),
+        );
         let mouse_mode = self.ctx.mouse_mode();
         let mods = self.ctx.modifiers().state();
         let mouse_bindings = self.ctx.config().mouse_bindings().to_owned();
@@ -1269,6 +1336,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 mod tests {
     use super::*;
 
+    use std::cell::{Cell, RefCell};
+
     use winit::event::{DeviceId, Event as WinitEvent, WindowEvent};
     use winit::keyboard::Key;
     use winit::window::WindowId;
@@ -1281,7 +1350,33 @@ mod tests {
     const KEY: Key<&'static str> = Key::Character("0");
 
     struct MockEventProxy;
-    impl EventListener for MockEventProxy {}
+
+    thread_local! {
+        static MOCK_QUIT_REQUESTED: Cell<bool> = const { Cell::new(false) };
+        static MOCK_SENT_EVENTS: RefCell<Vec<TerminalEvent>> = const { RefCell::new(Vec::new()) };
+    }
+
+    impl EventListener for MockEventProxy {
+        fn send_event(&self, event: TerminalEvent) {
+            MOCK_SENT_EVENTS.with(|events| events.borrow_mut().push(event));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reset_mock_action_state() {
+        MOCK_QUIT_REQUESTED.with(|requested| requested.set(false));
+        MOCK_SENT_EVENTS.with(|events| events.borrow_mut().clear());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mock_quit_requested() -> bool {
+        MOCK_QUIT_REQUESTED.with(|requested| requested.get())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mock_terminal_events() -> Vec<TerminalEvent> {
+        MOCK_SENT_EVENTS.with(|events| events.borrow().clone())
+    }
 
     struct ActionContext<'a, T> {
         pub terminal: &'a mut Term<T>,
@@ -1395,6 +1490,11 @@ mod tests {
         #[cfg(target_os = "macos")]
         fn event_loop(&self) -> &ActiveEventLoop {
             unimplemented!();
+        }
+
+        #[cfg(target_os = "macos")]
+        fn quit_application(&mut self) {
+            MOCK_QUIT_REQUESTED.with(|requested| requested.set(true));
         }
 
         fn scheduler_mut(&mut self) -> &mut Scheduler {
@@ -1576,6 +1676,39 @@ mod tests {
 
         assert_eq!(processor.ctx.mouse.x, 0);
         assert_eq!(processor.ctx.mouse.y, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn quit_action_requests_application_exit_without_exiting_terminal() {
+        reset_mock_action_state();
+
+        let mut clipboard = Clipboard::new_nop();
+        let cfg = UiConfig::default();
+        let size = SizeInfo::new(21.0, 51.0, 3.0, 3.0, 0., 0., 0., false);
+        let mut terminal = Term::new(cfg.term_options(), &size, MockEventProxy);
+        let mut mouse = Mouse::default();
+        let mut inline_search_state = InlineSearchState::default();
+        let mut message_buffer = MessageBuffer::default();
+
+        let mut context = ActionContext {
+            terminal: &mut terminal,
+            mouse: &mut mouse,
+            size_info: &size,
+            clipboard: &mut clipboard,
+            modifiers: Default::default(),
+            message_buffer: &mut message_buffer,
+            inline_search_state: &mut inline_search_state,
+            config: &cfg,
+            window_kind: WindowKind::Terminal,
+        };
+
+        execute_action(&mut context, &Action::Quit);
+
+        assert!(mock_quit_requested());
+        assert!(
+            mock_terminal_events().into_iter().all(|event| !matches!(event, TerminalEvent::Exit))
+        );
     }
 
     test_clickstate! {

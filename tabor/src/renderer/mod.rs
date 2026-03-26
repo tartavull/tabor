@@ -32,6 +32,8 @@ mod shader;
 mod text;
 
 #[cfg(target_os = "macos")]
+use crate::macos::image_view::ImageRenderQuad;
+#[cfg(target_os = "macos")]
 use images::SurfaceSlot;
 use images::{ImageRenderer, ImageSlice};
 pub use text::{GlyphCache, LoaderApi};
@@ -315,6 +317,18 @@ impl Renderer {
             format,
             slices,
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn draw_image_bitmap(
+        &mut self,
+        size_info: &SizeInfo,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+        quad: ImageRenderQuad,
+    ) {
+        self.image_renderer.draw_bitmap(size_info, width, height, rgba, quad);
     }
 
     /// Fill the window with `color` and `alpha`.

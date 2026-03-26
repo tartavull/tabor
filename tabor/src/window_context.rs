@@ -13,6 +13,7 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
@@ -59,12 +60,12 @@ use crate::clipboard::Clipboard;
 use crate::config::Action;
 use crate::config::UiConfig;
 #[cfg(not(windows))]
-use crate::daemon::foreground_process_name;
+use crate::daemon::{foreground_process_name, foreground_process_path};
 use crate::display::browser_layout::{BrowserViewMode, BrowserViewportLayout};
 use crate::display::color::Rgb;
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
-use crate::display::{Display, DisplayUpdateOptions};
+use crate::display::{Display, DisplayUpdateOptions, SizeInfo};
 #[cfg(target_os = "macos")]
 use crate::display::{TabPanelEditOutcome, TabPanelEditTarget};
 #[cfg(target_os = "macos")]
@@ -72,7 +73,7 @@ use crate::event::WebCommand;
 use crate::event::{
     ActionContext, CommandFooterFeedback, CommandHistory, CommandState, Event, EventProxy,
     EventType, InlineSearchState, Mouse, MultiColumnCommand, MultiColumnCommandScope, SearchState,
-    TouchPurpose, request_web_cursor_update,
+    TouchPurpose, request_image_load, request_web_cursor_update,
 };
 #[cfg(unix)]
 use crate::input::ActionContext as _;
@@ -82,12 +83,13 @@ use crate::ipc;
 use crate::ipc::{
     AgentActResult, AgentAction, AgentElementDetail, AgentEvent, AgentObservation, AgentPdf,
     AgentScreenshot, IpcBrowserAccelerationInfo, IpcBrowserAccelerationState,
-    IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcInspectorMessage,
-    IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
-    IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
-    IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
-    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
-    SocketReply, TabSelection, TerminalKeyInput,
+    IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageLoadState,
+    IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage, IpcInspectorSession,
+    IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind,
+    IpcTabPanelState, IpcTabState, IpcTerminalLayoutState, IpcWebCloseMetrics,
+    IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
+    IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
+    TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -96,10 +98,17 @@ use crate::scheduler::Scheduler;
 use crate::tab_panel::TabActivity;
 use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
+#[cfg(unix)]
+use crate::workspace::{
+    self, PersistedTerminalState, WorkspaceBrokerTerminalStatus, WorkspaceGroupLayout,
+    WorkspaceLayout, WorkspaceTabKind, WorkspaceTabLayout,
+};
 use crate::{input, renderer};
 
 #[cfg(target_os = "macos")]
 use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
+#[cfg(target_os = "macos")]
+use crate::macos::image_view::{ImageLoadState, ImageScaleMode, ImageViewState, classify_open_url};
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
@@ -119,7 +128,6 @@ struct TabState {
     kind: WindowKind,
     activity: TabActivity,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
-    notifier: Notifier,
     search_state: SearchState,
     inline_search_state: InlineSearchState,
     command_state: CommandState,
@@ -135,6 +143,8 @@ struct TabState {
     #[cfg(target_os = "macos")]
     web_view: Option<WebView>,
     #[cfg(target_os = "macos")]
+    image_view: Option<ImageViewState>,
+    #[cfg(target_os = "macos")]
     web_command_state: WebCommandState,
     #[cfg(target_os = "macos")]
     agent_runtime: AgentRuntimeState,
@@ -142,10 +152,145 @@ struct TabState {
     favicon: Option<TabFavicon>,
     #[cfg(target_os = "macos")]
     favicon_pending: bool,
+    notifier: TabNotifier,
+    terminal_runtime: TerminalRuntimeState,
+}
+
+enum TabNotifier {
+    Local(Notifier),
+    #[cfg(unix)]
+    Broker {
+        broker_id: u64,
+    },
+    #[cfg(unix)]
+    Disconnected,
+}
+
+impl Notify for TabNotifier {
+    fn notify<B>(&self, bytes: B)
+    where
+        B: Into<std::borrow::Cow<'static, [u8]>>,
+    {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return;
+        }
+
+        match self {
+            Self::Local(notifier) => notifier.notify(bytes),
+            #[cfg(unix)]
+            Self::Broker { broker_id } => {
+                let _ = workspace::send_terminal_input(*broker_id, bytes.into_owned());
+            },
+            #[cfg(unix)]
+            Self::Disconnected => {},
+        }
+    }
+}
+
+impl OnResize for TabNotifier {
+    fn on_resize(&mut self, window_size: tabor_terminal::event::WindowSize) {
+        match self {
+            Self::Local(notifier) => notifier.on_resize(window_size),
+            #[cfg(unix)]
+            Self::Broker { broker_id } => {
+                let _ = workspace::resize_terminal(*broker_id, window_size);
+            },
+            #[cfg(unix)]
+            Self::Disconnected => {},
+        }
+    }
+}
+
+impl TabNotifier {
+    fn close_terminal(&mut self) {
+        match self {
+            Self::Local(notifier) => {
+                let _ = notifier.0.send(Msg::Shutdown);
+            },
+            #[cfg(unix)]
+            Self::Broker { broker_id } => {
+                let _ = workspace::close_terminal(*broker_id);
+            },
+            #[cfg(unix)]
+            Self::Disconnected => {},
+        }
+    }
+
+    fn detach(&mut self) {
+        if let Self::Local(notifier) = self {
+            let _ = notifier.0.send(Msg::Shutdown);
+        }
+    }
+}
+
+#[derive(Clone)]
+enum TerminalRuntimeState {
+    Local {
+        #[cfg(not(windows))]
+        master_fd: RawFd,
+        #[cfg(not(windows))]
+        shell_pid: u32,
+        #[cfg(unix)]
+        workspace_id: Option<u64>,
+        launch_options: tty::Options,
+    },
+    #[cfg(unix)]
+    Broker {
+        broker_id: u64,
+        launch_options: tty::Options,
+        working_directory: Option<PathBuf>,
+        revision: u64,
+        _exit_code: Option<i32>,
+    },
+    #[cfg(unix)]
+    Disconnected {
+        broker_id: u64,
+        launch_options: tty::Options,
+        working_directory: Option<PathBuf>,
+    },
+}
+
+impl TerminalRuntimeState {
     #[cfg(not(windows))]
-    master_fd: RawFd,
-    #[cfg(not(windows))]
-    shell_pid: u32,
+    fn master_fd_shell_pid(&self) -> Option<(RawFd, u32)> {
+        match self {
+            Self::Local { master_fd, shell_pid, .. } => Some((*master_fd, *shell_pid)),
+            #[cfg(unix)]
+            Self::Broker { .. } | Self::Disconnected { .. } => None,
+        }
+    }
+
+    fn working_directory_hint(&self) -> Option<PathBuf> {
+        match self {
+            Self::Local { launch_options, .. } => launch_options.working_directory.clone(),
+            #[cfg(unix)]
+            Self::Broker { working_directory, launch_options, .. }
+            | Self::Disconnected { working_directory, launch_options, .. } => {
+                working_directory.clone().or_else(|| launch_options.working_directory.clone())
+            },
+        }
+    }
+
+    fn launch_options(&self) -> &tty::Options {
+        match self {
+            Self::Local { launch_options, .. } => launch_options,
+            #[cfg(unix)]
+            Self::Broker { launch_options, .. } | Self::Disconnected { launch_options, .. } => {
+                launch_options
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn workspace_terminal_id(&self) -> Option<u64> {
+        match self {
+            Self::Local { workspace_id, .. } => *workspace_id,
+            Self::Broker { broker_id, .. } | Self::Disconnected { broker_id, .. } => {
+                Some(*broker_id)
+            },
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -161,6 +306,11 @@ struct MultiColumnDefaults {
     browser: Option<usize>,
 }
 
+#[derive(Clone)]
+enum TerminalSpawnMode {
+    NewLocal { workspace_id: Option<u64> },
+}
+
 fn terminal_view_mode_for_count(count: Option<usize>) -> TerminalViewMode {
     match count {
         Some(count) if count > 1 => TerminalViewMode::MultiColumn,
@@ -173,6 +323,136 @@ fn browser_view_mode_for_count(count: Option<usize>) -> BrowserViewMode {
         Some(count) if count > 1 => BrowserViewMode::MultiColumn,
         _ => BrowserViewMode::Normal,
     }
+}
+
+#[cfg(unix)]
+fn non_empty_workspace_group_layouts(
+    layout: &WorkspaceLayout,
+) -> impl Iterator<Item = (usize, &WorkspaceGroupLayout)> {
+    layout.groups.iter().enumerate().filter(|(_, group)| !group.tabs.is_empty())
+}
+
+fn sync_terminal_tab_geometry(
+    display: &Display,
+    config: &UiConfig,
+    multi_column_defaults: MultiColumnDefaults,
+    tab: &mut TabState,
+) {
+    if !tab.kind.is_terminal() {
+        return;
+    }
+
+    let layout =
+        WindowContext::terminal_viewport_for_tab(display, config, multi_column_defaults, tab);
+    let new_size = layout.logical_size(&display.size_info);
+    let mut terminal = tab.terminal.lock();
+    if terminal.screen_lines() != new_size.screen_lines()
+        || terminal.columns() != new_size.columns()
+    {
+        tab.notifier.on_resize(new_size.into());
+        terminal.resize_with_anchor(new_size, ResizeAnchor::Top);
+    }
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn spawn_local_terminal_runtime(
+    terminal: &Arc<FairMutex<Term<EventProxy>>>,
+    event_proxy: &EventProxy,
+    pty_config: &tty::Options,
+    window_id: WindowId,
+    size_info: SizeInfo,
+    ref_test: bool,
+    workspace_id: Option<u64>,
+) -> Result<(String, TabNotifier, TerminalRuntimeState), Box<dyn Error>> {
+    let pty = tty::new(pty_config, size_info.into(), window_id.into())?;
+
+    #[cfg(not(windows))]
+    let master_fd = pty.file().as_raw_fd();
+    #[cfg(not(windows))]
+    let shell_pid = pty.child().id();
+
+    let event_loop = PtyEventLoop::new(
+        Arc::clone(terminal),
+        event_proxy.clone(),
+        pty,
+        pty_config.drain_on_exit,
+        ref_test,
+    )?;
+
+    let loop_tx = event_loop.channel();
+    let _io_thread = event_loop.spawn();
+
+    #[cfg(not(windows))]
+    let program_name = foreground_process_name(master_fd, shell_pid).unwrap_or_default();
+    #[cfg(windows)]
+    let program_name = String::new();
+
+    Ok((
+        program_name,
+        TabNotifier::Local(Notifier(loop_tx)),
+        TerminalRuntimeState::Local {
+            #[cfg(not(windows))]
+            master_fd,
+            #[cfg(not(windows))]
+            shell_pid,
+            #[cfg(unix)]
+            workspace_id,
+            launch_options: pty_config.clone(),
+        },
+    ))
+}
+
+#[cfg(unix)]
+fn persisted_terminal_state(tab: &TabState) -> Option<PersistedTerminalState> {
+    if !tab.kind.is_terminal() {
+        return None;
+    }
+
+    let workspace_id = tab.terminal_runtime.workspace_terminal_id()?;
+    let mut launch_options = tab.terminal_runtime.launch_options().clone();
+    let working_directory = match &tab.terminal_runtime {
+        TerminalRuntimeState::Local {
+            #[cfg(not(windows))]
+            master_fd,
+            #[cfg(not(windows))]
+            shell_pid,
+            ..
+        } => foreground_process_path(*master_fd, *shell_pid)
+            .ok()
+            .or_else(|| launch_options.working_directory.clone()),
+        TerminalRuntimeState::Broker { working_directory, .. }
+        | TerminalRuntimeState::Disconnected { working_directory, .. } => {
+            working_directory.clone().or_else(|| launch_options.working_directory.clone())
+        },
+    };
+    if let Some(working_directory) = working_directory.clone() {
+        launch_options.working_directory = Some(working_directory);
+    }
+
+    let program_name = match &tab.terminal_runtime {
+        TerminalRuntimeState::Local {
+            #[cfg(not(windows))]
+            master_fd,
+            #[cfg(not(windows))]
+            shell_pid,
+            ..
+        } => foreground_process_name(*master_fd, *shell_pid)
+            .unwrap_or_else(|_| tab.program_name.clone()),
+        TerminalRuntimeState::Broker { .. } | TerminalRuntimeState::Disconnected { .. } => {
+            tab.program_name.clone()
+        },
+    };
+
+    Some(PersistedTerminalState {
+        id: workspace_id,
+        launch_options,
+        snapshot: tab.terminal.lock().export_snapshot(),
+        revision: 1,
+        title: Some(tab.title.clone()),
+        program_name,
+        working_directory,
+        exit_code: None,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1058,10 +1338,17 @@ struct TabGroup {
 enum DrawMode {
     Terminal,
     Web,
+    Image,
 }
 
 fn draw_mode(kind: &WindowKind) -> DrawMode {
-    if kind.is_web() { DrawMode::Web } else { DrawMode::Terminal }
+    if kind.is_web() {
+        DrawMode::Web
+    } else if kind.is_image() {
+        DrawMode::Image
+    } else {
+        DrawMode::Terminal
+    }
 }
 
 struct TabManager {
@@ -1109,12 +1396,11 @@ impl TabManager {
         let slot = &mut self.slots[tab_id.slot_index()];
         slot.tab = Some(tab);
 
-        if self.groups.is_empty() {
+        let group_name = group_name.filter(|name| !name.is_empty());
+        if self.groups.is_empty() && group_id.is_none() && group_name.is_none() {
             let group = self.new_group();
             self.groups.push(group);
         }
-
-        let group_name = group_name.filter(|name| !name.is_empty());
         let target_index = if let Some(group_id) = group_id {
             self.groups
                 .iter()
@@ -1632,6 +1918,7 @@ impl WindowContext {
             options.window_kind,
             None,
             None,
+            None,
         )?;
 
         #[cfg(target_os = "macos")]
@@ -1687,35 +1974,15 @@ impl WindowContext {
         window_kind: WindowKind,
         group_id: Option<usize>,
         group_name: Option<String>,
+        terminal_spawn_mode: Option<TerminalSpawnMode>,
     ) -> Result<TabId, Box<dyn Error>> {
         let tab_id = tabs.allocate_id();
         let event_proxy = EventProxy::new(proxy.clone(), display.window.id(), tab_id);
-        let size_info = display.size_info_for_status_lines(usize::from(window_kind.is_web()));
+        let size_info =
+            display.size_info_for_status_lines(usize::from(window_kind.has_status_bar()));
 
         let terminal = Term::new(config.term_options(), &size_info, event_proxy.clone());
         let terminal = Arc::new(FairMutex::new(terminal));
-
-        let pty = tty::new(&pty_config, size_info.into(), display.window.id().into())?;
-
-        #[cfg(not(windows))]
-        let master_fd = pty.file().as_raw_fd();
-        #[cfg(not(windows))]
-        let shell_pid = pty.child().id();
-
-        let event_loop = PtyEventLoop::new(
-            Arc::clone(&terminal),
-            event_proxy.clone(),
-            pty,
-            pty_config.drain_on_exit,
-            config.debug.ref_test,
-        )?;
-
-        let loop_tx = event_loop.channel();
-        let _io_thread = event_loop.spawn();
-
-        if config.cursor.style().blinking {
-            event_proxy.send_event(TerminalEvent::CursorBlinkingChange.into());
-        }
 
         #[cfg(not(target_os = "macos"))]
         if matches!(window_kind, WindowKind::Web { .. }) {
@@ -1729,7 +1996,7 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         let browser_view_mode = match &window_kind {
             WindowKind::Web { .. } => browser_view_mode_for_count(multi_column_defaults.browser),
-            WindowKind::Terminal => BrowserViewMode::default(),
+            WindowKind::Terminal | WindowKind::Image { .. } => BrowserViewMode::default(),
         };
 
         #[cfg(target_os = "macos")]
@@ -1744,10 +2011,21 @@ impl WindowContext {
                 );
                 Some(WebView::new(&display.window, &size_info, layout, tab_id, url, proxy)?)
             },
-            WindowKind::Terminal => None,
+            WindowKind::Terminal | WindowKind::Image { .. } => None,
         };
 
-        let title = match &window_kind {
+        #[cfg(target_os = "macos")]
+        let image_view = match &window_kind {
+            WindowKind::Image { source } => Some(ImageViewState::new(source.clone())),
+            WindowKind::Terminal | WindowKind::Web { .. } => None,
+        };
+        #[cfg(target_os = "macos")]
+        let image_source = match &window_kind {
+            WindowKind::Image { source } => Some(source.clone()),
+            WindowKind::Terminal | WindowKind::Web { .. } => None,
+        };
+
+        let default_title = match &window_kind {
             WindowKind::Terminal => config.window.identity.title.clone(),
             WindowKind::Web { url } => {
                 if url.is_empty() {
@@ -1756,21 +2034,77 @@ impl WindowContext {
                     url.clone()
                 }
             },
+            WindowKind::Image { source } => ImageViewState::new(source.clone()).title,
         };
         let terminal_view_mode = match &window_kind {
             WindowKind::Terminal => terminal_view_mode_for_count(multi_column_defaults.terminal),
-            WindowKind::Web { .. } => TerminalViewMode::default(),
+            WindowKind::Web { .. } | WindowKind::Image { .. } => TerminalViewMode::default(),
         };
+
+        let (title, program_name, notifier, terminal_runtime) = if window_kind.is_terminal() {
+            #[cfg(unix)]
+            {
+                match terminal_spawn_mode
+                    .unwrap_or(TerminalSpawnMode::NewLocal { workspace_id: None })
+                {
+                    TerminalSpawnMode::NewLocal { workspace_id } => {
+                        let workspace_id = Some(match workspace_id {
+                            Some(workspace_id) => workspace_id,
+                            None => workspace::allocate_terminal_id()?,
+                        });
+                        let (program_name, notifier, terminal_runtime) =
+                            spawn_local_terminal_runtime(
+                                &terminal,
+                                &event_proxy,
+                                &pty_config,
+                                display.window.id(),
+                                size_info,
+                                config.debug.ref_test,
+                                workspace_id,
+                            )?;
+                        (default_title.clone(), program_name, notifier, terminal_runtime)
+                    },
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                let (program_name, notifier, terminal_runtime) = spawn_local_terminal_runtime(
+                    &terminal,
+                    &event_proxy,
+                    &pty_config,
+                    display.window.id(),
+                    size_info,
+                    config.debug.ref_test,
+                    None,
+                )?;
+                (default_title.clone(), program_name, notifier, terminal_runtime)
+            }
+        } else {
+            let (program_name, notifier, terminal_runtime) = spawn_local_terminal_runtime(
+                &terminal,
+                &event_proxy,
+                &pty_config,
+                display.window.id(),
+                size_info,
+                config.debug.ref_test,
+                None,
+            )?;
+            (default_title.clone(), program_name, notifier, terminal_runtime)
+        };
+
+        if config.cursor.style().blinking {
+            event_proxy.send_event(TerminalEvent::CursorBlinkingChange.into());
+        }
 
         let tab = TabState {
             id: tab_id,
             title,
             custom_title: None,
-            program_name: String::new(),
+            program_name,
             kind: window_kind,
             activity: TabActivity::default(),
             terminal,
-            notifier: Notifier(loop_tx),
             search_state: Default::default(),
             inline_search_state: Default::default(),
             command_state: Default::default(),
@@ -1789,6 +2123,8 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             web_view,
             #[cfg(target_os = "macos")]
+            image_view,
+            #[cfg(target_os = "macos")]
             web_command_state: Default::default(),
             #[cfg(target_os = "macos")]
             agent_runtime: Default::default(),
@@ -1796,13 +2132,15 @@ impl WindowContext {
             favicon: None,
             #[cfg(target_os = "macos")]
             favicon_pending: false,
-            #[cfg(not(windows))]
-            master_fd,
-            #[cfg(not(windows))]
-            shell_pid,
+            notifier,
+            terminal_runtime,
         };
 
         tabs.insert(tab_id, tab, group_id, group_name).map_err(std::io::Error::other)?;
+        #[cfg(target_os = "macos")]
+        if let Some(source) = image_source {
+            request_image_load(proxy, display.window.id(), tab_id, source);
+        }
         Ok(tab_id)
     }
 
@@ -1830,7 +2168,7 @@ impl WindowContext {
             return;
         };
 
-        if tab.kind.is_web() {
+        if !tab.kind.is_terminal() {
             return;
         }
 
@@ -1839,7 +2177,7 @@ impl WindowContext {
     }
 
     pub(crate) fn has_active_terminal_output(&self, now: Instant) -> bool {
-        self.tabs.iter().any(|tab| !tab.kind.is_web() && tab.activity.is_active(now))
+        self.tabs.iter().any(|tab| tab.kind.is_terminal() && tab.activity.is_active(now))
     }
 
     #[cfg(target_os = "macos")]
@@ -2158,6 +2496,67 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
+    fn handle_image_loaded(
+        &mut self,
+        tab_id: TabId,
+        image: Result<crate::macos::image_view::LoadedImage, String>,
+    ) {
+        let is_active = Some(tab_id) == self.tabs.active_id();
+        let viewport = winit::dpi::PhysicalSize::new(
+            self.display.size_info.width() as u32,
+            self.display.size_info.height() as u32,
+        );
+        let (title, error_message);
+
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return;
+            };
+            let WindowKind::Image { source } = &tab.kind else {
+                return;
+            };
+            let Some(image_view) = tab.image_view.as_mut() else {
+                return;
+            };
+
+            match image {
+                Ok(image) => {
+                    if &image.source != source {
+                        return;
+                    }
+                    image_view.set_loaded(image, viewport);
+                    title = Some(image_view.title.clone());
+                    error_message = None;
+                },
+                Err(message) => {
+                    image_view.set_error(message.clone());
+                    title = Some(image_view.title.clone());
+                    error_message = Some(message);
+                },
+            }
+        }
+
+        if let Some(title) = title {
+            self.update_tab_title(tab_id, title);
+        }
+        if let Some(message) = error_message {
+            self.message_buffer.push(crate::message_bar::Message::new(
+                message,
+                crate::message_bar::MessageType::Error,
+            ));
+        }
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.refresh_tab_panel();
+        if is_active {
+            self.dirty = true;
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn handle_web_cursor(&mut self, tab_id: TabId, cursor: Option<CursorIcon>) {
         let Some(tab) = self.tabs.get_mut(tab_id) else {
             return;
@@ -2271,6 +2670,10 @@ impl WindowContext {
             return;
         }
 
+        #[cfg(target_os = "macos")]
+        let previous_was_web =
+            previous.and_then(|prev_id| self.tabs.get(prev_id).map(|tab| tab.kind.is_web()));
+
         let changed = self.tabs.set_active(tab_id);
 
         if changed {
@@ -2329,6 +2732,12 @@ impl WindowContext {
             }
             self.display.tab_panel.cancel_edit();
             self.update_webview_visibility();
+            #[cfg(target_os = "macos")]
+            if previous_was_web == Some(true)
+                && self.tabs.get(tab_id).is_some_and(|tab| !tab.kind.is_web())
+            {
+                self.display.window.focus_content_view();
+            }
             self.display.pending_update.dirty = true;
             self.display.damage_tracker.frame().mark_fully_damaged();
             self.refresh_tab_panel();
@@ -2341,7 +2750,7 @@ impl WindowContext {
         options: WindowOptions,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_internal(options, proxy, None, None)
+        self.create_tab_internal(options, proxy, None, None, None)
     }
 
     pub(crate) fn create_tab_in_group(
@@ -2351,7 +2760,7 @@ impl WindowContext {
         group_name: Option<String>,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_internal(options, proxy, group_id, group_name)
+        self.create_tab_internal(options, proxy, group_id, group_name, None)
     }
 
     fn create_tab_internal(
@@ -2360,6 +2769,7 @@ impl WindowContext {
         proxy: &EventLoopProxy<Event>,
         group_id: Option<usize>,
         group_name: Option<String>,
+        terminal_spawn_mode: Option<TerminalSpawnMode>,
     ) -> Result<TabId, Box<dyn Error>> {
         let terminal_command_input = if matches!(&options.window_kind, WindowKind::Terminal) {
             options.terminal_options.command_input()
@@ -2380,6 +2790,7 @@ impl WindowContext {
             options.window_kind,
             group_id,
             group_name,
+            terminal_spawn_mode,
         )?;
         self.set_active_tab(tab_id);
         self.send_startup_input(tab_id, terminal_command_input);
@@ -2400,6 +2811,352 @@ impl WindowContext {
             }
         }
         Ok(tab_id)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn workspace_layout(&self) -> WorkspaceLayout {
+        let active_tab = self.tabs.active_id();
+        let groups = self
+            .tabs
+            .groups
+            .iter()
+            .filter(|group| !group.tabs.is_empty())
+            .enumerate()
+            .map(|(group_index, group)| {
+                let tabs = group
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(tab_index, tab_id)| {
+                        let tab = self.tabs.get(*tab_id)?;
+                        let persistent_id = format!("g{group_index}-t{tab_index}");
+                        let kind = match &tab.kind {
+                            WindowKind::Terminal => WorkspaceTabKind::Terminal {
+                                broker_id: tab
+                                    .terminal_runtime
+                                    .workspace_terminal_id()
+                                    .expect("terminal tabs require workspace ids"),
+                                launch_options: tab.terminal_runtime.launch_options().clone(),
+                            },
+                            WindowKind::Web { url } => WorkspaceTabKind::Web {
+                                url: url.clone(),
+                                browser_view_mode: tab.browser_view_mode,
+                                browser_multi_column_count_override: tab
+                                    .browser_multi_column_count_override,
+                            },
+                            WindowKind::Image { source } => {
+                                WorkspaceTabKind::Image { source: source.clone() }
+                            },
+                        };
+                        Some(WorkspaceTabLayout {
+                            persistent_id,
+                            custom_title: tab.custom_title.clone(),
+                            terminal_view_mode: tab.terminal_view_mode,
+                            terminal_multi_column_count_override: tab
+                                .terminal_multi_column_count_override,
+                            kind,
+                        })
+                    })
+                    .collect();
+                WorkspaceGroupLayout { name: group.name.clone(), tabs }
+            })
+            .collect::<Vec<_>>();
+
+        let active_tab_id =
+            self.tabs.groups.iter().filter(|group| !group.tabs.is_empty()).enumerate().find_map(
+                |(group_index, group)| {
+                    group.tabs.iter().enumerate().find_map(|(tab_index, tab_id)| {
+                        (Some(*tab_id) == active_tab)
+                            .then(|| format!("g{group_index}-t{tab_index}"))
+                    })
+                },
+            );
+
+        WorkspaceLayout {
+            protocol_version: workspace::WORKSPACE_PROTOCOL_VERSION,
+            active_tab_id,
+            groups,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn persisted_terminal_states(&self) -> Vec<PersistedTerminalState> {
+        self.tabs
+            .ordered_tabs()
+            .into_iter()
+            .filter_map(|tab_id| self.tabs.get(tab_id))
+            .filter_map(persisted_terminal_state)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_workspace_layout(
+        &mut self,
+        layout: &WorkspaceLayout,
+        persisted_terminals: &HashMap<u64, PersistedTerminalState>,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<(), Box<dyn Error>> {
+        if non_empty_workspace_group_layouts(layout).next().is_none() {
+            return Ok(());
+        }
+
+        let existing_tabs = self.tabs.ordered_tabs();
+        for tab_id in existing_tabs {
+            let _ = self.close_tab(tab_id);
+        }
+
+        let mut active_tab_id = None;
+        let multi_column_defaults = self.multi_column_defaults();
+        for (restored_group_count, (_, group)) in
+            non_empty_workspace_group_layouts(layout).enumerate()
+        {
+            let mut created_group_id = None;
+            if restored_group_count > 0 {
+                created_group_id = Some(self.tabs.create_group(group.name.clone()));
+            }
+
+            for tab_layout in &group.tabs {
+                let (window_kind, pty_config, terminal_spawn_mode, restored_terminal) =
+                    match &tab_layout.kind {
+                        WorkspaceTabKind::Terminal { broker_id, launch_options } => {
+                            let restored_terminal = persisted_terminals.get(broker_id).cloned();
+                            let mut pty_config = restored_terminal
+                                .as_ref()
+                                .map(|terminal| terminal.launch_options.clone())
+                                .unwrap_or_else(|| launch_options.clone());
+                            if let Some(working_directory) = restored_terminal
+                                .as_ref()
+                                .and_then(|terminal| terminal.working_directory.clone())
+                            {
+                                pty_config.working_directory = Some(working_directory);
+                            }
+                            (
+                                WindowKind::Terminal,
+                                pty_config,
+                                Some(TerminalSpawnMode::NewLocal {
+                                    workspace_id: Some(*broker_id),
+                                }),
+                                restored_terminal,
+                            )
+                        },
+                        WorkspaceTabKind::Web {
+                            url,
+                            browser_view_mode: _,
+                            browser_multi_column_count_override: _,
+                        } => (
+                            WindowKind::Web { url: url.clone() },
+                            self.config.pty_config(),
+                            None,
+                            None,
+                        ),
+                        WorkspaceTabKind::Image { source } => (
+                            WindowKind::Image { source: source.clone() },
+                            self.config.pty_config(),
+                            None,
+                            None,
+                        ),
+                    };
+
+                let group_name = if restored_group_count == 0 && created_group_id.is_none() {
+                    group.name.clone()
+                } else {
+                    None
+                };
+
+                let tab_id = Self::spawn_tab(
+                    &mut self.tabs,
+                    &self.display,
+                    &self.config,
+                    multi_column_defaults,
+                    pty_config,
+                    proxy,
+                    window_kind,
+                    created_group_id,
+                    group_name,
+                    terminal_spawn_mode,
+                )?;
+
+                if let Some(tab) = self.tabs.get_mut(tab_id) {
+                    tab.custom_title = tab_layout.custom_title.clone();
+                    tab.terminal_view_mode = tab_layout.terminal_view_mode;
+                    tab.terminal_multi_column_count_override =
+                        tab_layout.terminal_multi_column_count_override;
+                    if let Some(saved_terminal) = restored_terminal.as_ref() {
+                        if tab.custom_title.is_none() {
+                            tab.title =
+                                saved_terminal.title.clone().unwrap_or_else(|| tab.title.clone());
+                        }
+                        tab.program_name = saved_terminal.program_name.clone();
+                    }
+                    if let WorkspaceTabKind::Web {
+                        url: _,
+                        browser_view_mode,
+                        browser_multi_column_count_override,
+                    } = &tab_layout.kind
+                    {
+                        tab.browser_view_mode = *browser_view_mode;
+                        tab.browser_multi_column_count_override =
+                            *browser_multi_column_count_override;
+                    }
+                    sync_terminal_tab_geometry(
+                        &self.display,
+                        &self.config,
+                        multi_column_defaults,
+                        tab,
+                    );
+                }
+
+                if layout.active_tab_id.as_deref() == Some(tab_layout.persistent_id.as_str()) {
+                    active_tab_id = Some(tab_id);
+                }
+            }
+        }
+
+        if let Some(tab_id) = active_tab_id.or_else(|| self.tabs.active_id()) {
+            self.set_active_tab(tab_id);
+        }
+        self.refresh_tab_panel();
+        self.display.pending_update.dirty = true;
+        self.dirty = true;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn refresh_workspace_terminals(
+        &mut self,
+        live_terminals: &HashMap<u64, WorkspaceBrokerTerminalStatus>,
+        persisted_terminals: &HashMap<u64, PersistedTerminalState>,
+    ) -> Result<(), Box<dyn Error>> {
+        let active_tab_id = self.tabs.active_id();
+        let multi_column_defaults = self.multi_column_defaults();
+        let display = &self.display;
+        let config = &self.config;
+        let mut panel_dirty = false;
+        let mut redraw = false;
+        let tab_ids = self.tabs.ordered_tabs();
+
+        for tab_id in tab_ids {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                continue;
+            };
+            if !tab.kind.is_terminal() {
+                continue;
+            }
+
+            let mut next_runtime = None;
+            let mut sync_geometry = false;
+            match &tab.terminal_runtime {
+                TerminalRuntimeState::Local { .. } => continue,
+                TerminalRuntimeState::Broker {
+                    broker_id,
+                    launch_options,
+                    working_directory: _,
+                    revision,
+                    _exit_code: _,
+                } => {
+                    let broker_id = *broker_id;
+                    if let Some(status) = live_terminals.get(&broker_id) {
+                        if status.revision > *revision {
+                            let terminal = workspace::broker_snapshot(broker_id)?;
+                            tab.terminal.lock().apply_snapshot(terminal.snapshot.clone());
+                            tab.program_name = terminal.status.program_name.clone();
+                            if tab.custom_title.is_none() {
+                                tab.title =
+                                    terminal.status.title.clone().unwrap_or_else(|| {
+                                        self.config.window.identity.title.clone()
+                                    });
+                                panel_dirty = true;
+                            }
+                            redraw |= Some(tab_id) == active_tab_id;
+                            sync_geometry = true;
+                            next_runtime = Some(TerminalRuntimeState::Broker {
+                                broker_id,
+                                launch_options: launch_options.clone(),
+                                working_directory: terminal.status.working_directory.clone(),
+                                revision: terminal.status.revision,
+                                _exit_code: terminal.status.exit_code,
+                            });
+                        }
+                    } else if let Some(saved) = persisted_terminals.get(&broker_id) {
+                        tab.terminal.lock().apply_snapshot(saved.snapshot.clone());
+                        tab.notifier = TabNotifier::Disconnected;
+                        tab.program_name = saved.program_name.clone();
+                        if tab.custom_title.is_none() {
+                            tab.title = saved
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| self.config.window.identity.title.clone());
+                            panel_dirty = true;
+                        }
+                        redraw |= Some(tab_id) == active_tab_id;
+                        sync_geometry = true;
+                        next_runtime = Some(TerminalRuntimeState::Disconnected {
+                            broker_id,
+                            launch_options: launch_options.clone(),
+                            working_directory: saved.working_directory.clone(),
+                        });
+                    }
+                },
+                TerminalRuntimeState::Disconnected {
+                    broker_id,
+                    launch_options,
+                    working_directory: _,
+                } => {
+                    let broker_id = *broker_id;
+                    if live_terminals.contains_key(&broker_id) {
+                        let terminal = workspace::broker_snapshot(broker_id)?;
+                        tab.terminal.lock().apply_snapshot(terminal.snapshot.clone());
+                        tab.notifier = TabNotifier::Broker { broker_id };
+                        tab.program_name = terminal.status.program_name.clone();
+                        if tab.custom_title.is_none() {
+                            tab.title = terminal
+                                .status
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| self.config.window.identity.title.clone());
+                            panel_dirty = true;
+                        }
+                        redraw |= Some(tab_id) == active_tab_id;
+                        sync_geometry = true;
+                        next_runtime = Some(TerminalRuntimeState::Broker {
+                            broker_id,
+                            launch_options: launch_options.clone(),
+                            working_directory: terminal.status.working_directory.clone(),
+                            revision: terminal.status.revision,
+                            _exit_code: terminal.status.exit_code,
+                        });
+                    }
+                },
+            }
+
+            if let Some(runtime) = next_runtime {
+                tab.terminal_runtime = runtime;
+            }
+            if sync_geometry {
+                sync_terminal_tab_geometry(display, config, multi_column_defaults, tab);
+            }
+        }
+
+        if panel_dirty {
+            self.refresh_tab_panel();
+        }
+        if redraw {
+            self.display.pending_update.dirty = true;
+            self.dirty = true;
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn has_workspace_terminals(&self) -> bool {
+        self.tabs.ordered_tabs().into_iter().any(|tab_id| {
+            self.tabs.get(tab_id).is_some_and(|tab| {
+                matches!(tab.terminal_runtime, TerminalRuntimeState::Broker { .. })
+            })
+        })
     }
 
     fn multi_column_defaults(&self) -> MultiColumnDefaults {
@@ -2534,7 +3291,8 @@ impl WindowContext {
             self.cef_inspector.remove_sessions_for_tab(tab_id);
         }
 
-        let _ = tab.notifier.0.send(Msg::Shutdown);
+        let mut tab = tab;
+        tab.notifier.close_terminal();
 
         #[cfg(target_os = "macos")]
         if closed_web {
@@ -2598,15 +3356,63 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
+    pub(crate) fn open_url_in_tab(
+        &mut self,
+        tab_id: TabId,
+        url: String,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<(), String> {
+        match classify_open_url(&url) {
+            crate::macos::image_view::OpenUrlKind::Web => self.open_web_url_in_tab(tab_id, url),
+            crate::macos::image_view::OpenUrlKind::Image => {
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(String::from("Tab not found"));
+                };
+                let WindowKind::Image { source } = &mut tab.kind else {
+                    return Err(String::from("Not an image tab"));
+                };
+                *source = url.clone();
+                let Some(image_view) = tab.image_view.as_mut() else {
+                    return Err(String::from("Image view is unavailable"));
+                };
+                image_view.reset_source(url.clone());
+                let title = image_view.title.clone();
+                self.command_history.record_url(url.clone());
+                request_image_load(proxy, self.display.window.id(), tab_id, url);
+                self.update_tab_title(tab_id, title);
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+                Ok(())
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_url_new_tab(
+        &mut self,
+        url: String,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<TabId, Box<dyn Error>> {
+        let mut options = WindowOptions::default();
+        options.window_kind = match classify_open_url(&url) {
+            crate::macos::image_view::OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
+            crate::macos::image_view::OpenUrlKind::Image => {
+                WindowKind::Image { source: url.clone() }
+            },
+        };
+        let tab_id = self.create_tab(options, proxy)?;
+        self.command_history.record_url(url);
+        Ok(tab_id)
+    }
+
+    #[cfg(target_os = "macos")]
     pub(crate) fn open_web_url_new_tab(
         &mut self,
         url: String,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut options = WindowOptions::default();
-        options.window_kind = WindowKind::Web { url: url.clone() };
-        let _ = self.create_tab(options, proxy)?;
-        self.command_history.record_url(url);
+        let _ = self.open_url_new_tab(url, proxy)?;
         Ok(())
     }
 
@@ -2634,10 +3440,10 @@ impl WindowContext {
                     .enumerate()
                     .filter_map(|(index, tab_id)| {
                         let tab = self.tabs.get(*tab_id)?;
-                        let activity = if tab.kind.is_web() {
-                            None
-                        } else {
+                        let activity = if tab.kind.is_terminal() {
                             Some(Self::ipc_activity(&tab.activity, now))
+                        } else {
+                            None
                         };
                         Some(IpcTabState {
                             tab_id: (*tab_id).into(),
@@ -2662,6 +3468,7 @@ impl WindowContext {
                                 multi_column_defaults,
                                 tab,
                             ),
+                            image_view: Self::ipc_image_view(tab, &self.display),
                         })
                     })
                     .collect();
@@ -2676,8 +3483,11 @@ impl WindowContext {
         let tab = self.tabs.get(tab_id)?;
         let (group_id, index) = self.tabs.group_for_tab(tab_id)?;
         let multi_column_defaults = self.multi_column_defaults();
-        let activity =
-            if tab.kind.is_web() { None } else { Some(Self::ipc_activity(&tab.activity, now)) };
+        let activity = if tab.kind.is_terminal() {
+            Some(Self::ipc_activity(&tab.activity, now))
+        } else {
+            None
+        };
         Some(IpcTabState {
             tab_id: tab_id.into(),
             group_id,
@@ -2701,6 +3511,7 @@ impl WindowContext {
                 multi_column_defaults,
                 tab,
             ),
+            image_view: Self::ipc_image_view(tab, &self.display),
         })
     }
 
@@ -2834,8 +3645,7 @@ impl WindowContext {
     ) -> Result<(), IpcError> {
         #[cfg(target_os = "macos")]
         {
-            let _ = proxy;
-            self.open_web_url_in_tab(tab_id, url)
+            self.open_url_in_tab(tab_id, url, proxy)
                 .map_err(|err| IpcError::new(IpcErrorCode::InvalidRequest, err))
         }
 
@@ -2854,12 +3664,9 @@ impl WindowContext {
     ) -> Result<TabId, IpcError> {
         #[cfg(target_os = "macos")]
         {
-            let mut options = WindowOptions::default();
-            options.window_kind = WindowKind::Web { url: url.clone() };
             let tab_id = self
-                .create_tab(options, proxy)
+                .open_url_new_tab(url, proxy)
                 .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()))?;
-            self.command_history.record_url(url);
             Ok(tab_id)
         }
 
@@ -3137,6 +3944,9 @@ impl WindowContext {
         if !self.tabs.get(tab_id).is_some_and(|tab| tab.kind.is_web()) {
             return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Active tab is not a web tab"));
         }
+
+        #[cfg(target_os = "macos")]
+        self.display.window.focus_window();
 
         let steps = drag.steps.unwrap_or(24).max(1);
         self.with_action_context(
@@ -4154,7 +4964,7 @@ impl WindowContext {
         f: F,
     ) -> Result<(), IpcError>
     where
-        F: FnOnce(&mut ActionContext<'_, Notifier, EventProxy>),
+        F: FnOnce(&mut ActionContext<'_, TabNotifier, EventProxy>),
     {
         if self.tabs.get(tab_id).is_none() {
             return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
@@ -4193,6 +5003,8 @@ impl WindowContext {
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
+                image_view: active_tab.image_view.as_mut(),
+                #[cfg(target_os = "macos")]
                 web_command_state: &mut active_tab.web_command_state,
                 modifiers: &mut self.modifiers,
                 notifier: &mut active_tab.notifier,
@@ -4203,9 +5015,9 @@ impl WindowContext {
                 occluded: &mut self.occluded,
                 terminal: &mut terminal,
                 #[cfg(not(windows))]
-                master_fd: active_tab.master_fd,
+                foreground_process: active_tab.terminal_runtime.master_fd_shell_pid(),
                 #[cfg(not(windows))]
-                shell_pid: active_tab.shell_pid,
+                working_directory_hint: active_tab.terminal_runtime.working_directory_hint(),
                 preserve_title: self.preserve_title,
                 config: &self.config,
                 event_proxy,
@@ -4277,16 +5089,16 @@ impl WindowContext {
         terminal_view_mode: TerminalViewMode,
         exact_multi_column_count: Option<usize>,
     ) -> TerminalViewportLayout {
-        let size_info = display.size_info_for_status_lines(usize::from(kind.is_web()));
-        if kind.is_web() {
-            TerminalViewportLayout::normal(size_info)
-        } else {
+        let size_info = display.size_info_for_status_lines(usize::from(kind.has_status_bar()));
+        if kind.is_terminal() {
             TerminalViewportLayout::new(
                 &size_info,
                 terminal_view_mode,
                 &config.terminal.multi_column,
                 exact_multi_column_count,
             )
+        } else {
+            TerminalViewportLayout::normal(size_info)
         }
     }
 
@@ -4312,7 +5124,7 @@ impl WindowContext {
         browser_view_mode: BrowserViewMode,
         exact_column_count: Option<usize>,
     ) -> BrowserViewportLayout {
-        let size_info = display.size_info_for_status_lines(usize::from(kind.is_web()));
+        let size_info = display.size_info_for_status_lines(usize::from(kind.has_status_bar()));
         BrowserViewportLayout::new(
             &size_info,
             display.window.scale_factor,
@@ -4353,7 +5165,7 @@ impl WindowContext {
         multi_column_defaults: MultiColumnDefaults,
         tab: &TabState,
     ) -> Option<IpcTerminalLayoutState> {
-        if tab.kind.is_web() {
+        if !tab.kind.is_terminal() {
             return None;
         }
 
@@ -4413,6 +5225,48 @@ impl WindowContext {
         })
     }
 
+    #[cfg(all(unix, target_os = "macos"))]
+    fn ipc_image_view(tab: &TabState, display: &Display) -> Option<IpcImageViewState> {
+        let image_view = tab.image_view.as_ref()?;
+        let (width, height) = image_view
+            .bitmap()
+            .map(|bitmap| (Some(bitmap.width), Some(bitmap.height)))
+            .unwrap_or((None, None));
+        let error = match &image_view.load_state {
+            ImageLoadState::Error(message) => Some(message.clone()),
+            ImageLoadState::Loading | ImageLoadState::Ready => None,
+        };
+        let viewport = winit::dpi::PhysicalSize::new(
+            display.size_info.width() as u32,
+            display.size_info.height() as u32,
+        );
+
+        Some(IpcImageViewState {
+            source: image_view.source.clone(),
+            state: match image_view.load_state {
+                ImageLoadState::Loading => IpcImageLoadState::Loading,
+                ImageLoadState::Ready => IpcImageLoadState::Ready,
+                ImageLoadState::Error(_) => IpcImageLoadState::Error,
+            },
+            scale_mode: match image_view.scale_mode {
+                ImageScaleMode::Fit => IpcImageScaleMode::Fit,
+                ImageScaleMode::Fill => IpcImageScaleMode::Fill,
+                ImageScaleMode::Actual => IpcImageScaleMode::Actual,
+                ImageScaleMode::Manual => IpcImageScaleMode::Manual,
+            },
+            zoom: image_view.zoom_factor(viewport).unwrap_or(1.0),
+            rotation_quarter_turns: image_view.rotation_quarter_turns,
+            width,
+            height,
+            error,
+        })
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ipc_image_view(_tab: &TabState, _display: &Display) -> Option<IpcImageViewState> {
+        None
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn select_tab_by_query(&mut self, query: &str) {
         let query = query.trim();
@@ -4425,6 +5279,7 @@ impl WindowContext {
             let title = tab.title.to_lowercase();
             let url_match = match &tab.kind {
                 WindowKind::Web { url } => url.to_lowercase().contains(&needle),
+                WindowKind::Image { source } => source.to_lowercase().contains(&needle),
                 WindowKind::Terminal => false,
             };
 
@@ -4501,8 +5356,37 @@ impl WindowContext {
         if tab.kind.is_web() {
             return false;
         }
+        if tab.kind.is_image() {
+            return false;
+        }
 
-        let Ok(program_name) = foreground_process_name(tab.master_fd, tab.shell_pid) else {
+        let program_name = match &tab.terminal_runtime {
+            TerminalRuntimeState::Local {
+                #[cfg(not(windows))]
+                master_fd,
+                #[cfg(not(windows))]
+                shell_pid,
+                ..
+            } => foreground_process_name(*master_fd, *shell_pid).ok(),
+            #[cfg(unix)]
+            TerminalRuntimeState::Broker { broker_id, .. } => {
+                workspace::broker_status().ok().and_then(|status| {
+                    status
+                        .terminals
+                        .into_iter()
+                        .find(|terminal| terminal.id == *broker_id)
+                        .map(|terminal| terminal.program_name)
+                })
+            },
+            #[cfg(unix)]
+            TerminalRuntimeState::Disconnected { broker_id, .. } => {
+                workspace::load_persisted_terminals().ok().and_then(|terminals| {
+                    terminals.get(broker_id).map(|terminal| terminal.program_name.clone())
+                })
+            },
+        };
+
+        let Some(program_name) = program_name else {
             return false;
         };
 
@@ -4663,6 +5547,7 @@ impl WindowContext {
             DrawMode::Web => {
                 let url = match &tab.kind {
                     WindowKind::Web { url } => url.as_str(),
+                    WindowKind::Image { source } => source.as_str(),
                     WindowKind::Terminal => "",
                 };
                 let browser_layout = Self::browser_viewport_for_tab(
@@ -4684,6 +5569,20 @@ impl WindowContext {
                         highlight_notch_ears,
                     ),
                 );
+            },
+            DrawMode::Image =>
+            {
+                #[cfg(target_os = "macos")]
+                if let Some(image_view) = tab.image_view.as_ref() {
+                    self.display.draw_image(
+                        scheduler,
+                        &self.message_buffer,
+                        &self.config,
+                        image_view,
+                        &tab.command_state,
+                        highlight_notch_ears,
+                    );
+                }
             },
             DrawMode::Terminal => {
                 let terminal = tab.terminal.lock();
@@ -4807,12 +5706,20 @@ impl WindowContext {
                         }
                         continue;
                     },
+                    #[cfg(target_os = "macos")]
+                    EventType::ImageLoaded { image } => {
+                        let Some(tab_id) = event.tab_id() else {
+                            continue;
+                        };
+                        self.handle_image_loaded(tab_id, image.clone());
+                        continue;
+                    },
                     EventType::Terminal(term_event) => {
                         let Some(tab_id) = event.tab_id() else {
                             continue;
                         };
 
-                        if self.tabs.get(tab_id).is_some_and(|tab| tab.kind.is_web()) {
+                        if self.tabs.get(tab_id).is_some_and(|tab| !tab.kind.is_terminal()) {
                             continue;
                         }
 
@@ -4878,6 +5785,8 @@ impl WindowContext {
                 #[cfg(target_os = "macos")]
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
+                image_view: active_tab.image_view.as_mut(),
+                #[cfg(target_os = "macos")]
                 web_command_state: &mut active_tab.web_command_state,
                 modifiers: &mut self.modifiers,
                 notifier: &mut active_tab.notifier,
@@ -4888,9 +5797,9 @@ impl WindowContext {
                 occluded: &mut self.occluded,
                 terminal: &mut terminal,
                 #[cfg(not(windows))]
-                master_fd: active_tab.master_fd,
+                foreground_process: active_tab.terminal_runtime.master_fd_shell_pid(),
                 #[cfg(not(windows))]
-                shell_pid: active_tab.shell_pid,
+                working_directory_hint: active_tab.terminal_runtime.working_directory_hint(),
                 preserve_title: self.preserve_title,
                 config: &self.config,
                 event_proxy,
@@ -5511,9 +6420,9 @@ fn normalize_favicon_char_counter(next_favicon_char: u32) -> u32 {
 
 impl Drop for WindowContext {
     fn drop(&mut self) {
-        // Shutdown each tab's PTY.
+        // Local PTYs are tied to the UI process. Broker-backed terminals outlive the UI.
         for tab in self.tabs.iter_mut() {
-            let _ = tab.notifier.0.send(Msg::Shutdown);
+            tab.notifier.detach();
         }
     }
 }
@@ -5540,5 +6449,36 @@ mod tests {
         assert_eq!(normalize_favicon_char_counter(0xE000), FIRST_DYNAMIC_FAVICON_CHAR);
         assert_eq!(normalize_favicon_char_counter(0xE00F), FIRST_DYNAMIC_FAVICON_CHAR);
         assert_eq!(normalize_favicon_char_counter(0xF900), 0xF0000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_empty_workspace_group_layouts_skip_empty_groups() {
+        let layout = WorkspaceLayout {
+            protocol_version: workspace::WORKSPACE_PROTOCOL_VERSION,
+            active_tab_id: None,
+            groups: vec![
+                WorkspaceGroupLayout { name: None, tabs: Vec::new() },
+                WorkspaceGroupLayout {
+                    name: Some(String::from("test")),
+                    tabs: vec![WorkspaceTabLayout {
+                        persistent_id: String::from("g1-t0"),
+                        custom_title: None,
+                        terminal_view_mode: TerminalViewMode::Normal,
+                        terminal_multi_column_count_override: None,
+                        kind: WorkspaceTabKind::Terminal {
+                            broker_id: 1,
+                            launch_options: tty::Options::default(),
+                        },
+                    }],
+                },
+            ],
+        };
+
+        let groups = non_empty_workspace_group_layouts(&layout)
+            .map(|(index, group)| (index, group.name.clone(), group.tabs.len()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups, vec![(1, Some(String::from("test")), 1)]);
     }
 }

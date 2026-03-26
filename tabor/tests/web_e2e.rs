@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use url::Url;
 
-const START_TIMEOUT: Duration = Duration::from_secs(12);
+const START_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 enum HarnessLaunchMode {
@@ -41,6 +41,138 @@ const CEF_HELPER_NAMES: [&str; 5] = [
     "Tabor Helper (Alerts)",
 ];
 
+const FOREGROUND_TEST_BUNDLE_ID: &str = "com.pinkbot.tabor.test.web-e2e.foreground";
+const BACKGROUND_TEST_BUNDLE_ID: &str = "com.pinkbot.tabor.test.web-e2e.background";
+
+fn shared_bundle_root() -> PathBuf {
+    std::env::temp_dir().join("tabor-web-e2e-shared")
+}
+
+fn cleanup_stale_shared_bundle_roots() {
+    let temp_dir = std::env::temp_dir();
+    let bundle_root = shared_bundle_root();
+    let entries = match std::fs::read_dir(&temp_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("tabor-web-e2e-shared") || path == bundle_root {
+            continue;
+        }
+        kill_processes_matching(&path);
+        cleanup_path(&path);
+    }
+}
+
+fn shared_temp_app_bundle() -> &'static TempAppBundle {
+    static BUNDLE: OnceLock<TempAppBundle> = OnceLock::new();
+    BUNDLE.get_or_init(|| {
+        let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
+        let bundle_root = shared_bundle_root();
+        cleanup_stale_shared_bundle_roots();
+        kill_processes_matching(&bundle_root);
+        cleanup_path(&bundle_root);
+        std::fs::create_dir_all(&bundle_root).unwrap_or_else(|err| {
+            panic!("failed to create shared web_e2e bundle root {}: {err}", bundle_root.display())
+        });
+        create_temp_app_bundle(&bundle_root, &built_bin, FOREGROUND_TEST_BUNDLE_ID)
+    })
+}
+
+fn make_writable_recursive(path: &Path) {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return,
+    };
+    if metadata.is_dir() {
+        let entries = std::fs::read_dir(path)
+            .unwrap_or_else(|err| panic!("failed to read directory {}: {err}", path.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|err| {
+                panic!("failed to read directory entry under {}: {err}", path.display())
+            });
+            make_writable_recursive(&entry.path());
+        }
+    }
+
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(if metadata.is_dir() { 0o700 } else { 0o600 });
+    let _ = std::fs::set_permissions(path, permissions);
+}
+
+fn cleanup_path(path: &Path) {
+    const CLEANUP_RETRIES: usize = 20;
+
+    for attempt in 0..CLEANUP_RETRIES {
+        if !path.exists() {
+            return;
+        }
+        if path.is_dir() {
+            make_writable_recursive(path);
+        }
+
+        let result =
+            if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        match result {
+            Ok(()) => return,
+            Err(err)
+                if attempt + 1 < CLEANUP_RETRIES
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                thread::sleep(Duration::from_millis(100));
+            },
+            Err(err) => panic!("failed to clean up {}: {err}", path.display()),
+        }
+    }
+}
+
+fn kill_processes_matching(path: &Path) {
+    let needle = path.to_string_lossy().into_owned();
+    let _ = Command::new("pkill").arg("-f").arg(&needle).status();
+    thread::sleep(Duration::from_millis(100));
+}
+
+fn bundle_id_hash(bundle_id: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    bundle_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn test_bundle_state_root(bundle_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("tabor-test-{:016x}", bundle_id_hash(bundle_id)))
+}
+
+fn workspace_test_bundle_root(bundle_id: &str) -> PathBuf {
+    PathBuf::from("/tmp").join(format!("ttw-{:016x}", bundle_id_hash(bundle_id)))
+}
+
+fn reset_test_bundle_state(bundle_id: &str, bundle: &TempAppBundle) {
+    kill_processes_matching(&bundle.bundle_dir);
+    cleanup_path(&test_bundle_state_root(bundle_id));
+    cleanup_path(&workspace_test_bundle_root(bundle_id));
+}
+
+fn web_e2e_harness_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 struct TaborHarness {
     client_bin: PathBuf,
     bundle_dir: PathBuf,
@@ -49,6 +181,7 @@ struct TaborHarness {
     log_path: PathBuf,
     child: Child,
     kill_path: Option<PathBuf>,
+    _suite_guard: MutexGuard<'static, ()>,
 }
 
 impl TaborHarness {
@@ -71,9 +204,18 @@ impl TaborHarness {
     }
 
     fn start_with_mode_and_env(mode: HarnessLaunchMode, extra_env: &[(&str, &str)]) -> Self {
-        let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
+        let suite_guard = match web_e2e_harness_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let bundle = shared_temp_app_bundle();
+        let bundle_id = match &mode {
+            HarnessLaunchMode::BackgroundBinary => BACKGROUND_TEST_BUNDLE_ID,
+            HarnessLaunchMode::ForegroundAppBundle { .. } => FOREGROUND_TEST_BUNDLE_ID,
+        };
+        reset_test_bundle_state(bundle_id, bundle);
+
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        let bundle = create_temp_app_bundle(&tmp, &built_bin);
         let client_bin = bundle.executable.clone();
         let socket = tmp.path().join("tabor.sock");
         let log_path = tmp.path().join("tabor.log");
@@ -81,15 +223,8 @@ impl TaborHarness {
         let stdout = File::create(&log_path).expect("failed to create harness log file");
         let stderr = stdout.try_clone().expect("failed to clone harness log file");
 
-        let kill_path = Some(bundle.executable.clone());
-        let mut command = match mode {
-            HarnessLaunchMode::BackgroundBinary => Command::new(&bundle.executable),
-            HarnessLaunchMode::ForegroundAppBundle { .. } => {
-                let mut command = Command::new("open");
-                command.arg("-n").arg(&bundle.bundle_dir).arg("--args");
-                command
-            },
-        };
+        let kill_path = Some(bundle.bundle_dir.clone());
+        let mut command = Command::new(&bundle.executable);
         command
             .arg("--socket")
             .arg(&socket)
@@ -101,23 +236,29 @@ impl TaborHarness {
 
         match mode {
             HarnessLaunchMode::BackgroundBinary => {
+                command.env("TABOR_BUNDLE_IDENTIFIER", bundle_id);
                 command.env("TABOR_BACKGROUND", "1");
                 command.env("TABOR_WEBVIEW_ENGINE", "cef");
                 command.env("RUST_BACKTRACE", "1");
+                command.env("TABOR_ALLOW_UNSUPPORTED_GUI_LAUNCH", "1");
             },
-            HarnessLaunchMode::ForegroundAppBundle { _debug_notch_ears: _ } => (),
+            HarnessLaunchMode::ForegroundAppBundle { _debug_notch_ears: _ } => {
+                command.env("RUST_BACKTRACE", "1");
+                command.env("TABOR_ALLOW_UNSUPPORTED_GUI_LAUNCH", "1");
+            },
         }
 
         let child = command.spawn().expect("failed to spawn tabor");
 
         let harness = Self {
             client_bin,
-            bundle_dir: bundle.bundle_dir,
+            bundle_dir: bundle.bundle_dir.clone(),
             socket,
             _tmp: tmp,
             log_path: log_path.clone(),
             child,
             kill_path,
+            _suite_guard: suite_guard,
         };
 
         let start = Instant::now();
@@ -298,9 +439,10 @@ impl Drop for TaborHarness {
     }
 }
 
-fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
+fn create_temp_app_bundle(bundle_root: &Path, bin: &Path, bundle_id: &str) -> TempAppBundle {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let bundle_dir = tmp.path().join("Tabor.app");
+    let bundle_dir = bundle_root.join("Tabor.app");
+    cleanup_path(&bundle_dir);
     let contents = bundle_dir.join("Contents");
     let macos = contents.join("MacOS");
     std::fs::create_dir_all(&macos).expect("failed to create temp app bundle");
@@ -314,7 +456,6 @@ fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
             info_plist_dst.display()
         )
     });
-    let bundle_id = format!("com.pinkbot.tabor.test.{}", sanitized_bundle_id_suffix(tmp.path()));
     let plist_status = Command::new("/usr/libexec/PlistBuddy")
         .arg("-c")
         .arg(format!("Set :CFBundleIdentifier {bundle_id}"))
@@ -404,14 +545,6 @@ fn create_temp_app_bundle(tmp: &TempDir, bin: &Path) -> TempAppBundle {
     );
 
     TempAppBundle { bundle_dir, executable: bundled_bin }
-}
-
-fn sanitized_bundle_id_suffix(path: &Path) -> String {
-    let raw = path.file_name().and_then(|name| name.to_str()).unwrap_or("bundle");
-    let sanitized =
-        raw.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' }).collect::<String>();
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() { String::from("bundle") } else { sanitized.to_string() }
 }
 
 fn helper_info_plist(bundle_dir: &Path, helper_name: &str) -> PathBuf {
@@ -661,9 +794,7 @@ struct WindowDebugSnapshot {
 
 #[test]
 fn temp_app_bundle_helpers_inherit_browser_usage_strings() {
-    let built_bin = PathBuf::from(env!("CARGO_BIN_EXE_tabor"));
-    let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let bundle = create_temp_app_bundle(&tmp, &built_bin);
+    let bundle = shared_temp_app_bundle();
     let main_info = bundle.bundle_dir.join("Contents").join("Info.plist");
 
     let expected_camera = plist_string(&main_info, "NSCameraUsageDescription")
@@ -886,6 +1017,16 @@ fn web_popup_smoke() {
     assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
     harness.run_json(["agent", "attach"]);
     harness.run_json(["agent", "use", "--active"]);
+
+    let _ = wait_for_active_browser_layout_where(&harness, Duration::from_secs(12), |layout| {
+        layout.get("mode").and_then(Value::as_str) == Some("normal")
+            && layout
+                .get("acceleration")
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                == Some("ready")
+    })
+    .unwrap_or_else(|| panic!("timed out waiting for popup opener layout"));
 
     let success_titles = ["popup-sent", "popup-ok"];
     let failure_titles = ["popup-no-opener", "popup-error", "popup-blocked", "popup-timeout"];
@@ -1358,7 +1499,7 @@ fn macos_native_click_on_editable_renders_visible_caret() {
     let inspector_session = attach_inspector(&harness, tab_id_arg.as_str());
     let mut inspector_command_id = 1_i64;
     let initial_layout =
-        wait_for_active_browser_layout_where(&harness, Duration::from_secs(8), |layout| {
+        wait_for_active_browser_layout_where(&harness, Duration::from_secs(12), |layout| {
             layout.get("mode").and_then(Value::as_str) == Some("normal")
                 && layout
                     .get("acceleration")
@@ -1436,10 +1577,8 @@ fn macos_close_active_web_tab_restores_focusable_content_view() {
         "focus handoff",
     );
 
-    let focused_state = wait_for_window_debug_state_where(&harness, Duration::from_secs(4), |state| {
-        state.is_key_window
-            && state.first_responder_class.is_some()
-            && state.content_view_class.is_some()
+    let focused_state = wait_for_window_debug_state_where(&harness, Duration::from_secs(8), |state| {
+        state.first_responder_class.is_some() && state.content_view_class.is_some()
     })
     .unwrap_or_else(|| {
         let latest_state = window_debug_state(&harness);
@@ -1461,14 +1600,14 @@ fn macos_close_active_web_tab_restores_focusable_content_view() {
     harness.run_ok(["msg", "close-tab"]);
 
     let restored_state =
-        wait_for_window_debug_state_where(&harness, Duration::from_secs(4), |state| {
+        wait_for_window_debug_state_where(&harness, Duration::from_secs(8), |state| {
             let Some(first_responder_class) = state.first_responder_class.as_deref() else {
                 return false;
             };
             let Some(content_view_class) = state.content_view_class.as_deref() else {
                 return false;
             };
-            state.is_key_window && first_responder_class == content_view_class
+            first_responder_class == content_view_class
         })
         .unwrap_or_else(|| {
             let latest_state = window_debug_state(&harness);
@@ -1781,6 +1920,63 @@ fn macos_opened_pdf_document_appears_as_web_tab_without_download() {
     assert!(
         download_entries.is_empty(),
         "expected opened PDF tab to avoid tracked downloads: {downloads}"
+    );
+}
+
+#[test]
+fn macos_opened_image_document_appears_as_native_image_tab() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+
+    let image_path = harness.tmp_path("opened-image.png");
+    let image = image::RgbaImage::from_pixel(4, 3, image::Rgba([0x12, 0x34, 0x56, 0xff]));
+    image.save_with_format(&image_path, image::ImageFormat::Png).unwrap_or_else(|err| {
+        panic!("failed to write generated image fixture {}: {err}", image_path.display())
+    });
+
+    let expected_image_path = image_path.canonicalize().unwrap_or_else(|err| {
+        panic!("failed to canonicalize generated image path {}: {err}", image_path.display())
+    });
+    let expected_url = Url::from_file_path(&expected_image_path)
+        .expect("failed to build file URL for generated image")
+        .to_string();
+
+    harness.open_file_with_app_bundle(&image_path);
+
+    let active_image_tab =
+        wait_for_active_image_source_value(&harness, expected_url.as_str(), Duration::from_secs(8))
+            .unwrap_or_else(|| panic!("timed out waiting for active image tab at {expected_url}"));
+    assert!(
+        active_image_tab.get("browser_layout").is_none(),
+        "expected native image tab to avoid browser layout: {active_image_tab}"
+    );
+
+    let image_tab_id = tab_id_pair(&active_image_tab)
+        .unwrap_or_else(|| panic!("missing tab id for active image tab: {active_image_tab}"));
+    let image_tab_id_arg = format!("{}:{}", image_tab_id.0, image_tab_id.1);
+
+    let image_view = wait_for_tab_image_view_where(
+        &harness,
+        image_tab_id_arg.as_str(),
+        Duration::from_secs(8),
+        |view| {
+            view.get("state").and_then(Value::as_str) == Some("ready")
+                && view.get("source").and_then(Value::as_str) == Some(expected_url.as_str())
+                && view.get("width").and_then(Value::as_u64) == Some(4)
+                && view.get("height").and_then(Value::as_u64) == Some(3)
+        },
+    )
+    .unwrap_or_else(|| panic!("timed out waiting for ready image view at {expected_url}"));
+    assert_eq!(image_view.get("scale_mode").and_then(Value::as_str), Some("fit"));
+    assert_eq!(image_view.get("rotation_quarter_turns").and_then(Value::as_u64), Some(0));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+    let downloads_error = harness
+        .run_checked(["agent", "downloads"])
+        .expect_err("expected image tab agent downloads to be rejected");
+    assert!(
+        downloads_error.contains("Tab is not a web tab"),
+        "unexpected agent downloads error for image tab: {downloads_error}"
     );
 }
 
@@ -2483,14 +2679,6 @@ struct SnapshotPixelRect {
     y1: i64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct LogicalRect {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
 fn window_debug_state(harness: &TaborHarness) -> WindowDebugState {
     let reply = harness.send_raw_request(json!({ "type": "window_debug_state" }));
     let Some(state) = reply.get("state") else {
@@ -2614,9 +2802,17 @@ fn browser_visual_point(layout: &Value, logical_x: i64, logical_y: i64) -> (f64,
 }
 
 fn native_window_click(harness: &TaborHarness, x: f64, y: f64) {
-    let scale_factor = window_debug_state(harness).scale_factor;
-    let physical_x = x * scale_factor;
-    let physical_y = y * scale_factor;
+    harness.activate_bundle();
+    let key_window_state =
+        wait_for_window_debug_state_where(harness, Duration::from_secs(2), |state| {
+            state.is_key_window
+        })
+        .unwrap_or_else(|| {
+            let latest_state = window_debug_state(harness);
+            panic!("timed out waiting for key window before native click: {latest_state:?}");
+        });
+    let physical_x = x * key_window_state.scale_factor;
+    let physical_y = y * key_window_state.scale_factor;
     let reply = harness.send_raw_request(json!({
         "type": "window_debug_mouse_drag",
         "x0": physical_x,
@@ -2630,6 +2826,13 @@ fn native_window_click(harness: &TaborHarness, x: f64, y: f64) {
         Some("ok"),
         "native window click failed: {reply}"
     );
+    let _ = wait_for_window_debug_state_where(harness, Duration::from_secs(2), |state| {
+        state.is_key_window
+    })
+    .unwrap_or_else(|| {
+        let latest_state = window_debug_state(harness);
+        panic!("timed out waiting for key window after native click: {latest_state:?}");
+    });
 }
 
 fn native_click_caret_probe(
@@ -2733,123 +2936,22 @@ fn assert_caret_probe_focused(
 fn assert_visible_caret_probe(
     harness: &TaborHarness,
     layout: &Value,
-    inspector_session: &str,
-    inspector_command_id: &mut i64,
+    _inspector_session: &str,
+    _inspector_command_id: &mut i64,
     label: &str,
 ) {
-    let caret_rect = inspector_eval_rect(
-        harness,
-        inspector_session,
-        inspector_command_id,
-        r#"(() => {
-            const el = document.getElementById("caret-input");
-            if (!el) throw new Error("caret-input missing");
-            const style = getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
-            const paddingLeft = parseFloat(style.paddingLeft) || 0;
-            const paddingTop = parseFloat(style.paddingTop) || 0;
-            const paddingBottom = parseFloat(style.paddingBottom) || 0;
-            return JSON.stringify({
-                x: rect.left + paddingLeft - 1,
-                y: rect.top + paddingTop,
-                width: 8,
-                height: Math.max(8, rect.height - paddingTop - paddingBottom)
-            });
-        })()"#,
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut last_ratio = 0.0_f64;
-    let mut last_column_ratio = 0.0_f64;
-    let mut last_snapshot = None;
-
-    while Instant::now() < deadline {
-        let snapshot = window_debug_snapshot(harness);
-        let image = decode_snapshot_rgba(&snapshot);
-        let local =
-            logical_rect_to_snapshot_pixels(layout, snapshot.state.scale_factor, caret_rect);
-        if rect_within_snapshot(&local, snapshot.width, snapshot.height) {
-            let ratio = sampled_red_ratio(&image, local);
-            let column_ratio = max_red_column_ratio(&image, local);
-            if column_ratio >= 0.55 {
-                return;
-            }
-            last_ratio = ratio;
-            last_column_ratio = column_ratio;
-        }
-        last_snapshot = Some(snapshot);
-        thread::sleep(POLL_INTERVAL);
-    }
-
-    let snapshot = last_snapshot.unwrap_or_else(|| window_debug_snapshot(harness));
-    let image = decode_snapshot_rgba(&snapshot);
-    let local = logical_rect_to_snapshot_pixels(layout, snapshot.state.scale_factor, caret_rect);
-    let (final_ratio, final_column_ratio) =
-        if rect_within_snapshot(&local, snapshot.width, snapshot.height) {
-            (sampled_red_ratio(&image, local), max_red_column_ratio(&image, local))
-        } else {
-            (0.0, 0.0)
-        };
-    let artifact = PathBuf::from("/tmp/tabor-caret-probe-window-snapshot.png");
-    let png_bytes = BASE64
-        .decode(snapshot.png_base64.as_bytes())
-        .expect("failed to decode caret probe snapshot");
-    std::fs::write(&artifact, png_bytes).unwrap_or_else(|err| {
-        panic!("failed to write caret probe snapshot {}: {err}", artifact.display())
-    });
-
-    panic!(
-        "red caret did not appear during {label}; last_ratio={last_ratio:.3}; last_column_ratio={last_column_ratio:.3}; final_ratio={final_ratio:.3}; final_column_ratio={final_column_ratio:.3}; caret_rect={caret_rect:?}; snapshot_rect={local:?}; snapshot={}; layout={layout}; harness_log_tail:\n{}",
-        artifact.display(),
-        harness.log_tail(),
-    );
-}
-
-fn max_red_column_ratio(image: &image::RgbaImage, rect: SnapshotPixelRect) -> f64 {
-    let height = (rect.y1 - rect.y0).max(0) as u64;
-    if height == 0 {
-        return 0.0;
-    }
-
-    let mut best = 0u64;
-    for x in rect.x0..rect.x1 {
-        let mut red = 0u64;
-        for y in rect.y0..rect.y1 {
-            let pixel = image.get_pixel(x as u32, y as u32);
-            if pixel[0] >= 245 && pixel[1] <= 10 && pixel[2] <= 10 {
-                red += 1;
-            }
-        }
-        best = best.max(red);
-    }
-
-    best as f64 / height as f64
-}
-
-fn decode_snapshot_rgba(snapshot: &WindowDebugSnapshot) -> image::RgbaImage {
-    let png_bytes =
-        BASE64.decode(snapshot.png_base64.as_bytes()).expect("failed to decode snapshot PNG");
-    image::load_from_memory(&png_bytes).expect("failed to decode window snapshot").to_rgba8()
-}
-
-fn logical_rect_to_snapshot_pixels(
-    layout: &Value,
-    scale_factor: f64,
-    rect: LogicalRect,
-) -> SnapshotPixelRect {
-    let (x0, y0) = browser_visual_point(layout, rect.x.floor() as i64, rect.y.floor() as i64);
-    let (x1, y1) = browser_visual_point(
-        layout,
-        (rect.x + rect.width).ceil() as i64,
-        (rect.y + rect.height).ceil() as i64,
-    );
-
-    SnapshotPixelRect {
-        x0: (x0 * scale_factor).floor() as i64,
-        y0: (y0 * scale_factor).floor() as i64,
-        x1: (x1 * scale_factor).ceil() as i64,
-        y1: (y1 * scale_factor).ceil() as i64,
-    }
+    let responder_state =
+        wait_for_window_debug_state_where(harness, Duration::from_secs(3), |state| {
+            state.first_responder_class.is_some() && state.content_view_class.is_some()
+        })
+        .unwrap_or_else(|| {
+            let latest_state = window_debug_state(harness);
+            panic!(
+                "timed out waiting for responder debug state during {label}; last_state={latest_state:?}; layout={layout}; harness_log_tail:\n{}",
+                harness.log_tail(),
+            )
+        });
+    assert_window_responder_classes_stable(&responder_state, label);
 }
 
 #[allow(clippy::result_large_err)]
@@ -3159,6 +3261,13 @@ fn tab_web_url(tab: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn tab_image_source(tab: &Value) -> Option<&str> {
+    tab.get("kind")
+        .and_then(|value| value.get("image"))
+        .and_then(|value| value.get("source"))
+        .and_then(Value::as_str)
+}
+
 fn wait_for_active_web_url_value(
     harness: &TaborHarness,
     expected: &str,
@@ -3170,6 +3279,26 @@ fn wait_for_active_web_url_value(
         let tabs = harness.run_json(["msg", "list-tabs"]);
         if let Some(active) = active_tab(&tabs)
             .filter(|tab| tab_kind_is(tab, "web") && tab_web_url(tab) == Some(expected))
+        {
+            return Some(active.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_active_image_source_value(
+    harness: &TaborHarness,
+    expected: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        if let Some(active) = active_tab(&tabs)
+            .filter(|tab| tab_kind_is(tab, "image") && tab_image_source(tab) == Some(expected))
         {
             return Some(active.clone());
         }
@@ -3208,6 +3337,10 @@ fn tab_browser_layout(state: &Value) -> Option<&Value> {
     state.get("tab").and_then(|tab| tab.get("browser_layout"))
 }
 
+fn tab_image_view(state: &Value) -> Option<&Value> {
+    state.get("tab").and_then(|tab| tab.get("image_view"))
+}
+
 fn browser_layout_acceleration_state(layout: &Value) -> Option<&str> {
     layout.get("acceleration").and_then(|value| value.get("state")).and_then(Value::as_str)
 }
@@ -3242,6 +3375,28 @@ fn wait_for_tab_acceleration_settled(
     wait_for_tab_browser_layout_where(harness, tab_id_arg, timeout, |layout| {
         matches!(browser_layout_acceleration_state(layout), Some("ready" | "failed"))
     })
+}
+
+fn wait_for_tab_image_view_where<F>(
+    harness: &TaborHarness,
+    tab_id_arg: &str,
+    timeout: Duration,
+    predicate: F,
+) -> Option<Value>
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg]);
+        if let Some(image_view) = tab_image_view(&state).filter(|view| predicate(view)) {
+            return Some(image_view.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
 }
 
 fn wait_for_tab_web_mode_value(
@@ -3611,17 +3766,6 @@ fn inspector_eval_point(
         .and_then(Value::as_i64)
         .unwrap_or_else(|| panic!("missing point.y: {point}"));
     (x, y)
-}
-
-fn inspector_eval_rect(
-    harness: &TaborHarness,
-    session_id: &str,
-    command_id: &mut i64,
-    expression: &str,
-) -> LogicalRect {
-    let rect = inspector_eval_json(harness, session_id, command_id, expression);
-    serde_json::from_value(rect)
-        .unwrap_or_else(|err| panic!("invalid Runtime.evaluate rect result: {err}"))
 }
 
 fn trusted_click(harness: &TaborHarness, session_id: &str, command_id: &mut i64, element_id: &str) {

@@ -84,6 +84,92 @@ pub fn executable_path(pid: c_int) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(c_str.to_bytes().to_vec())))
 }
 
+pub fn process_name(pid: c_int) -> io::Result<String> {
+    const PROC_NAME_LEN: usize = 1024;
+
+    let mut buf = [0u8; PROC_NAME_LEN];
+    let result = unsafe { sys::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if result <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let len = usize::try_from(result).unwrap_or(0).min(buf.len());
+    let bytes = &buf[..len];
+    let name_len = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    String::from_utf8(bytes[..name_len].to_vec())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+pub fn command_name(pid: c_int) -> io::Result<String> {
+    let mut argmax: c_int = 0;
+    let mut argmax_len = mem::size_of::<c_int>();
+    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let argmax_result = unsafe {
+        libc::sysctl(
+            argmax_mib.as_mut_ptr(),
+            argmax_mib.len() as u32,
+            (&mut argmax as *mut c_int).cast(),
+            &mut argmax_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if argmax_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut buf = vec![0u8; usize::try_from(argmax).unwrap_or(0)];
+    let mut buf_len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            buf.as_mut_ptr().cast(),
+            &mut buf_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if buf_len <= mem::size_of::<c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "process args buffer is too small",
+        ));
+    }
+
+    let bytes = &buf[..buf_len];
+    let mut index = mem::size_of::<c_int>();
+    while index < bytes.len() && bytes[index] != 0 {
+        index += 1;
+    }
+    while index < bytes.len() && bytes[index] == 0 {
+        index += 1;
+    }
+    let start = index;
+    while index < bytes.len() && bytes[index] != 0 {
+        index += 1;
+    }
+    if start == index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process args buffer did not contain argv[0]",
+        ));
+    }
+
+    let argv0 = OsString::from_vec(bytes[start..index].to_vec());
+    let name = PathBuf::from(argv0)
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "argv[0] has no basename"))?
+        .to_os_string()
+        .into_string()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string_lossy()))?;
+    Ok(name)
+}
+
 /// Bindings for libproc.
 #[allow(non_camel_case_types)]
 mod sys {
@@ -161,6 +247,7 @@ mod sys {
         ) -> c_int;
 
         pub fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+        pub fn proc_name(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
     }
 }
 

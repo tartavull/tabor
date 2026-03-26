@@ -244,6 +244,27 @@ pub enum Action {
     /// Toggle the command bar.
     ToggleCommandBar,
 
+    /// Zoom the active image view in.
+    ImageZoomIn,
+
+    /// Zoom the active image view out.
+    ImageZoomOut,
+
+    /// Fit the active image to the viewport.
+    ImageZoomFit,
+
+    /// Fill the active image viewport.
+    ImageZoomFill,
+
+    /// Show the active image at 1:1 scale.
+    ImageZoomActual,
+
+    /// Rotate the active image clockwise.
+    ImageRotateClockwise,
+
+    /// Reset the active image view transform.
+    ImageResetView,
+
     /// Allow receiving char input.
     ReceiveChar,
 
@@ -626,6 +647,15 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
         "b",    ModifiersState::SUPER, ~BindingMode::SEARCH;                   Action::SearchBackward;
         "+" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::IncreaseFontSize;
         "-" => KeyLocation::Numpad, ModifiersState::SUPER;                     Action::DecreaseFontSize;
+        "=",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageZoomIn;
+        "+",    ModifiersState::SHIFT, +BindingMode::IMAGE;                    Action::ImageZoomIn;
+        "+" => KeyLocation::Numpad, ModifiersState::empty(), +BindingMode::IMAGE; Action::ImageZoomIn;
+        "-",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageZoomOut;
+        "-" => KeyLocation::Numpad, ModifiersState::empty(), +BindingMode::IMAGE; Action::ImageZoomOut;
+        "0",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageZoomActual;
+        "/",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageZoomFit;
+        "!",    ModifiersState::SHIFT, +BindingMode::IMAGE;                    Action::ImageZoomFill;
+        "r",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageRotateClockwise;
     )
 }
 
@@ -775,17 +805,19 @@ bitflags! {
         const SEARCH                 = 0b0001_0000;
         const DISAMBIGUATE_ESC_CODES = 0b0010_0000;
         const REPORT_ALL_KEYS_AS_ESC = 0b0100_0000;
+        const IMAGE                  = 0b1000_0000;
     }
 }
 
 impl BindingMode {
-    pub fn new(mode: &TermMode, search: bool) -> BindingMode {
+    pub fn new(mode: &TermMode, search: bool, image: bool) -> BindingMode {
         let mut binding_mode = BindingMode::empty();
         binding_mode.set(BindingMode::APP_CURSOR, mode.contains(TermMode::APP_CURSOR));
         binding_mode.set(BindingMode::APP_KEYPAD, mode.contains(TermMode::APP_KEYPAD));
         binding_mode.set(BindingMode::ALT_SCREEN, mode.contains(TermMode::ALT_SCREEN));
         binding_mode.set(BindingMode::VI, mode.contains(TermMode::VI));
         binding_mode.set(BindingMode::SEARCH, search);
+        binding_mode.set(BindingMode::IMAGE, image);
         binding_mode.set(
             BindingMode::DISAMBIGUATE_ESC_CODES,
             mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
@@ -816,7 +848,7 @@ impl<'a> Deserialize<'a> for ModeWrapper {
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
-                    "a combination of AppCursor | AppKeypad | Alt | Vi, possibly with negation (~)",
+                    "a combination of AppCursor | AppKeypad | Alt | Vi | Search | Image, possibly with negation (~)",
                 )
             }
 
@@ -839,6 +871,8 @@ impl<'a> Deserialize<'a> for ModeWrapper {
                         "~vi" => res.not_mode |= BindingMode::VI,
                         "search" => res.mode |= BindingMode::SEARCH,
                         "~search" => res.not_mode |= BindingMode::SEARCH,
+                        "image" => res.mode |= BindingMode::IMAGE,
+                        "~image" => res.not_mode |= BindingMode::IMAGE,
                         _ => return Err(E::invalid_value(Unexpected::Str(modifier), &self)),
                     }
                 }

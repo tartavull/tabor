@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::{env, io};
 
 use polling::{Event, PollMode, Poller};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(windows))]
 mod unix;
@@ -19,6 +21,7 @@ pub use self::windows::*;
 
 /// Configuration for the `Pty` interface.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
     /// Shell options.
     ///
@@ -44,6 +47,7 @@ pub struct Options {
 
 /// Shell options.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Shell {
     /// Path to a shell program to run on startup.
     pub(crate) program: String,
