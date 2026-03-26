@@ -100,11 +100,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    #[cfg(unix)]
-    if workspace::maybe_run_internal_from_argv()? {
-        return Ok(());
-    }
-
     #[cfg(target_os = "macos")]
     if args_indicate_cef_subprocess(std::env::args_os().skip(1)) {
         let Some(exit_code) = macos::cef::maybe_execute_subprocess()? else {

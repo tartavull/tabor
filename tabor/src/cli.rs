@@ -362,10 +362,6 @@ pub struct WorkspaceOptions {
 pub enum WorkspaceCommand {
     Status,
     Stop,
-    RestartTerminal {
-        #[clap(long)]
-        id: u64,
-    },
 }
 
 #[cfg(unix)]

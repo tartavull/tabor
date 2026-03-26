@@ -292,9 +292,6 @@ _tabor() {
             tabor__help__msg__inspector,send)
                 cmd="tabor__help__msg__inspector__send"
                 ;;
-            tabor__help__workspace,restart-terminal)
-                cmd="tabor__help__workspace__restart__terminal"
-                ;;
             tabor__help__workspace,status)
                 cmd="tabor__help__workspace__status"
                 ;;
@@ -517,9 +514,6 @@ _tabor() {
             tabor__workspace,help)
                 cmd="tabor__workspace__help"
                 ;;
-            tabor__workspace,restart-terminal)
-                cmd="tabor__workspace__restart__terminal"
-                ;;
             tabor__workspace,status)
                 cmd="tabor__workspace__status"
                 ;;
@@ -528,9 +522,6 @@ _tabor() {
                 ;;
             tabor__workspace__help,help)
                 cmd="tabor__workspace__help__help"
-                ;;
-            tabor__workspace__help,restart-terminal)
-                cmd="tabor__workspace__help__restart__terminal"
                 ;;
             tabor__workspace__help,status)
                 cmd="tabor__workspace__help__status"
@@ -1952,22 +1943,8 @@ _tabor() {
             return 0
             ;;
         tabor__help__workspace)
-            opts="status stop restart-terminal"
+            opts="status stop"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        tabor__help__workspace__restart__terminal)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -3289,7 +3266,7 @@ _tabor() {
             return 0
             ;;
         tabor__workspace)
-            opts="-h --help status stop restart-terminal help"
+            opts="-h --help status stop help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3303,7 +3280,7 @@ _tabor() {
             return 0
             ;;
         tabor__workspace__help)
-            opts="status stop restart-terminal help"
+            opts="status stop help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3317,20 +3294,6 @@ _tabor() {
             return 0
             ;;
         tabor__workspace__help__help)
-            opts=""
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        tabor__workspace__help__restart__terminal)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3365,24 +3328,6 @@ _tabor() {
                 return 0
             fi
             case "${prev}" in
-                *)
-                    COMPREPLY=()
-                    ;;
-            esac
-            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-            return 0
-            ;;
-        tabor__workspace__restart__terminal)
-            opts="-h --id --help"
-            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
-                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
-                return 0
-            fi
-            case "${prev}" in
-                --id)
-                    COMPREPLY=($(compgen -f "${cur}"))
-                    return 0
-                    ;;
                 *)
                     COMPREPLY=()
                     ;;

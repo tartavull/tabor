@@ -807,13 +807,6 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
-(restart-terminal)
-_arguments "${_arguments_options[@]}" : \
-'--id=[]:ID:_default' \
-'-h[Print help]' \
-'--help[Print help]' \
-&& ret=0
-;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_tabor__workspace__help_commands" \
@@ -831,10 +824,6 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (stop)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(restart-terminal)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1134,10 +1123,6 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (stop)
-_arguments "${_arguments_options[@]}" : \
-&& ret=0
-;;
-(restart-terminal)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1715,14 +1700,8 @@ _tabor__help__workspace_commands() {
     local commands; commands=(
 'status:' \
 'stop:' \
-'restart-terminal:' \
     )
     _describe -t commands 'tabor help workspace commands' commands "$@"
-}
-(( $+functions[_tabor__help__workspace__restart-terminal_commands] )) ||
-_tabor__help__workspace__restart-terminal_commands() {
-    local commands; commands=()
-    _describe -t commands 'tabor help workspace restart-terminal commands' commands "$@"
 }
 (( $+functions[_tabor__help__workspace__status_commands] )) ||
 _tabor__help__workspace__status_commands() {
@@ -2180,7 +2159,6 @@ _tabor__workspace_commands() {
     local commands; commands=(
 'status:' \
 'stop:' \
-'restart-terminal:' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor workspace commands' commands "$@"
@@ -2190,7 +2168,6 @@ _tabor__workspace__help_commands() {
     local commands; commands=(
 'status:' \
 'stop:' \
-'restart-terminal:' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'tabor workspace help commands' commands "$@"
@@ -2199,11 +2176,6 @@ _tabor__workspace__help_commands() {
 _tabor__workspace__help__help_commands() {
     local commands; commands=()
     _describe -t commands 'tabor workspace help help commands' commands "$@"
-}
-(( $+functions[_tabor__workspace__help__restart-terminal_commands] )) ||
-_tabor__workspace__help__restart-terminal_commands() {
-    local commands; commands=()
-    _describe -t commands 'tabor workspace help restart-terminal commands' commands "$@"
 }
 (( $+functions[_tabor__workspace__help__status_commands] )) ||
 _tabor__workspace__help__status_commands() {
@@ -2214,11 +2186,6 @@ _tabor__workspace__help__status_commands() {
 _tabor__workspace__help__stop_commands() {
     local commands; commands=()
     _describe -t commands 'tabor workspace help stop commands' commands "$@"
-}
-(( $+functions[_tabor__workspace__restart-terminal_commands] )) ||
-_tabor__workspace__restart-terminal_commands() {
-    local commands; commands=()
-    _describe -t commands 'tabor workspace restart-terminal commands' commands "$@"
 }
 (( $+functions[_tabor__workspace__status_commands] )) ||
 _tabor__workspace__status_commands() {

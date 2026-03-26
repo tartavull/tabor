@@ -1,81 +1,78 @@
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::error::Error;
-use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Write};
-#[cfg(unix)]
+use std::io::{BufReader, Error as IoError, ErrorKind, Read, Write};
+#[cfg(not(windows))]
 use std::os::unix::io::RawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tabor_terminal::event::{Event as TerminalEvent, EventListener, Notify, OnResize, WindowSize};
-use tabor_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
+use tabor_terminal::event::{VoidListener, WindowSize};
 use tabor_terminal::grid::Dimensions;
 use tabor_terminal::sync::FairMutex;
 use tabor_terminal::term::test::TermSize;
-use tabor_terminal::term::{Term, TermSnapshot};
+use tabor_terminal::term::{ResizeAnchor, Term, TermSnapshot};
 use tabor_terminal::tty;
+use tabor_terminal::vte::ansi;
 
 use crate::cli::{WorkspaceCommand, WorkspaceOptions};
+use crate::event::EventProxy;
 #[cfg(target_os = "macos")]
 use crate::macos;
 
 pub(crate) const WORKSPACE_PROTOCOL_VERSION: u32 = 1;
-const BROKER_START_TIMEOUT: Duration = Duration::from_secs(5);
-const BROKER_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const BROKER_IDLE_WAIT: Duration = Duration::from_millis(25);
-const INTERNAL_SERVE_ARG: &str = "__tabor_workspace_serve";
 
-#[derive(Serialize, Deserialize)]
-struct BrokerRuntimeState {
-    control_socket: PathBuf,
-    persisted_state_file: PathBuf,
-}
+const PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const CHECKPOINT_IDLE_DEBOUNCE: Duration = Duration::from_millis(400);
+const MAX_JOURNAL_BYTES_BEFORE_CHECKPOINT: u64 = 128 * 1024;
+const JOURNAL_RECORD_OUTPUT: u8 = 1;
+const JOURNAL_RECORD_RESIZE: u8 = 2;
+const STATE_FILE_NAME: &str = "workspace-state.json";
+const LEGACY_STATE_FILE_NAME: &str = "workspace-broker-state.json";
 
-#[derive(Serialize, Deserialize, Default)]
-struct PersistedWorkspaceBrokerState {
-    next_terminal_id: u64,
-    terminals: Vec<PersistedTerminalState>,
-}
+static PERSISTENCE_WORKER: LazyLock<Mutex<Option<PersistenceWorker>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedTerminalState {
     pub id: u64,
     pub launch_options: tty::Options,
-    pub snapshot: TermSnapshot,
-    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default)]
     pub program_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub clean_exit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<TermSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WorkspaceBrokerTerminalStatus {
+pub(crate) struct WorkspaceTerminalStatus {
     pub id: u64,
-    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub program_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub clean_exit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WorkspaceBrokerTerminalSnapshot {
-    pub status: WorkspaceBrokerTerminalStatus,
-    pub snapshot: TermSnapshot,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WorkspaceBrokerStatus {
-    pub terminals: Vec<WorkspaceBrokerTerminalStatus>,
+pub(crate) struct WorkspaceStatus {
+    pub terminals: Vec<WorkspaceTerminalStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +88,9 @@ pub(crate) struct WorkspaceTabLayout {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WorkspaceTabKind {
     Terminal {
-        broker_id: u64,
+        #[serde(alias = "broker_id")]
+        terminal_id: u64,
+        #[serde(default)]
         launch_options: tty::Options,
     },
     Web {
@@ -117,231 +116,229 @@ pub(crate) struct WorkspaceLayout {
     pub groups: Vec<WorkspaceGroupLayout>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializableWindowSize {
-    num_lines: u16,
-    num_cols: u16,
-    cell_width: u16,
-    cell_height: u16,
-}
-
-impl From<WindowSize> for SerializableWindowSize {
-    fn from(value: WindowSize) -> Self {
-        Self {
-            num_lines: value.num_lines,
-            num_cols: value.num_cols,
-            cell_width: value.cell_width,
-            cell_height: value.cell_height,
-        }
-    }
-}
-
-impl From<SerializableWindowSize> for WindowSize {
-    fn from(value: SerializableWindowSize) -> Self {
-        Self {
-            num_lines: value.num_lines,
-            num_cols: value.num_cols,
-            cell_width: value.cell_width,
-            cell_height: value.cell_height,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum BrokerRequest {
-    Ping,
-    Status,
-    CreateTerminal { launch_options: tty::Options, window_size: SerializableWindowSize },
-    RestartTerminal { id: u64 },
-    SendInput { id: u64, data: Vec<u8> },
-    Resize { id: u64, window_size: SerializableWindowSize },
-    Snapshot { id: u64 },
-    CloseTerminal { id: u64 },
-    Stop,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum BrokerReply {
-    Pong,
-    Status { status: WorkspaceBrokerStatus },
-    Created { terminal: WorkspaceBrokerTerminalSnapshot },
-    Restarted { terminal: WorkspaceBrokerTerminalSnapshot },
-    Snapshot { terminal: WorkspaceBrokerTerminalSnapshot },
-    Closed,
-    Stopped,
-    Error { error: String },
-}
-
-struct RuntimeTerminalState {
-    id: u64,
-    launch_options: tty::Options,
-    terminal: Arc<FairMutex<Term<BrokerEventProxy>>>,
-    notifier: Notifier,
-    #[cfg(unix)]
-    master_fd: RawFd,
-    #[cfg(unix)]
-    shell_pid: u32,
-    revision: u64,
-    title: Option<String>,
-    program_name: String,
-    working_directory: Option<PathBuf>,
-    exit_code: Option<i32>,
-}
-
-#[derive(Debug, Clone)]
-struct BrokerEventRecord {
-    terminal_id: u64,
-    event: TerminalEvent,
-}
-
 #[derive(Clone)]
-struct BrokerEventProxy {
+pub(crate) struct TerminalOutputObserver {
     terminal_id: u64,
-    sender: Sender<BrokerEventRecord>,
+    sender: Sender<PersistenceCommand>,
+    sequence: Arc<AtomicU64>,
 }
 
-impl EventListener for BrokerEventProxy {
-    fn send_event(&self, event: TerminalEvent) {
-        let _ = self.sender.send(BrokerEventRecord { terminal_id: self.terminal_id, event });
-    }
-}
-
-pub(crate) fn maybe_run_internal_from_argv() -> Result<bool, Box<dyn Error>> {
-    let mut args = std::env::args_os();
-    let _ = args.next();
-    let Some(command) = args.next() else {
-        return Ok(false);
-    };
-    if command != INTERNAL_SERVE_ARG {
-        return Ok(false);
-    }
-
-    let mut control_socket = None;
-    let mut persisted_state_file = None;
-    while let Some(arg) = args.next() {
-        if arg == "--control-socket" {
-            control_socket = args.next().map(PathBuf::from);
-        } else if arg == "--persisted-state-file" {
-            persisted_state_file = args.next().map(PathBuf::from);
+impl TerminalOutputObserver {
+    pub(crate) fn observe(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
         }
-    }
 
-    let control_socket = control_socket
-        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "missing control socket"))?;
-    let persisted_state_file = persisted_state_file
-        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "missing persisted state file"))?;
-    serve(control_socket, persisted_state_file)?;
-    Ok(true)
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let _ = self.sender.send(PersistenceCommand::Output {
+            terminal_id: self.terminal_id,
+            sequence,
+            bytes: bytes.to_vec(),
+        });
+    }
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct PersistedWorkspaceState {
+    next_terminal_id: u64,
+    terminals: Vec<PersistedTerminalState>,
+}
+
+struct PersistenceWorker {
+    sender: Sender<PersistenceCommand>,
+    sequence: Arc<AtomicU64>,
+    join: JoinHandle<()>,
+}
+
+pub(crate) struct LiveTerminalRegistration {
+    pub terminal_id: u64,
+    pub terminal: Arc<FairMutex<Term<EventProxy>>>,
+    pub launch_options: tty::Options,
+    pub title: Option<String>,
+    pub program_name: String,
+    pub working_directory: Option<PathBuf>,
+    #[cfg(not(windows))]
+    pub master_fd: RawFd,
+    #[cfg(not(windows))]
+    pub shell_pid: u32,
+}
+
+struct LiveTerminalState {
+    terminal: Arc<FairMutex<Term<EventProxy>>>,
+    metadata: PersistedTerminalState,
+    #[cfg(not(windows))]
+    master_fd: RawFd,
+    #[cfg(not(windows))]
+    shell_pid: u32,
+    journal_bytes: u64,
+    dirty: bool,
+    last_activity: Instant,
+}
+
+enum PersistenceCommand {
+    Register {
+        terminal_id: u64,
+        terminal: Arc<FairMutex<Term<EventProxy>>>,
+        launch_options: tty::Options,
+        title: Option<String>,
+        program_name: String,
+        working_directory: Option<PathBuf>,
+        #[cfg(not(windows))]
+        master_fd: RawFd,
+        #[cfg(not(windows))]
+        shell_pid: u32,
+    },
+    Output {
+        terminal_id: u64,
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        terminal_id: u64,
+        sequence: u64,
+        columns: u32,
+        lines: u32,
+    },
+    Metadata {
+        terminal_id: u64,
+        title: Option<String>,
+        program_name: Option<String>,
+        working_directory: Option<PathBuf>,
+        exit_code: Option<i32>,
+        clean_exit: Option<bool>,
+    },
+    Checkpoint {
+        terminal_id: u64,
+        force: bool,
+    },
+    Remove {
+        terminal_id: u64,
+    },
+    Shutdown {
+        clear_persisted: bool,
+    },
+}
+
+#[derive(Debug)]
+enum JournalRecord {
+    Output { sequence: u64, bytes: Vec<u8> },
+    Resize { sequence: u64, columns: u32, lines: u32 },
 }
 
 pub(crate) fn run(options: WorkspaceOptions) -> Result<(), Box<dyn Error>> {
     match options.command {
         WorkspaceCommand::Status => {
-            let status = status()?;
-            println!("{}", serde_json::to_string(&status)?);
+            println!("{}", serde_json::to_string(&status()?)?);
         },
         WorkspaceCommand::Stop => {
             stop_workspace()?;
-        },
-        WorkspaceCommand::RestartTerminal { id } => {
-            let terminal = restart_terminal(id)?;
-            println!("{}", serde_json::to_string(&terminal)?);
         },
     }
     Ok(())
 }
 
-pub(crate) fn ensure_broker_running() -> Result<(), Box<dyn Error>> {
-    let runtime = runtime_state_path();
+pub(crate) fn register_live_terminal(
+    registration: LiveTerminalRegistration,
+) -> Result<TerminalOutputObserver, Box<dyn Error>> {
+    let LiveTerminalRegistration {
+        terminal_id,
+        terminal,
+        launch_options,
+        title,
+        program_name,
+        working_directory,
+        #[cfg(not(windows))]
+        master_fd,
+        #[cfg(not(windows))]
+        shell_pid,
+    } = registration;
 
-    if let Ok(state) = load_runtime_state() {
-        if matches!(
-            send_request(&state.control_socket, &BrokerRequest::Ping),
-            Ok(BrokerReply::Pong)
-        ) {
-            return Ok(());
-        }
-        let _ = fs::remove_file(&state.control_socket);
-    }
-
-    let control_socket = control_socket_path();
-    let persisted_state_file = persisted_state_file();
-    let _ = fs::remove_file(&runtime);
-    let _ = fs::remove_file(&control_socket);
-
-    let current_exe = std::env::current_exe()?;
-    let args = vec![
-        OsString::from(INTERNAL_SERVE_ARG),
-        OsString::from("--control-socket"),
-        control_socket.into_os_string(),
-        OsString::from("--persisted-state-file"),
-        persisted_state_file.into_os_string(),
-    ];
-    Command::new(current_exe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .args(args)
-        .spawn()?;
-
-    let deadline = Instant::now() + BROKER_START_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Ok(state) = load_runtime_state() {
-            if matches!(
-                send_request(&state.control_socket, &BrokerRequest::Ping),
-                Ok(BrokerReply::Pong)
-            ) {
-                return Ok(());
-            }
-        }
-        thread::sleep(BROKER_POLL_INTERVAL);
-    }
-
-    Err("timed out waiting for workspace broker".into())
+    let (sender, sequence) = ensure_persistence_worker()?;
+    sender.send(PersistenceCommand::Register {
+        terminal_id,
+        terminal,
+        launch_options,
+        title,
+        program_name,
+        working_directory,
+        #[cfg(not(windows))]
+        master_fd,
+        #[cfg(not(windows))]
+        shell_pid,
+    })?;
+    Ok(TerminalOutputObserver { terminal_id, sender, sequence })
 }
 
-pub(crate) fn broker_status() -> Result<WorkspaceBrokerStatus, Box<dyn Error>> {
-    ensure_broker_running()?;
-    let control_socket = load_runtime_state()?.control_socket;
-    let reply = send_request(&control_socket, &BrokerRequest::Status)?;
-    match reply {
-        BrokerReply::Status { status } => Ok(status),
-        BrokerReply::Error { error } => Err(error.into()),
-        other => Err(format!("unexpected status reply: {other:?}").into()),
-    }
+pub(crate) fn record_terminal_resize(terminal_id: u64, window_size: WindowSize) {
+    let Some((sender, sequence)) = persistence_sender() else {
+        return;
+    };
+
+    let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+    let _ = sender.send(PersistenceCommand::Resize {
+        terminal_id,
+        sequence,
+        columns: u32::from(window_size.num_cols),
+        lines: u32::from(window_size.num_lines),
+    });
 }
 
-pub(crate) fn broker_snapshot(id: u64) -> Result<WorkspaceBrokerTerminalSnapshot, Box<dyn Error>> {
-    let control_socket = load_runtime_state()?.control_socket;
-    let reply = send_request(&control_socket, &BrokerRequest::Snapshot { id })?;
-    match reply {
-        BrokerReply::Snapshot { terminal } => Ok(terminal),
-        BrokerReply::Error { error } => Err(error.into()),
-        other => Err(format!("unexpected snapshot reply: {other:?}").into()),
+pub(crate) fn update_terminal_metadata(
+    terminal_id: u64,
+    title: Option<String>,
+    program_name: Option<String>,
+    working_directory: Option<PathBuf>,
+    exit_code: Option<i32>,
+    clean_exit: Option<bool>,
+) {
+    if let Some((sender, _)) = persistence_sender() {
+        let _ = sender.send(PersistenceCommand::Metadata {
+            terminal_id,
+            title,
+            program_name,
+            working_directory,
+            exit_code,
+            clean_exit,
+        });
+        return;
     }
+
+    let _ = update_terminal_metadata_sync(
+        terminal_id,
+        title,
+        program_name,
+        working_directory,
+        exit_code,
+        clean_exit,
+    );
 }
 
-pub(crate) fn restart_terminal(id: u64) -> Result<WorkspaceBrokerTerminalSnapshot, Box<dyn Error>> {
-    ensure_broker_running()?;
-    let control_socket = load_runtime_state()?.control_socket;
-    let reply = send_request(&control_socket, &BrokerRequest::RestartTerminal { id })?;
-    match reply {
-        BrokerReply::Restarted { terminal } => Ok(terminal),
-        BrokerReply::Error { error } => Err(error.into()),
-        other => Err(format!("unexpected restart reply: {other:?}").into()),
+pub(crate) fn checkpoint_terminal(terminal_id: u64, force: bool) {
+    let Some((sender, _)) = persistence_sender() else {
+        return;
+    };
+    let _ = sender.send(PersistenceCommand::Checkpoint { terminal_id, force });
+}
+
+pub(crate) fn remove_terminal(terminal_id: u64) -> Result<(), Box<dyn Error>> {
+    if let Some((sender, _)) = persistence_sender() {
+        sender.send(PersistenceCommand::Remove { terminal_id })?;
+        return Ok(());
     }
+
+    remove_terminal_sync(terminal_id)
+}
+
+pub(crate) fn shutdown_persistence() -> Result<(), Box<dyn Error>> {
+    shutdown_persistence_worker(false)
 }
 
 pub(crate) fn stop_workspace() -> Result<(), Box<dyn Error>> {
-    if let Ok(state) = load_runtime_state() {
-        let _ = send_request(&state.control_socket, &BrokerRequest::Stop);
-        let _ = fs::remove_file(&state.control_socket);
-        let _ = fs::remove_file(runtime_state_path());
-    }
+    shutdown_persistence_worker(true)?;
     let _ = fs::remove_file(workspace_layout_file());
-    let _ = fs::remove_file(persisted_state_file());
+    let _ = fs::remove_file(current_state_file());
+    let _ = fs::remove_file(legacy_state_file());
+    let _ = fs::remove_dir_all(terminals_dir());
     Ok(())
 }
 
@@ -364,459 +361,517 @@ pub(crate) fn load_persisted_terminals()
     Ok(state.terminals.into_iter().map(|terminal| (terminal.id, terminal)).collect())
 }
 
-pub(crate) fn save_persisted_terminals(
-    terminals: impl IntoIterator<Item = PersistedTerminalState>,
-) -> Result<(), Box<dyn Error>> {
-    let mut state = load_persisted_state()?;
-    let mut terminals = terminals.into_iter().collect::<Vec<_>>();
-    terminals.sort_by_key(|terminal| terminal.id);
-    state.terminals = terminals;
-    write_json_atomic(&persisted_state_file(), &state)
+pub(crate) fn load_terminal_snapshot(
+    terminal_id: u64,
+    state: &PersistedTerminalState,
+) -> Result<Option<TermSnapshot>, Box<dyn Error>> {
+    if let Ok(bytes) = fs::read(checkpoint_file(terminal_id)) {
+        let mut snapshot: TermSnapshot = serde_json::from_slice(&bytes)?;
+        replay_journal_into_snapshot(&mut snapshot, terminal_id)?;
+        return Ok(Some(snapshot));
+    }
+
+    if let Some(mut snapshot) = state.snapshot.clone() {
+        replay_journal_into_snapshot(&mut snapshot, terminal_id)?;
+        return Ok(Some(snapshot));
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn allocate_terminal_id() -> Result<u64, Box<dyn Error>> {
     let mut state = load_persisted_state()?;
     let id = allocate_terminal_id_from_state(&mut state);
-    write_json_atomic(&persisted_state_file(), &state)?;
+    write_persisted_state(&state)?;
     Ok(id)
 }
 
-pub(crate) fn send_terminal_input(id: u64, data: Vec<u8>) -> Result<(), Box<dyn Error>> {
-    let control_socket = load_runtime_state()?.control_socket;
-    let reply = send_request(&control_socket, &BrokerRequest::SendInput { id, data })?;
-    match reply {
-        BrokerReply::Closed => Ok(()),
-        BrokerReply::Error { error } => Err(error.into()),
-        other => Err(format!("unexpected send input reply: {other:?}").into()),
-    }
-}
-
-pub(crate) fn resize_terminal(id: u64, window_size: WindowSize) -> Result<(), Box<dyn Error>> {
-    let control_socket = load_runtime_state()?.control_socket;
-    let reply = send_request(
-        &control_socket,
-        &BrokerRequest::Resize { id, window_size: window_size.into() },
-    )?;
-    match reply {
-        BrokerReply::Closed => Ok(()),
-        BrokerReply::Error { error } => Err(error.into()),
-        other => Err(format!("unexpected resize reply: {other:?}").into()),
-    }
-}
-
-pub(crate) fn close_terminal(id: u64) -> Result<(), Box<dyn Error>> {
-    let control_socket = load_runtime_state()?.control_socket;
-    let reply = send_request(&control_socket, &BrokerRequest::CloseTerminal { id })?;
-    match reply {
-        BrokerReply::Closed => Ok(()),
-        BrokerReply::Error { error } => Err(error.into()),
-        other => Err(format!("unexpected close reply: {other:?}").into()),
-    }
-}
-
-pub(crate) fn status() -> Result<WorkspaceBrokerStatus, Box<dyn Error>> {
-    if let Ok(state) = load_runtime_state() {
-        if matches!(
-            send_request(&state.control_socket, &BrokerRequest::Ping),
-            Ok(BrokerReply::Pong)
-        ) {
-            return broker_status();
-        }
-    }
-
+pub(crate) fn status() -> Result<WorkspaceStatus, Box<dyn Error>> {
     let mut terminals = load_persisted_terminals()?
         .into_values()
-        .map(|terminal| WorkspaceBrokerTerminalStatus {
+        .map(|terminal| WorkspaceTerminalStatus {
             id: terminal.id,
-            revision: terminal.revision,
             title: terminal.title,
             program_name: terminal.program_name,
             working_directory: terminal.working_directory,
             exit_code: terminal.exit_code,
+            clean_exit: terminal.clean_exit,
         })
         .collect::<Vec<_>>();
     terminals.sort_by_key(|terminal| terminal.id);
-    Ok(WorkspaceBrokerStatus { terminals })
+    Ok(WorkspaceStatus { terminals })
 }
 
-fn serve(control_socket: PathBuf, persisted_state_path: PathBuf) -> Result<(), Box<dyn Error>> {
-    tty::setup_env();
-
-    ensure_parent_dir(&control_socket)?;
-    ensure_parent_dir(&persisted_state_path)?;
-    if control_socket.exists() {
-        let _ = fs::remove_file(&control_socket);
+fn ensure_persistence_worker()
+-> Result<(Sender<PersistenceCommand>, Arc<AtomicU64>), Box<dyn Error>> {
+    let mut worker = PERSISTENCE_WORKER.lock().expect("persistence worker lock poisoned");
+    if let Some(worker) = worker.as_ref() {
+        return Ok((worker.sender.clone(), Arc::clone(&worker.sequence)));
     }
 
-    let listener = UnixListener::bind(&control_socket)?;
-    listener.set_nonblocking(true)?;
+    let (sender, receiver) = mpsc::channel();
+    let sequence = Arc::new(AtomicU64::new(1));
+    let join = thread::spawn(move || persistence_loop(receiver));
+    *worker =
+        Some(PersistenceWorker { sender: sender.clone(), sequence: Arc::clone(&sequence), join });
+    Ok((sender, sequence))
+}
 
-    let runtime_state = BrokerRuntimeState {
-        control_socket: control_socket.clone(),
-        persisted_state_file: persisted_state_path.clone(),
+fn persistence_sender() -> Option<(Sender<PersistenceCommand>, Arc<AtomicU64>)> {
+    let worker = PERSISTENCE_WORKER.lock().ok()?;
+    let worker = worker.as_ref()?;
+    Some((worker.sender.clone(), Arc::clone(&worker.sequence)))
+}
+
+fn shutdown_persistence_worker(clear_persisted: bool) -> Result<(), Box<dyn Error>> {
+    let mut worker = PERSISTENCE_WORKER.lock().expect("persistence worker lock poisoned");
+    let Some(worker) = worker.take() else {
+        if clear_persisted {
+            let _ = fs::remove_dir_all(terminals_dir());
+        }
+        return Ok(());
     };
-    write_json_atomic(&runtime_state_path(), &runtime_state)?;
 
-    let (event_tx, event_rx) = mpsc::channel();
-    let mut persisted_state = load_persisted_state().unwrap_or_default();
-    let mut terminals = BTreeMap::<u64, RuntimeTerminalState>::new();
-    let mut should_exit = false;
+    worker.sender.send(PersistenceCommand::Shutdown { clear_persisted })?;
+    worker.join.join().map_err(|_| "persistence worker panicked")?;
+    Ok(())
+}
 
-    while !should_exit {
-        should_exit |= process_terminal_events(&mut terminals, &event_rx, &mut persisted_state)?;
+fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
+    let mut state = load_persisted_state().unwrap_or_default();
+    let mut live = HashMap::<u64, LiveTerminalState>::new();
+    let mut state_dirty = false;
+    let mut clear_persisted = false;
 
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_nonblocking(false)?;
-                let request = read_request(&stream)?;
-                let reply = handle_request(
-                    request,
-                    &event_tx,
-                    &mut terminals,
-                    &mut persisted_state,
-                    &persisted_state_path,
-                )?;
-                should_exit |= matches!(reply, BrokerReply::Stopped);
-                write_reply(&mut stream, &reply)?;
+    loop {
+        match receiver.recv_timeout(PERSISTENCE_POLL_INTERVAL) {
+            Ok(command) => match command {
+                PersistenceCommand::Register {
+                    terminal_id,
+                    terminal,
+                    launch_options,
+                    title,
+                    program_name,
+                    working_directory,
+                    #[cfg(not(windows))]
+                    master_fd,
+                    #[cfg(not(windows))]
+                    shell_pid,
+                } => {
+                    let metadata = PersistedTerminalState {
+                        id: terminal_id,
+                        launch_options,
+                        title,
+                        program_name,
+                        working_directory,
+                        exit_code: None,
+                        clean_exit: false,
+                        snapshot: None,
+                    };
+                    live.insert(
+                        terminal_id,
+                        LiveTerminalState {
+                            terminal,
+                            metadata: metadata.clone(),
+                            #[cfg(not(windows))]
+                            master_fd,
+                            #[cfg(not(windows))]
+                            shell_pid,
+                            journal_bytes: journal_file(terminal_id)
+                                .metadata()
+                                .map(|meta| meta.len())
+                                .unwrap_or(0),
+                            dirty: true,
+                            last_activity: Instant::now()
+                                .checked_sub(CHECKPOINT_IDLE_DEBOUNCE)
+                                .unwrap_or_else(Instant::now),
+                        },
+                    );
+                    upsert_terminal_state(&mut state, metadata);
+                    state_dirty = true;
+                    let _ = checkpoint_live_terminal(
+                        live.get_mut(&terminal_id).expect("live terminal exists"),
+                        true,
+                    );
+                },
+                PersistenceCommand::Output { terminal_id, sequence, bytes } => {
+                    let Some(live_terminal) = live.get_mut(&terminal_id) else {
+                        continue;
+                    };
+                    if append_output_record(terminal_id, sequence, &bytes).is_ok() {
+                        live_terminal.journal_bytes =
+                            live_terminal.journal_bytes.saturating_add(bytes.len() as u64);
+                        live_terminal.dirty = true;
+                        live_terminal.last_activity = Instant::now();
+                    }
+                },
+                PersistenceCommand::Resize { terminal_id, sequence, columns, lines } => {
+                    let Some(live_terminal) = live.get_mut(&terminal_id) else {
+                        continue;
+                    };
+                    if append_resize_record(terminal_id, sequence, columns, lines).is_ok() {
+                        live_terminal.journal_bytes = live_terminal.journal_bytes.saturating_add(
+                            (1 + std::mem::size_of::<u64>() + 2 * std::mem::size_of::<u32>())
+                                as u64,
+                        );
+                        live_terminal.dirty = true;
+                        live_terminal.last_activity = Instant::now();
+                    }
+                },
+                PersistenceCommand::Metadata {
+                    terminal_id,
+                    title,
+                    program_name,
+                    working_directory,
+                    exit_code,
+                    clean_exit,
+                } => {
+                    if let Some(live_terminal) = live.get_mut(&terminal_id) {
+                        apply_metadata_update(
+                            &mut live_terminal.metadata,
+                            title,
+                            program_name,
+                            working_directory,
+                            exit_code,
+                            clean_exit,
+                        );
+                        upsert_terminal_state(&mut state, live_terminal.metadata.clone());
+                        state_dirty = true;
+                    } else if apply_metadata_update_to_state(
+                        &mut state,
+                        terminal_id,
+                        title,
+                        program_name,
+                        working_directory,
+                        exit_code,
+                        clean_exit,
+                    ) {
+                        state_dirty = true;
+                    }
+                },
+                PersistenceCommand::Checkpoint { terminal_id, force } => {
+                    if let Some(live_terminal) = live.get_mut(&terminal_id) {
+                        if checkpoint_live_terminal(live_terminal, force).is_ok() {
+                            upsert_terminal_state(&mut state, live_terminal.metadata.clone());
+                            state_dirty = true;
+                        }
+                    }
+                },
+                PersistenceCommand::Remove { terminal_id } => {
+                    live.remove(&terminal_id);
+                    state.terminals.retain(|terminal| terminal.id != terminal_id);
+                    let _ = remove_terminal_files(terminal_id);
+                    state_dirty = true;
+                },
+                PersistenceCommand::Shutdown { clear_persisted: clear } => {
+                    clear_persisted = clear;
+                    for terminal in live.values_mut() {
+                        let _ = checkpoint_live_terminal(terminal, true);
+                        upsert_terminal_state(&mut state, terminal.metadata.clone());
+                    }
+                    break;
+                },
             },
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(BROKER_IDLE_WAIT);
+            Err(RecvTimeoutError::Timeout) => {},
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        for terminal in live.values_mut() {
+            if !terminal.dirty {
+                continue;
+            }
+            if terminal.journal_bytes < MAX_JOURNAL_BYTES_BEFORE_CHECKPOINT
+                && terminal.last_activity.elapsed() < CHECKPOINT_IDLE_DEBOUNCE
+            {
+                continue;
+            }
+            if checkpoint_live_terminal(terminal, false).is_ok() {
+                upsert_terminal_state(&mut state, terminal.metadata.clone());
+                state_dirty = true;
+            }
+        }
+
+        if state_dirty {
+            let _ = write_persisted_state(&state);
+            state_dirty = false;
+        }
+    }
+
+    if clear_persisted {
+        let _ = fs::remove_file(current_state_file());
+        let _ = fs::remove_file(legacy_state_file());
+        let _ = fs::remove_dir_all(terminals_dir());
+    } else {
+        let _ = write_persisted_state(&state);
+    }
+}
+
+fn checkpoint_live_terminal(
+    terminal: &mut LiveTerminalState,
+    force: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !terminal.dirty && !force {
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    refresh_live_terminal_metadata(terminal);
+
+    let snapshot = if force {
+        terminal.terminal.lock().export_snapshot()
+    } else {
+        let Some(terminal_guard) = terminal.terminal.try_lock_unfair() else {
+            return Err("terminal busy".into());
+        };
+        terminal_guard.export_snapshot()
+    };
+
+    write_json_atomic(&checkpoint_file(terminal.metadata.id), &snapshot)?;
+    fs::write(journal_file(terminal.metadata.id), [])?;
+    terminal.journal_bytes = 0;
+    terminal.dirty = false;
+    terminal.metadata.snapshot = None;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn refresh_live_terminal_metadata(terminal: &mut LiveTerminalState) {
+    terminal.metadata.program_name =
+        crate::daemon::foreground_process_name(terminal.master_fd, terminal.shell_pid)
+            .unwrap_or_else(|_| terminal.metadata.program_name.clone());
+    terminal.metadata.working_directory =
+        crate::daemon::foreground_process_path(terminal.master_fd, terminal.shell_pid)
+            .ok()
+            .or_else(|| terminal.metadata.working_directory.clone());
+}
+
+fn apply_metadata_update(
+    terminal: &mut PersistedTerminalState,
+    title: Option<String>,
+    program_name: Option<String>,
+    working_directory: Option<PathBuf>,
+    exit_code: Option<i32>,
+    clean_exit: Option<bool>,
+) {
+    if let Some(title) = title {
+        terminal.title = Some(title);
+    }
+    if let Some(program_name) = program_name {
+        terminal.program_name = program_name;
+    }
+    if let Some(working_directory) = working_directory {
+        terminal.working_directory = Some(working_directory);
+    }
+    if let Some(exit_code) = exit_code {
+        terminal.exit_code = Some(exit_code);
+    }
+    if let Some(clean_exit) = clean_exit {
+        terminal.clean_exit = clean_exit;
+    }
+}
+
+fn apply_metadata_update_to_state(
+    state: &mut PersistedWorkspaceState,
+    terminal_id: u64,
+    title: Option<String>,
+    program_name: Option<String>,
+    working_directory: Option<PathBuf>,
+    exit_code: Option<i32>,
+    clean_exit: Option<bool>,
+) -> bool {
+    let Some(terminal) = state.terminals.iter_mut().find(|terminal| terminal.id == terminal_id)
+    else {
+        return false;
+    };
+
+    apply_metadata_update(terminal, title, program_name, working_directory, exit_code, clean_exit);
+    true
+}
+
+fn upsert_terminal_state(state: &mut PersistedWorkspaceState, terminal: PersistedTerminalState) {
+    if let Some(existing) = state.terminals.iter_mut().find(|saved| saved.id == terminal.id) {
+        *existing = terminal;
+    } else {
+        state.terminals.push(terminal);
+    }
+    state.terminals.sort_by_key(|terminal| terminal.id);
+}
+
+fn update_terminal_metadata_sync(
+    terminal_id: u64,
+    title: Option<String>,
+    program_name: Option<String>,
+    working_directory: Option<PathBuf>,
+    exit_code: Option<i32>,
+    clean_exit: Option<bool>,
+) -> Result<(), Box<dyn Error>> {
+    let mut state = load_persisted_state()?;
+    if apply_metadata_update_to_state(
+        &mut state,
+        terminal_id,
+        title,
+        program_name,
+        working_directory,
+        exit_code,
+        clean_exit,
+    ) {
+        write_persisted_state(&state)?;
+    }
+    Ok(())
+}
+
+fn remove_terminal_sync(terminal_id: u64) -> Result<(), Box<dyn Error>> {
+    let mut state = load_persisted_state()?;
+    let original_len = state.terminals.len();
+    state.terminals.retain(|terminal| terminal.id != terminal_id);
+    if state.terminals.len() != original_len {
+        write_persisted_state(&state)?;
+    }
+    remove_terminal_files(terminal_id)
+}
+
+fn replay_journal_into_snapshot(
+    snapshot: &mut TermSnapshot,
+    terminal_id: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut terminal = Term::new(
+        Default::default(),
+        &TermSize::new(snapshot.grid.columns(), snapshot.grid.screen_lines()),
+        VoidListener,
+    );
+    terminal.apply_snapshot(snapshot.clone());
+    let mut parser: ansi::Processor = Default::default();
+    let mut journal = load_journal_records(terminal_id)?;
+    journal.sort_by_key(|record| match record {
+        JournalRecord::Output { sequence, .. } | JournalRecord::Resize { sequence, .. } => {
+            *sequence
+        },
+    });
+    for record in journal {
+        match record {
+            JournalRecord::Output { bytes, .. } => parser.advance(&mut terminal, &bytes),
+            JournalRecord::Resize { columns, lines, .. } => {
+                terminal.resize_with_anchor(
+                    TermSize::new(columns as usize, lines as usize),
+                    ResizeAnchor::Top,
+                );
             },
+        }
+    }
+    *snapshot = terminal.export_snapshot();
+    Ok(())
+}
+
+fn load_journal_records(terminal_id: u64) -> Result<Vec<JournalRecord>, Box<dyn Error>> {
+    let path = journal_file(terminal_id);
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut reader = BufReader::new(file);
+    let mut records = Vec::new();
+    loop {
+        let mut tag = [0u8; 1];
+        match reader.read_exact(&mut tag) {
+            Ok(()) => {},
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
+        }
+
+        let sequence = read_u64(&mut reader)?;
+        match tag[0] {
+            JOURNAL_RECORD_OUTPUT => {
+                let len = read_u32(&mut reader)? as usize;
+                let mut bytes = vec![0; len];
+                if let Err(err) = reader.read_exact(&mut bytes) {
+                    if err.kind() == ErrorKind::UnexpectedEof {
+                        break;
+                    }
+                    return Err(err.into());
+                }
+                records.push(JournalRecord::Output { sequence, bytes });
+            },
+            JOURNAL_RECORD_RESIZE => {
+                let columns = read_u32(&mut reader)?;
+                let lines = read_u32(&mut reader)?;
+                records.push(JournalRecord::Resize { sequence, columns, lines });
+            },
+            _ => break,
+        }
+    }
+
+    Ok(records)
+}
+
+fn append_output_record(
+    terminal_id: u64,
+    sequence: u64,
+    bytes: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let path = journal_file(terminal_id);
+    ensure_parent_dir(&path)?;
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&[JOURNAL_RECORD_OUTPUT])?;
+    file.write_all(&sequence.to_le_bytes())?;
+    file.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn append_resize_record(
+    terminal_id: u64,
+    sequence: u64,
+    columns: u32,
+    lines: u32,
+) -> Result<(), Box<dyn Error>> {
+    let path = journal_file(terminal_id);
+    ensure_parent_dir(&path)?;
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&[JOURNAL_RECORD_RESIZE])?;
+    file.write_all(&sequence.to_le_bytes())?;
+    file.write_all(&columns.to_le_bytes())?;
+    file.write_all(&lines.to_le_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn read_u64<R: Read>(reader: &mut R) -> Result<u64, Box<dyn Error>> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> Result<u32, Box<dyn Error>> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn load_persisted_state() -> Result<PersistedWorkspaceState, Box<dyn Error>> {
+    for path in [current_state_file(), legacy_state_file()] {
+        match fs::read(&path) {
+            Ok(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) => return Err(err.into()),
         }
     }
+    Ok(PersistedWorkspaceState::default())
+}
 
-    for terminal in terminals.values_mut() {
-        let _ = terminal.notifier.0.send(Msg::Shutdown);
+fn write_persisted_state(state: &PersistedWorkspaceState) -> Result<(), Box<dyn Error>> {
+    let mut serializable = state.clone();
+    for terminal in &mut serializable.terminals {
+        terminal.snapshot = None;
     }
-    let _ = fs::remove_file(control_socket);
-    let _ = fs::remove_file(runtime_state_path());
+    write_json_atomic(&current_state_file(), &serializable)?;
+    let legacy = legacy_state_file();
+    if legacy.exists() {
+        let _ = fs::remove_file(legacy);
+    }
     Ok(())
-}
-
-fn process_terminal_events(
-    terminals: &mut BTreeMap<u64, RuntimeTerminalState>,
-    rx: &Receiver<BrokerEventRecord>,
-    persisted_state: &mut PersistedWorkspaceBrokerState,
-) -> Result<bool, Box<dyn Error>> {
-    let mut saw_stop = false;
-    loop {
-        match rx.try_recv() {
-            Ok(record) => {
-                let Some(terminal) = terminals.get_mut(&record.terminal_id) else {
-                    continue;
-                };
-                match record.event {
-                    TerminalEvent::ClipboardStore(_, _) | TerminalEvent::ClipboardLoad(_, _) => {},
-                    TerminalEvent::ColorRequest(index, format) => {
-                        let terminal_state = terminal.terminal.lock();
-                        let color = terminal_state.colors()[index]
-                            .unwrap_or(tabor_terminal::vte::ansi::Rgb { r: 0, g: 0, b: 0 });
-                        terminal.notifier.notify(format(color).into_bytes());
-                    },
-                    TerminalEvent::PtyWrite(text) => {
-                        terminal.notifier.notify(text.into_bytes());
-                    },
-                    TerminalEvent::TextAreaSizeRequest(format) => {
-                        let terminal_state = terminal.terminal.lock();
-                        let size = WindowSize {
-                            num_cols: terminal_state.columns() as u16,
-                            num_lines: terminal_state.screen_lines() as u16,
-                            cell_width: 8,
-                            cell_height: 16,
-                        };
-                        terminal.notifier.notify(format(size).into_bytes());
-                    },
-                    TerminalEvent::Title(title) => {
-                        terminal.title = Some(title);
-                    },
-                    TerminalEvent::ResetTitle => {
-                        terminal.title = None;
-                    },
-                    TerminalEvent::Exit => {
-                        saw_stop = false;
-                    },
-                    TerminalEvent::ChildExit(code) => {
-                        terminal.exit_code = Some(code);
-                    },
-                    TerminalEvent::Wakeup
-                    | TerminalEvent::Bell
-                    | TerminalEvent::MouseCursorDirty
-                    | TerminalEvent::CursorBlinkingChange => {},
-                }
-
-                refresh_terminal_metadata(terminal);
-                terminal.revision = terminal.revision.saturating_add(1);
-                persist_terminal_state(terminal, persisted_state);
-            },
-            Err(TryRecvError::Empty) => return Ok(saw_stop),
-            Err(TryRecvError::Disconnected) => return Ok(true),
-        }
-    }
-}
-
-fn handle_request(
-    request: BrokerRequest,
-    event_tx: &Sender<BrokerEventRecord>,
-    terminals: &mut BTreeMap<u64, RuntimeTerminalState>,
-    persisted_state: &mut PersistedWorkspaceBrokerState,
-    persisted_state_path: &Path,
-) -> Result<BrokerReply, Box<dyn Error>> {
-    match request {
-        BrokerRequest::Ping => Ok(BrokerReply::Pong),
-        BrokerRequest::Status => Ok(BrokerReply::Status {
-            status: WorkspaceBrokerStatus {
-                terminals: terminals
-                    .values_mut()
-                    .map(|terminal| {
-                        refresh_terminal_metadata(terminal);
-                        runtime_status(terminal)
-                    })
-                    .collect(),
-            },
-        }),
-        BrokerRequest::CreateTerminal { launch_options, window_size } => {
-            let id = allocate_terminal_id_from_state(persisted_state);
-            let terminal =
-                spawn_terminal(id, launch_options, window_size.into(), event_tx.clone())?;
-            let snapshot = runtime_snapshot(&terminal);
-            persist_terminal_state(&terminal, persisted_state);
-            terminals.insert(id, terminal);
-            write_json_atomic(persisted_state_path, persisted_state)?;
-            Ok(BrokerReply::Created { terminal: snapshot })
-        },
-        BrokerRequest::RestartTerminal { id } => {
-            if terminals.contains_key(&id) {
-                return Ok(BrokerReply::Error {
-                    error: format!("terminal {id} is already running"),
-                });
-            }
-            let Some(saved) = persisted_state.terminals.iter().find(|terminal| terminal.id == id)
-            else {
-                return Ok(BrokerReply::Error { error: format!("terminal {id} not found") });
-            };
-            let window_size = WindowSize {
-                num_cols: saved.snapshot.grid.columns() as u16,
-                num_lines: saved.snapshot.grid.screen_lines() as u16,
-                cell_width: 8,
-                cell_height: 16,
-            };
-            let terminal =
-                spawn_terminal(id, saved.launch_options.clone(), window_size, event_tx.clone())?;
-            let snapshot = runtime_snapshot(&terminal);
-            persist_terminal_state(&terminal, persisted_state);
-            terminals.insert(id, terminal);
-            write_json_atomic(persisted_state_path, persisted_state)?;
-            Ok(BrokerReply::Restarted { terminal: snapshot })
-        },
-        BrokerRequest::SendInput { id, data } => {
-            let Some(terminal) = terminals.get(&id) else {
-                return Ok(BrokerReply::Error { error: format!("terminal {id} not found") });
-            };
-            terminal.notifier.notify(Cow::Owned(data));
-            Ok(BrokerReply::Closed)
-        },
-        BrokerRequest::Resize { id, window_size } => {
-            let Some(terminal) = terminals.get_mut(&id) else {
-                return Ok(BrokerReply::Error { error: format!("terminal {id} not found") });
-            };
-            terminal.notifier.on_resize(window_size.into());
-            Ok(BrokerReply::Closed)
-        },
-        BrokerRequest::Snapshot { id } => {
-            let Some(terminal) = terminals.get_mut(&id) else {
-                return Ok(BrokerReply::Error { error: format!("terminal {id} not found") });
-            };
-            refresh_terminal_metadata(terminal);
-            Ok(BrokerReply::Snapshot { terminal: runtime_snapshot(terminal) })
-        },
-        BrokerRequest::CloseTerminal { id } => {
-            let Some(terminal) = terminals.remove(&id) else {
-                return Ok(BrokerReply::Error { error: format!("terminal {id} not found") });
-            };
-            let _ = terminal.notifier.0.send(Msg::Shutdown);
-            persisted_state.terminals.retain(|terminal| terminal.id != id);
-            write_json_atomic(persisted_state_path, persisted_state)?;
-            Ok(BrokerReply::Closed)
-        },
-        BrokerRequest::Stop => {
-            for terminal in terminals.values_mut() {
-                let _ = terminal.notifier.0.send(Msg::Shutdown);
-            }
-            terminals.clear();
-            persisted_state.terminals.clear();
-            write_json_atomic(persisted_state_path, persisted_state)?;
-            Ok(BrokerReply::Stopped)
-        },
-    }
-}
-
-fn normalized_launch_options(mut launch_options: tty::Options) -> tty::Options {
-    #[cfg(target_os = "macos")]
-    if launch_options.working_directory.is_none() {
-        launch_options.working_directory = Some(macos::preferred_working_dir());
-    }
-
-    launch_options
-}
-
-fn spawn_terminal(
-    id: u64,
-    launch_options: tty::Options,
-    window_size: WindowSize,
-    event_tx: Sender<BrokerEventRecord>,
-) -> Result<RuntimeTerminalState, Box<dyn Error>> {
-    let launch_options = normalized_launch_options(launch_options);
-    let listener = BrokerEventProxy { terminal_id: id, sender: event_tx };
-    let term_size = TermSize::new(window_size.num_cols as usize, window_size.num_lines as usize);
-    let terminal =
-        Arc::new(FairMutex::new(Term::new(Default::default(), &term_size, listener.clone())));
-
-    let pty = tty::new(&launch_options, window_size, 0)?;
-    #[cfg(unix)]
-    let master_fd = std::os::fd::AsRawFd::as_raw_fd(pty.file());
-    #[cfg(unix)]
-    let shell_pid = pty.child().id();
-
-    let event_loop = PtyEventLoop::new(
-        Arc::clone(&terminal),
-        listener,
-        pty,
-        launch_options.drain_on_exit,
-        false,
-    )?;
-    let notifier = Notifier(event_loop.channel());
-    let _io_thread = event_loop.spawn();
-
-    let mut state = RuntimeTerminalState {
-        id,
-        launch_options,
-        terminal,
-        notifier,
-        #[cfg(unix)]
-        master_fd,
-        #[cfg(unix)]
-        shell_pid,
-        revision: 1,
-        title: None,
-        program_name: String::new(),
-        working_directory: None,
-        exit_code: None,
-    };
-    refresh_terminal_metadata(&mut state);
-    Ok(state)
-}
-
-fn runtime_snapshot(terminal: &RuntimeTerminalState) -> WorkspaceBrokerTerminalSnapshot {
-    WorkspaceBrokerTerminalSnapshot {
-        status: runtime_status(terminal),
-        snapshot: terminal.terminal.lock().export_snapshot(),
-    }
-}
-
-fn runtime_status(terminal: &RuntimeTerminalState) -> WorkspaceBrokerTerminalStatus {
-    WorkspaceBrokerTerminalStatus {
-        id: terminal.id,
-        revision: terminal.revision,
-        title: terminal.title.clone(),
-        program_name: terminal.program_name.clone(),
-        working_directory: terminal.working_directory.clone(),
-        exit_code: terminal.exit_code,
-    }
-}
-
-fn refresh_terminal_metadata(terminal: &mut RuntimeTerminalState) {
-    #[cfg(unix)]
-    {
-        terminal.program_name =
-            crate::daemon::foreground_process_name(terminal.master_fd, terminal.shell_pid)
-                .unwrap_or_else(|_| String::from("shell"));
-        terminal.working_directory =
-            crate::daemon::foreground_process_path(terminal.master_fd, terminal.shell_pid).ok();
-    }
-}
-
-fn persist_terminal_state(
-    terminal: &RuntimeTerminalState,
-    persisted_state: &mut PersistedWorkspaceBrokerState,
-) {
-    let persisted = PersistedTerminalState {
-        id: terminal.id,
-        launch_options: terminal.launch_options.clone(),
-        snapshot: terminal.terminal.lock().export_snapshot(),
-        revision: terminal.revision,
-        title: terminal.title.clone(),
-        program_name: terminal.program_name.clone(),
-        working_directory: terminal.working_directory.clone(),
-        exit_code: terminal.exit_code,
-    };
-
-    if let Some(existing) =
-        persisted_state.terminals.iter_mut().find(|saved| saved.id == terminal.id)
-    {
-        *existing = persisted;
-    } else {
-        persisted_state.terminals.push(persisted);
-    }
-}
-
-fn allocate_terminal_id_from_state(persisted_state: &mut PersistedWorkspaceBrokerState) -> u64 {
-    let next = persisted_state.next_terminal_id.max(1);
-    persisted_state.next_terminal_id = next.saturating_add(1);
-    next
-}
-
-fn send_request(
-    control_socket: &Path,
-    request: &BrokerRequest,
-) -> Result<BrokerReply, Box<dyn Error>> {
-    let mut stream = UnixStream::connect(control_socket)?;
-    let json = serde_json::to_string(request)?;
-    stream.write_all(json.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line.is_empty() {
-        return Err("empty broker reply".into());
-    }
-    Ok(serde_json::from_str(&line)?)
-}
-
-fn read_request(stream: &UnixStream) -> Result<BrokerRequest, Box<dyn Error>> {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    if line.is_empty() {
-        return Err("empty broker request".into());
-    }
-    Ok(serde_json::from_str(&line)?)
-}
-
-fn write_reply(stream: &mut UnixStream, reply: &BrokerReply) -> Result<(), Box<dyn Error>> {
-    let json = serde_json::to_string(reply)?;
-    stream.write_all(json.as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn load_runtime_state() -> Result<BrokerRuntimeState, Box<dyn Error>> {
-    let bytes = fs::read(runtime_state_path())?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn load_persisted_state() -> Result<PersistedWorkspaceBrokerState, Box<dyn Error>> {
-    let path = persisted_state_file();
-    match fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            Ok(PersistedWorkspaceBrokerState::default())
-        },
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>> {
@@ -834,20 +889,46 @@ fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn runtime_state_path() -> PathBuf {
-    runtime_dir().join("tabor-workspace-broker.json")
+fn checkpoint_file(terminal_id: u64) -> PathBuf {
+    terminal_dir(terminal_id).join("checkpoint.json")
 }
 
-fn control_socket_path() -> PathBuf {
-    runtime_dir().join("tabor-workspace-broker.sock")
+fn journal_file(terminal_id: u64) -> PathBuf {
+    terminal_dir(terminal_id).join("journal.bin")
+}
+
+fn terminal_dir(terminal_id: u64) -> PathBuf {
+    terminals_dir().join(terminal_id.to_string())
+}
+
+fn terminals_dir() -> PathBuf {
+    persisted_dir().join("terminals")
+}
+
+fn remove_terminal_files(terminal_id: u64) -> Result<(), Box<dyn Error>> {
+    let dir = terminal_dir(terminal_id);
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+fn allocate_terminal_id_from_state(state: &mut PersistedWorkspaceState) -> u64 {
+    let next = state.next_terminal_id.max(1);
+    state.next_terminal_id = next.saturating_add(1);
+    next
 }
 
 fn workspace_layout_file() -> PathBuf {
     persisted_dir().join("workspace-layout.json")
 }
 
-fn persisted_state_file() -> PathBuf {
-    persisted_dir().join("workspace-broker-state.json")
+fn current_state_file() -> PathBuf {
+    persisted_dir().join(STATE_FILE_NAME)
+}
+
+fn legacy_state_file() -> PathBuf {
+    persisted_dir().join(LEGACY_STATE_FILE_NAME)
 }
 
 #[cfg(target_os = "macos")]
@@ -867,25 +948,6 @@ fn test_bundle_workspace_root() -> Option<PathBuf> {
     Some(path)
 }
 
-fn runtime_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(path) = test_bundle_workspace_root() {
-            let path = path.join("r");
-            let _ = fs::create_dir_all(&path);
-            return path;
-        }
-        macos::runtime_tmp_dir()
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let path = std::env::temp_dir().join("tabor");
-        let _ = fs::create_dir_all(&path);
-        path
-    }
-}
-
 fn persisted_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -894,6 +956,7 @@ fn persisted_dir() -> PathBuf {
             let _ = fs::create_dir_all(&path);
             return path;
         }
+
         let base = if macos::distribution_channel().is_mac_app_store() {
             macos::container_data_dir().join("Library").join("Application Support").join("Tabor")
         } else {
@@ -922,71 +985,44 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn create_terminal_reply_survives_large_snapshot_roundtrip() {
-        let tempdir = tempdir().expect("tempdir");
-        let persisted_state = tempdir.path().join("broker-state.json");
-        let (client_stream, mut server_stream) = UnixStream::pair().expect("stream pair");
+    fn workspace_tab_kind_deserializes_legacy_broker_id() {
+        let launch_options =
+            serde_json::to_value(tty::Options::default()).expect("serialize launch options");
+        let tab: WorkspaceTabKind = serde_json::from_value(serde_json::json!({
+            "kind": "terminal",
+            "broker_id": 7,
+            "launch_options": launch_options
+        }))
+        .expect("deserialize terminal layout");
 
-        let server_state = persisted_state.clone();
-        let server = thread::spawn(move || {
-            let (event_tx, _event_rx) = mpsc::channel();
-            let mut persisted_state = PersistedWorkspaceBrokerState::default();
-            let mut terminals = BTreeMap::new();
-            let request = read_request(&server_stream).expect("read request");
-            let reply = handle_request(
-                request,
-                &event_tx,
-                &mut terminals,
-                &mut persisted_state,
-                &server_state,
-            )
-            .expect("handle request");
-            write_reply(&mut server_stream, &reply).expect("write reply");
-            for terminal in terminals.values_mut() {
-                let _ = terminal.notifier.0.send(Msg::Shutdown);
-            }
-        });
-
-        let request = BrokerRequest::CreateTerminal {
-            launch_options: tty::Options {
-                shell: Some(tty::Shell::new(
-                    String::from("/bin/sh"),
-                    vec![String::from("-lc"), String::from("sleep 60")],
-                )),
-                ..tty::Options::default()
-            },
-            window_size: WindowSize {
-                num_lines: 49,
-                num_cols: 109,
-                cell_width: 10,
-                cell_height: 24,
-            }
-            .into(),
-        };
-        let mut client_stream = client_stream;
-        client_stream
-            .write_all(serde_json::to_string(&request).expect("serialize request").as_bytes())
-            .expect("write request");
-        client_stream.write_all(b"\n").expect("write request terminator");
-        client_stream.flush().expect("flush request");
-
-        let mut line = String::new();
-        BufReader::new(client_stream).read_line(&mut line).expect("read reply");
-        let reply: BrokerReply = serde_json::from_str(&line).expect("parse reply");
-        match reply {
-            BrokerReply::Created { terminal } => {
-                assert!(terminal.snapshot.grid.columns() > 0);
-                assert!(terminal.snapshot.grid.screen_lines() > 0);
-            },
-            other => panic!("unexpected reply: {other:?}"),
+        match tab {
+            WorkspaceTabKind::Terminal { terminal_id, .. } => assert_eq!(terminal_id, 7),
+            _ => panic!("expected terminal layout"),
         }
+    }
 
-        server.join().expect("server thread");
+    #[test]
+    fn load_terminal_snapshot_returns_inline_snapshot_when_no_checkpoint_exists() {
+        let snapshot =
+            Term::new(Default::default(), &TermSize::new(4, 2), VoidListener).export_snapshot();
+        let state = PersistedTerminalState {
+            id: 77,
+            launch_options: tty::Options::default(),
+            title: Some(String::from("shell")),
+            program_name: String::from("shell"),
+            working_directory: None,
+            exit_code: None,
+            clean_exit: false,
+            snapshot: Some(snapshot.clone()),
+        };
+
+        let restored = load_terminal_snapshot(77, &state).expect("load snapshot");
+        assert_eq!(restored, Some(snapshot));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn normalized_launch_options_uses_preferred_working_dir_when_missing() {
+    fn stop_workspace_removes_terminal_state() {
         let _env_guard = env_lock().lock().expect("environment lock poisoned");
         let tempdir = tempdir().expect("tempdir");
         let home_dir = tempdir.path().join("home");
@@ -995,19 +1031,15 @@ mod tests {
         let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
         let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
 
-        let launch_options = normalized_launch_options(tty::Options::default());
-        assert_eq!(launch_options.working_directory, Some(home_dir));
-    }
+        let path = persisted_dir();
+        std::fs::create_dir_all(path.join("terminals/1")).expect("create terminals dir");
+        std::fs::write(path.join(STATE_FILE_NAME), b"{}").expect("write state");
+        std::fs::write(path.join("workspace-layout.json"), b"{}").expect("write layout");
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn normalized_launch_options_preserves_explicit_working_dir() {
-        let explicit_dir = PathBuf::from("/tmp/tabor-explicit-cwd");
-        let launch_options = normalized_launch_options(tty::Options {
-            working_directory: Some(explicit_dir.clone()),
-            ..tty::Options::default()
-        });
+        stop_workspace().expect("stop workspace");
 
-        assert_eq!(launch_options.working_directory, Some(explicit_dir));
+        assert!(!path.join(STATE_FILE_NAME).exists());
+        assert!(!path.join("workspace-layout.json").exists());
+        assert!(!path.join("terminals").exists());
     }
 }

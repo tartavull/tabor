@@ -43,6 +43,8 @@ pub enum Msg {
 ///
 /// Handles all the PTY I/O and runs the PTY parser which updates terminal
 /// state.
+type OutputObserver = Box<dyn FnMut(&[u8]) + Send>;
+
 pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     poll: Arc<polling::Poller>,
     pty: T,
@@ -50,6 +52,7 @@ pub struct EventLoop<T: tty::EventedPty, U: EventListener> {
     tx: Sender<Msg>,
     terminal: Arc<FairMutex<Term<U>>>,
     event_proxy: U,
+    output_observer: Option<OutputObserver>,
     drain_on_exit: bool,
     ref_test: bool,
 }
@@ -64,6 +67,7 @@ where
         terminal: Arc<FairMutex<Term<U>>>,
         event_proxy: U,
         pty: T,
+        output_observer: Option<OutputObserver>,
         drain_on_exit: bool,
         ref_test: bool,
     ) -> io::Result<EventLoop<T, U>> {
@@ -76,6 +80,7 @@ where
             rx: PeekableReceiver::new(rx),
             terminal,
             event_proxy,
+            output_observer,
             drain_on_exit,
             ref_test,
         })
@@ -148,6 +153,10 @@ where
             // Write a copy of the bytes to the ref test file.
             if let Some(writer) = &mut writer {
                 writer.write_all(&buf[..unprocessed]).unwrap();
+            }
+
+            if let Some(observer) = &mut self.output_observer {
+                observer(&buf[..unprocessed]);
             }
 
             // Parse the incoming bytes.

@@ -33,7 +33,6 @@ pub enum Topic {
     CefPump,
     CefWatchdog,
     WebCursor,
-    WorkspacePoll,
     WorkspaceAutosave,
     Frame,
 }

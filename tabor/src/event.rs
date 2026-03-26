@@ -259,8 +259,6 @@ const TOUCH_ZOOM_FACTOR: f32 = 0.01;
 /// Cooldown between invocations of the bell command.
 const BELL_CMD_COOLDOWN: Duration = Duration::from_millis(100);
 #[cfg(unix)]
-const WORKSPACE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-#[cfg(unix)]
 const WORKSPACE_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The event processor.
@@ -704,12 +702,6 @@ impl Processor {
 
     #[cfg(unix)]
     fn ensure_workspace_timers(&mut self, window_id: WindowId) {
-        let poll_timer = TimerId::new(Topic::WorkspacePoll, window_id);
-        if !self.scheduler.scheduled(poll_timer) {
-            let event = Event::new(EventType::WorkspacePoll, Some(window_id));
-            self.scheduler.schedule(event, WORKSPACE_POLL_INTERVAL, true, poll_timer);
-        }
-
         let autosave_timer = TimerId::new(Topic::WorkspaceAutosave, window_id);
         if !self.scheduler.scheduled(autosave_timer) {
             let event = Event::new(EventType::WorkspaceAutosave, Some(window_id));
@@ -725,11 +717,6 @@ impl Processor {
         let layout = window_context.workspace_layout();
         if let Err(err) = workspace::save_workspace_layout(&layout) {
             error!("Could not save workspace layout: {err}");
-        }
-        if let Err(err) =
-            workspace::save_persisted_terminals(window_context.persisted_terminal_states())
-        {
-            error!("Could not save workspace terminals: {err}");
         }
     }
 
@@ -1097,11 +1084,6 @@ impl Processor {
             if let Err(err) = workspace::save_workspace_layout(&layout) {
                 error!("Could not save workspace layout during window close: {err}");
             }
-            if let Err(err) =
-                workspace::save_persisted_terminals(window_context.persisted_terminal_states())
-            {
-                error!("Could not save workspace terminals during window close: {err}");
-            }
         }
 
         self.scheduler.unschedule_window(window_context.id());
@@ -1464,7 +1446,9 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             (
-                EventType::Terminal(TerminalEvent::Exit | TerminalEvent::ChildExit(_)),
+                EventType::Terminal(
+                    terminal_event @ (TerminalEvent::Exit | TerminalEvent::ChildExit(_)),
+                ),
                 Some(window_id),
             ) => {
                 let Some(tab_id) = tab_id else {
@@ -1478,6 +1462,12 @@ impl ApplicationHandler<Event> for Processor {
                 if window_context.tab_kind(tab_id).is_some_and(WindowKind::is_web) {
                     return;
                 }
+
+                let exit_code = match terminal_event {
+                    TerminalEvent::ChildExit(code) => Some(code),
+                    _ => None,
+                };
+                window_context.record_terminal_exit(tab_id, exit_code);
 
                 if window_context.display.window.hold {
                     return;
@@ -1521,33 +1511,6 @@ impl ApplicationHandler<Event> for Processor {
                 window_context.dirty = true;
                 if window_context.display.window.has_frame {
                     window_context.display.window.request_redraw();
-                }
-            },
-            #[cfg(unix)]
-            (EventType::WorkspacePoll, Some(window_id)) => {
-                let timer_id = TimerId::new(Topic::WorkspacePoll, window_id);
-                let Some(window_context) = self.windows.get_mut(&window_id) else {
-                    self.scheduler.unschedule(timer_id);
-                    return;
-                };
-                if !window_context.has_workspace_terminals() {
-                    self.scheduler.unschedule(timer_id);
-                    return;
-                }
-                let live_terminals = workspace::broker_status()
-                    .map(|status| {
-                        status
-                            .terminals
-                            .into_iter()
-                            .map(|terminal| (terminal.id, terminal))
-                            .collect::<HashMap<_, _>>()
-                    })
-                    .unwrap_or_default();
-                let persisted_terminals = workspace::load_persisted_terminals().unwrap_or_default();
-                if let Err(err) = window_context
-                    .refresh_workspace_terminals(&live_terminals, &persisted_terminals)
-                {
-                    error!("Could not refresh workspace terminals: {err}");
                 }
             },
             #[cfg(unix)]
@@ -1617,7 +1580,12 @@ impl ApplicationHandler<Event> for Processor {
         }
 
         #[cfg(unix)]
-        self.persist_workspace_snapshot();
+        {
+            self.persist_workspace_snapshot();
+            if let Err(err) = workspace::shutdown_persistence() {
+                error!("Could not flush workspace terminal state: {err}");
+            }
+        }
 
         #[cfg(target_os = "macos")]
         cef::shutdown();
@@ -1753,8 +1721,6 @@ pub enum EventType {
     TabSearch(String),
     #[cfg(target_os = "macos")]
     OpenUrls(Vec<String>),
-    #[cfg(unix)]
-    WorkspacePoll,
     #[cfg(unix)]
     WorkspaceAutosave,
     #[cfg(unix)]
@@ -5531,7 +5497,6 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::CefWatchdog
                 | EventType::TabSearch(_)
                 | EventType::OpenUrls(_)
-                | EventType::WorkspacePoll
                 | EventType::WorkspaceAutosave
                 | EventType::Frame => (),
                 #[cfg(not(target_os = "macos"))]
@@ -5543,7 +5508,6 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::SetMultiColumnCount(_)
                 | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
-                | EventType::WorkspacePoll
                 | EventType::WorkspaceAutosave
                 | EventType::Frame => (),
             },

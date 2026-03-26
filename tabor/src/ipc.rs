@@ -198,11 +198,24 @@ pub struct IpcTabState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_mode: Option<IpcWebMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session: Option<IpcTerminalSessionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_layout: Option<IpcTerminalLayoutState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_layout: Option<IpcBrowserLayoutState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_view: Option<IpcImageViewState>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum IpcTerminalSessionState {
+    Live,
+    Restored {
+        clean_exit: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2060,6 +2073,7 @@ mod tests {
                                 kind: tab.kind.clone(),
                                 activity: None,
                                 web_mode: None,
+                                terminal_session: None,
                                 terminal_layout: None,
                                 browser_layout: tab.browser_layout.clone(),
                                 image_view: mock_image_view(&tab.kind),
@@ -2085,6 +2099,7 @@ mod tests {
                 kind: tab.kind.clone(),
                 activity: None,
                 web_mode: None,
+                terminal_session: None,
                 terminal_layout: None,
                 browser_layout: tab.browser_layout.clone(),
                 image_view: mock_image_view(&tab.kind),

@@ -86,10 +86,10 @@ use crate::ipc::{
     IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageLoadState,
     IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage, IpcInspectorSession,
     IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind,
-    IpcTabPanelState, IpcTabState, IpcTerminalLayoutState, IpcWebCloseMetrics,
-    IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
-    IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
-    TerminalKeyInput,
+    IpcTabPanelState, IpcTabState, IpcTerminalLayoutState, IpcTerminalSessionState,
+    IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
+    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
+    SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -100,8 +100,8 @@ use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
 #[cfg(unix)]
 use crate::workspace::{
-    self, PersistedTerminalState, WorkspaceBrokerTerminalStatus, WorkspaceGroupLayout,
-    WorkspaceLayout, WorkspaceTabKind, WorkspaceTabLayout,
+    self, PersistedTerminalState, WorkspaceGroupLayout, WorkspaceLayout, WorkspaceTabKind,
+    WorkspaceTabLayout,
 };
 use crate::{input, renderer};
 
@@ -157,10 +157,10 @@ struct TabState {
 }
 
 enum TabNotifier {
-    Local(Notifier),
-    #[cfg(unix)]
-    Broker {
-        broker_id: u64,
+    Local {
+        notifier: Notifier,
+        #[cfg(unix)]
+        terminal_id: Option<u64>,
     },
     #[cfg(unix)]
     Disconnected,
@@ -177,11 +177,7 @@ impl Notify for TabNotifier {
         }
 
         match self {
-            Self::Local(notifier) => notifier.notify(bytes),
-            #[cfg(unix)]
-            Self::Broker { broker_id } => {
-                let _ = workspace::send_terminal_input(*broker_id, bytes.into_owned());
-            },
+            Self::Local { notifier, .. } => notifier.notify(bytes),
             #[cfg(unix)]
             Self::Disconnected => {},
         }
@@ -191,10 +187,16 @@ impl Notify for TabNotifier {
 impl OnResize for TabNotifier {
     fn on_resize(&mut self, window_size: tabor_terminal::event::WindowSize) {
         match self {
-            Self::Local(notifier) => notifier.on_resize(window_size),
-            #[cfg(unix)]
-            Self::Broker { broker_id } => {
-                let _ = workspace::resize_terminal(*broker_id, window_size);
+            Self::Local {
+                notifier,
+                #[cfg(unix)]
+                terminal_id,
+            } => {
+                notifier.on_resize(window_size);
+                #[cfg(unix)]
+                if let Some(terminal_id) = terminal_id {
+                    workspace::record_terminal_resize(*terminal_id, window_size);
+                }
             },
             #[cfg(unix)]
             Self::Disconnected => {},
@@ -205,12 +207,8 @@ impl OnResize for TabNotifier {
 impl TabNotifier {
     fn close_terminal(&mut self) {
         match self {
-            Self::Local(notifier) => {
+            Self::Local { notifier, .. } => {
                 let _ = notifier.0.send(Msg::Shutdown);
-            },
-            #[cfg(unix)]
-            Self::Broker { broker_id } => {
-                let _ = workspace::close_terminal(*broker_id);
             },
             #[cfg(unix)]
             Self::Disconnected => {},
@@ -218,7 +216,7 @@ impl TabNotifier {
     }
 
     fn detach(&mut self) {
-        if let Self::Local(notifier) = self {
+        if let Self::Local { notifier, .. } = self {
             let _ = notifier.0.send(Msg::Shutdown);
         }
     }
@@ -232,22 +230,16 @@ enum TerminalRuntimeState {
         #[cfg(not(windows))]
         shell_pid: u32,
         #[cfg(unix)]
-        workspace_id: Option<u64>,
+        terminal_id: Option<u64>,
         launch_options: tty::Options,
-    },
-    #[cfg(unix)]
-    Broker {
-        broker_id: u64,
-        launch_options: tty::Options,
-        working_directory: Option<PathBuf>,
-        revision: u64,
-        _exit_code: Option<i32>,
     },
     #[cfg(unix)]
     Disconnected {
-        broker_id: u64,
+        terminal_id: u64,
         launch_options: tty::Options,
         working_directory: Option<PathBuf>,
+        clean_exit: bool,
+        exit_code: Option<i32>,
     },
 }
 
@@ -257,7 +249,7 @@ impl TerminalRuntimeState {
         match self {
             Self::Local { master_fd, shell_pid, .. } => Some((*master_fd, *shell_pid)),
             #[cfg(unix)]
-            Self::Broker { .. } | Self::Disconnected { .. } => None,
+            Self::Disconnected { .. } => None,
         }
     }
 
@@ -265,8 +257,7 @@ impl TerminalRuntimeState {
         match self {
             Self::Local { launch_options, .. } => launch_options.working_directory.clone(),
             #[cfg(unix)]
-            Self::Broker { working_directory, launch_options, .. }
-            | Self::Disconnected { working_directory, launch_options, .. } => {
+            Self::Disconnected { working_directory, launch_options, .. } => {
                 working_directory.clone().or_else(|| launch_options.working_directory.clone())
             },
         }
@@ -276,19 +267,15 @@ impl TerminalRuntimeState {
         match self {
             Self::Local { launch_options, .. } => launch_options,
             #[cfg(unix)]
-            Self::Broker { launch_options, .. } | Self::Disconnected { launch_options, .. } => {
-                launch_options
-            },
+            Self::Disconnected { launch_options, .. } => launch_options,
         }
     }
 
     #[cfg(unix)]
-    fn workspace_terminal_id(&self) -> Option<u64> {
+    fn terminal_id(&self) -> Option<u64> {
         match self {
-            Self::Local { workspace_id, .. } => *workspace_id,
-            Self::Broker { broker_id, .. } | Self::Disconnected { broker_id, .. } => {
-                Some(*broker_id)
-            },
+            Self::Local { terminal_id, .. } => *terminal_id,
+            Self::Disconnected { terminal_id, .. } => Some(*terminal_id),
         }
     }
 }
@@ -308,7 +295,32 @@ struct MultiColumnDefaults {
 
 #[derive(Clone)]
 enum TerminalSpawnMode {
-    NewLocal { workspace_id: Option<u64> },
+    NewLocal {
+        terminal_id: Option<u64>,
+    },
+    #[cfg(unix)]
+    RestoredLocalShell(Box<RestoredTerminalSpawn>),
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct RestoredTerminalSpawn {
+    terminal_id: u64,
+    launch_options: tty::Options,
+    snapshot: Option<tabor_terminal::term::TermSnapshot>,
+    title: Option<String>,
+    working_directory: Option<PathBuf>,
+}
+
+struct LocalTerminalSpawnRequest<'a> {
+    terminal: &'a Arc<FairMutex<Term<EventProxy>>>,
+    event_proxy: &'a EventProxy,
+    pty_config: &'a tty::Options,
+    title: &'a str,
+    window_id: WindowId,
+    size_info: SizeInfo,
+    ref_test: bool,
+    terminal_id: Option<u64>,
 }
 
 fn terminal_view_mode_for_count(count: Option<usize>) -> TerminalViewMode {
@@ -356,14 +368,19 @@ fn sync_terminal_tab_geometry(
 
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn spawn_local_terminal_runtime(
-    terminal: &Arc<FairMutex<Term<EventProxy>>>,
-    event_proxy: &EventProxy,
-    pty_config: &tty::Options,
-    window_id: WindowId,
-    size_info: SizeInfo,
-    ref_test: bool,
-    workspace_id: Option<u64>,
+    request: LocalTerminalSpawnRequest<'_>,
 ) -> Result<(String, TabNotifier, TerminalRuntimeState), Box<dyn Error>> {
+    let LocalTerminalSpawnRequest {
+        terminal,
+        event_proxy,
+        pty_config,
+        title,
+        window_id,
+        size_info,
+        ref_test,
+        terminal_id,
+    } = request;
+
     let pty = tty::new(pty_config, size_info.into(), window_id.into())?;
 
     #[cfg(not(windows))]
@@ -371,10 +388,35 @@ fn spawn_local_terminal_runtime(
     #[cfg(not(windows))]
     let shell_pid = pty.child().id();
 
+    let output_observer = if let Some(terminal_id) = terminal_id {
+        Some(Box::new({
+            let observer =
+                workspace::register_live_terminal(workspace::LiveTerminalRegistration {
+                    terminal_id,
+                    terminal: Arc::clone(terminal),
+                    launch_options: pty_config.clone(),
+                    title: Some(title.to_string()),
+                    #[cfg(not(windows))]
+                    program_name: foreground_process_name(master_fd, shell_pid).unwrap_or_default(),
+                    #[cfg(windows)]
+                    program_name: String::new(),
+                    working_directory: pty_config.working_directory.clone(),
+                    #[cfg(not(windows))]
+                    master_fd,
+                    #[cfg(not(windows))]
+                    shell_pid,
+                })?;
+            move |bytes: &[u8]| observer.observe(bytes)
+        }) as Box<dyn FnMut(&[u8]) + Send>)
+    } else {
+        None
+    };
+
     let event_loop = PtyEventLoop::new(
         Arc::clone(terminal),
         event_proxy.clone(),
         pty,
+        output_observer,
         pty_config.drain_on_exit,
         ref_test,
     )?;
@@ -389,70 +431,21 @@ fn spawn_local_terminal_runtime(
 
     Ok((
         program_name,
-        TabNotifier::Local(Notifier(loop_tx)),
+        TabNotifier::Local {
+            notifier: Notifier(loop_tx),
+            #[cfg(unix)]
+            terminal_id,
+        },
         TerminalRuntimeState::Local {
             #[cfg(not(windows))]
             master_fd,
             #[cfg(not(windows))]
             shell_pid,
             #[cfg(unix)]
-            workspace_id,
+            terminal_id,
             launch_options: pty_config.clone(),
         },
     ))
-}
-
-#[cfg(unix)]
-fn persisted_terminal_state(tab: &TabState) -> Option<PersistedTerminalState> {
-    if !tab.kind.is_terminal() {
-        return None;
-    }
-
-    let workspace_id = tab.terminal_runtime.workspace_terminal_id()?;
-    let mut launch_options = tab.terminal_runtime.launch_options().clone();
-    let working_directory = match &tab.terminal_runtime {
-        TerminalRuntimeState::Local {
-            #[cfg(not(windows))]
-            master_fd,
-            #[cfg(not(windows))]
-            shell_pid,
-            ..
-        } => foreground_process_path(*master_fd, *shell_pid)
-            .ok()
-            .or_else(|| launch_options.working_directory.clone()),
-        TerminalRuntimeState::Broker { working_directory, .. }
-        | TerminalRuntimeState::Disconnected { working_directory, .. } => {
-            working_directory.clone().or_else(|| launch_options.working_directory.clone())
-        },
-    };
-    if let Some(working_directory) = working_directory.clone() {
-        launch_options.working_directory = Some(working_directory);
-    }
-
-    let program_name = match &tab.terminal_runtime {
-        TerminalRuntimeState::Local {
-            #[cfg(not(windows))]
-            master_fd,
-            #[cfg(not(windows))]
-            shell_pid,
-            ..
-        } => foreground_process_name(*master_fd, *shell_pid)
-            .unwrap_or_else(|_| tab.program_name.clone()),
-        TerminalRuntimeState::Broker { .. } | TerminalRuntimeState::Disconnected { .. } => {
-            tab.program_name.clone()
-        },
-    };
-
-    Some(PersistedTerminalState {
-        id: workspace_id,
-        launch_options,
-        snapshot: tab.terminal.lock().export_snapshot(),
-        revision: 1,
-        title: Some(tab.title.clone()),
-        program_name,
-        working_directory,
-        exit_code: None,
-    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2045,51 +2038,84 @@ impl WindowContext {
             #[cfg(unix)]
             {
                 match terminal_spawn_mode
-                    .unwrap_or(TerminalSpawnMode::NewLocal { workspace_id: None })
+                    .unwrap_or(TerminalSpawnMode::NewLocal { terminal_id: None })
                 {
-                    TerminalSpawnMode::NewLocal { workspace_id } => {
-                        let workspace_id = Some(match workspace_id {
-                            Some(workspace_id) => workspace_id,
+                    TerminalSpawnMode::NewLocal { terminal_id } => {
+                        let terminal_id = Some(match terminal_id {
+                            Some(terminal_id) => terminal_id,
                             None => workspace::allocate_terminal_id()?,
                         });
                         let (program_name, notifier, terminal_runtime) =
-                            spawn_local_terminal_runtime(
-                                &terminal,
-                                &event_proxy,
-                                &pty_config,
-                                display.window.id(),
+                            spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                                terminal: &terminal,
+                                event_proxy: &event_proxy,
+                                pty_config: &pty_config,
+                                title: &default_title,
+                                window_id: display.window.id(),
                                 size_info,
-                                config.debug.ref_test,
-                                workspace_id,
-                            )?;
+                                ref_test: config.debug.ref_test,
+                                terminal_id,
+                            })?;
                         (default_title.clone(), program_name, notifier, terminal_runtime)
+                    },
+                    TerminalSpawnMode::RestoredLocalShell(restored) => {
+                        let RestoredTerminalSpawn {
+                            terminal_id,
+                            mut launch_options,
+                            snapshot,
+                            title,
+                            working_directory,
+                        } = *restored;
+                        if let Some(working_directory) = working_directory {
+                            launch_options.working_directory = Some(working_directory);
+                        }
+                        let restored_title = title.unwrap_or_else(|| default_title.clone());
+                        if let Some(snapshot) = snapshot {
+                            terminal.lock().apply_snapshot(snapshot);
+                        }
+                        let (program_name, notifier, terminal_runtime) =
+                            spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                                terminal: &terminal,
+                                event_proxy: &event_proxy,
+                                pty_config: &launch_options,
+                                title: &restored_title,
+                                window_id: display.window.id(),
+                                size_info,
+                                ref_test: config.debug.ref_test,
+                                terminal_id: Some(terminal_id),
+                            })?;
+                        (restored_title, program_name, notifier, terminal_runtime)
                     },
                 }
             }
 
             #[cfg(not(unix))]
             {
-                let (program_name, notifier, terminal_runtime) = spawn_local_terminal_runtime(
-                    &terminal,
-                    &event_proxy,
-                    &pty_config,
-                    display.window.id(),
-                    size_info,
-                    config.debug.ref_test,
-                    None,
-                )?;
+                let (program_name, notifier, terminal_runtime) =
+                    spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                        terminal: &terminal,
+                        event_proxy: &event_proxy,
+                        pty_config: &pty_config,
+                        title: &default_title,
+                        window_id: display.window.id(),
+                        size_info,
+                        ref_test: config.debug.ref_test,
+                        terminal_id: None,
+                    })?;
                 (default_title.clone(), program_name, notifier, terminal_runtime)
             }
         } else {
-            let (program_name, notifier, terminal_runtime) = spawn_local_terminal_runtime(
-                &terminal,
-                &event_proxy,
-                &pty_config,
-                display.window.id(),
-                size_info,
-                config.debug.ref_test,
-                None,
-            )?;
+            let (program_name, notifier, terminal_runtime) =
+                spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                    terminal: &terminal,
+                    event_proxy: &event_proxy,
+                    pty_config: &pty_config,
+                    title: &default_title,
+                    window_id: display.window.id(),
+                    size_info,
+                    ref_test: config.debug.ref_test,
+                    terminal_id: None,
+                })?;
             (default_title.clone(), program_name, notifier, terminal_runtime)
         };
 
@@ -2832,9 +2858,9 @@ impl WindowContext {
                         let persistent_id = format!("g{group_index}-t{tab_index}");
                         let kind = match &tab.kind {
                             WindowKind::Terminal => WorkspaceTabKind::Terminal {
-                                broker_id: tab
+                                terminal_id: tab
                                     .terminal_runtime
-                                    .workspace_terminal_id()
+                                    .terminal_id()
                                     .expect("terminal tabs require workspace ids"),
                                 launch_options: tab.terminal_runtime.launch_options().clone(),
                             },
@@ -2880,16 +2906,6 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
-    pub(crate) fn persisted_terminal_states(&self) -> Vec<PersistedTerminalState> {
-        self.tabs
-            .ordered_tabs()
-            .into_iter()
-            .filter_map(|tab_id| self.tabs.get(tab_id))
-            .filter_map(persisted_terminal_state)
-            .collect()
-    }
-
-    #[cfg(unix)]
     pub(crate) fn restore_workspace_layout(
         &mut self,
         layout: &WorkspaceLayout,
@@ -2918,8 +2934,8 @@ impl WindowContext {
             for tab_layout in &group.tabs {
                 let (window_kind, pty_config, terminal_spawn_mode, restored_terminal) =
                     match &tab_layout.kind {
-                        WorkspaceTabKind::Terminal { broker_id, launch_options } => {
-                            let restored_terminal = persisted_terminals.get(broker_id).cloned();
+                        WorkspaceTabKind::Terminal { terminal_id, launch_options } => {
+                            let restored_terminal = persisted_terminals.get(terminal_id).cloned();
                             let mut pty_config = restored_terminal
                                 .as_ref()
                                 .map(|terminal| terminal.launch_options.clone())
@@ -2930,12 +2946,32 @@ impl WindowContext {
                             {
                                 pty_config.working_directory = Some(working_directory);
                             }
+                            let snapshot = restored_terminal
+                                .as_ref()
+                                .and_then(|terminal| {
+                                    workspace::load_terminal_snapshot(*terminal_id, terminal).ok()
+                                })
+                                .flatten();
+                            let terminal_spawn_mode = Some(TerminalSpawnMode::RestoredLocalShell(
+                                Box::new(RestoredTerminalSpawn {
+                                    terminal_id: *terminal_id,
+                                    launch_options: restored_terminal
+                                        .as_ref()
+                                        .map(|terminal| terminal.launch_options.clone())
+                                        .unwrap_or_else(|| launch_options.clone()),
+                                    snapshot,
+                                    title: restored_terminal
+                                        .as_ref()
+                                        .and_then(|terminal| terminal.title.clone()),
+                                    working_directory: restored_terminal
+                                        .as_ref()
+                                        .and_then(|terminal| terminal.working_directory.clone()),
+                                }),
+                            ));
                             (
                                 WindowKind::Terminal,
                                 pty_config,
-                                Some(TerminalSpawnMode::NewLocal {
-                                    workspace_id: Some(*broker_id),
-                                }),
+                                terminal_spawn_mode,
                                 restored_terminal,
                             )
                         },
@@ -3019,144 +3055,6 @@ impl WindowContext {
         self.display.pending_update.dirty = true;
         self.dirty = true;
         Ok(())
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn refresh_workspace_terminals(
-        &mut self,
-        live_terminals: &HashMap<u64, WorkspaceBrokerTerminalStatus>,
-        persisted_terminals: &HashMap<u64, PersistedTerminalState>,
-    ) -> Result<(), Box<dyn Error>> {
-        let active_tab_id = self.tabs.active_id();
-        let multi_column_defaults = self.multi_column_defaults();
-        let display = &self.display;
-        let config = &self.config;
-        let mut panel_dirty = false;
-        let mut redraw = false;
-        let tab_ids = self.tabs.ordered_tabs();
-
-        for tab_id in tab_ids {
-            let Some(tab) = self.tabs.get_mut(tab_id) else {
-                continue;
-            };
-            if !tab.kind.is_terminal() {
-                continue;
-            }
-
-            let mut next_runtime = None;
-            let mut sync_geometry = false;
-            match &tab.terminal_runtime {
-                TerminalRuntimeState::Local { .. } => continue,
-                TerminalRuntimeState::Broker {
-                    broker_id,
-                    launch_options,
-                    working_directory: _,
-                    revision,
-                    _exit_code: _,
-                } => {
-                    let broker_id = *broker_id;
-                    if let Some(status) = live_terminals.get(&broker_id) {
-                        if status.revision > *revision {
-                            let terminal = workspace::broker_snapshot(broker_id)?;
-                            tab.terminal.lock().apply_snapshot(terminal.snapshot.clone());
-                            tab.program_name = terminal.status.program_name.clone();
-                            if tab.custom_title.is_none() {
-                                tab.title =
-                                    terminal.status.title.clone().unwrap_or_else(|| {
-                                        self.config.window.identity.title.clone()
-                                    });
-                                panel_dirty = true;
-                            }
-                            redraw |= Some(tab_id) == active_tab_id;
-                            sync_geometry = true;
-                            next_runtime = Some(TerminalRuntimeState::Broker {
-                                broker_id,
-                                launch_options: launch_options.clone(),
-                                working_directory: terminal.status.working_directory.clone(),
-                                revision: terminal.status.revision,
-                                _exit_code: terminal.status.exit_code,
-                            });
-                        }
-                    } else if let Some(saved) = persisted_terminals.get(&broker_id) {
-                        tab.terminal.lock().apply_snapshot(saved.snapshot.clone());
-                        tab.notifier = TabNotifier::Disconnected;
-                        tab.program_name = saved.program_name.clone();
-                        if tab.custom_title.is_none() {
-                            tab.title = saved
-                                .title
-                                .clone()
-                                .unwrap_or_else(|| self.config.window.identity.title.clone());
-                            panel_dirty = true;
-                        }
-                        redraw |= Some(tab_id) == active_tab_id;
-                        sync_geometry = true;
-                        next_runtime = Some(TerminalRuntimeState::Disconnected {
-                            broker_id,
-                            launch_options: launch_options.clone(),
-                            working_directory: saved.working_directory.clone(),
-                        });
-                    }
-                },
-                TerminalRuntimeState::Disconnected {
-                    broker_id,
-                    launch_options,
-                    working_directory: _,
-                } => {
-                    let broker_id = *broker_id;
-                    if live_terminals.contains_key(&broker_id) {
-                        let terminal = workspace::broker_snapshot(broker_id)?;
-                        tab.terminal.lock().apply_snapshot(terminal.snapshot.clone());
-                        tab.notifier = TabNotifier::Broker { broker_id };
-                        tab.program_name = terminal.status.program_name.clone();
-                        if tab.custom_title.is_none() {
-                            tab.title = terminal
-                                .status
-                                .title
-                                .clone()
-                                .unwrap_or_else(|| self.config.window.identity.title.clone());
-                            panel_dirty = true;
-                        }
-                        redraw |= Some(tab_id) == active_tab_id;
-                        sync_geometry = true;
-                        next_runtime = Some(TerminalRuntimeState::Broker {
-                            broker_id,
-                            launch_options: launch_options.clone(),
-                            working_directory: terminal.status.working_directory.clone(),
-                            revision: terminal.status.revision,
-                            _exit_code: terminal.status.exit_code,
-                        });
-                    }
-                },
-            }
-
-            if let Some(runtime) = next_runtime {
-                tab.terminal_runtime = runtime;
-            }
-            if sync_geometry {
-                sync_terminal_tab_geometry(display, config, multi_column_defaults, tab);
-            }
-        }
-
-        if panel_dirty {
-            self.refresh_tab_panel();
-        }
-        if redraw {
-            self.display.pending_update.dirty = true;
-            self.dirty = true;
-            if self.display.window.has_frame {
-                self.display.window.request_redraw();
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn has_workspace_terminals(&self) -> bool {
-        self.tabs.ordered_tabs().into_iter().any(|tab_id| {
-            self.tabs.get(tab_id).is_some_and(|tab| {
-                matches!(tab.terminal_runtime, TerminalRuntimeState::Broker { .. })
-            })
-        })
     }
 
     fn multi_column_defaults(&self) -> MultiColumnDefaults {
@@ -3293,6 +3191,10 @@ impl WindowContext {
 
         let mut tab = tab;
         tab.notifier.close_terminal();
+        #[cfg(unix)]
+        if let Some(terminal_id) = tab.terminal_runtime.terminal_id() {
+            let _ = workspace::remove_terminal(terminal_id);
+        }
 
         #[cfg(target_os = "macos")]
         if closed_web {
@@ -3313,6 +3215,64 @@ impl WindowContext {
         self.dirty = true;
 
         self.tabs.active_id().is_none()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn record_terminal_exit(&mut self, tab_id: TabId, exit_code: Option<i32>) {
+        let Some(tab) = self.tabs.get_mut(tab_id) else {
+            return;
+        };
+        if !tab.kind.is_terminal() {
+            return;
+        }
+
+        let TerminalRuntimeState::Local {
+            terminal_id,
+            launch_options,
+            #[cfg(not(windows))]
+            master_fd,
+            #[cfg(not(windows))]
+            shell_pid,
+        } = &tab.terminal_runtime
+        else {
+            return;
+        };
+
+        let Some(terminal_id) = *terminal_id else {
+            return;
+        };
+
+        let working_directory = {
+            #[cfg(not(windows))]
+            {
+                foreground_process_path(*master_fd, *shell_pid)
+                    .ok()
+                    .or_else(|| launch_options.working_directory.clone())
+            }
+            #[cfg(windows)]
+            {
+                launch_options.working_directory.clone()
+            }
+        };
+
+        workspace::update_terminal_metadata(
+            terminal_id,
+            Some(tab.title.clone()),
+            Some(tab.program_name.clone()),
+            working_directory.clone(),
+            exit_code,
+            Some(true),
+        );
+        workspace::checkpoint_terminal(terminal_id, true);
+
+        tab.notifier = TabNotifier::Disconnected;
+        tab.terminal_runtime = TerminalRuntimeState::Disconnected {
+            terminal_id,
+            launch_options: launch_options.clone(),
+            working_directory,
+            clean_exit: true,
+            exit_code,
+        };
     }
 
     #[cfg(target_os = "macos")]
@@ -3456,6 +3416,7 @@ impl WindowContext {
                             kind: IpcTabKind::from(&tab.kind),
                             activity,
                             web_mode: Self::ipc_web_mode(tab),
+                            terminal_session: Self::ipc_terminal_session(tab),
                             terminal_layout: Self::ipc_terminal_layout(
                                 &self.display,
                                 &self.config,
@@ -3499,6 +3460,7 @@ impl WindowContext {
             kind: IpcTabKind::from(&tab.kind),
             activity,
             web_mode: Self::ipc_web_mode(tab),
+            terminal_session: Self::ipc_terminal_session(tab),
             terminal_layout: Self::ipc_terminal_layout(
                 &self.display,
                 &self.config,
@@ -5159,6 +5121,20 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
+    fn ipc_terminal_session(tab: &TabState) -> Option<IpcTerminalSessionState> {
+        if !tab.kind.is_terminal() {
+            return None;
+        }
+
+        Some(match &tab.terminal_runtime {
+            TerminalRuntimeState::Local { .. } => IpcTerminalSessionState::Live,
+            TerminalRuntimeState::Disconnected { clean_exit, exit_code, .. } => {
+                IpcTerminalSessionState::Restored { clean_exit: *clean_exit, exit_code: *exit_code }
+            },
+        })
+    }
+
+    #[cfg(unix)]
     fn ipc_terminal_layout(
         display: &Display,
         config: &UiConfig,
@@ -5369,21 +5345,7 @@ impl WindowContext {
                 ..
             } => foreground_process_name(*master_fd, *shell_pid).ok(),
             #[cfg(unix)]
-            TerminalRuntimeState::Broker { broker_id, .. } => {
-                workspace::broker_status().ok().and_then(|status| {
-                    status
-                        .terminals
-                        .into_iter()
-                        .find(|terminal| terminal.id == *broker_id)
-                        .map(|terminal| terminal.program_name)
-                })
-            },
-            #[cfg(unix)]
-            TerminalRuntimeState::Disconnected { broker_id, .. } => {
-                workspace::load_persisted_terminals().ok().and_then(|terminals| {
-                    terminals.get(broker_id).map(|terminal| terminal.program_name.clone())
-                })
-            },
+            TerminalRuntimeState::Disconnected { .. } => Some(tab.program_name.clone()),
         };
 
         let Some(program_name) = program_name else {
@@ -6467,7 +6429,7 @@ mod tests {
                         terminal_view_mode: TerminalViewMode::Normal,
                         terminal_multi_column_count_override: None,
                         kind: WorkspaceTabKind::Terminal {
-                            broker_id: 1,
+                            terminal_id: 1,
                             launch_options: tty::Options::default(),
                         },
                     }],
