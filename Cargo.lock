@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "tabor"
-version = "1.0.0"
+version = "0.10.0"
 dependencies = [
  "ahash",
  "base64",
