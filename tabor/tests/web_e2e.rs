@@ -410,6 +410,20 @@ impl TaborHarness {
         );
     }
 
+    fn open_url_with_app_bundle(&self, url: &str) {
+        let output =
+            Command::new("open").arg("-a").arg(&self.bundle_dir).arg(url).output().unwrap_or_else(
+                |err| panic!("failed to open {url} with {}: {err}", self.bundle_dir.display()),
+            );
+        assert!(
+            output.status.success(),
+            "open -a {} {} failed: {}",
+            self.bundle_dir.display(),
+            url,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn activate_bundle(&self) {
         let output =
             Command::new("open").arg("-a").arg(&self.bundle_dir).output().unwrap_or_else(|err| {
@@ -1920,6 +1934,24 @@ fn macos_opened_pdf_document_appears_as_web_tab_without_download() {
     assert!(
         download_entries.is_empty(),
         "expected opened PDF tab to avoid tracked downloads: {downloads}"
+    );
+}
+
+#[test]
+fn macos_opened_http_url_appears_as_web_tab() {
+    let harness = TaborHarness::start_foreground_app_bundle(false);
+    let server = ClipboardFixtureServer::start();
+    let expected_url = server.url("/fixture.html");
+
+    harness.open_url_with_app_bundle(expected_url.as_str());
+
+    let active_web_tab =
+        wait_for_active_web_url_value(&harness, expected_url.as_str(), Duration::from_secs(8));
+    let active_web_tab = active_web_tab
+        .unwrap_or_else(|| panic!("timed out waiting for active web tab at {expected_url}"));
+    assert!(
+        tab_kind_is(&active_web_tab, "web"),
+        "expected opened http URL to appear as a web tab: {active_web_tab}"
     );
 }
 

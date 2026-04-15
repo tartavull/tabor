@@ -13,12 +13,10 @@ use tabor_terminal::term::{self, RenderableContent as TerminalContent, Term, Ter
 use tabor_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 
 use crate::config::UiConfig;
+use crate::display::SizeInfo;
 use crate::display::color::{CellRgb, DIM_FACTOR, List, Rgb};
 use crate::display::hint::{self, HintState};
 use crate::display::terminal_layout::TerminalViewportLayout;
-use crate::display::{Display, SizeInfo};
-use crate::event::SearchState;
-
 /// Minimum contrast between a fixed cursor color and the cell's background.
 pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 
@@ -30,32 +28,48 @@ pub struct RenderableContent<'a> {
     cursor: RenderableCursor,
     cursor_shape: CursorShape,
     cursor_point: Option<Point<usize>>,
-    search: Option<HintMatches<'a>>,
-    hint: Option<Hint<'a>>,
+    search: Option<HintMatches<'static>>,
+    hint: Option<Hint>,
     config: &'a UiConfig,
-    colors: &'a List,
+    colors: List,
     focused_match: Option<&'a Match>,
-    size: &'a SizeInfo,
+    size: SizeInfo,
     layout: TerminalViewportLayout,
+}
+
+pub struct RenderableContentContext<'a> {
+    pub colors: List,
+    pub size: SizeInfo,
+    pub layout: TerminalViewportLayout,
+    pub search: Option<HintMatches<'static>>,
+    pub focused_match: Option<&'a Match>,
+    pub cursor_hidden: bool,
+    pub ime_preedit_active: bool,
 }
 
 impl<'a> RenderableContent<'a> {
     pub fn new<T: EventListener>(
         config: &'a UiConfig,
-        display: &'a mut Display,
+        hint_state: &mut HintState,
         term: &'a Term<T>,
-        search_state: &'a mut SearchState,
+        context: RenderableContentContext<'a>,
     ) -> Self {
-        let layout = display.terminal_viewport.with_terminal_content(term);
-        let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
-        let focused_match = search_state.focused_match();
+        let RenderableContentContext {
+            colors,
+            size,
+            layout,
+            search,
+            focused_match,
+            cursor_hidden,
+            ime_preedit_active,
+        } = context;
         let terminal_content = term.renderable_content();
 
         // Find terminal cursor shape.
         let cursor_shape = if terminal_content.cursor.shape == CursorShape::Hidden
-            || display.cursor_hidden
-            || search_state.regex().is_some()
-            || display.ime.preedit().is_some()
+            || cursor_hidden
+            || search.is_some()
+            || ime_preedit_active
         {
             CursorShape::Hidden
         } else if !term.is_focused && config.cursor.unfocused_hollow {
@@ -69,16 +83,16 @@ impl<'a> RenderableContent<'a> {
         let display_offset = terminal_content.display_offset;
         let cursor_point = visual_cursor_point(layout, display_offset, cursor_point);
 
-        let hint = if display.hint_state.active() {
-            display.hint_state.update_matches(term);
-            Some(Hint::from(&display.hint_state))
+        let hint = if hint_state.active() {
+            hint_state.update_matches(term);
+            Some(Hint::from(&*hint_state))
         } else {
             None
         };
 
         Self {
-            colors: &display.colors,
-            size: &display.size_info,
+            colors,
+            size,
             cursor: RenderableCursor::new_hidden(),
             terminal_content,
             focused_match,
@@ -239,7 +253,7 @@ impl RenderableCell {
         let mut character = cell.c;
         let mut flags = cell.flags;
 
-        let num_cols = content.layout.logical_size(content.size).columns();
+        let num_cols = content.layout.logical_size(&content.size).columns();
         if let Some((c, is_first)) = content
             .hint
             .as_mut()
@@ -463,15 +477,15 @@ impl RenderableCursor {
 }
 
 /// Regex hints for keyboard shortcuts.
-struct Hint<'a> {
+struct Hint {
     /// Hint matches and position.
-    matches: HintMatches<'a>,
+    matches: HintMatches<'static>,
 
     /// Last match checked against current cell position.
-    labels: &'a Vec<Vec<char>>,
+    labels: Vec<Vec<char>>,
 }
 
-impl Hint<'_> {
+impl Hint {
     /// Advance the hint iterator.
     ///
     /// If the point is within a hint, the keyboard shortcut character that should be displayed at
@@ -515,16 +529,17 @@ impl Hint<'_> {
     }
 }
 
-impl<'a> From<&'a HintState> for Hint<'a> {
-    fn from(hint_state: &'a HintState) -> Self {
-        let matches = HintMatches::new(hint_state.matches());
-        Self { labels: hint_state.labels(), matches }
+impl From<&HintState> for Hint {
+    fn from(hint_state: &HintState) -> Self {
+        let matches = HintMatches::new(hint_state.matches().to_vec());
+        let labels = hint_state.labels().clone();
+        Self { labels, matches }
     }
 }
 
 /// Visible hint match tracking.
 #[derive(Default)]
-struct HintMatches<'a> {
+pub(crate) struct HintMatches<'a> {
     /// All visible matches.
     matches: Cow<'a, [Match]>,
 
@@ -539,7 +554,7 @@ impl<'a> HintMatches<'a> {
     }
 
     /// Create from regex matches on term visible part.
-    fn visible_regex_matches<T>(term: &Term<T>, dfas: &mut RegexSearch) -> Self {
+    pub(crate) fn visible_regex_matches<T>(term: &Term<T>, dfas: &mut RegexSearch) -> Self {
         let matches = hint::visible_regex_match_iter(term, dfas).collect::<Vec<_>>();
         Self::new(matches)
     }

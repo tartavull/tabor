@@ -3616,7 +3616,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 }
 
-impl<'a, N, T> ActionContext<'a, N, T> {
+impl<N, T> ActionContext<'_, N, T> {
     #[cfg(not(windows))]
     fn current_working_directory(&self) -> Option<PathBuf> {
         self.foreground_process

@@ -47,7 +47,9 @@ use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
 use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::color::{List, Rgb};
-use crate::display::content::{RenderableContent, RenderableCursor};
+use crate::display::content::{
+    HintMatches, RenderableContent, RenderableContentContext, RenderableCursor,
+};
 use crate::display::cursor::IntoRects;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
@@ -322,7 +324,7 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
             padding_y: size_info.padding_y as u32,
             padding_bottom: size_info.padding_bottom as u32,
             screen_lines: size_info.screen_lines,
-            columns: size_info.screen_lines,
+            columns: size_info.columns,
         }
     }
 }
@@ -1202,18 +1204,6 @@ impl Display {
 
         let terminal_viewport = self.terminal_viewport.with_terminal_content(&terminal);
 
-        // Collect renderable content before the terminal is dropped.
-        let mut content = RenderableContent::new(config, self, &terminal, search_state);
-        let mut grid_cells = Vec::new();
-        for cell in &mut content {
-            grid_cells.push(cell);
-        }
-        let selection_range = content.selection_range();
-        let foreground_color = content.color(NamedColor::Foreground as usize);
-        let background_color = content.color(NamedColor::Background as usize);
-        let display_offset = content.display_offset();
-        let cursor = content.cursor();
-
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
         let metrics = self.glyph_cache.font_metrics();
@@ -1249,9 +1239,28 @@ impl Display {
             }
         }
         terminal.reset_damage();
+        let search =
+            search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(&terminal, dfas));
+        let focused_match = search_state.focused_match();
 
-        // Drop terminal as early as possible to free lock.
-        drop(terminal);
+        let mut content = RenderableContent::new(
+            config,
+            &mut self.hint_state,
+            &terminal,
+            RenderableContentContext {
+                colors: self.colors,
+                size: size_info,
+                layout: terminal_viewport,
+                search,
+                focused_match,
+                cursor_hidden: self.cursor_hidden,
+                ime_preedit_active: self.ime.preedit().is_some(),
+            },
+        );
+        let selection_range = content.selection_range();
+        let foreground_color = content.color(NamedColor::Foreground as usize);
+        let background_color = content.color(NamedColor::Background as usize);
+        let display_offset = content.display_offset();
 
         // Invalidate highlighted hints if grid has changed.
         self.validate_hint_highlights(display_offset);
@@ -1261,7 +1270,7 @@ impl Display {
         let requires_full_damage = folded_terminal
             || self.visual_bell.intensity() != 0.
             || self.hint_state.active()
-            || search_state.regex().is_some()
+            || search_active
             || command_active
             || command_feedback_active;
         if requires_full_damage {
@@ -1312,7 +1321,7 @@ impl Display {
             let vi_highlighted_hint = &self.vi_highlighted_hint;
             let damage_tracker = &mut self.damage_tracker;
 
-            let cells = grid_cells.into_iter().map(|mut cell| {
+            let cells = content.by_ref().map(|mut cell| {
                 // Underline hints hovered by mouse or vi mode cursor.
                 if has_highlighted_hint {
                     let point = cell.logical_point;
@@ -1334,12 +1343,16 @@ impl Display {
             });
             self.renderer.draw_cells(&size_info, glyph_cache, cells);
         }
+        let cursor = content.cursor();
+
+        // Drop terminal as early as possible to free lock.
+        drop(terminal);
 
         let mut rects = lines.rects(&metrics, &size_info);
 
         if vi_mode {
             // Vi mode reuses the footer bar as its status indicator.
-        } else if search_state.regex().is_some() {
+        } else if search_active {
             // Show current display offset in vi-less search to indicate match position.
             self.draw_line_indicator(config, total_lines, None, display_offset);
         };
@@ -2839,6 +2852,15 @@ mod tests {
         assert_eq!(size.viewport_height(), 76.);
         assert_eq!(size.screen_lines(), 75);
         assert_eq!(size.footer_offset(), 5.);
+    }
+
+    #[test]
+    fn size_info_u32_conversion_preserves_columns() {
+        let size = SizeInfo::new(300., 120., 10., 20., 40., 20., 12., false);
+        let converted: SizeInfo<u32> = size.into();
+
+        assert_eq!(converted.columns, size.columns());
+        assert_eq!(converted.screen_lines, size.screen_lines());
     }
 
     #[test]

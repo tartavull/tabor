@@ -37,14 +37,6 @@ fn dispatch_open_urls(urls: Vec<String>) {
     });
 }
 
-fn is_file_url(url: &str) -> bool {
-    url.starts_with("file:")
-}
-
-fn filter_file_urls(urls: Vec<String>) -> Vec<String> {
-    urls.into_iter().filter(|url| is_file_url(url)).collect()
-}
-
 fn urls_from_url_list(urls: *mut AnyObject) -> Vec<String> {
     if urls.is_null() {
         return Vec::new();
@@ -139,7 +131,7 @@ unsafe extern "C-unwind" fn handle_open_urls(
     _app: *mut AnyObject,
     urls: *mut AnyObject,
 ) {
-    dispatch_open_urls(filter_file_urls(urls_from_url_list(urls)));
+    dispatch_open_urls(urls_from_url_list(urls));
 }
 
 unsafe extern "C-unwind" fn handle_get_url_event(
@@ -345,30 +337,4 @@ fn add_method_if_missing(
     }
 
     unsafe { add_method_raw(cls as *const AnyClass as *mut AnyClass, selector, imp, ret, args) }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{filter_file_urls, is_file_url};
-
-    #[test]
-    fn file_url_filter_keeps_only_file_urls() {
-        let urls = vec![
-            String::from("file:///tmp/doc.pdf"),
-            String::from("https://example.com"),
-            String::from("file:///tmp/other.txt"),
-        ];
-
-        assert_eq!(
-            filter_file_urls(urls),
-            vec![String::from("file:///tmp/doc.pdf"), String::from("file:///tmp/other.txt")]
-        );
-    }
-
-    #[test]
-    fn is_file_url_requires_file_scheme() {
-        assert!(is_file_url("file:///tmp/doc.pdf"));
-        assert!(!is_file_url("https://example.com/doc.pdf"));
-        assert!(!is_file_url("about:blank"));
-    }
 }
