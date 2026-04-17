@@ -53,6 +53,13 @@ enum CliCommand {
     Install { options: BuildOptions, launch: bool },
     Package { options: BuildOptions },
     RunRaw { options: BuildOptions, args: Vec<String> },
+    Version { target: Option<String> },
+}
+
+#[derive(Debug)]
+struct VersionUpdate {
+    old: String,
+    new: String,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -90,6 +97,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let status = run_raw_binary(&root, options, &args)?;
             std::process::exit(status.code().unwrap_or(1));
+        },
+        CliCommand::Version { target } => {
+            let update = bump_tabor_version(&root, target.as_deref())?;
+            println!("Updated Tabor version {} -> {}", update.old, update.new);
         },
     }
 
@@ -140,6 +151,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliCommand, Box<dyn Error>> {
         "run-raw" => {
             let (options, forwarded) = parse_build_options(tail, true)?;
             CliCommand::RunRaw { options, args: forwarded }
+        },
+        "version" => {
+            let target = parse_version_args(tail)?;
+            CliCommand::Version { target }
         },
         other => return Err(format!("unknown command `{other}`").into()),
     };
@@ -227,6 +242,26 @@ fn parse_install_options(args: &[String]) -> Result<(BuildOptions, bool), Box<dy
     Ok((options, launch))
 }
 
+fn parse_version_args(args: &[String]) -> Result<Option<String>, Box<dyn Error>> {
+    let mut target = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            },
+            _ if arg.starts_with('-') => {
+                return Err(format!("unknown option `{arg}` for `version`").into());
+            },
+            _ if target.is_none() => target = Some(arg.clone()),
+            _ => return Err(format!("unexpected argument `{arg}` for `version`").into()),
+        }
+    }
+
+    Ok(target)
+}
+
 fn validate_build_options(options: BuildOptions) -> Result<(), Box<dyn Error>> {
     if options.universal && !cfg!(target_os = "macos") {
         return Err("`--universal` is supported only on macOS".into());
@@ -276,6 +311,7 @@ Usage:
   cargo xtask install [--release] [--passkey] [--universal] [--launch]
   cargo xtask package [--release] [--universal] --mac-app-store
   cargo xtask run-raw [--release] [--passkey] [-- <tabor args>]
+  cargo xtask version [<semver>]
 
 Commands:
   app      Build/package and install Tabor.app to /Applications and set it as the default PDF and image opener, or stage a Mac App Store app
@@ -283,6 +319,7 @@ Commands:
   install  Build/package and install Tabor.app to /Applications and set it as the default PDF and image opener
   package  Build and sign a Mac App Store `.pkg` submission artifact
   run-raw  Build and run the raw tabor binary directly (disabled on macOS)
+  version  Update Tabor release metadata; defaults to the next minor version when no semver is provided
 
 Flags:
   --release         Build release profile (default: debug)
@@ -315,6 +352,147 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask should live under workspace root")
         .to_path_buf()
+}
+
+fn bump_tabor_version(
+    root: &Path,
+    requested_target: Option<&str>,
+) -> Result<VersionUpdate, Box<dyn Error>> {
+    let tabor_manifest = root.join("tabor").join("Cargo.toml");
+    let current = read_tabor_version(&tabor_manifest)?;
+    let target = match requested_target {
+        Some(version) => normalize_release_version(version)?,
+        None => next_minor_version(&current)?,
+    };
+
+    if current == target {
+        return Err(format!("Tabor is already at version {target}").into());
+    }
+
+    replace_literal_in_file(
+        &tabor_manifest,
+        &format!("version = \"{current}\""),
+        &format!("version = \"{target}\""),
+        1,
+    )?;
+    replace_literal_in_file(
+        &root.join("extra").join("osx").join("Tabor.Info.plist"),
+        &format!("<string>{current}</string>"),
+        &format!("<string>{target}</string>"),
+        2,
+    )?;
+    replace_literal_in_file(
+        &root.join("scripts").join("create-macos-cef-helpers.sh"),
+        &format!("\"{current}\""),
+        &format!("\"{target}\""),
+        2,
+    )?;
+    replace_literal_in_file(
+        &root.join("tabor").join("windows").join("wix").join("tabor.wxs"),
+        &format!("Version=\"{current}\""),
+        &format!("Version=\"{target}\""),
+        1,
+    )?;
+    replace_literal_in_file(
+        &root.join("Cargo.lock"),
+        &format!("name = \"tabor\"\nversion = \"{current}\""),
+        &format!("name = \"tabor\"\nversion = \"{target}\""),
+        1,
+    )?;
+
+    verify_tabor_version(root, &target)?;
+
+    Ok(VersionUpdate { old: current, new: target })
+}
+
+fn read_tabor_version(manifest_path: &Path) -> Result<String, Box<dyn Error>> {
+    let contents = fs::read_to_string(manifest_path)?;
+    let line = contents
+        .lines()
+        .find(|line| line.starts_with("version = \""))
+        .ok_or_else(|| format!("missing package version in {}", manifest_path.display()))?;
+    let version = line
+        .strip_prefix("version = \"")
+        .and_then(|line| line.strip_suffix('"'))
+        .ok_or_else(|| format!("invalid package version line in {}", manifest_path.display()))?;
+    Ok(version.to_string())
+}
+
+fn normalize_release_version(version: &str) -> Result<String, Box<dyn Error>> {
+    let (major, minor, patch) = parse_release_version(version)?;
+    Ok(format!("{major}.{minor}.{patch}"))
+}
+
+fn next_minor_version(current: &str) -> Result<String, Box<dyn Error>> {
+    let (major, minor, _) = parse_release_version(current)?;
+    Ok(format!("{major}.{}.0", minor + 1))
+}
+
+fn parse_release_version(version: &str) -> Result<(u64, u64, u64), Box<dyn Error>> {
+    let mut parts = version.split('.');
+    let major =
+        parts.next().ok_or_else(|| format!("invalid release version `{version}`"))?.parse()?;
+    let minor =
+        parts.next().ok_or_else(|| format!("invalid release version `{version}`"))?.parse()?;
+    let patch =
+        parts.next().ok_or_else(|| format!("invalid release version `{version}`"))?.parse()?;
+
+    if parts.next().is_some() {
+        return Err(format!("invalid release version `{version}`").into());
+    }
+
+    Ok((major, minor, patch))
+}
+
+fn replace_literal_in_file(
+    path: &Path,
+    old: &str,
+    new: &str,
+    expected_matches: usize,
+) -> Result<(), Box<dyn Error>> {
+    let contents = fs::read_to_string(path)?;
+    let matches = contents.matches(old).count();
+
+    if matches != expected_matches {
+        return Err(format!(
+            "expected {expected_matches} matches for `{old}` in {}, found {matches}",
+            path.display()
+        )
+        .into());
+    }
+
+    fs::write(path, contents.replace(old, new))?;
+    Ok(())
+}
+
+fn verify_tabor_version(root: &Path, expected_version: &str) -> Result<(), Box<dyn Error>> {
+    let checks = [
+        (root.join("tabor").join("Cargo.toml"), format!("version = \"{expected_version}\"")),
+        (
+            root.join("extra").join("osx").join("Tabor.Info.plist"),
+            format!("<string>{expected_version}</string>"),
+        ),
+        (
+            root.join("scripts").join("create-macos-cef-helpers.sh"),
+            format!("\"{expected_version}\""),
+        ),
+        (
+            root.join("tabor").join("windows").join("wix").join("tabor.wxs"),
+            format!("Version=\"{expected_version}\""),
+        ),
+        (root.join("Cargo.lock"), format!("name = \"tabor\"\nversion = \"{expected_version}\"")),
+    ];
+
+    for (path, needle) in checks {
+        let contents = fs::read_to_string(&path)?;
+        if !contents.contains(&needle) {
+            return Err(
+                format!("missing updated version marker `{needle}` in {}", path.display()).into()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn run_raw_binary(
