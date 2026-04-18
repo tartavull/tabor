@@ -6,6 +6,7 @@ use tabor_terminal::grid::Dimensions;
 
 use crate::config::browser::MultiColumnBrowserConfig;
 use crate::display::SizeInfo;
+use crate::display::auxiliary_regions::EarAwareTopRegions;
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,12 +40,25 @@ impl BrowserViewportRect {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct BrowserViewportColumn {
+    rect: BrowserViewportRect,
+    logical_y: usize,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BrowserViewportLayout {
     mode: BrowserViewMode,
     viewport: BrowserViewportRect,
     target_width_px: usize,
     logical_width: usize,
     logical_height: usize,
+    columns: Vec<BrowserViewportColumn>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct BrowserColumnLayoutParams {
+    target_width_px: usize,
+    logical_width: usize,
     column_count: usize,
     left_padding_px: usize,
 }
@@ -57,8 +71,7 @@ impl BrowserViewportLayout {
             target_width_px: max(target_width_px, 1),
             logical_width: viewport.width,
             logical_height: viewport.height,
-            column_count: 1,
-            left_padding_px: 0,
+            columns: vec![BrowserViewportColumn { rect: viewport, logical_y: 0 }],
         }
     }
 
@@ -68,6 +81,7 @@ impl BrowserViewportLayout {
         mode: BrowserViewMode,
         config: &MultiColumnBrowserConfig,
         exact_column_count: Option<usize>,
+        ear_aware_regions: Option<EarAwareTopRegions>,
     ) -> Self {
         let target_width_px = max(config.target_width_px, 1);
         let viewport = Self::viewport_from_size_info(size_info, scale_factor);
@@ -81,16 +95,18 @@ impl BrowserViewportLayout {
             let logical_width = max(viewport.width / column_count, 1);
             let left_padding_px =
                 viewport.width.saturating_sub(logical_width.saturating_mul(column_count));
-
-            return Self {
+            return Self::with_columns(
                 mode,
                 viewport,
-                target_width_px: logical_width,
-                logical_width,
-                logical_height: viewport.height.saturating_mul(column_count),
-                column_count,
-                left_padding_px,
-            };
+                scale_factor,
+                BrowserColumnLayoutParams {
+                    target_width_px: logical_width,
+                    logical_width,
+                    column_count,
+                    left_padding_px,
+                },
+                ear_aware_regions,
+            );
         }
 
         let column_count = max(viewport.width / target_width_px, 1);
@@ -101,8 +117,7 @@ impl BrowserViewportLayout {
                 target_width_px,
                 logical_width: viewport.width,
                 logical_height: viewport.height,
-                column_count,
-                left_padding_px: 0,
+                columns: vec![BrowserViewportColumn { rect: viewport, logical_y: 0 }],
             };
         }
 
@@ -110,15 +125,18 @@ impl BrowserViewportLayout {
         let left_padding_px =
             viewport.width.saturating_sub(logical_width.saturating_mul(column_count));
 
-        Self {
+        Self::with_columns(
             mode,
             viewport,
-            target_width_px,
-            logical_width,
-            logical_height: viewport.height.saturating_mul(column_count),
-            column_count,
-            left_padding_px,
-        }
+            scale_factor,
+            BrowserColumnLayoutParams {
+                target_width_px,
+                logical_width,
+                column_count,
+                left_padding_px,
+            },
+            ear_aware_regions,
+        )
     }
 
     pub fn mode(&self) -> BrowserViewMode {
@@ -142,20 +160,19 @@ impl BrowserViewportLayout {
     }
 
     pub fn column_count(&self) -> usize {
-        self.column_count
+        self.columns.len()
+    }
+
+    pub(crate) fn column(&self, column_index: usize) -> Option<BrowserViewportColumn> {
+        self.columns.get(column_index).copied()
     }
 
     pub fn column_rect(&self, column_index: usize) -> Option<BrowserViewportRect> {
-        if column_index >= self.column_count {
-            return None;
-        }
+        self.column(column_index).map(|column| column.rect)
+    }
 
-        Some(BrowserViewportRect {
-            x: self.column_start_x(column_index),
-            y: self.viewport.y,
-            width: self.logical_width,
-            height: self.viewport.height,
-        })
+    pub fn column_logical_y(&self, column_index: usize) -> Option<usize> {
+        self.column(column_index).map(|column| column.logical_y)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -164,26 +181,16 @@ impl BrowserViewportLayout {
             return None;
         }
 
-        let column_index = y / self.viewport.height;
-        if column_index >= self.column_count {
-            return None;
-        }
-
-        Some((
-            self.column_start_x(column_index).saturating_add(x),
-            self.viewport.y.saturating_add(y % self.viewport.height),
-        ))
+        let column = self.columns.iter().find(|column| {
+            (column.logical_y..column.logical_y + column.rect.height).contains(&y)
+        })?;
+        Some((column.rect.x.saturating_add(x), column.rect.y.saturating_add(y - column.logical_y)))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn logical_point_for_visual(&self, x: usize, y: usize) -> Option<(usize, usize)> {
-        if self.viewport.height == 0 || !self.viewport.contains(x, y) {
-            return None;
-        }
-
-        let y = y - self.viewport.y;
-        let (column_index, column_x) = self.column_x_at_visual(x)?;
-        Some((column_x, column_index * self.viewport.height + y))
+        let column = self.columns.iter().find(|column| column.rect.contains(x, y))?;
+        Some((x - column.rect.x, column.logical_y + (y - column.rect.y)))
     }
 
     fn viewport_from_size_info(size_info: &SizeInfo, scale_factor: f64) -> BrowserViewportRect {
@@ -200,21 +207,48 @@ impl BrowserViewportLayout {
         }
     }
 
-    fn column_start_x(&self, column_index: usize) -> usize {
-        self.viewport.x + self.left_padding_px + column_index * self.logical_width
-    }
+    fn with_columns(
+        mode: BrowserViewMode,
+        viewport: BrowserViewportRect,
+        scale_factor: f64,
+        params: BrowserColumnLayoutParams,
+        ear_aware_regions: Option<EarAwareTopRegions>,
+    ) -> Self {
+        let scale_factor = scale_factor.max(f64::MIN_POSITIVE);
+        let reclaim_top_px = ear_aware_regions
+            .map_or(0, |regions| ((regions.reclaim_top_px as f64) / scale_factor) as usize);
+        let mut logical_y = 0;
+        let mut columns = Vec::with_capacity(params.column_count);
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn column_x_at_visual(&self, x: usize) -> Option<(usize, usize)> {
-        for column_index in 0..self.column_count {
-            let start = self.column_start_x(column_index);
-            let end = start.saturating_add(self.logical_width);
-            if (start..end).contains(&x) {
-                return Some((column_index, x - start));
-            }
+        for column_index in 0..params.column_count {
+            let x = viewport.x + params.left_padding_px + column_index * params.logical_width;
+            let eligible_for_ear = ear_aware_regions.is_some_and(|regions| {
+                regions.span_fits_auxiliary_region(
+                    ((x as f64) * scale_factor) as usize,
+                    ((params.logical_width as f64) * scale_factor) as usize,
+                )
+            });
+            let y = if eligible_for_ear {
+                viewport.y.saturating_sub(reclaim_top_px)
+            } else {
+                viewport.y
+            };
+            let height = viewport.height + usize::from(eligible_for_ear) * reclaim_top_px;
+            columns.push(BrowserViewportColumn {
+                rect: BrowserViewportRect { x, y, width: params.logical_width, height },
+                logical_y,
+            });
+            logical_y = logical_y.saturating_add(height);
         }
 
-        None
+        Self {
+            mode,
+            viewport,
+            target_width_px: params.target_width_px,
+            logical_width: params.logical_width,
+            logical_height: logical_y,
+            columns,
+        }
     }
 }
 
@@ -237,6 +271,7 @@ mod tests {
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig { target_width_px },
             None,
+            None,
         )
     }
 
@@ -247,6 +282,7 @@ mod tests {
             1.0,
             BrowserViewMode::Normal,
             &MultiColumnBrowserConfig::default(),
+            None,
             None,
         );
 
@@ -264,6 +300,7 @@ mod tests {
             1.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
             None,
         );
 
@@ -287,6 +324,7 @@ mod tests {
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
             None,
+            None,
         );
         let logical = (17, 745);
         let visual = layout.visual_point_for_logical(logical.0, logical.1).unwrap();
@@ -303,6 +341,7 @@ mod tests {
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
             Some(3),
+            None,
         );
 
         assert_eq!(layout.column_count(), 3);
@@ -360,6 +399,7 @@ mod tests {
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
             None,
+            None,
         );
 
         assert_eq!(layout.mode(), BrowserViewMode::MultiColumn);
@@ -381,6 +421,7 @@ mod tests {
             2.0,
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
+            None,
             None,
         );
 
@@ -404,6 +445,7 @@ mod tests {
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
             None,
+            None,
         );
 
         assert_eq!(
@@ -412,5 +454,90 @@ mod tests {
         );
         assert_eq!(layout.logical_width(), 1770);
         assert_eq!(layout.logical_height(), 550);
+    }
+
+    #[test]
+    fn ear_aware_columns_reclaim_top_band_only_when_fully_inside_ears() {
+        let size_info =
+            SizeInfo::new_with_vertical_padding(900., 680., 1., 1., 0., 0., 40., 0., false);
+        let layout = BrowserViewportLayout::new(
+            &size_info,
+            1.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+            Some(3),
+            Some(EarAwareTopRegions {
+                reclaim_top_px: 40,
+                left: Some(crate::display::auxiliary_regions::AuxiliaryTopRegion {
+                    x: 0,
+                    width: 300,
+                }),
+                right: Some(crate::display::auxiliary_regions::AuxiliaryTopRegion {
+                    x: 600,
+                    width: 300,
+                }),
+            }),
+        );
+
+        assert_eq!(layout.column_count(), 3);
+        assert_eq!(
+            layout.column_rect(0),
+            Some(BrowserViewportRect { x: 0, y: 0, width: 300, height: 680 })
+        );
+        assert_eq!(
+            layout.column_rect(1),
+            Some(BrowserViewportRect { x: 300, y: 40, width: 300, height: 640 })
+        );
+        assert_eq!(
+            layout.column_rect(2),
+            Some(BrowserViewportRect { x: 600, y: 0, width: 300, height: 680 })
+        );
+        assert_eq!(layout.column_logical_y(0), Some(0));
+        assert_eq!(layout.column_logical_y(1), Some(680));
+        assert_eq!(layout.column_logical_y(2), Some(1320));
+        assert_eq!(layout.logical_height(), 2000);
+        assert_eq!(layout.visual_point_for_logical(17, 700), Some((317, 60)));
+        assert_eq!(layout.logical_point_for_visual(317, 20), None);
+        assert_eq!(layout.logical_point_for_visual(317, 60), Some((17, 700)));
+        assert_eq!(layout.logical_point_for_visual(617, 20), Some((17, 1340)));
+    }
+
+    #[test]
+    fn ear_aware_columns_handle_physical_ear_regions_on_scaled_displays() {
+        let size_info =
+            SizeInfo::new_with_vertical_padding(1800., 1360., 1., 1., 0., 0., 80., 0., false);
+        let layout = BrowserViewportLayout::new(
+            &size_info,
+            2.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+            Some(3),
+            Some(EarAwareTopRegions {
+                reclaim_top_px: 80,
+                left: Some(crate::display::auxiliary_regions::AuxiliaryTopRegion {
+                    x: 0,
+                    width: 600,
+                }),
+                right: Some(crate::display::auxiliary_regions::AuxiliaryTopRegion {
+                    x: 1200,
+                    width: 600,
+                }),
+            }),
+        );
+
+        assert_eq!(layout.column_count(), 3);
+        assert_eq!(
+            layout.column_rect(0),
+            Some(BrowserViewportRect { x: 0, y: 0, width: 300, height: 680 })
+        );
+        assert_eq!(
+            layout.column_rect(1),
+            Some(BrowserViewportRect { x: 300, y: 40, width: 300, height: 640 })
+        );
+        assert_eq!(
+            layout.column_rect(2),
+            Some(BrowserViewportRect { x: 600, y: 0, width: 300, height: 680 })
+        );
+        assert_eq!(layout.logical_height(), 2000);
     }
 }

@@ -158,13 +158,14 @@ impl<'a> RenderableContent<'a> {
         } else {
             NonZeroU32::new(1).unwrap()
         };
-        RenderableCursor {
-            width,
-            shape: self.cursor_shape,
-            point: self.cursor_point.expect("cursor point must match the visible cursor cell"),
+        RenderableCursor::with_y_offset(
+            self.cursor_point.expect("cursor point must match the visible cursor cell"),
+            self.cursor_shape,
             cursor_color,
-            text_color,
-        }
+            width,
+            cell.y_offset_px,
+        )
+        .with_text_color(text_color)
     }
 }
 
@@ -209,6 +210,7 @@ impl Iterator for RenderableContent<'_> {
 pub struct RenderableCell {
     pub character: char,
     pub point: Point<usize>,
+    pub y_offset_px: i16,
     pub logical_point: Point,
     pub fg: Rgb,
     pub bg: Rgb,
@@ -302,6 +304,7 @@ impl RenderableCell {
         let cell_point = cell.point;
         let point = term::point_to_viewport(display_offset, cell_point)
             .and_then(|point| content.layout.visual_point_for_logical_viewport(point))?;
+        let y_offset_px = content.layout.y_offset_px_for_visual_column(point.column.0) as i16;
 
         let underline = cell
             .underline_color()
@@ -322,6 +325,7 @@ impl RenderableCell {
             character,
             bg_alpha,
             point,
+            y_offset_px,
             logical_point: cell_point,
             fg,
             bg,
@@ -436,6 +440,7 @@ pub struct RenderableCursor {
     text_color: Rgb,
     width: NonZeroU32,
     point: Point<usize>,
+    y_offset_px: i16,
 }
 
 impl RenderableCursor {
@@ -445,7 +450,7 @@ impl RenderableCursor {
         let text_color = Rgb::default();
         let width = NonZeroU32::new(1).unwrap();
         let point = Point::default();
-        Self { shape, cursor_color, text_color, width, point }
+        Self { shape, cursor_color, text_color, width, point, y_offset_px: 0 }
     }
 }
 
@@ -456,7 +461,17 @@ impl RenderableCursor {
         cursor_color: Rgb,
         width: NonZeroU32,
     ) -> Self {
-        Self { shape, cursor_color, text_color: cursor_color, width, point }
+        Self { shape, cursor_color, text_color: cursor_color, width, point, y_offset_px: 0 }
+    }
+
+    pub fn with_y_offset(
+        point: Point<usize>,
+        shape: CursorShape,
+        cursor_color: Rgb,
+        width: NonZeroU32,
+        y_offset_px: i16,
+    ) -> Self {
+        Self { shape, cursor_color, text_color: cursor_color, width, point, y_offset_px }
     }
 
     pub fn color(&self) -> Rgb {
@@ -473,6 +488,15 @@ impl RenderableCursor {
 
     pub fn point(&self) -> Point<usize> {
         self.point
+    }
+
+    pub fn y_offset_px(&self) -> i16 {
+        self.y_offset_px
+    }
+
+    fn with_text_color(mut self, text_color: Rgb) -> Self {
+        self.text_color = text_color;
+        self
     }
 }
 
@@ -615,6 +639,7 @@ mod tests {
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
             None,
+            None,
         );
         let cursor_point = Point::new(Line(0), Column(0));
         let display_offset = layout.logical_size(&size_info).screen_lines();
@@ -629,6 +654,7 @@ mod tests {
             &size_info,
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
         let cursor_point = Point::new(Line(0), Column(0));

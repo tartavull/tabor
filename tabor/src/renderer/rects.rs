@@ -37,6 +37,7 @@ impl RenderRect {
 pub struct RenderLine {
     pub start: Point<usize>,
     pub end: Point<usize>,
+    pub y_offset_px: i16,
     pub color: Rgb,
 }
 
@@ -58,10 +59,26 @@ impl RenderLine {
         let mut start = self.start;
         while start.line < self.end.line {
             let end = Point::new(start.line, size.last_column());
-            Self::push_rects(&mut rects, metrics, size, flag, start, end, self.color);
+            Self::push_rects(
+                &mut rects,
+                metrics,
+                size,
+                flag,
+                (start, end),
+                self.y_offset_px,
+                self.color,
+            );
             start = Point::new(start.line + 1, Column(0));
         }
-        Self::push_rects(&mut rects, metrics, size, flag, start, self.end, self.color);
+        Self::push_rects(
+            &mut rects,
+            metrics,
+            size,
+            flag,
+            (start, self.end),
+            self.y_offset_px,
+            self.color,
+        );
 
         rects
     }
@@ -72,10 +89,11 @@ impl RenderLine {
         metrics: &Metrics,
         size: &SizeInfo,
         flag: Flags,
-        start: Point<usize>,
-        end: Point<usize>,
+        span: (Point<usize>, Point<usize>),
+        y_offset_px: i16,
         color: Rgb,
     ) {
+        let (start, end) = span;
         let (position, thickness, ty) = match flag {
             Flags::DOUBLE_UNDERLINE => {
                 // Position underlines so each one has 50% of descent available.
@@ -85,8 +103,8 @@ impl RenderLine {
                 rects.push(Self::create_rect(
                     size,
                     metrics.descent,
-                    start,
-                    end,
+                    (start, end),
+                    y_offset_px,
                     top_pos,
                     metrics.underline_thickness,
                     color,
@@ -112,8 +130,15 @@ impl RenderLine {
             _ => unimplemented!("Invalid flag for cell line drawing specified"),
         };
 
-        let mut rect =
-            Self::create_rect(size, metrics.descent, start, end, position, thickness, color);
+        let mut rect = Self::create_rect(
+            size,
+            metrics.descent,
+            (start, end),
+            y_offset_px,
+            position,
+            thickness,
+            color,
+        );
         rect.kind = ty;
         rects.push(rect);
     }
@@ -122,12 +147,13 @@ impl RenderLine {
     fn create_rect(
         size: &SizeInfo,
         descent: f32,
-        start: Point<usize>,
-        end: Point<usize>,
+        span: (Point<usize>, Point<usize>),
+        y_offset_px: i16,
         position: f32,
         mut thickness: f32,
         color: Rgb,
     ) -> RenderRect {
+        let (start, end) = span;
         let start_x = start.column.0 as f32 * size.cell_width();
         let end_x = (end.column.0 + 1) as f32 * size.cell_width();
         let width = end_x - start_x;
@@ -146,7 +172,7 @@ impl RenderLine {
 
         RenderRect::new(
             start_x + size.padding_x(),
-            y + size.padding_y(),
+            y + size.padding_y() - f32::from(y_offset_px),
             width,
             thickness,
             color,
@@ -206,6 +232,7 @@ impl RenderLines {
         // Check if there's an active line.
         if let Some(line) = self.inner.get_mut(&flag).and_then(|lines| lines.last_mut()) {
             if color == line.color
+                && cell.y_offset_px == line.y_offset_px
                 && cell.point.column == line.end.column + 1
                 && cell.point.line == line.end.line
             {
@@ -216,7 +243,7 @@ impl RenderLines {
         }
 
         // Start new line if there currently is none.
-        let line = RenderLine { start: cell.point, end, color };
+        let line = RenderLine { start: cell.point, end, y_offset_px: cell.y_offset_px, color };
         match self.inner.get_mut(&flag) {
             Some(lines) => lines.push(line),
             None => {

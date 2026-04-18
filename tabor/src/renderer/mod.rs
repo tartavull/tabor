@@ -227,6 +227,7 @@ impl Renderer {
 
             Some(RenderableCell {
                 point: Point::new(point.line, point.column + i),
+                y_offset_px: 0,
                 logical_point: Point::new(Line(point.line as i32), Column(point.column.0 + i)),
                 character,
                 extra: None,

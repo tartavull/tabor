@@ -15,6 +15,9 @@ layout(location = 3) in vec4 textColor;
 // Background color.
 layout(location = 4) in vec4 backgroundColor;
 
+// Per-cell vertical offset in pixels.
+layout(location = 5) in float yOffset;
+
 out vec2 TexCoords;
 flat out vec4 fg;
 flat out vec4 bg;
@@ -38,6 +41,7 @@ void main() {
 
     // Position of cell from top-left
     vec2 cellPosition = cellDim * gridCoords;
+    cellPosition.y -= yOffset;
 
     fg = vec4(textColor.rgb / 255.0, textColor.a);
     bg = backgroundColor / 255.0;

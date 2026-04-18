@@ -44,6 +44,7 @@ use crate::config::window::Decorations;
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
+use crate::display::auxiliary_regions::{AuxiliaryTopRegion, EarAwareTopRegions};
 use crate::display::bell::VisualBell;
 use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::color::{List, Rgb};
@@ -79,6 +80,8 @@ struct PanelDimensions {
     width: f32,
 }
 
+pub mod auxiliary_regions;
+
 pub mod browser_layout;
 pub mod color;
 pub mod content;
@@ -93,7 +96,7 @@ mod tab_panel;
 pub(crate) use tab_panel::{TabPanelEditOutcome, TabPanelEditTarget};
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct MacOsWebDraw<'a> {
     web_view: Option<&'a WebView>,
     browser_layout: BrowserViewportLayout,
@@ -906,6 +909,50 @@ impl Display {
         size_info
     }
 
+    pub fn ear_aware_top_regions(&self, size_info: &SizeInfo) -> Option<EarAwareTopRegions> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = size_info;
+            None
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let state = self.window.macos_window_debug_state()?;
+            if !state.real_ear_fullscreen_active {
+                return None;
+            }
+
+            let reclaim_top_px =
+                (size_info.padding_y() - size_info.padding_bottom()).max(0.) as usize;
+            if reclaim_top_px == 0 {
+                return None;
+            }
+
+            let scale_factor = state.scale_factor.max(f64::MIN_POSITIVE);
+            let content_left = state.content_frame_screen_points.x * scale_factor;
+            let content_width = state.content_frame_screen_points.width.max(0.0) * scale_factor;
+            let left = auxiliary_top_region_in_content_space(
+                content_left,
+                content_width,
+                state.auxiliary_top_left_screen_points,
+                scale_factor,
+            );
+            let right = auxiliary_top_region_in_content_space(
+                content_left,
+                content_width,
+                state.auxiliary_top_right_screen_points,
+                scale_factor,
+            );
+
+            (left.is_some() || right.is_some()).then_some(EarAwareTopRegions {
+                reclaim_top_px,
+                left,
+                right,
+            })
+        }
+    }
+
     #[inline]
     pub fn gl_context(&self) -> &PossiblyCurrentContext {
         &self.context
@@ -1108,6 +1155,7 @@ impl Display {
                     mode,
                     &config.terminal.multi_column,
                     options.exact_multi_column_count,
+                    self.ear_aware_top_regions(&new_size),
                 )
             },
         );
@@ -1320,6 +1368,15 @@ impl Display {
             let highlighted_hint = &self.highlighted_hint;
             let vi_highlighted_hint = &self.vi_highlighted_hint;
             let damage_tracker = &mut self.damage_tracker;
+            let needs_ear_aware_cell_viewport =
+                terminal_viewport.strip_geometries().iter().any(|strip| strip.y_offset_px > 0);
+            let mut cell_render_size = size_info;
+            let cell_projection_offset = if needs_ear_aware_cell_viewport {
+                cell_render_size.padding_y = 0.;
+                (0., size_info.padding_y())
+            } else {
+                (0., 0.)
+            };
 
             let cells = content.by_ref().map(|mut cell| {
                 // Underline hints hovered by mouse or vi mode cursor.
@@ -1341,7 +1398,18 @@ impl Display {
 
                 cell
             });
-            self.renderer.draw_cells(&size_info, glyph_cache, cells);
+            #[cfg(target_os = "macos")]
+            if needs_ear_aware_cell_viewport {
+                self.renderer.set_viewport(&cell_render_size);
+            }
+            self.renderer
+                .set_text_projection_with_offset(&cell_render_size, cell_projection_offset);
+            self.renderer.draw_cells(&cell_render_size, glyph_cache, cells);
+            if needs_ear_aware_cell_viewport {
+                #[cfg(target_os = "macos")]
+                self.renderer.set_viewport(&size_info);
+                self.renderer.set_text_projection(&size_info);
+            }
         }
         let cursor = content.cursor();
 
@@ -1456,16 +1524,10 @@ impl Display {
                 self.draw_command_bar(config, "", footer_offset);
                 None
             },
-            TerminalFooterBarMode::None => {
-                let num_lines = self.size_info.screen_lines();
-                match vi_cursor_viewport_point {
-                    None => term::point_to_viewport(display_offset, cursor_point)
-                        .and_then(|point| {
-                            terminal_viewport.visual_point_for_logical_viewport(point)
-                        })
-                        .filter(|point| point.line < num_lines),
-                    point => point,
-                }
+            TerminalFooterBarMode::None => match vi_cursor_viewport_point {
+                None => term::point_to_viewport(display_offset, cursor_point)
+                    .and_then(|point| terminal_viewport.visual_point_for_logical_viewport(point)),
+                point => point,
             },
         };
 
@@ -1478,7 +1540,17 @@ impl Display {
                     (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
                 };
 
-                self.draw_ime_preview(point, fg, bg, &mut rects, config, footer_offset);
+                self.draw_ime_preview(
+                    point,
+                    fg,
+                    bg,
+                    &mut rects,
+                    config,
+                    (
+                        footer_offset,
+                        terminal_viewport.y_offset_px_for_visual_column(point.column.0) as f32,
+                    ),
+                );
             }
         }
 
@@ -1585,7 +1657,7 @@ impl Display {
             web_view.with_surfaces(|surface, popup| {
                 if let Some(surface) = surface {
                     let slices = browser_main_image_slices(
-                        macos.browser_layout,
+                        &macos.browser_layout,
                         self.window.scale_factor,
                         surface.width,
                         surface.height,
@@ -1603,7 +1675,7 @@ impl Display {
 
                 if let Some(popup) = popup {
                     let slices = browser_popup_image_slices(
-                        macos.browser_layout,
+                        &macos.browser_layout,
                         self.window.scale_factor,
                         popup,
                     );
@@ -1666,7 +1738,7 @@ impl Display {
             if let Some(point) = ime_position {
                 let fg = config.colors.footer_bar_foreground();
                 let bg = config.colors.footer_bar_background();
-                self.draw_ime_preview(point, fg, bg, &mut rects, config, footer_offset);
+                self.draw_ime_preview(point, fg, bg, &mut rects, config, (footer_offset, 0.));
             }
         }
 
@@ -1819,7 +1891,7 @@ impl Display {
             if let Some(point) = ime_position {
                 let fg = config.colors.footer_bar_foreground();
                 let bg = config.colors.footer_bar_background();
-                self.draw_ime_preview(point, fg, bg, &mut rects, config, footer_offset);
+                self.draw_ime_preview(point, fg, bg, &mut rects, config, (footer_offset, 0.));
             }
         }
 
@@ -1983,11 +2055,13 @@ impl Display {
         bg: Rgb,
         rects: &mut Vec<RenderRect>,
         config: &UiConfig,
-        offset_y: f32,
+        offsets: (f32, f32),
     ) {
+        let (offset_y, y_offset_px) = offsets;
         let mut ime_size_info = self.size_info;
-        if offset_y != 0. {
-            ime_size_info.padding_y += offset_y;
+        let total_offset_y = offset_y - y_offset_px;
+        if total_offset_y != 0. {
+            ime_size_info.padding_y += total_offset_y;
         }
 
         let preedit = match self.ime.preedit() {
@@ -2026,8 +2100,8 @@ impl Display {
         let glyph_cache = &mut self.glyph_cache;
         let metrics = glyph_cache.font_metrics();
 
-        if offset_y != 0. {
-            self.renderer.set_text_projection_with_offset(&self.size_info, (0., offset_y));
+        if total_offset_y != 0. {
+            self.renderer.set_text_projection_with_offset(&self.size_info, (0., total_offset_y));
         }
 
         self.renderer.draw_string(
@@ -2039,7 +2113,7 @@ impl Display {
             glyph_cache,
         );
 
-        if offset_y != 0. {
+        if total_offset_y != 0. {
             self.renderer.set_text_projection(&self.size_info);
         }
 
@@ -2051,10 +2125,10 @@ impl Display {
         }
 
         // Add underline for preedit text.
-        let underline = RenderLine { start, end, color: fg };
+        let underline = RenderLine { start, end, y_offset_px: 0, color: fg };
         let mut underline_rects = underline.rects(Flags::UNDERLINE, &metrics, &self.size_info);
         for rect in &mut underline_rects {
-            rect.y += offset_y;
+            rect.y += total_offset_y;
         }
         rects.extend(underline_rects);
 
@@ -2490,14 +2564,32 @@ fn dip_to_physical(value: usize, scale_factor: f64) -> usize {
 }
 
 #[cfg(target_os = "macos")]
+fn auxiliary_top_region_in_content_space(
+    content_left: f64,
+    content_width: f64,
+    region: crate::ipc::IpcWindowDebugRect,
+    scale_factor: f64,
+) -> Option<AuxiliaryTopRegion> {
+    if region.width <= 0.0 || region.height <= 0.0 || content_width <= 0.0 {
+        return None;
+    }
+
+    let start_x = (region.x.mul_add(scale_factor, -content_left)).max(0.0).floor();
+    let end_x = ((region.x + region.width) * scale_factor - content_left).min(content_width).ceil();
+    if end_x <= start_x {
+        return None;
+    }
+
+    Some(AuxiliaryTopRegion { x: start_x as usize, width: (end_x - start_x) as usize })
+}
+
+#[cfg(target_os = "macos")]
 fn browser_main_image_slices(
-    layout: BrowserViewportLayout,
+    layout: &BrowserViewportLayout,
     scale_factor: f64,
     image_width_px: usize,
     image_height_px: usize,
 ) -> Vec<ImageSlice> {
-    let viewport = layout.viewport();
-    let viewport_height_px = dip_to_physical(viewport.height, scale_factor).max(1);
     let viewport_width_px = dip_to_physical(layout.logical_width(), scale_factor).max(1);
     let mut slices = Vec::with_capacity(layout.column_count());
 
@@ -2505,14 +2597,18 @@ fn browser_main_image_slices(
         let Some(column_rect) = layout.column_rect(column_index) else {
             continue;
         };
+        let Some(column_logical_y) = layout.column_logical_y(column_index) else {
+            continue;
+        };
 
-        let src_y_px = column_index.saturating_mul(viewport_height_px);
+        let column_height_px = dip_to_physical(column_rect.height, scale_factor).max(1);
+        let src_y_px = dip_to_physical(column_logical_y, scale_factor);
         if src_y_px >= image_height_px {
             continue;
         }
 
-        let src_height_px = viewport_height_px.min(image_height_px.saturating_sub(src_y_px));
-        let dest_height_px = ((src_height_px as f64 / viewport_height_px as f64)
+        let src_height_px = column_height_px.min(image_height_px.saturating_sub(src_y_px));
+        let dest_height_px = ((src_height_px as f64 / column_height_px as f64)
             * dip_to_physical(column_rect.height, scale_factor) as f64)
             .round() as usize;
 
@@ -2533,12 +2629,11 @@ fn browser_main_image_slices(
 
 #[cfg(target_os = "macos")]
 fn browser_popup_image_slices(
-    layout: BrowserViewportLayout,
+    layout: &BrowserViewportLayout,
     scale_factor: f64,
     popup: WebPopupSurfaceRef,
 ) -> Vec<ImageSlice> {
-    let viewport_height = layout.viewport().height;
-    if viewport_height == 0 || popup.width == 0 || popup.height == 0 {
+    if popup.width == 0 || popup.height == 0 {
         return Vec::new();
     }
 
@@ -2551,17 +2646,18 @@ fn browser_popup_image_slices(
     let mut slices = Vec::new();
 
     for column_index in 0..layout.column_count() {
-        let column_top = column_index.saturating_mul(viewport_height);
-        let column_bottom = column_top.saturating_add(viewport_height);
+        let Some(column_rect) = layout.column_rect(column_index) else {
+            continue;
+        };
+        let Some(column_top) = layout.column_logical_y(column_index) else {
+            continue;
+        };
+        let column_bottom = column_top.saturating_add(column_rect.height);
         let slice_top = popup_top.max(column_top);
         let slice_bottom = popup_bottom.min(column_bottom);
         if slice_top >= slice_bottom {
             continue;
         }
-
-        let Some(column_rect) = layout.column_rect(column_index) else {
-            continue;
-        };
 
         let logical_slice_height = slice_bottom.saturating_sub(slice_top);
         let src_y_px =
@@ -2932,6 +3028,7 @@ mod tests {
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
             None,
+            None,
         );
 
         assert_eq!(vi_mode_line_indicator_line(layout, &size, Point::new(Line(11), Column(0))), 0);
@@ -2947,6 +3044,7 @@ mod tests {
             BrowserViewMode::MultiColumn,
             &MultiColumnBrowserConfig::default(),
             None,
+            None,
         )
     }
 
@@ -2954,7 +3052,7 @@ mod tests {
     #[test]
     fn browser_main_image_slices_follow_column_layout() {
         let layout = browser_layout(1950, 600);
-        let slices = browser_main_image_slices(layout, 1.0, layout.logical_width(), 1200);
+        let slices = browser_main_image_slices(&layout, 1.0, layout.logical_width(), 1200);
 
         assert_eq!(slices.len(), 2);
         assert_eq!(
@@ -3001,8 +3099,7 @@ mod tests {
                 format: cef::ColorType::BGRA_8888,
             },
         };
-        let slices = browser_popup_image_slices(layout, 1.0, popup);
-
+        let slices = browser_popup_image_slices(&layout, 1.0, popup);
         assert_eq!(slices.len(), 2);
         assert_eq!(
             slices[0],
@@ -3030,5 +3127,92 @@ mod tests {
                 src_height_px: 40,
             }
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn browser_main_image_slices_follow_mixed_height_columns() {
+        let size = SizeInfo::new_with_vertical_padding(900., 680., 1., 1., 0., 0., 40., 0., false);
+        let layout = BrowserViewportLayout::new(
+            &size,
+            1.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+            Some(3),
+            Some(EarAwareTopRegions {
+                reclaim_top_px: 40,
+                left: Some(AuxiliaryTopRegion { x: 0, width: 300 }),
+                right: Some(AuxiliaryTopRegion { x: 600, width: 300 }),
+            }),
+        );
+        let slices = browser_main_image_slices(&layout, 1.0, layout.logical_width(), 2000);
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].src_y_px, 0);
+        assert_eq!(slices[0].src_height_px, 680);
+        assert_eq!(slices[0].dest_y_px, 0);
+        assert_eq!(slices[0].dest_height_px, 680);
+        assert_eq!(slices[1].src_y_px, 680);
+        assert_eq!(slices[1].src_height_px, 640);
+        assert_eq!(slices[1].dest_y_px, 40);
+        assert_eq!(slices[1].dest_height_px, 640);
+        assert_eq!(slices[2].src_y_px, 1320);
+        assert_eq!(slices[2].src_height_px, 680);
+        assert_eq!(slices[2].dest_y_px, 0);
+        assert_eq!(slices[2].dest_height_px, 680);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn browser_popup_image_slices_follow_mixed_height_columns() {
+        let size = SizeInfo::new_with_vertical_padding(900., 680., 1., 1., 0., 0., 40., 0., false);
+        let layout = BrowserViewportLayout::new(
+            &size,
+            1.0,
+            BrowserViewMode::MultiColumn,
+            &MultiColumnBrowserConfig::default(),
+            Some(3),
+            Some(EarAwareTopRegions {
+                reclaim_top_px: 40,
+                left: Some(AuxiliaryTopRegion { x: 0, width: 300 }),
+                right: Some(AuxiliaryTopRegion { x: 600, width: 300 }),
+            }),
+        );
+        let popup = crate::macos::webview::WebPopupSurfaceRef {
+            x: 40,
+            y: 1300,
+            width: 100,
+            height: 60,
+            surface: crate::macos::webview::WebSurfaceRef {
+                io_surface: std::ptr::null_mut(),
+                width: 100,
+                height: 60,
+                format: cef::ColorType::BGRA_8888,
+            },
+        };
+        let slices = browser_popup_image_slices(&layout, 1.0, popup);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].dest_x_px, 340);
+        assert_eq!(slices[0].dest_y_px, 660);
+        assert_eq!(slices[0].dest_height_px, 20);
+        assert_eq!(slices[0].src_y_px, 0);
+        assert_eq!(slices[0].src_height_px, 20);
+        assert_eq!(slices[1].dest_x_px, 640);
+        assert_eq!(slices[1].dest_y_px, 0);
+        assert_eq!(slices[1].dest_height_px, 40);
+        assert_eq!(slices[1].src_y_px, 20);
+        assert_eq!(slices[1].src_height_px, 40);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auxiliary_top_regions_convert_screen_points_to_physical_pixels() {
+        let region = auxiliary_top_region_in_content_space(
+            0.0,
+            3840.0,
+            crate::ipc::IpcWindowDebugRect { x: 0.0, y: 1206.0, width: 856.0, height: 37.0 },
+            2.0,
+        );
+
+        assert_eq!(region, Some(AuxiliaryTopRegion { x: 0, width: 1712 }));
     }
 }

@@ -279,7 +279,7 @@ impl TextRenderBatch for Batch {
 
         // Calculate the cell position.
         let x = cell.point.column.0 as i16 * size_info.cell_width() as i16;
-        let y = cell.point.line as i16 * size_info.cell_height() as i16;
+        let y = cell.point.line as i16 * size_info.cell_height() as i16 - cell.y_offset_px;
 
         // Calculate the glyph position.
         let glyph_x = cell.point.column.0 as i16 * size_info.cell_width() as i16 + glyph.left;

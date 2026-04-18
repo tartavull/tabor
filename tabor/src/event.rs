@@ -2079,6 +2079,7 @@ fn browser_viewport_layout(
         browser_view_mode,
         &config.browser.multi_column,
         exact_column_count,
+        display.ear_aware_top_regions(&size_info),
     )
 }
 
@@ -5236,6 +5237,7 @@ mod tests {
             &size_info,
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
 

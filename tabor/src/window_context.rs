@@ -86,10 +86,10 @@ use crate::ipc::{
     IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageLoadState,
     IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage, IpcInspectorSession,
     IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind,
-    IpcTabPanelState, IpcTabState, IpcTerminalLayoutState, IpcTerminalSessionState,
-    IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
-    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
-    SocketReply, TabSelection, TerminalKeyInput,
+    IpcTabPanelState, IpcTabState, IpcTerminalLayoutState, IpcTerminalLayoutStrip,
+    IpcTerminalSessionState, IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode,
+    IpcWebViewMetrics, IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot,
+    IpcWindowDebugState, SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -5059,6 +5059,7 @@ impl WindowContext {
                 terminal_view_mode,
                 &config.terminal.multi_column,
                 exact_multi_column_count,
+                display.ear_aware_top_regions(&size_info),
             )
         } else {
             TerminalViewportLayout::normal(size_info)
@@ -5094,6 +5095,7 @@ impl WindowContext {
             browser_view_mode,
             &config.browser.multi_column,
             exact_column_count,
+            display.ear_aware_top_regions(&size_info),
         )
     }
 
@@ -5151,6 +5153,18 @@ impl WindowContext {
             mode: tab.terminal_view_mode,
             target_columns: layout.target_columns(),
             strip_count: layout.strip_count(),
+            strips: layout
+                .strip_geometries()
+                .into_iter()
+                .map(|strip| IpcTerminalLayoutStrip {
+                    start_column: strip.start_column,
+                    column_count: strip.column_count,
+                    y_offset_px: strip.y_offset_px,
+                    visual_line_count: strip.visual_line_count,
+                    logical_start_line: strip.logical_start_line,
+                    logical_line_count: strip.logical_line_count,
+                })
+                .collect(),
         })
     }
 

@@ -83,6 +83,18 @@ pub struct IpcTerminalLayoutState {
     pub mode: TerminalViewMode,
     pub target_columns: usize,
     pub strip_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strips: Vec<IpcTerminalLayoutStrip>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTerminalLayoutStrip {
+    pub start_column: usize,
+    pub column_count: usize,
+    pub y_offset_px: usize,
+    pub visual_line_count: usize,
+    pub logical_start_line: usize,
+    pub logical_line_count: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

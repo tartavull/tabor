@@ -9,6 +9,7 @@ use tabor_terminal::term::{self, Term};
 
 use crate::config::terminal::{MultiColumnOrder, MultiColumnTerminalConfig};
 use crate::display::SizeInfo;
+use crate::display::auxiliary_regions::EarAwareTopRegions;
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +59,16 @@ impl From<TerminalLogicalSize> for WindowSize {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct TerminalViewportStripGeometry {
+    pub start_column: usize,
+    pub column_count: usize,
+    pub y_offset_px: usize,
+    pub visual_line_count: usize,
+    pub logical_start_line: usize,
+    pub logical_line_count: usize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct TerminalViewportLayout {
     mode: TerminalViewMode,
     order: MultiColumnOrder,
@@ -72,6 +83,10 @@ pub struct TerminalViewportLayout {
     extra_gutter_columns: usize,
     left_padding_columns: usize,
     right_padding_columns: usize,
+    padding_x_px: usize,
+    cell_width_px: usize,
+    ear_aware_regions: Option<EarAwareTopRegions>,
+    ear_extra_lines: usize,
 }
 
 impl TerminalViewportLayout {
@@ -90,6 +105,10 @@ impl TerminalViewportLayout {
             extra_gutter_columns: 0,
             left_padding_columns: 0,
             right_padding_columns: 0,
+            padding_x_px: size_info.padding_x() as usize,
+            cell_width_px: size_info.cell_width() as usize,
+            ear_aware_regions: None,
+            ear_extra_lines: 0,
         }
     }
 
@@ -98,9 +117,13 @@ impl TerminalViewportLayout {
         mode: TerminalViewMode,
         config: &MultiColumnTerminalConfig,
         exact_strip_count: Option<usize>,
+        ear_aware_regions: Option<EarAwareTopRegions>,
     ) -> Self {
         let visual_columns = size_info.columns();
         let visual_lines = size_info.screen_lines();
+        let ear_extra_lines = ear_aware_regions.map_or(0, |regions| {
+            regions.reclaim_top_px / (size_info.cell_height() as usize).max(1)
+        });
 
         if mode != TerminalViewMode::MultiColumn {
             return Self::normal(*size_info);
@@ -116,9 +139,7 @@ impl TerminalViewportLayout {
                 if gutter_slots == 0 { 0 } else { leftover_columns / gutter_slots };
             let extra_gutter_columns =
                 if gutter_slots == 0 { 0 } else { leftover_columns % gutter_slots };
-            let logical_lines = visual_lines * strip_count;
-
-            return Self {
+            let mut layout = Self {
                 mode,
                 order: config.order,
                 content_line_offset: 0,
@@ -126,13 +147,19 @@ impl TerminalViewportLayout {
                 visual_columns,
                 visual_lines,
                 logical_columns,
-                logical_lines,
+                logical_lines: 0,
                 strip_count,
                 gutter_columns,
                 extra_gutter_columns,
                 left_padding_columns: 0,
                 right_padding_columns: 0,
+                padding_x_px: size_info.padding_x() as usize,
+                cell_width_px: size_info.cell_width() as usize,
+                ear_aware_regions,
+                ear_extra_lines,
             };
+            layout.logical_lines = layout.total_logical_capacity();
+            return layout;
         }
 
         let target_columns = max(config.target_columns, 1);
@@ -144,9 +171,7 @@ impl TerminalViewportLayout {
         let gutter_columns = if gutter_slots == 0 { 0 } else { leftover_columns / gutter_slots };
         let extra_gutter_columns =
             if gutter_slots == 0 { 0 } else { leftover_columns % gutter_slots };
-        let logical_lines = visual_lines * strip_count;
-
-        Self {
+        let mut layout = Self {
             mode,
             order: config.order,
             content_line_offset: 0,
@@ -154,13 +179,19 @@ impl TerminalViewportLayout {
             visual_columns,
             visual_lines,
             logical_columns,
-            logical_lines,
+            logical_lines: 0,
             strip_count,
             gutter_columns,
             extra_gutter_columns,
             left_padding_columns: 0,
             right_padding_columns: 0,
-        }
+            padding_x_px: size_info.padding_x() as usize,
+            cell_width_px: size_info.cell_width() as usize,
+            ear_aware_regions,
+            ear_extra_lines,
+        };
+        layout.logical_lines = layout.total_logical_capacity();
+        layout
     }
 
     pub fn strip_count(&self) -> usize {
@@ -192,14 +223,42 @@ impl TerminalViewportLayout {
         self
     }
 
+    pub fn strip_geometries(&self) -> Vec<TerminalViewportStripGeometry> {
+        let mut strips = Vec::with_capacity(self.strip_count);
+
+        for visual_strip_index in 0..self.strip_count {
+            let logical_strip_index = self.logical_strip_index_for_visual(visual_strip_index);
+            let logical_start_line = self.logical_strip_start_line(logical_strip_index);
+            let logical_line_count = self
+                .logical_lines
+                .saturating_sub(logical_start_line)
+                .min(self.logical_strip_line_capacity(logical_strip_index));
+
+            strips.push(TerminalViewportStripGeometry {
+                start_column: self.strip_start_column(visual_strip_index),
+                column_count: self.logical_columns,
+                y_offset_px: self.visual_strip_y_offset_px(visual_strip_index),
+                visual_line_count: self.visual_strip_line_capacity(visual_strip_index),
+                logical_start_line,
+                logical_line_count,
+            });
+        }
+
+        strips
+    }
+
+    pub fn y_offset_px_for_visual_column(&self, visual_column: usize) -> usize {
+        self.strip_column_at_visual(visual_column)
+            .map_or(0, |(visual_strip_index, _)| self.visual_strip_y_offset_px(visual_strip_index))
+    }
+
     pub fn visual_point_for_logical_viewport(&self, point: Point<usize>) -> Option<Point<usize>> {
         let line = point.line.checked_add(self.content_line_offset)?;
         if line >= self.logical_lines || point.column.0 >= self.logical_columns {
             return None;
         }
 
-        let logical_strip_index = line / self.visual_lines;
-        let line = line % self.visual_lines;
+        let (logical_strip_index, line) = self.logical_strip_for_line(line)?;
         let visual_strip_index = self.visual_strip_index_for_logical(logical_strip_index);
         let column = self.strip_start_column(visual_strip_index) + point.column.0;
 
@@ -207,13 +266,13 @@ impl TerminalViewportLayout {
     }
 
     pub fn logical_viewport_point_for_visual(&self, point: Point<usize>) -> Option<Point<usize>> {
-        if point.line >= self.visual_lines {
+        let (visual_strip_index, strip_column) = self.strip_column_at_visual(point.column.0)?;
+        if point.line >= self.visual_strip_line_capacity(visual_strip_index) {
             return None;
         }
 
-        let (visual_strip_index, strip_column) = self.strip_column_at_visual(point.column.0)?;
         let logical_strip_index = self.logical_strip_index_for_visual(visual_strip_index);
-        let line = logical_strip_index * self.visual_lines + point.line;
+        let line = self.logical_strip_start_line(logical_strip_index).saturating_add(point.line);
         let line = line.checked_sub(self.content_line_offset)?;
         if line >= self.logical_lines || strip_column >= self.logical_columns {
             return None;
@@ -244,7 +303,9 @@ impl TerminalViewportLayout {
                 .strip_column_at_visual(visual_point.column.0)
                 .expect("clamped visual point should always land inside a strip cell, not padding");
             let logical_strip_index = self.logical_strip_index_for_visual(visual_strip_index);
-            let display_line = logical_strip_index * self.visual_lines + visual_point.line;
+            let display_line = self
+                .logical_strip_start_line(logical_strip_index)
+                .saturating_add(visual_point.line);
             let clamped_display_line = display_line.clamp(
                 self.content_line_offset,
                 self.content_line_offset + self.visible_logical_lines().saturating_sub(1),
@@ -268,12 +329,13 @@ impl TerminalViewportLayout {
         x: usize,
         y: usize,
     ) -> Option<Point<usize>> {
-        if !size_info.contains_point(x, y) {
+        if !Self::contains_x(size_info, x) {
             return None;
         }
 
         let col = Self::visual_column_from_pixels(size_info, x)?;
-        let line = Self::visual_line_from_pixels(size_info, y)?;
+        let (visual_strip_index, _) = self.strip_column_at_visual(col)?;
+        let line = self.visual_line_from_pixels(size_info, y, visual_strip_index)?;
         Some(Point::new(line, Column(col)))
     }
 
@@ -284,13 +346,19 @@ impl TerminalViewportLayout {
         y: usize,
     ) -> Point<usize> {
         let visual_columns = size_info.columns().saturating_sub(1);
-        let visual_lines = size_info.screen_lines().saturating_sub(1);
         let col = Self::visual_column_from_pixels_clamped(size_info, x);
-        let line = Self::visual_line_from_pixels_clamped(size_info, y);
         let col = min(col, visual_columns);
-        let line = min(line, visual_lines);
         let col = self.clamp_visual_column(col);
+        let (visual_strip_index, _) = self
+            .strip_column_at_visual(col)
+            .expect("clamped visual column should always resolve to a strip");
+        let line = self.visual_line_from_pixels_clamped(size_info, y, visual_strip_index);
         Point::new(line, Column(col))
+    }
+
+    fn contains_x(size_info: &SizeInfo, x: usize) -> bool {
+        x <= (size_info.padding_x() + size_info.columns() as f32 * size_info.cell_width()) as usize
+            && x > size_info.padding_x() as usize
     }
 
     fn visual_column_from_pixels(size_info: &SizeInfo, x: usize) -> Option<usize> {
@@ -300,11 +368,17 @@ impl TerminalViewportLayout {
         Some(min(local_x / cell_width, size_info.columns().saturating_sub(1)))
     }
 
-    fn visual_line_from_pixels(size_info: &SizeInfo, y: usize) -> Option<usize> {
-        let padding_y = size_info.padding_y() as usize;
+    fn visual_line_from_pixels(
+        &self,
+        size_info: &SizeInfo,
+        y: usize,
+        visual_strip_index: usize,
+    ) -> Option<usize> {
+        let padding_y = self.strip_top_padding_px(size_info, visual_strip_index);
         let cell_height = size_info.cell_height() as usize;
         let local_y = y.checked_sub(padding_y + 1)?;
-        Some(min(local_y / cell_height, size_info.screen_lines().saturating_sub(1)))
+        let line = local_y / cell_height;
+        (line < self.visual_strip_line_capacity(visual_strip_index)).then_some(line)
     }
 
     fn visual_column_from_pixels_clamped(size_info: &SizeInfo, x: usize) -> usize {
@@ -314,11 +388,19 @@ impl TerminalViewportLayout {
         min(local_x / cell_width, size_info.columns().saturating_sub(1))
     }
 
-    fn visual_line_from_pixels_clamped(size_info: &SizeInfo, y: usize) -> usize {
-        let padding_y = size_info.padding_y() as usize;
+    fn visual_line_from_pixels_clamped(
+        &self,
+        size_info: &SizeInfo,
+        y: usize,
+        visual_strip_index: usize,
+    ) -> usize {
+        let padding_y = self.strip_top_padding_px(size_info, visual_strip_index);
         let cell_height = size_info.cell_height() as usize;
         let local_y = y.saturating_sub(padding_y);
-        min(local_y / cell_height, size_info.screen_lines().saturating_sub(1))
+        min(
+            local_y / cell_height,
+            self.visual_strip_line_capacity(visual_strip_index).saturating_sub(1),
+        )
     }
 
     fn strip_start_column(&self, strip_index: usize) -> usize {
@@ -344,6 +426,62 @@ impl TerminalViewportLayout {
             MultiColumnOrder::StartLeft => visual_strip_index,
             MultiColumnOrder::EndLeft => self.strip_count - 1 - visual_strip_index,
         }
+    }
+
+    fn total_logical_capacity(&self) -> usize {
+        (0..self.strip_count).map(|strip_index| self.logical_strip_line_capacity(strip_index)).sum()
+    }
+
+    fn logical_strip_for_line(&self, line: usize) -> Option<(usize, usize)> {
+        let mut start_line = 0usize;
+        for logical_strip_index in 0..self.strip_count {
+            let strip_lines = self.logical_strip_line_capacity(logical_strip_index);
+            let end_line = start_line.saturating_add(strip_lines);
+            if line < end_line {
+                return Some((logical_strip_index, line - start_line));
+            }
+            start_line = end_line;
+        }
+
+        None
+    }
+
+    fn logical_strip_start_line(&self, logical_strip_index: usize) -> usize {
+        (0..logical_strip_index).map(|index| self.logical_strip_line_capacity(index)).sum()
+    }
+
+    fn logical_strip_line_capacity(&self, logical_strip_index: usize) -> usize {
+        self.visual_strip_line_capacity(self.visual_strip_index_for_logical(logical_strip_index))
+    }
+
+    fn visual_strip_line_capacity(&self, visual_strip_index: usize) -> usize {
+        self.visual_lines
+            + usize::from(self.visual_strip_y_offset_px(visual_strip_index) > 0)
+                * self.ear_extra_lines
+    }
+
+    fn visual_strip_y_offset_px(&self, visual_strip_index: usize) -> usize {
+        self.ear_aware_regions
+            .filter(|regions| {
+                regions.span_fits_auxiliary_region(
+                    self.strip_start_x_px(visual_strip_index),
+                    self.strip_width_px(),
+                )
+            })
+            .map_or(0, |regions| regions.reclaim_top_px)
+    }
+
+    fn strip_start_x_px(&self, strip_index: usize) -> usize {
+        self.padding_x_px + self.strip_start_column(strip_index) * self.cell_width_px
+    }
+
+    fn strip_width_px(&self) -> usize {
+        self.logical_columns * self.cell_width_px
+    }
+
+    fn strip_top_padding_px(&self, size_info: &SizeInfo, visual_strip_index: usize) -> usize {
+        (size_info.padding_y() as usize)
+            .saturating_sub(self.visual_strip_y_offset_px(visual_strip_index))
     }
 
     fn strip_column_at_visual(&self, visual_column: usize) -> Option<(usize, usize)> {
@@ -425,12 +563,28 @@ mod tests {
         SizeInfo::new(columns as f32, lines as f32, 1., 1., 0., 0., 0., false)
     }
 
+    fn notched_size() -> SizeInfo {
+        SizeInfo::new_with_vertical_padding(300., 120., 10., 20., 0., 0., 40., 0., false)
+    }
+
+    fn ear_regions() -> EarAwareTopRegions {
+        EarAwareTopRegions {
+            reclaim_top_px: 40,
+            left: Some(crate::display::auxiliary_regions::AuxiliaryTopRegion { x: 0, width: 100 }),
+            right: Some(crate::display::auxiliary_regions::AuxiliaryTopRegion {
+                x: 200,
+                width: 100,
+            }),
+        }
+    }
+
     #[test]
     fn multi_column_exact_fit_uses_all_strips() {
         let layout = TerminalViewportLayout::new(
             &size(300, 40),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
 
@@ -446,6 +600,7 @@ mod tests {
             &size(250, 40),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
 
@@ -463,6 +618,7 @@ mod tests {
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
             Some(3),
+            None,
         );
 
         assert_eq!(layout.strip_count(), 3);
@@ -476,6 +632,7 @@ mod tests {
             &size(250, 10),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
         let logical = Point::new(13, Column(7));
@@ -491,6 +648,7 @@ mod tests {
             &size(333, 10),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
 
@@ -509,6 +667,7 @@ mod tests {
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
             None,
+            None,
         );
         let eof = Point::new(11, Column(0));
 
@@ -521,6 +680,7 @@ mod tests {
             &size(300, 4),
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         );
 
@@ -542,6 +702,7 @@ mod tests {
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
             None,
+            None,
         );
 
         assert_eq!(
@@ -559,6 +720,7 @@ mod tests {
             &size_info,
             TerminalViewMode::Normal,
             &MultiColumnTerminalConfig::default(),
+            None,
             None,
         )
         .with_terminal_content(&term);
@@ -581,6 +743,7 @@ mod tests {
                 ..MultiColumnTerminalConfig::default()
             },
             None,
+            None,
         );
         let eof = Point::new(11, Column(0));
 
@@ -594,6 +757,7 @@ mod tests {
             TerminalViewMode::MultiColumn,
             &MultiColumnTerminalConfig::default(),
             None,
+            None,
         );
         let gutter = Point::new(0, Column(102));
 
@@ -601,5 +765,87 @@ mod tests {
         assert_eq!(layout.logical_viewport_point_for_visual(gutter), None);
         assert_eq!(layout.logical_viewport_point_for_visual(Point::new(0, Column(104))), None);
         assert!(layout.logical_viewport_point_for_visual(Point::new(0, Column(105))).is_some());
+    }
+
+    #[test]
+    fn ear_aware_strips_extend_outer_columns_and_roundtrip_pixels() {
+        let size_info = notched_size();
+        let layout = TerminalViewportLayout::new(
+            &size_info,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+            Some(3),
+            Some(ear_regions()),
+        );
+
+        assert_eq!(layout.logical_size(&size_info).columns(), 10);
+        assert_eq!(layout.logical_size(&size_info).screen_lines(), 16);
+        assert_eq!(
+            layout.strip_geometries(),
+            vec![
+                TerminalViewportStripGeometry {
+                    start_column: 0,
+                    column_count: 10,
+                    y_offset_px: 40,
+                    visual_line_count: 6,
+                    logical_start_line: 0,
+                    logical_line_count: 6,
+                },
+                TerminalViewportStripGeometry {
+                    start_column: 10,
+                    column_count: 10,
+                    y_offset_px: 0,
+                    visual_line_count: 4,
+                    logical_start_line: 6,
+                    logical_line_count: 4,
+                },
+                TerminalViewportStripGeometry {
+                    start_column: 20,
+                    column_count: 10,
+                    y_offset_px: 40,
+                    visual_line_count: 6,
+                    logical_start_line: 10,
+                    logical_line_count: 6,
+                },
+            ]
+        );
+        assert_eq!(
+            layout.visual_point_for_logical_viewport(Point::new(13, Column(2))),
+            Some(Point::new(3, Column(22)))
+        );
+        assert_eq!(
+            layout.logical_viewport_point_for_visual(Point::new(3, Column(22))),
+            Some(Point::new(13, Column(2)))
+        );
+        assert!(layout.contains_point(&size_info, 5, 5));
+        assert!(!layout.contains_point(&size_info, 105, 5));
+        assert_eq!(
+            layout.logical_terminal_point_from_pixels_clamped(&size_info, 5, 5, 0),
+            Point::new(Line(0), Column(0)),
+        );
+    }
+
+    #[test]
+    fn ear_aware_strip_geometry_preserves_end_left_logical_order() {
+        let size_info = notched_size();
+        let layout = TerminalViewportLayout::new(
+            &size_info,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig {
+                order: MultiColumnOrder::EndLeft,
+                ..MultiColumnTerminalConfig::default()
+            },
+            Some(3),
+            Some(ear_regions()),
+        );
+
+        let strips = layout.strip_geometries();
+        assert_eq!(strips[0].logical_start_line, 10);
+        assert_eq!(strips[1].logical_start_line, 6);
+        assert_eq!(strips[2].logical_start_line, 0);
+        assert_eq!(
+            layout.visual_point_for_logical_viewport(Point::new(0, Column(0))),
+            Some(Point::new(0, Column(20)))
+        );
     }
 }

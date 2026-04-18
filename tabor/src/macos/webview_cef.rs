@@ -460,7 +460,7 @@ fn browser_device_scale_factor(scale_factor: f64) -> f32 {
 }
 
 fn browser_screen_point(
-    layout: BrowserViewportLayout,
+    layout: &BrowserViewportLayout,
     screen_rect: cef::Rect,
     view_x: i32,
     view_y: i32,
@@ -475,7 +475,7 @@ fn browser_screen_point(
     ))
 }
 
-fn scaled_browser_wheel_delta_y(layout: BrowserViewportLayout, delta_y: f64) -> f64 {
+fn scaled_browser_wheel_delta_y(layout: &BrowserViewportLayout, delta_y: f64) -> f64 {
     delta_y * layout.column_count().max(1) as f64
 }
 
@@ -837,7 +837,7 @@ cef::wrap_render_handler! {
             let paint_state = self.paint_state.borrow();
             let Some((mapped_x, mapped_y)) =
                 browser_screen_point(
-                    paint_state.layout,
+                    &paint_state.layout,
                     paint_state.screen_rect.clone(),
                     view_x,
                     view_y,
@@ -1481,7 +1481,7 @@ impl WebView {
 
         let result = (|| {
             let parent = ns_view(window)?;
-            let screen_rect = cef_screen_rect(window, layout);
+            let screen_rect = cef_screen_rect(window, &layout);
             let paint_state =
                 StdRc::new(RefCell::new(PaintState::new(layout, screen_rect, window.scale_factor)));
             let render_handler = TaborRenderHandler::new(
@@ -1627,7 +1627,7 @@ impl WebView {
         layout: BrowserViewportLayout,
     ) {
         {
-            let screen_rect = cef_screen_rect(window, layout);
+            let screen_rect = cef_screen_rect(window, &layout);
             let mut paint_state = self.paint_state.borrow_mut();
             paint_state.update_geometry(layout, screen_rect, window.scale_factor);
         }
@@ -1779,8 +1779,10 @@ impl WebView {
             return false;
         };
 
-        let layout = self.paint_state.borrow().layout;
-        let scaled_delta_y = scaled_browser_wheel_delta_y(layout, delta_y);
+        let scaled_delta_y = {
+            let paint_state = self.paint_state.borrow();
+            scaled_browser_wheel_delta_y(&paint_state.layout, delta_y)
+        };
 
         self.last_mouse_event = Some(event.clone());
         host.send_mouse_wheel_event(
@@ -2368,8 +2370,10 @@ impl WebView {
         let scale_factor = window.scale_factor.max(f64::MIN_POSITIVE);
         let x = (position.x / scale_factor).floor().max(0.0) as usize;
         let y = (position.y / scale_factor).floor().max(0.0) as usize;
-        let layout = self.paint_state.borrow().layout;
-        let (logical_x, logical_y) = layout.logical_point_for_visual(x, y)?;
+        let (logical_x, logical_y) = {
+            let paint_state = self.paint_state.borrow();
+            paint_state.layout.logical_point_for_visual(x, y)?
+        };
 
         Some(cef::MouseEvent {
             x: logical_x as i32,
@@ -2799,7 +2803,7 @@ fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
     }
 }
 
-fn cef_screen_rect(window: &Window, layout: BrowserViewportLayout) -> cef::Rect {
+fn cef_screen_rect(window: &Window, layout: &BrowserViewportLayout) -> cef::Rect {
     let layout_viewport = layout.viewport();
     let fallback = cef::Rect {
         x: layout_viewport.x as i32,
@@ -2949,7 +2953,7 @@ mod tests {
             900,
         );
         let mut paint_state =
-            PaintState::new(layout, cef::Rect { x: 0, y: 0, width: 900, height: 600 }, 2.0);
+            PaintState::new(layout.clone(), cef::Rect { x: 0, y: 0, width: 900, height: 600 }, 2.0);
         assert_eq!(paint_state.scale_factor, 2.0);
 
         paint_state.update_geometry(
@@ -2974,7 +2978,7 @@ mod tests {
             },
             900,
         );
-        assert_eq!(scaled_browser_wheel_delta_y(normal, 48.0), 48.0);
+        assert_eq!(scaled_browser_wheel_delta_y(&normal, 48.0), 48.0);
 
         let folded = crate::display::browser_layout::BrowserViewportLayout::new(
             &crate::display::SizeInfo::new(1100.0, 708.0, 1.0, 1.0, 0.0, 0.0, 0.0, false),
@@ -2982,9 +2986,10 @@ mod tests {
             crate::display::browser_layout::BrowserViewMode::MultiColumn,
             &crate::config::browser::MultiColumnBrowserConfig { target_width_px: 400 },
             None,
+            None,
         );
         assert_eq!(folded.column_count(), 2);
-        assert_eq!(scaled_browser_wheel_delta_y(folded, 48.0), 96.0);
+        assert_eq!(scaled_browser_wheel_delta_y(&folded, 48.0), 96.0);
     }
 
     #[test]
@@ -2995,11 +3000,12 @@ mod tests {
             crate::display::browser_layout::BrowserViewMode::MultiColumn,
             &crate::config::browser::MultiColumnBrowserConfig::default(),
             None,
+            None,
         );
         let screen_rect = cef::Rect { x: 500, y: 200, width: 1950, height: 600 };
 
         assert_eq!(folded.column_count(), 2);
-        assert_eq!(browser_screen_point(folded, screen_rect, 17, 745), Some((1492, 345)));
+        assert_eq!(browser_screen_point(&folded, screen_rect, 17, 745), Some((1492, 345)));
     }
 
     #[test]

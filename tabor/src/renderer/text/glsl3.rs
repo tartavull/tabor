@@ -126,6 +126,9 @@ impl Glsl3Renderer {
             // Background color.
             add_attr!(4, gl::UNSIGNED_BYTE, u8);
 
+            // Per-cell vertical offset for mixed-height folded strips.
+            add_attr!(1, gl::SHORT, i16);
+
             // Cleanup.
             gl::BindVertexArray(0);
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
@@ -315,6 +318,9 @@ struct InstanceData {
     bg_g: u8,
     bg_b: u8,
     bg_a: u8,
+
+    // Per-cell vertical offset in pixels.
+    y_offset: i16,
 }
 
 #[derive(Debug, Default)]
@@ -371,6 +377,7 @@ impl TextRenderBatch for Batch {
             bg_g: cell.bg.g,
             bg_b: cell.bg.b,
             bg_a: (cell.bg_alpha * 255.0) as u8,
+            y_offset: cell.y_offset_px,
         });
     }
 }
