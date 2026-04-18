@@ -618,6 +618,53 @@ impl<T> Term<T> {
         res.strip_suffix('\n').map(str::to_owned).unwrap_or(res)
     }
 
+    /// Export the most recent logical terminal lines as plain text.
+    pub fn export_preview_lines(&self, max_lines: usize) -> Vec<String> {
+        if max_lines == 0 {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        let mut logical_line = String::new();
+        for line in (self.topmost_line().0..=self.bottommost_line().0).map(Line::from) {
+            let text = self.line_to_string(line, Column(0)..self.last_column(), true);
+            if let Some(stripped) = text.strip_suffix('\n') {
+                logical_line.push_str(stripped);
+                lines.push(std::mem::take(&mut logical_line));
+            } else {
+                logical_line.push_str(&text);
+            }
+        }
+
+        if !logical_line.is_empty() {
+            lines.push(logical_line);
+        }
+
+        while matches!(lines.last(), Some(line) if line.is_empty()) {
+            lines.pop();
+        }
+
+        if lines.len() > max_lines {
+            lines.drain(..lines.len() - max_lines);
+        }
+
+        lines
+    }
+
+    /// Paint preview lines into a fresh terminal before the PTY is attached.
+    pub fn apply_preview_lines(&mut self, lines: &[String])
+    where
+        T: EventListener,
+    {
+        let mut parser: ansi::Processor = Default::default();
+        for (index, line) in lines.iter().enumerate() {
+            parser.advance(self, line.as_bytes());
+            if index + 1 != lines.len() {
+                parser.advance(self, b"\r\n");
+            }
+        }
+    }
+
     /// Convert a single line in the grid to a String.
     fn line_to_string(
         &self,
@@ -2857,6 +2904,34 @@ mod tests {
         restored.apply_snapshot(decoded);
 
         assert_eq!(restored.export_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn export_preview_lines_returns_recent_logical_lines() {
+        let size = TermSize::new(4, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.apply_preview_lines(&[
+            String::from("one"),
+            String::from("twolong"),
+            String::from("three"),
+            String::from("four"),
+        ]);
+
+        assert_eq!(
+            term.export_preview_lines(3),
+            vec![String::from("twolong"), String::from("three"), String::from("four")]
+        );
+    }
+
+    #[test]
+    fn apply_preview_lines_replays_recent_output() {
+        let size = TermSize::new(8, 4);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let lines = vec![String::from("alpha"), String::new(), String::from("gamma")];
+
+        term.apply_preview_lines(&lines);
+
+        assert_eq!(term.export_preview_lines(3), lines);
     }
 
     #[test]

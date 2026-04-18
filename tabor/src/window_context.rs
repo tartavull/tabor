@@ -307,7 +307,7 @@ enum TerminalSpawnMode {
 struct RestoredTerminalSpawn {
     terminal_id: u64,
     launch_options: tty::Options,
-    snapshot: Option<tabor_terminal::term::TermSnapshot>,
+    preview_lines: Option<Vec<String>>,
     title: Option<String>,
     working_directory: Option<PathBuf>,
 }
@@ -2062,7 +2062,7 @@ impl WindowContext {
                         let RestoredTerminalSpawn {
                             terminal_id,
                             mut launch_options,
-                            snapshot,
+                            preview_lines,
                             title,
                             working_directory,
                         } = *restored;
@@ -2070,8 +2070,8 @@ impl WindowContext {
                             launch_options.working_directory = Some(working_directory);
                         }
                         let restored_title = title.unwrap_or_else(|| default_title.clone());
-                        if let Some(snapshot) = snapshot {
-                            terminal.lock().apply_snapshot(snapshot);
+                        if let Some(preview_lines) = preview_lines {
+                            terminal.lock().apply_preview_lines(&preview_lines);
                         }
                         let (program_name, notifier, terminal_runtime) =
                             spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
@@ -2946,10 +2946,11 @@ impl WindowContext {
                             {
                                 pty_config.working_directory = Some(working_directory);
                             }
-                            let snapshot = restored_terminal
+                            let preview_lines = restored_terminal
                                 .as_ref()
                                 .and_then(|terminal| {
-                                    workspace::load_terminal_snapshot(*terminal_id, terminal).ok()
+                                    workspace::load_terminal_preview_lines(*terminal_id, terminal)
+                                        .ok()
                                 })
                                 .flatten();
                             let terminal_spawn_mode = Some(TerminalSpawnMode::RestoredLocalShell(
@@ -2959,7 +2960,7 @@ impl WindowContext {
                                         .as_ref()
                                         .map(|terminal| terminal.launch_options.clone())
                                         .unwrap_or_else(|| launch_options.clone()),
-                                    snapshot,
+                                    preview_lines,
                                     title: restored_terminal
                                         .as_ref()
                                         .and_then(|terminal| terminal.title.clone()),

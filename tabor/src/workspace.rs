@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
-use std::io::{BufReader, Error as IoError, ErrorKind, Read, Write};
+use std::io::{BufReader, Error as IoError, ErrorKind, Read};
 #[cfg(not(windows))]
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
@@ -28,12 +27,15 @@ use crate::macos;
 pub(crate) const WORKSPACE_PROTOCOL_VERSION: u32 = 1;
 
 const PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const CHECKPOINT_IDLE_DEBOUNCE: Duration = Duration::from_millis(400);
-const MAX_JOURNAL_BYTES_BEFORE_CHECKPOINT: u64 = 128 * 1024;
+const PREVIEW_IDLE_DEBOUNCE: Duration = Duration::from_secs(2);
+const MAX_PENDING_PREVIEW_BYTES_BEFORE_FLUSH: u64 = 16 * 1024;
+const MAX_PERSISTED_PREVIEW_LINES: usize = 50;
+const TERMINAL_PREVIEW_VERSION: u32 = 1;
 const JOURNAL_RECORD_OUTPUT: u8 = 1;
 const JOURNAL_RECORD_RESIZE: u8 = 2;
 const STATE_FILE_NAME: &str = "workspace-state.json";
 const LEGACY_STATE_FILE_NAME: &str = "workspace-broker-state.json";
+const PREVIEW_FILE_NAME: &str = "preview.json";
 
 static PERSISTENCE_WORKER: LazyLock<Mutex<Option<PersistenceWorker>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -120,7 +122,6 @@ pub(crate) struct WorkspaceLayout {
 pub(crate) struct TerminalOutputObserver {
     terminal_id: u64,
     sender: Sender<PersistenceCommand>,
-    sequence: Arc<AtomicU64>,
 }
 
 impl TerminalOutputObserver {
@@ -129,10 +130,8 @@ impl TerminalOutputObserver {
             return;
         }
 
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let _ = self.sender.send(PersistenceCommand::Output {
             terminal_id: self.terminal_id,
-            sequence,
             bytes: bytes.to_vec(),
         });
     }
@@ -146,8 +145,14 @@ struct PersistedWorkspaceState {
 
 struct PersistenceWorker {
     sender: Sender<PersistenceCommand>,
-    sequence: Arc<AtomicU64>,
     join: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TerminalPreview {
+    version: u32,
+    #[serde(default)]
+    lines: Vec<String>,
 }
 
 pub(crate) struct LiveTerminalRegistration {
@@ -170,7 +175,7 @@ struct LiveTerminalState {
     master_fd: RawFd,
     #[cfg(not(windows))]
     shell_pid: u32,
-    journal_bytes: u64,
+    pending_output_bytes: u64,
     dirty: bool,
     last_activity: Instant,
 }
@@ -190,14 +195,10 @@ enum PersistenceCommand {
     },
     Output {
         terminal_id: u64,
-        sequence: u64,
         bytes: Vec<u8>,
     },
     Resize {
         terminal_id: u64,
-        sequence: u64,
-        columns: u32,
-        lines: u32,
     },
     Metadata {
         terminal_id: u64,
@@ -253,7 +254,7 @@ pub(crate) fn register_live_terminal(
         shell_pid,
     } = registration;
 
-    let (sender, sequence) = ensure_persistence_worker()?;
+    let sender = ensure_persistence_worker()?;
     sender.send(PersistenceCommand::Register {
         terminal_id,
         terminal,
@@ -266,21 +267,15 @@ pub(crate) fn register_live_terminal(
         #[cfg(not(windows))]
         shell_pid,
     })?;
-    Ok(TerminalOutputObserver { terminal_id, sender, sequence })
+    Ok(TerminalOutputObserver { terminal_id, sender })
 }
 
-pub(crate) fn record_terminal_resize(terminal_id: u64, window_size: WindowSize) {
-    let Some((sender, sequence)) = persistence_sender() else {
+pub(crate) fn record_terminal_resize(terminal_id: u64, _window_size: WindowSize) {
+    let Some(sender) = persistence_sender() else {
         return;
     };
 
-    let sequence = sequence.fetch_add(1, Ordering::Relaxed);
-    let _ = sender.send(PersistenceCommand::Resize {
-        terminal_id,
-        sequence,
-        columns: u32::from(window_size.num_cols),
-        lines: u32::from(window_size.num_lines),
-    });
+    let _ = sender.send(PersistenceCommand::Resize { terminal_id });
 }
 
 pub(crate) fn update_terminal_metadata(
@@ -291,7 +286,7 @@ pub(crate) fn update_terminal_metadata(
     exit_code: Option<i32>,
     clean_exit: Option<bool>,
 ) {
-    if let Some((sender, _)) = persistence_sender() {
+    if let Some(sender) = persistence_sender() {
         let _ = sender.send(PersistenceCommand::Metadata {
             terminal_id,
             title,
@@ -314,14 +309,14 @@ pub(crate) fn update_terminal_metadata(
 }
 
 pub(crate) fn checkpoint_terminal(terminal_id: u64, force: bool) {
-    let Some((sender, _)) = persistence_sender() else {
+    let Some(sender) = persistence_sender() else {
         return;
     };
     let _ = sender.send(PersistenceCommand::Checkpoint { terminal_id, force });
 }
 
 pub(crate) fn remove_terminal(terminal_id: u64) -> Result<(), Box<dyn Error>> {
-    if let Some((sender, _)) = persistence_sender() {
+    if let Some(sender) = persistence_sender() {
         sender.send(PersistenceCommand::Remove { terminal_id })?;
         return Ok(());
     }
@@ -361,7 +356,24 @@ pub(crate) fn load_persisted_terminals()
     Ok(state.terminals.into_iter().map(|terminal| (terminal.id, terminal)).collect())
 }
 
-pub(crate) fn load_terminal_snapshot(
+pub(crate) fn load_terminal_preview_lines(
+    terminal_id: u64,
+    state: &PersistedTerminalState,
+) -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    if let Some(lines) = load_preview_lines_file(terminal_id)? {
+        return Ok(Some(lines));
+    }
+
+    if let Some(snapshot) = load_legacy_terminal_snapshot(terminal_id, state)? {
+        let lines = legacy_snapshot_to_preview_lines(snapshot);
+        write_terminal_preview_lines(terminal_id, &lines)?;
+        return Ok(Some(lines));
+    }
+
+    Ok(None)
+}
+
+fn load_legacy_terminal_snapshot(
     terminal_id: u64,
     state: &PersistedTerminalState,
 ) -> Result<Option<TermSnapshot>, Box<dyn Error>> {
@@ -377,6 +389,30 @@ pub(crate) fn load_terminal_snapshot(
     }
 
     Ok(None)
+}
+
+fn load_preview_lines_file(terminal_id: u64) -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    match fs::read(preview_file(terminal_id)) {
+        Ok(bytes) => {
+            let mut preview: TerminalPreview = serde_json::from_slice(&bytes)?;
+            if preview.lines.len() > MAX_PERSISTED_PREVIEW_LINES {
+                preview.lines.drain(..preview.lines.len() - MAX_PERSISTED_PREVIEW_LINES);
+            }
+            Ok((!preview.lines.is_empty()).then_some(preview.lines))
+        },
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn legacy_snapshot_to_preview_lines(snapshot: TermSnapshot) -> Vec<String> {
+    let mut terminal = Term::new(
+        Default::default(),
+        &TermSize::new(snapshot.grid.columns(), snapshot.grid.screen_lines()),
+        VoidListener,
+    );
+    terminal.apply_snapshot(snapshot);
+    terminal.export_preview_lines(MAX_PERSISTED_PREVIEW_LINES)
 }
 
 pub(crate) fn allocate_terminal_id() -> Result<u64, Box<dyn Error>> {
@@ -402,25 +438,22 @@ pub(crate) fn status() -> Result<WorkspaceStatus, Box<dyn Error>> {
     Ok(WorkspaceStatus { terminals })
 }
 
-fn ensure_persistence_worker()
--> Result<(Sender<PersistenceCommand>, Arc<AtomicU64>), Box<dyn Error>> {
+fn ensure_persistence_worker() -> Result<Sender<PersistenceCommand>, Box<dyn Error>> {
     let mut worker = PERSISTENCE_WORKER.lock().expect("persistence worker lock poisoned");
     if let Some(worker) = worker.as_ref() {
-        return Ok((worker.sender.clone(), Arc::clone(&worker.sequence)));
+        return Ok(worker.sender.clone());
     }
 
     let (sender, receiver) = mpsc::channel();
-    let sequence = Arc::new(AtomicU64::new(1));
     let join = thread::spawn(move || persistence_loop(receiver));
-    *worker =
-        Some(PersistenceWorker { sender: sender.clone(), sequence: Arc::clone(&sequence), join });
-    Ok((sender, sequence))
+    *worker = Some(PersistenceWorker { sender: sender.clone(), join });
+    Ok(sender)
 }
 
-fn persistence_sender() -> Option<(Sender<PersistenceCommand>, Arc<AtomicU64>)> {
+fn persistence_sender() -> Option<Sender<PersistenceCommand>> {
     let worker = PERSISTENCE_WORKER.lock().ok()?;
     let worker = worker.as_ref()?;
-    Some((worker.sender.clone(), Arc::clone(&worker.sequence)))
+    Some(worker.sender.clone())
 }
 
 fn shutdown_persistence_worker(clear_persisted: bool) -> Result<(), Box<dyn Error>> {
@@ -477,46 +510,29 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
                             master_fd,
                             #[cfg(not(windows))]
                             shell_pid,
-                            journal_bytes: journal_file(terminal_id)
-                                .metadata()
-                                .map(|meta| meta.len())
-                                .unwrap_or(0),
-                            dirty: true,
-                            last_activity: Instant::now()
-                                .checked_sub(CHECKPOINT_IDLE_DEBOUNCE)
-                                .unwrap_or_else(Instant::now),
+                            pending_output_bytes: 0,
+                            dirty: false,
+                            last_activity: Instant::now(),
                         },
                     );
                     upsert_terminal_state(&mut state, metadata);
                     state_dirty = true;
-                    let _ = checkpoint_live_terminal(
-                        live.get_mut(&terminal_id).expect("live terminal exists"),
-                        true,
-                    );
                 },
-                PersistenceCommand::Output { terminal_id, sequence, bytes } => {
+                PersistenceCommand::Output { terminal_id, bytes, .. } => {
                     let Some(live_terminal) = live.get_mut(&terminal_id) else {
                         continue;
                     };
-                    if append_output_record(terminal_id, sequence, &bytes).is_ok() {
-                        live_terminal.journal_bytes =
-                            live_terminal.journal_bytes.saturating_add(bytes.len() as u64);
-                        live_terminal.dirty = true;
-                        live_terminal.last_activity = Instant::now();
-                    }
+                    live_terminal.pending_output_bytes =
+                        live_terminal.pending_output_bytes.saturating_add(bytes.len() as u64);
+                    live_terminal.dirty = true;
+                    live_terminal.last_activity = Instant::now();
                 },
-                PersistenceCommand::Resize { terminal_id, sequence, columns, lines } => {
+                PersistenceCommand::Resize { terminal_id, .. } => {
                     let Some(live_terminal) = live.get_mut(&terminal_id) else {
                         continue;
                     };
-                    if append_resize_record(terminal_id, sequence, columns, lines).is_ok() {
-                        live_terminal.journal_bytes = live_terminal.journal_bytes.saturating_add(
-                            (1 + std::mem::size_of::<u64>() + 2 * std::mem::size_of::<u32>())
-                                as u64,
-                        );
-                        live_terminal.dirty = true;
-                        live_terminal.last_activity = Instant::now();
-                    }
+                    live_terminal.dirty = true;
+                    live_terminal.last_activity = Instant::now();
                 },
                 PersistenceCommand::Metadata {
                     terminal_id,
@@ -551,7 +567,7 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
                 },
                 PersistenceCommand::Checkpoint { terminal_id, force } => {
                     if let Some(live_terminal) = live.get_mut(&terminal_id) {
-                        if checkpoint_live_terminal(live_terminal, force).is_ok() {
+                        if flush_terminal_preview(live_terminal, force).is_ok() {
                             upsert_terminal_state(&mut state, live_terminal.metadata.clone());
                             state_dirty = true;
                         }
@@ -566,7 +582,7 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
                 PersistenceCommand::Shutdown { clear_persisted: clear } => {
                     clear_persisted = clear;
                     for terminal in live.values_mut() {
-                        let _ = checkpoint_live_terminal(terminal, true);
+                        let _ = flush_terminal_preview(terminal, true);
                         upsert_terminal_state(&mut state, terminal.metadata.clone());
                     }
                     break;
@@ -580,12 +596,12 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
             if !terminal.dirty {
                 continue;
             }
-            if terminal.journal_bytes < MAX_JOURNAL_BYTES_BEFORE_CHECKPOINT
-                && terminal.last_activity.elapsed() < CHECKPOINT_IDLE_DEBOUNCE
+            if terminal.pending_output_bytes < MAX_PENDING_PREVIEW_BYTES_BEFORE_FLUSH
+                && terminal.last_activity.elapsed() < PREVIEW_IDLE_DEBOUNCE
             {
                 continue;
             }
-            if checkpoint_live_terminal(terminal, false).is_ok() {
+            if flush_terminal_preview(terminal, false).is_ok() {
                 upsert_terminal_state(&mut state, terminal.metadata.clone());
                 state_dirty = true;
             }
@@ -606,7 +622,7 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
     }
 }
 
-fn checkpoint_live_terminal(
+fn flush_terminal_preview(
     terminal: &mut LiveTerminalState,
     force: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -617,18 +633,17 @@ fn checkpoint_live_terminal(
     #[cfg(not(windows))]
     refresh_live_terminal_metadata(terminal);
 
-    let snapshot = if force {
-        terminal.terminal.lock().export_snapshot()
+    let preview_lines = if force {
+        terminal.terminal.lock().export_preview_lines(MAX_PERSISTED_PREVIEW_LINES)
     } else {
         let Some(terminal_guard) = terminal.terminal.try_lock_unfair() else {
             return Err("terminal busy".into());
         };
-        terminal_guard.export_snapshot()
+        terminal_guard.export_preview_lines(MAX_PERSISTED_PREVIEW_LINES)
     };
 
-    write_json_atomic(&checkpoint_file(terminal.metadata.id), &snapshot)?;
-    fs::write(journal_file(terminal.metadata.id), [])?;
-    terminal.journal_bytes = 0;
+    write_terminal_preview_lines(terminal.metadata.id, &preview_lines)?;
+    terminal.pending_output_bytes = 0;
     terminal.dirty = false;
     terminal.metadata.snapshot = None;
     Ok(())
@@ -805,36 +820,20 @@ fn load_journal_records(terminal_id: u64) -> Result<Vec<JournalRecord>, Box<dyn 
     Ok(records)
 }
 
-fn append_output_record(
+fn write_terminal_preview_lines(
     terminal_id: u64,
-    sequence: u64,
-    bytes: &[u8],
+    preview_lines: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    let path = journal_file(terminal_id);
-    ensure_parent_dir(&path)?;
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&[JOURNAL_RECORD_OUTPUT])?;
-    file.write_all(&sequence.to_le_bytes())?;
-    file.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    Ok(())
-}
-
-fn append_resize_record(
-    terminal_id: u64,
-    sequence: u64,
-    columns: u32,
-    lines: u32,
-) -> Result<(), Box<dyn Error>> {
-    let path = journal_file(terminal_id);
-    ensure_parent_dir(&path)?;
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&[JOURNAL_RECORD_RESIZE])?;
-    file.write_all(&sequence.to_le_bytes())?;
-    file.write_all(&columns.to_le_bytes())?;
-    file.write_all(&lines.to_le_bytes())?;
-    file.flush()?;
+    let path = preview_file(terminal_id);
+    if preview_lines.is_empty() {
+        let _ = fs::remove_file(&path);
+    } else {
+        let preview =
+            TerminalPreview { version: TERMINAL_PREVIEW_VERSION, lines: preview_lines.to_vec() };
+        write_json_atomic_compact(&path, &preview)?;
+    }
+    let _ = fs::remove_file(checkpoint_file(terminal_id));
+    let _ = fs::remove_file(journal_file(terminal_id));
     Ok(())
 }
 
@@ -882,6 +881,14 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn
     Ok(())
 }
 
+fn write_json_atomic_compact<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>> {
+    ensure_parent_dir(path)?;
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, serde_json::to_vec(value)?)?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn Error>> {
     let parent =
         path.parent().ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "path has no parent"))?;
@@ -895,6 +902,10 @@ fn checkpoint_file(terminal_id: u64) -> PathBuf {
 
 fn journal_file(terminal_id: u64) -> PathBuf {
     terminal_dir(terminal_id).join("journal.bin")
+}
+
+fn preview_file(terminal_id: u64) -> PathBuf {
+    terminal_dir(terminal_id).join(PREVIEW_FILE_NAME)
 }
 
 fn terminal_dir(terminal_id: u64) -> PathBuf {
@@ -1002,9 +1013,14 @@ mod tests {
     }
 
     #[test]
-    fn load_terminal_snapshot_returns_inline_snapshot_when_no_checkpoint_exists() {
-        let snapshot =
-            Term::new(Default::default(), &TermSize::new(4, 2), VoidListener).export_snapshot();
+    fn load_terminal_preview_lines_returns_inline_snapshot_preview_when_no_preview_exists() {
+        let mut terminal = Term::new(Default::default(), &TermSize::new(8, 3), VoidListener);
+        terminal.apply_preview_lines(&[
+            String::from("alpha"),
+            String::from("beta"),
+            String::from("gamma"),
+        ]);
+        let snapshot = terminal.export_snapshot();
         let state = PersistedTerminalState {
             id: 77,
             launch_options: tty::Options::default(),
@@ -1013,11 +1029,106 @@ mod tests {
             working_directory: None,
             exit_code: None,
             clean_exit: false,
-            snapshot: Some(snapshot.clone()),
+            snapshot: Some(snapshot),
         };
 
-        let restored = load_terminal_snapshot(77, &state).expect("load snapshot");
-        assert_eq!(restored, Some(snapshot));
+        let restored = load_terminal_preview_lines(77, &state).expect("load preview");
+        assert_eq!(
+            restored,
+            Some(vec![String::from("alpha"), String::from("beta"), String::from("gamma")])
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_terminal_preview_lines_migrates_legacy_checkpoint_files() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let tempdir = tempdir().expect("tempdir");
+        let home_dir = tempdir.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+
+        let mut terminal = Term::new(Default::default(), &TermSize::new(8, 3), VoidListener);
+        terminal.apply_preview_lines(&[
+            String::from("legacy"),
+            String::from("preview"),
+            String::from("lines"),
+        ]);
+        let snapshot = terminal.export_snapshot();
+
+        std::fs::create_dir_all(terminal_dir(7)).expect("create terminal dir");
+        std::fs::write(
+            checkpoint_file(7),
+            serde_json::to_vec(&snapshot).expect("serialize checkpoint snapshot"),
+        )
+        .expect("write legacy checkpoint");
+        std::fs::write(journal_file(7), []).expect("write empty legacy journal");
+
+        let state = PersistedTerminalState {
+            id: 7,
+            launch_options: tty::Options::default(),
+            title: Some(String::from("shell")),
+            program_name: String::from("shell"),
+            working_directory: None,
+            exit_code: None,
+            clean_exit: false,
+            snapshot: None,
+        };
+
+        let restored = load_terminal_preview_lines(7, &state).expect("load migrated preview");
+
+        assert_eq!(
+            restored,
+            Some(vec![String::from("legacy"), String::from("preview"), String::from("lines"),])
+        );
+        assert_eq!(load_preview_lines_file(7).expect("load migrated preview file"), restored);
+        assert!(!checkpoint_file(7).exists());
+        assert!(!journal_file(7).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_terminal_preview_lines_roundtrips_and_cleans_legacy_files() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let tempdir = tempdir().expect("tempdir");
+        let home_dir = tempdir.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+
+        std::fs::create_dir_all(terminal_dir(7)).expect("create terminal dir");
+        std::fs::write(checkpoint_file(7), br#"{"legacy":true}"#).expect("write legacy checkpoint");
+        std::fs::write(journal_file(7), b"legacy").expect("write legacy journal");
+
+        let preview_lines = vec![String::from("recent"), String::from("output")];
+        write_terminal_preview_lines(7, &preview_lines).expect("write preview");
+
+        assert_eq!(load_preview_lines_file(7).expect("load preview"), Some(preview_lines));
+        assert!(!checkpoint_file(7).exists());
+        assert!(!journal_file(7).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_terminal_preview_lines_removes_empty_preview_file() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let tempdir = tempdir().expect("tempdir");
+        let home_dir = tempdir.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+
+        write_terminal_preview_lines(11, &[String::from("recent")]).expect("seed preview");
+        assert!(preview_file(11).exists());
+
+        write_terminal_preview_lines(11, &[]).expect("remove preview");
+
+        assert_eq!(load_preview_lines_file(11).expect("load preview"), None);
+        assert!(!preview_file(11).exists());
     }
 
     #[cfg(target_os = "macos")]
