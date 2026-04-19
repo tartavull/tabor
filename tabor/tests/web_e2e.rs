@@ -1885,7 +1885,7 @@ fn agent_artifacts_smoke() {
 }
 
 #[test]
-fn macos_opened_pdf_document_appears_as_web_tab_without_download() {
+fn macos_opened_pdf_document_appears_as_native_pdf_tab() {
     let harness = TaborHarness::start_foreground_app_bundle(false);
     let fixture = fixture_url();
 
@@ -1913,27 +1913,36 @@ fn macos_opened_pdf_document_appears_as_web_tab_without_download() {
     harness.open_file_with_app_bundle(&pdf_path);
 
     let active_pdf_tab =
-        wait_for_active_web_url_value(&harness, expected_url.as_str(), Duration::from_secs(8))
+        wait_for_active_pdf_source_value(&harness, expected_url.as_str(), Duration::from_secs(8))
             .unwrap_or_else(|| panic!("timed out waiting for active PDF tab at {expected_url}"));
+    assert!(
+        active_pdf_tab.get("browser_layout").is_none(),
+        "expected native PDF tab to avoid browser layout: {active_pdf_tab}"
+    );
     let pdf_tab_id = tab_id_pair(&active_pdf_tab)
         .unwrap_or_else(|| panic!("missing tab id for active PDF tab: {active_pdf_tab}"));
     let pdf_tab_id_arg = format!("{}:{}", pdf_tab_id.0, pdf_tab_id.1);
-    let _ = wait_for_tab_acceleration_settled(
+    let pdf_view = wait_for_tab_pdf_view_where(
         &harness,
         pdf_tab_id_arg.as_str(),
         Duration::from_secs(8),
+        |view| {
+            view.get("state").and_then(Value::as_str) == Some("ready")
+                && view.get("source").and_then(Value::as_str) == Some(expected_url.as_str())
+                && view.get("page_count").and_then(Value::as_u64).is_some_and(|count| count > 0)
+                && view.get("current_page").and_then(Value::as_u64) == Some(1)
+        },
     )
-    .unwrap_or_else(|| panic!("timed out waiting for PDF tab acceleration to settle"));
+    .unwrap_or_else(|| panic!("timed out waiting for ready PDF view at {expected_url}"));
+    assert_eq!(pdf_view.get("zoom_mode").and_then(Value::as_str), Some("fit_width"));
 
     harness.run_json(["agent", "use", "--active"]);
-    let downloads = harness.run_json(["agent", "downloads"]);
-    let download_entries = downloads
-        .get("downloads")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("missing downloads array: {downloads}"));
+    let downloads_error = harness
+        .run_checked(["agent", "downloads"])
+        .expect_err("expected PDF tab agent downloads to be rejected");
     assert!(
-        download_entries.is_empty(),
-        "expected opened PDF tab to avoid tracked downloads: {downloads}"
+        downloads_error.contains("Tab is not a web tab"),
+        "unexpected agent downloads error for PDF tab: {downloads_error}"
     );
 }
 
@@ -3300,6 +3309,13 @@ fn tab_image_source(tab: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn tab_pdf_source(tab: &Value) -> Option<&str> {
+    tab.get("kind")
+        .and_then(|value| value.get("pdf"))
+        .and_then(|value| value.get("source"))
+        .and_then(Value::as_str)
+}
+
 fn wait_for_active_web_url_value(
     harness: &TaborHarness,
     expected: &str,
@@ -3340,6 +3356,26 @@ fn wait_for_active_image_source_value(
     None
 }
 
+fn wait_for_active_pdf_source_value(
+    harness: &TaborHarness,
+    expected: &str,
+    timeout: Duration,
+) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        if let Some(active) = active_tab(&tabs)
+            .filter(|tab| tab_kind_is(tab, "pdf") && tab_pdf_source(tab) == Some(expected))
+        {
+            return Some(active.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
 fn wait_for_active_browser_layout_where<F>(
     harness: &TaborHarness,
     timeout: Duration,
@@ -3371,6 +3407,10 @@ fn tab_browser_layout(state: &Value) -> Option<&Value> {
 
 fn tab_image_view(state: &Value) -> Option<&Value> {
     state.get("tab").and_then(|tab| tab.get("image_view"))
+}
+
+fn tab_pdf_view(state: &Value) -> Option<&Value> {
+    state.get("tab").and_then(|tab| tab.get("pdf_view"))
 }
 
 fn browser_layout_acceleration_state(layout: &Value) -> Option<&str> {
@@ -3424,6 +3464,28 @@ where
         let state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg]);
         if let Some(image_view) = tab_image_view(&state).filter(|view| predicate(view)) {
             return Some(image_view.clone());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    None
+}
+
+fn wait_for_tab_pdf_view_where<F>(
+    harness: &TaborHarness,
+    tab_id_arg: &str,
+    timeout: Duration,
+    predicate: F,
+) -> Option<Value>
+where
+    F: Fn(&Value) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let state = harness.run_json(["msg", "get-tab-state", "--tab-id", tab_id_arg]);
+        if let Some(pdf_view) = tab_pdf_view(&state).filter(|view| predicate(view)) {
+            return Some(pdf_view.clone());
         }
         thread::sleep(POLL_INTERVAL);
     }

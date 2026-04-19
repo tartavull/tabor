@@ -24,12 +24,6 @@ const REMOTE_IMAGE_EXTENSIONS: &[&str] =
     &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenUrlKind {
-    Web,
-    Image,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageScaleMode {
     Fit,
     Fill,
@@ -488,14 +482,6 @@ impl ImageViewState {
     }
 }
 
-pub(crate) fn classify_open_url(url: &str) -> OpenUrlKind {
-    if is_remote_image_url(url) || is_local_image_url(url) {
-        OpenUrlKind::Image
-    } else {
-        OpenUrlKind::Web
-    }
-}
-
 pub(crate) fn image_title_for_source(source: &str) -> String {
     if let Some(path) = local_image_path(source) {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
@@ -548,11 +534,7 @@ pub(crate) fn load_image_source(source: &str) -> Result<LoadedImage, String> {
 }
 
 pub(crate) fn local_image_path(url: &str) -> Option<PathBuf> {
-    let parsed = Url::parse(url).ok()?;
-    if parsed.scheme() != "file" {
-        return None;
-    }
-    parsed.to_file_path().ok()
+    crate::macos::open_url::local_file_path(url)
 }
 
 fn is_local_image_url(url: &str) -> bool {
@@ -579,6 +561,10 @@ fn is_remote_image_url(url: &str) -> bool {
         return false;
     };
     REMOTE_IMAGE_EXTENSIONS.iter().any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+pub(crate) fn is_image_source(url: &str) -> bool {
+    is_remote_image_url(url) || is_local_image_url(url)
 }
 
 fn probe_local_image_format(path: &Path) -> Result<Option<ImageFormat>, String> {
@@ -688,6 +674,7 @@ fn premultiply_rgba(buffer: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macos::open_url::{OpenUrlKind, classify_open_url};
 
     const ONE_BY_ONE_PNG: &[u8] = &[
         0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',

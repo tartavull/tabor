@@ -73,7 +73,8 @@ use crate::event::WebCommand;
 use crate::event::{
     ActionContext, CommandFooterFeedback, CommandHistory, CommandState, Event, EventProxy,
     EventType, InlineSearchState, Mouse, MultiColumnCommand, MultiColumnCommandScope, SearchState,
-    TouchPurpose, request_image_load, request_web_cursor_update,
+    TouchPurpose, request_image_load, request_pdf_load, request_pdf_raster,
+    request_web_cursor_update,
 };
 #[cfg(unix)]
 use crate::input::ActionContext as _;
@@ -85,8 +86,8 @@ use crate::ipc::{
     AgentScreenshot, IpcBrowserAccelerationInfo, IpcBrowserAccelerationState,
     IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageDebugSnapshot,
     IpcImageLoadState, IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage,
-    IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
-    IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
+    IpcInspectorSession, IpcInspectorTarget, IpcPdfViewState, IpcRuntimeMetrics, IpcTabActivity,
+    IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
     IpcTerminalLayoutStrip, IpcTerminalSessionState, IpcTouchPhase, IpcWebCloseMetrics,
     IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
     IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
@@ -109,7 +110,13 @@ use crate::{input, renderer};
 #[cfg(target_os = "macos")]
 use crate::macos::favicon::{FaviconImage, fetch_favicon, resolve_favicon_url};
 #[cfg(target_os = "macos")]
-use crate::macos::image_view::{ImageLoadState, ImageScaleMode, ImageViewState, classify_open_url};
+use crate::macos::image_view::{ImageLoadState, ImageScaleMode, ImageViewState};
+#[cfg(target_os = "macos")]
+use crate::macos::open_url::{OpenUrlKind, classify_open_url};
+#[cfg(target_os = "macos")]
+use crate::macos::pdf_view::{
+    LoadedPdfSource, PdfLoadState, PdfRasterizedPage, PdfViewState, PdfZoomMode,
+};
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::WebCommandState;
 #[cfg(target_os = "macos")]
@@ -145,6 +152,8 @@ struct TabState {
     web_view: Option<WebView>,
     #[cfg(target_os = "macos")]
     image_view: Option<ImageViewState>,
+    #[cfg(target_os = "macos")]
+    pdf_view: Option<PdfViewState>,
     #[cfg(target_os = "macos")]
     web_command_state: WebCommandState,
     #[cfg(target_os = "macos")]
@@ -1333,6 +1342,7 @@ enum DrawMode {
     Terminal,
     Web,
     Image,
+    Pdf,
 }
 
 fn draw_mode(kind: &WindowKind) -> DrawMode {
@@ -1340,6 +1350,8 @@ fn draw_mode(kind: &WindowKind) -> DrawMode {
         DrawMode::Web
     } else if kind.is_image() {
         DrawMode::Image
+    } else if kind.is_pdf() {
+        DrawMode::Pdf
     } else {
         DrawMode::Terminal
     }
@@ -1990,7 +2002,9 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         let browser_view_mode = match &window_kind {
             WindowKind::Web { .. } => browser_view_mode_for_count(multi_column_defaults.browser),
-            WindowKind::Terminal | WindowKind::Image { .. } => BrowserViewMode::default(),
+            WindowKind::Terminal | WindowKind::Image { .. } | WindowKind::Pdf { .. } => {
+                BrowserViewMode::default()
+            },
         };
 
         #[cfg(target_os = "macos")]
@@ -2005,18 +2019,28 @@ impl WindowContext {
                 );
                 Some(WebView::new(&display.window, &size_info, layout, tab_id, url, proxy)?)
             },
-            WindowKind::Terminal | WindowKind::Image { .. } => None,
+            WindowKind::Terminal | WindowKind::Image { .. } | WindowKind::Pdf { .. } => None,
         };
 
         #[cfg(target_os = "macos")]
         let image_view = match &window_kind {
             WindowKind::Image { source } => Some(ImageViewState::new(source.clone())),
-            WindowKind::Terminal | WindowKind::Web { .. } => None,
+            WindowKind::Terminal | WindowKind::Web { .. } | WindowKind::Pdf { .. } => None,
         };
         #[cfg(target_os = "macos")]
         let image_source = match &window_kind {
             WindowKind::Image { source } => Some(source.clone()),
-            WindowKind::Terminal | WindowKind::Web { .. } => None,
+            WindowKind::Terminal | WindowKind::Web { .. } | WindowKind::Pdf { .. } => None,
+        };
+        #[cfg(target_os = "macos")]
+        let pdf_view = match &window_kind {
+            WindowKind::Pdf { source } => Some(PdfViewState::new(source.clone())),
+            WindowKind::Terminal | WindowKind::Web { .. } | WindowKind::Image { .. } => None,
+        };
+        #[cfg(target_os = "macos")]
+        let pdf_source = match &window_kind {
+            WindowKind::Pdf { source } => Some(source.clone()),
+            WindowKind::Terminal | WindowKind::Web { .. } | WindowKind::Image { .. } => None,
         };
 
         let default_title = match &window_kind {
@@ -2029,10 +2053,13 @@ impl WindowContext {
                 }
             },
             WindowKind::Image { source } => ImageViewState::new(source.clone()).title,
+            WindowKind::Pdf { source } => PdfViewState::new(source.clone()).title,
         };
         let terminal_view_mode = match &window_kind {
             WindowKind::Terminal => terminal_view_mode_for_count(multi_column_defaults.terminal),
-            WindowKind::Web { .. } | WindowKind::Image { .. } => TerminalViewMode::default(),
+            WindowKind::Web { .. } | WindowKind::Image { .. } | WindowKind::Pdf { .. } => {
+                TerminalViewMode::default()
+            },
         };
 
         let (title, program_name, notifier, terminal_runtime) = if window_kind.is_terminal() {
@@ -2152,6 +2179,8 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             image_view,
             #[cfg(target_os = "macos")]
+            pdf_view,
+            #[cfg(target_os = "macos")]
             web_command_state: Default::default(),
             #[cfg(target_os = "macos")]
             agent_runtime: Default::default(),
@@ -2167,6 +2196,10 @@ impl WindowContext {
         #[cfg(target_os = "macos")]
         if let Some(source) = image_source {
             request_image_load(proxy, display.window.id(), tab_id, source);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(source) = pdf_source {
+            request_pdf_load(proxy, display.window.id(), tab_id, source);
         }
         Ok(tab_id)
     }
@@ -2584,6 +2617,125 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
+    fn handle_pdf_loaded(
+        &mut self,
+        tab_id: TabId,
+        pdf: Result<LoadedPdfSource, String>,
+        event_proxy: &EventLoopProxy<Event>,
+    ) {
+        let is_active = Some(tab_id) == self.tabs.active_id();
+        let viewport = winit::dpi::PhysicalSize::new(
+            self.display.size_info.width() as u32,
+            self.display.size_info.height() as u32,
+        );
+        let (title, error_message);
+        let mut raster_requests = Vec::new();
+
+        {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return;
+            };
+            let WindowKind::Pdf { source } = &tab.kind else {
+                return;
+            };
+            let Some(pdf_view) = tab.pdf_view.as_mut() else {
+                return;
+            };
+
+            match pdf {
+                Ok(pdf) => {
+                    if &pdf.source != source {
+                        return;
+                    }
+                    if let Err(message) = pdf_view.set_loaded(pdf) {
+                        pdf_view.set_error(message.clone());
+                        title = Some(pdf_view.title.clone());
+                        error_message = Some(message);
+                    } else {
+                        raster_requests = pdf_view.take_visible_render_requests(viewport);
+                        title = Some(pdf_view.title.clone());
+                        error_message = None;
+                    }
+                },
+                Err(message) => {
+                    pdf_view.set_error(message.clone());
+                    title = Some(pdf_view.title.clone());
+                    error_message = Some(message);
+                },
+            }
+        }
+
+        if let Some(title) = title {
+            self.update_tab_title(tab_id, title);
+        }
+        if let Some(message) = error_message {
+            self.message_buffer.push(crate::message_bar::Message::new(
+                message,
+                crate::message_bar::MessageType::Error,
+            ));
+        }
+        for request in raster_requests {
+            request_pdf_raster(event_proxy, self.display.window.id(), tab_id, request);
+        }
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.refresh_tab_panel();
+        if is_active {
+            self.dirty = true;
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_pdf_page_rasterized(
+        &mut self,
+        tab_id: TabId,
+        raster: PdfRasterizedPage,
+        event_proxy: &EventLoopProxy<Event>,
+    ) {
+        let is_active = Some(tab_id) == self.tabs.active_id();
+        let viewport = winit::dpi::PhysicalSize::new(
+            self.display.size_info.width() as u32,
+            self.display.size_info.height() as u32,
+        );
+        let mut raster_requests = Vec::new();
+
+        let changed = {
+            let Some(tab) = self.tabs.get_mut(tab_id) else {
+                return;
+            };
+            let Some(pdf_view) = tab.pdf_view.as_mut() else {
+                return;
+            };
+
+            let changed = pdf_view.apply_rasterized_page(raster);
+            if changed {
+                raster_requests = pdf_view.take_visible_render_requests(viewport);
+            }
+            changed
+        };
+
+        for request in raster_requests {
+            request_pdf_raster(event_proxy, self.display.window.id(), tab_id, request);
+        }
+
+        if !changed {
+            return;
+        }
+
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        if is_active {
+            self.dirty = true;
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn handle_web_cursor(&mut self, tab_id: TabId, cursor: Option<CursorIcon>) {
         let Some(tab) = self.tabs.get_mut(tab_id) else {
             return;
@@ -2874,6 +3026,9 @@ impl WindowContext {
                             WindowKind::Image { source } => {
                                 WorkspaceTabKind::Image { source: source.clone() }
                             },
+                            WindowKind::Pdf { source } => {
+                                WorkspaceTabKind::Pdf { source: source.clone() }
+                            },
                         };
                         Some(WorkspaceTabLayout {
                             persistent_id,
@@ -2989,6 +3144,12 @@ impl WindowContext {
                         ),
                         WorkspaceTabKind::Image { source } => (
                             WindowKind::Image { source: source.clone() },
+                            self.config.pty_config(),
+                            None,
+                            None,
+                        ),
+                        WorkspaceTabKind::Pdf { source } => (
+                            WindowKind::Pdf { source: source.clone() },
                             self.config.pty_config(),
                             None,
                             None,
@@ -3325,8 +3486,8 @@ impl WindowContext {
         proxy: &EventLoopProxy<Event>,
     ) -> Result<(), String> {
         match classify_open_url(&url) {
-            crate::macos::image_view::OpenUrlKind::Web => self.open_web_url_in_tab(tab_id, url),
-            crate::macos::image_view::OpenUrlKind::Image => {
+            OpenUrlKind::Web => self.open_web_url_in_tab(tab_id, url),
+            OpenUrlKind::Image => {
                 let Some(tab) = self.tabs.get_mut(tab_id) else {
                     return Err(String::from("Tab not found"));
                 };
@@ -3347,6 +3508,27 @@ impl WindowContext {
                 self.dirty = true;
                 Ok(())
             },
+            OpenUrlKind::Pdf => {
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(String::from("Tab not found"));
+                };
+                let WindowKind::Pdf { source } = &mut tab.kind else {
+                    return Err(String::from("Not a PDF tab"));
+                };
+                *source = url.clone();
+                let Some(pdf_view) = tab.pdf_view.as_mut() else {
+                    return Err(String::from("PDF view is unavailable"));
+                };
+                pdf_view.reset_source(url.clone());
+                let title = pdf_view.title.clone();
+                self.command_history.record_url(url.clone());
+                request_pdf_load(proxy, self.display.window.id(), tab_id, url);
+                self.update_tab_title(tab_id, title);
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+                Ok(())
+            },
         }
     }
 
@@ -3358,10 +3540,9 @@ impl WindowContext {
     ) -> Result<TabId, Box<dyn Error>> {
         let mut options = WindowOptions::default();
         options.window_kind = match classify_open_url(&url) {
-            crate::macos::image_view::OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
-            crate::macos::image_view::OpenUrlKind::Image => {
-                WindowKind::Image { source: url.clone() }
-            },
+            OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
+            OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
+            OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
         };
         let tab_id = self.create_tab(options, proxy)?;
         self.command_history.record_url(url);
@@ -3432,6 +3613,7 @@ impl WindowContext {
                                 tab,
                             ),
                             image_view: Self::ipc_image_view(tab, &self.display),
+                            pdf_view: Self::ipc_pdf_view(tab, &self.display),
                         })
                     })
                     .collect();
@@ -3476,6 +3658,7 @@ impl WindowContext {
                 tab,
             ),
             image_view: Self::ipc_image_view(tab, &self.display),
+            pdf_view: Self::ipc_pdf_view(tab, &self.display),
         })
     }
 
@@ -5224,6 +5407,8 @@ impl WindowContext {
                 #[cfg(target_os = "macos")]
                 image_view: active_tab.image_view.as_mut(),
                 #[cfg(target_os = "macos")]
+                pdf_view: active_tab.pdf_view.as_mut(),
+                #[cfg(target_os = "macos")]
                 web_command_state: &mut active_tab.web_command_state,
                 modifiers: &mut self.modifiers,
                 notifier: &mut active_tab.notifier,
@@ -5509,8 +5694,47 @@ impl WindowContext {
         })
     }
 
+    #[cfg(all(unix, target_os = "macos"))]
+    fn ipc_pdf_view(tab: &TabState, display: &Display) -> Option<IpcPdfViewState> {
+        let pdf_view = tab.pdf_view.as_ref()?;
+        let error = match &pdf_view.load_state {
+            PdfLoadState::Error(message) => Some(message.clone()),
+            PdfLoadState::Loading | PdfLoadState::Ready => None,
+        };
+        let viewport = winit::dpi::PhysicalSize::new(
+            display.size_info.width() as u32,
+            display.size_info.height() as u32,
+        );
+
+        Some(IpcPdfViewState {
+            source: pdf_view.source.clone(),
+            state: match pdf_view.load_state {
+                PdfLoadState::Loading => ipc::IpcPdfLoadState::Loading,
+                PdfLoadState::Ready => ipc::IpcPdfLoadState::Ready,
+                PdfLoadState::Error(_) => ipc::IpcPdfLoadState::Error,
+            },
+            page_count: pdf_view.page_count(),
+            current_page: pdf_view.current_page(viewport),
+            zoom_mode: match pdf_view.zoom_mode {
+                PdfZoomMode::FitWidth => ipc::IpcPdfZoomMode::FitWidth,
+                PdfZoomMode::FitPage => ipc::IpcPdfZoomMode::FitPage,
+                PdfZoomMode::Actual => ipc::IpcPdfZoomMode::Actual,
+                PdfZoomMode::Manual => ipc::IpcPdfZoomMode::Manual,
+            },
+            zoom: pdf_view.zoom_factor(viewport).unwrap_or(1.0),
+            search_query: pdf_view.search_query().map(str::to_string),
+            search_match_count: pdf_view.active_search_match_count(),
+            error,
+        })
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     fn ipc_image_view(_tab: &TabState, _display: &Display) -> Option<IpcImageViewState> {
+        None
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn ipc_pdf_view(_tab: &TabState, _display: &Display) -> Option<IpcPdfViewState> {
         None
     }
 
@@ -5527,6 +5751,7 @@ impl WindowContext {
             let url_match = match &tab.kind {
                 WindowKind::Web { url } => url.to_lowercase().contains(&needle),
                 WindowKind::Image { source } => source.to_lowercase().contains(&needle),
+                WindowKind::Pdf { source } => source.to_lowercase().contains(&needle),
                 WindowKind::Terminal => false,
             };
 
@@ -5781,6 +6006,7 @@ impl WindowContext {
                 let url = match &tab.kind {
                     WindowKind::Web { url } => url.as_str(),
                     WindowKind::Image { source } => source.as_str(),
+                    WindowKind::Pdf { source } => source.as_str(),
                     WindowKind::Terminal => "",
                 };
                 let browser_layout = Self::browser_viewport_for_tab(
@@ -5812,6 +6038,20 @@ impl WindowContext {
                         &self.message_buffer,
                         &self.config,
                         image_view,
+                        &tab.command_state,
+                        highlight_notch_ears,
+                    );
+                }
+            },
+            DrawMode::Pdf =>
+            {
+                #[cfg(target_os = "macos")]
+                if let Some(pdf_view) = tab.pdf_view.as_mut() {
+                    self.display.draw_pdf(
+                        scheduler,
+                        &self.message_buffer,
+                        &self.config,
+                        pdf_view,
                         &tab.command_state,
                         highlight_notch_ears,
                     );
@@ -5947,6 +6187,22 @@ impl WindowContext {
                         self.handle_image_loaded(tab_id, image.clone());
                         continue;
                     },
+                    #[cfg(target_os = "macos")]
+                    EventType::PdfLoaded { pdf } => {
+                        let Some(tab_id) = event.tab_id() else {
+                            continue;
+                        };
+                        self.handle_pdf_loaded(tab_id, pdf.clone(), event_proxy);
+                        continue;
+                    },
+                    #[cfg(target_os = "macos")]
+                    EventType::PdfPageRasterized { raster } => {
+                        let Some(tab_id) = event.tab_id() else {
+                            continue;
+                        };
+                        self.handle_pdf_page_rasterized(tab_id, raster.clone(), event_proxy);
+                        continue;
+                    },
                     EventType::Terminal(term_event) => {
                         let Some(tab_id) = event.tab_id() else {
                             continue;
@@ -6019,6 +6275,8 @@ impl WindowContext {
                 web_view: active_tab.web_view.as_mut(),
                 #[cfg(target_os = "macos")]
                 image_view: active_tab.image_view.as_mut(),
+                #[cfg(target_os = "macos")]
+                pdf_view: active_tab.pdf_view.as_mut(),
                 #[cfg(target_os = "macos")]
                 web_command_state: &mut active_tab.web_command_state,
                 modifiers: &mut self.modifiers,

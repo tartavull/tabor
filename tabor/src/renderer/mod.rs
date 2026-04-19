@@ -34,6 +34,8 @@ mod text;
 #[cfg(target_os = "macos")]
 use crate::macos::image_view::ImageRenderQuad;
 #[cfg(target_os = "macos")]
+pub use images::BitmapCacheKey;
+#[cfg(target_os = "macos")]
 use images::SurfaceSlot;
 use images::{ImageRenderer, ImageSlice};
 pub use text::{GlyphCache, LoaderApi};
@@ -330,6 +332,19 @@ impl Renderer {
         quad: ImageRenderQuad,
     ) {
         self.image_renderer.draw_bitmap(size_info, width, height, rgba, quad);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn draw_cached_image_bitmap(
+        &mut self,
+        size_info: &SizeInfo,
+        cache_key: BitmapCacheKey,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+        quad: ImageRenderQuad,
+    ) {
+        self.image_renderer.draw_cached_bitmap(size_info, cache_key, width, height, rgba, quad);
     }
 
     /// Fill the window with `color` and `alpha`.

@@ -1,0 +1,326 @@
+//! PDF patterns.
+
+use crate::cache::Cache;
+use crate::color::{Color, ColorSpace};
+use crate::context::Context;
+use crate::device::Device;
+use crate::font::Glyph;
+use crate::interpret::state::State;
+use crate::shading::Shading;
+use crate::soft_mask::SoftMask;
+use crate::util::hash128;
+use crate::{CacheKey, ClipPath};
+use crate::{FillRule, InterpreterSettings, LumaData, Paint, RgbData, StrokeProps, interpret};
+use hayro_syntax::content::TypedIter;
+use hayro_syntax::object::Dict;
+use hayro_syntax::object::Rect;
+use hayro_syntax::object::Stream;
+use hayro_syntax::object::dict::keys::{
+    BBOX, EXT_G_STATE, MATRIX, PAINT_TYPE, RESOURCES, SHADING, X_STEP, Y_STEP,
+};
+use hayro_syntax::object::{Object, dict_or_stream};
+use hayro_syntax::page::Resources;
+use hayro_syntax::xref::XRef;
+use kurbo::{Affine, BezPath, Shape};
+use log::warn;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+
+/// A PDF pattern.
+#[derive(Debug, Clone)]
+pub enum Pattern<'a> {
+    /// A shading pattern.
+    Shading(ShadingPattern),
+    /// A tiling pattern.
+    Tiling(Box<TilingPattern<'a>>),
+}
+
+impl<'a> Pattern<'a> {
+    pub(crate) fn new(
+        object: Object<'a>,
+        ctx: &Context<'a>,
+        resources: &Resources<'a>,
+    ) -> Option<Self> {
+        if let Some(dict) = object.clone().into_dict() {
+            Some(Self::Shading(ShadingPattern::new(
+                &dict,
+                &ctx.object_cache,
+            )?))
+        } else if let Some(stream) = object.clone().into_stream() {
+            Some(Self::Tiling(Box::new(TilingPattern::new(
+                stream, ctx, resources,
+            )?)))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn pre_concat_transform(&mut self, transform: Affine) {
+        match self {
+            Self::Shading(p) => {
+                p.matrix = transform * p.matrix;
+                let transformed_clip_path = p.shading.clip_path.clone().map(|r| (transform * r));
+                Arc::make_mut(&mut p.shading).clip_path = transformed_clip_path
+            }
+            Self::Tiling(p) => p.matrix = transform * p.matrix,
+        }
+    }
+}
+
+/// A shading pattern.
+#[derive(Clone, Debug)]
+pub struct ShadingPattern {
+    /// The underlying shading of the pattern.
+    pub shading: Arc<Shading>,
+    /// A transformation matrix to apply prior to rendering.
+    pub matrix: Affine,
+}
+
+impl ShadingPattern {
+    pub(crate) fn new(dict: &Dict, cache: &Cache) -> Option<Self> {
+        let shading = dict.get::<Object>(SHADING).and_then(|o| {
+            let (dict, stream) = dict_or_stream(&o)?;
+
+            Shading::new(&dict, stream.as_ref(), cache)
+        })?;
+        let matrix = dict
+            .get::<[f64; 6]>(MATRIX)
+            .map(Affine::new)
+            .unwrap_or_default();
+
+        if dict.contains_key(EXT_G_STATE) {
+            warn!("shading patterns with ext_g_state are not supported yet");
+        }
+
+        Some(Self {
+            shading: Arc::new(shading),
+            matrix,
+        })
+    }
+}
+
+impl CacheKey for ShadingPattern {
+    fn cache_key(&self) -> u128 {
+        hash128(&(self.shading.cache_key(), self.matrix.cache_key()))
+    }
+}
+
+/// A tiling pattern.
+#[derive(Clone)]
+pub struct TilingPattern<'a> {
+    cache_key: u128,
+    /// The bbox of the tiling pattern.
+    pub bbox: Rect,
+    /// The step in the x direction.
+    pub x_step: f32,
+    /// The step in the y direction.
+    pub y_step: f32,
+    /// A transformation to apply prior to rendering.
+    pub matrix: Affine,
+    stream: Stream<'a>,
+    is_color: bool,
+    pub(crate) stroke_paint: Color,
+    pub(crate) non_stroking_paint: Color,
+    pub(crate) state: Box<State<'a>>,
+    pub(crate) parent_resources: Resources<'a>,
+    pub(crate) cache: Cache,
+    pub(crate) settings: InterpreterSettings,
+    pub(crate) xref: &'a XRef,
+}
+
+impl Debug for TilingPattern<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TilingPattern")
+    }
+}
+
+impl<'a> TilingPattern<'a> {
+    pub(crate) fn new(
+        stream: Stream<'a>,
+        ctx: &Context<'a>,
+        resources: &Resources<'a>,
+    ) -> Option<Self> {
+        let cache_key = stream.cache_key();
+        let dict = stream.dict();
+
+        let bbox = dict.get::<Rect>(BBOX)?;
+        let x_step = dict.get::<f32>(X_STEP)?;
+        let y_step = dict.get::<f32>(Y_STEP)?;
+        let is_color = dict.get::<u8>(PAINT_TYPE)? == 1;
+        let matrix = dict
+            .get::<[f64; 6]>(MATRIX)
+            .map(Affine::new)
+            .unwrap_or_default();
+
+        let state = ctx.get();
+
+        let fill_cs = ctx
+            .get()
+            .none_stroke_cs
+            .pattern_cs()
+            .unwrap_or(ColorSpace::device_gray());
+        let stroke_cs = ctx
+            .get()
+            .stroke_cs
+            .pattern_cs()
+            .unwrap_or(ColorSpace::device_gray());
+
+        let non_stroking_paint = Color::new(
+            fill_cs,
+            state.non_stroke_color.clone(),
+            state.non_stroke_alpha,
+        );
+        let stroke_paint = Color::new(stroke_cs, state.stroke_color.clone(), state.stroke_alpha);
+
+        Some(Self {
+            cache_key,
+            bbox,
+            x_step,
+            y_step,
+            matrix,
+            is_color,
+            stream,
+            stroke_paint,
+            non_stroking_paint,
+            state: Box::new(ctx.get().clone()),
+            settings: ctx.settings.clone(),
+            parent_resources: resources.clone(),
+            cache: ctx.object_cache.clone(),
+            xref: ctx.xref,
+        })
+    }
+
+    /// Interpret the contents of the pattern into the given device.
+    pub fn interpret(
+        &self,
+        device: &mut impl Device<'a>,
+        initial_transform: Affine,
+        is_stroke: bool,
+    ) -> Option<()> {
+        let mut state = (*self.state).clone();
+        state.ctm = initial_transform;
+
+        let mut context = Context::new_with(
+            state.ctm,
+            // TODO: bbox?
+            kurbo::Rect::new(0.0, 0.0, 1.0, 1.0),
+            self.cache.clone(),
+            self.xref,
+            self.settings.clone(),
+            state,
+        );
+
+        let decoded = self.stream.decoded().ok()?;
+        let resources = Resources::from_parent(
+            self.stream.dict().get(RESOURCES).unwrap_or_default(),
+            self.parent_resources.clone(),
+        );
+        let iter = TypedIter::new(decoded.as_ref());
+
+        let clip_path = ClipPath {
+            path: initial_transform * self.bbox.to_path(0.1),
+            fill: FillRule::NonZero,
+        };
+        device.push_clip_path(&clip_path);
+
+        if self.is_color {
+            interpret(iter, &resources, &mut context, device);
+        } else {
+            let paint = if !is_stroke {
+                Paint::Color(self.non_stroking_paint.clone())
+            } else {
+                Paint::Color(self.stroke_paint.clone())
+            };
+
+            let mut device = StencilPatternDevice::new(device, paint.clone());
+            interpret(iter, &resources, &mut context, &mut device);
+        }
+
+        device.pop_clip_path();
+
+        Some(())
+    }
+}
+
+impl CacheKey for TilingPattern<'_> {
+    fn cache_key(&self) -> u128 {
+        self.cache_key
+    }
+}
+
+struct StencilPatternDevice<'a, 'b, T: Device<'a>> {
+    inner: &'b mut T,
+    paint: Paint<'a>,
+}
+
+impl<'a, 'b, T: Device<'a>> StencilPatternDevice<'a, 'b, T> {
+    pub fn new(device: &'b mut T, paint: Paint<'a>) -> Self {
+        Self {
+            inner: device,
+            paint,
+        }
+    }
+}
+
+// Only filling, stroking of paths and stencil masks are allowed.
+impl<'a, T: Device<'a>> Device<'a> for StencilPatternDevice<'a, '_, T> {
+    fn stroke_path(
+        &mut self,
+        path: &BezPath,
+        transform: Affine,
+        _: &Paint,
+        stroke_props: &StrokeProps,
+    ) {
+        self.inner
+            .stroke_path(path, transform, &self.paint, stroke_props)
+    }
+
+    fn set_soft_mask(&mut self, _: Option<SoftMask>) {}
+
+    fn fill_path(&mut self, path: &BezPath, transform: Affine, _: &Paint, fill_rule: FillRule) {
+        self.inner
+            .fill_path(path, transform, &self.paint, fill_rule)
+    }
+
+    fn push_clip_path(&mut self, clip_path: &ClipPath) {
+        self.inner.push_clip_path(clip_path)
+    }
+
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask>) {}
+
+    fn fill_glyph(
+        &mut self,
+        glyph: &Glyph<'a>,
+        transform: Affine,
+        glyph_transform: Affine,
+        _: &Paint,
+    ) {
+        self.inner
+            .fill_glyph(glyph, transform, glyph_transform, &self.paint)
+    }
+
+    fn stroke_glyph(
+        &mut self,
+        glyph: &Glyph<'a>,
+        transform: Affine,
+        glyph_transform: Affine,
+        _: &Paint,
+        stroke_props: &StrokeProps,
+    ) {
+        self.inner
+            .stroke_glyph(glyph, transform, glyph_transform, &self.paint, stroke_props)
+    }
+
+    fn draw_rgba_image(&mut self, _: RgbData, _: Affine, _: Option<LumaData>) {}
+
+    fn draw_stencil_image(&mut self, stencil: LumaData, transform: Affine, _: &Paint) {
+        self.inner
+            .draw_stencil_image(stencil, transform, &self.paint);
+    }
+
+    fn pop_clip_path(&mut self) {
+        self.inner.pop_clip_path();
+    }
+
+    fn pop_transparency_group(&mut self) {}
+}

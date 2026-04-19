@@ -103,6 +103,9 @@ pub(crate) enum WorkspaceTabKind {
     Image {
         source: String,
     },
+    Pdf {
+        source: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

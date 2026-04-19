@@ -63,6 +63,8 @@ use crate::event::{CommandFooterMessage, CommandState, Event, EventType, Mouse, 
 #[cfg(target_os = "macos")]
 use crate::macos::image_view::ImageViewState;
 #[cfg(target_os = "macos")]
+use crate::macos::pdf_view::PdfViewState;
+#[cfg(target_os = "macos")]
 use crate::macos::webview::{WebPopupSurfaceRef, WebView};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::images::ImageSlice;
@@ -1930,6 +1932,167 @@ impl Display {
             let bg = config.colors.footer_bar_background();
             let line = size_info.screen_lines().saturating_sub(1);
             self.draw_footer_bar_line(&source_text, fg, bg, line, footer_offset);
+        }
+
+        self.draw_render_timer(config);
+        self.window.pre_present_notify();
+
+        if self.damage_tracker.debug {
+            let damage = self.damage_tracker.shape_frame_damage(self.size_info.into());
+            let mut rects = Vec::with_capacity(damage.len());
+            self.highlight_damage(&mut rects);
+            self.renderer.draw_rects(&self.size_info, &metrics, rects);
+        }
+
+        self.swap_buffers();
+
+        if matches!(self.raw_window_handle, RawWindowHandle::Xcb(_) | RawWindowHandle::Xlib(_)) {
+            self.renderer.finish();
+        }
+
+        if !matches!(self.raw_window_handle, RawWindowHandle::Wayland(_)) {
+            self.request_frame(scheduler);
+        }
+
+        self.damage_tracker.swap_damage();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn draw_pdf(
+        &mut self,
+        scheduler: &mut Scheduler,
+        message_buffer: &MessageBuffer,
+        config: &UiConfig,
+        pdf_view: &mut PdfViewState,
+        command_state: &CommandState,
+        force_notch_ears: bool,
+    ) {
+        self.sync_macos_tab_panel_semaphore_inset_for_draw(config, force_notch_ears);
+
+        let size_info = self.size_info;
+        let metrics = self.glyph_cache.font_metrics();
+        let background_color = config.colors.primary.background;
+        let command_active = command_state.is_active();
+        let message_visible = message_buffer.message().is_some() && !command_active;
+        let viewport = PhysicalSize::new(size_info.width() as u32, size_info.height() as u32);
+
+        self.damage_tracker.frame().mark_fully_damaged();
+
+        self.make_current();
+        self.renderer.clear(background_color, config.window_opacity());
+        self.renderer.set_viewport(&size_info);
+
+        for (cache_key, bitmap, quad) in pdf_view.visible_page_images(viewport) {
+            self.renderer.draw_cached_image_bitmap(
+                &size_info,
+                cache_key,
+                bitmap.width as usize,
+                bitmap.height as usize,
+                &bitmap.rgba,
+                quad,
+            );
+        }
+
+        let mut rects = Vec::new();
+        for rect in pdf_view.overlay_rects(viewport) {
+            rects.push(RenderRect::new(
+                rect.x as f32,
+                rect.y as f32,
+                rect.width as f32,
+                rect.height as f32,
+                config.colors.normal.yellow,
+                0.35,
+            ));
+        }
+
+        if self.tab_panel.is_enabled() {
+            self.tab_panel.push_rects(&size_info, config, &mut rects);
+            self.damage_tracker.frame().add_viewport_rect(
+                &size_info,
+                0,
+                0,
+                self.tab_panel.width().round() as i32,
+                size_info.height() as i32,
+            );
+        }
+
+        let footer_offset = self.footer_offset();
+
+        let ime_position = if command_active {
+            let command_text = Self::format_command(command_state.text(), size_info.columns());
+            self.draw_command_bar(config, &command_text, footer_offset);
+
+            let line = size_info.screen_lines().saturating_sub(1);
+            let column = Column(command_text.chars().count().saturating_sub(1));
+
+            if self.ime.preedit().is_none() {
+                let fg = config.colors.footer_bar_foreground();
+                let shape = CursorShape::Underline;
+                let cursor_width = NonZeroU32::new(1).unwrap();
+                let cursor =
+                    RenderableCursor::new(Point::new(line, column), shape, fg, cursor_width);
+                let mut cursor_rects: Vec<_> =
+                    cursor.rects(&size_info, config.cursor.thickness()).collect();
+                for rect in &mut cursor_rects {
+                    rect.y += footer_offset;
+                }
+                rects.extend(cursor_rects);
+            }
+
+            Some(Point::new(line, column))
+        } else {
+            None
+        };
+
+        if self.ime.is_enabled() {
+            if let Some(point) = ime_position {
+                let fg = config.colors.footer_bar_foreground();
+                let bg = config.colors.footer_bar_background();
+                self.draw_ime_preview(point, fg, bg, &mut rects, config, (footer_offset, 0.));
+            }
+        }
+
+        self.renderer.draw_rects(&size_info, &metrics, rects);
+        self.tab_panel.draw_text(&size_info, config, &mut self.renderer, &mut self.glyph_cache);
+
+        if message_visible {
+            if let Some(message) = message_buffer.message() {
+                let message_text = message.text(&size_info).into_iter().next().unwrap_or_default();
+                let fg = config.colors.primary.background;
+                let bg = match message.ty() {
+                    MessageType::Error => config.colors.normal.red,
+                    MessageType::Warning => config.colors.normal.yellow,
+                };
+                let line = size_info.screen_lines().saturating_sub(1);
+                let band = FooterBarViewportBand::new(
+                    &size_info,
+                    line,
+                    footer_offset,
+                    size_info.cell_height(),
+                );
+                let (x, y, width, height) = band.damage_rect();
+                self.damage_tracker.frame().add_viewport_rect(&size_info, x, y, width, height);
+                self.damage_tracker.next_frame().add_viewport_rect(&size_info, x, y, width, height);
+                self.draw_footer_bar_line(&message_text, fg, bg, line, footer_offset);
+            }
+        } else if !command_active {
+            let footer = format!(
+                "{}  [page {}/{}]",
+                pdf_view.source,
+                pdf_view.current_page(viewport),
+                pdf_view.page_count(),
+            );
+            let footer_text: String = StrShortener::new(
+                &footer,
+                size_info.columns(),
+                ShortenDirection::Right,
+                Some(SHORTENER),
+            )
+            .collect();
+            let fg = config.colors.footer_bar_foreground();
+            let bg = config.colors.footer_bar_background();
+            let line = size_info.screen_lines().saturating_sub(1);
+            self.draw_footer_bar_line(&footer_text, fg, bg, line, footer_offset);
         }
 
         self.draw_render_timer(config);

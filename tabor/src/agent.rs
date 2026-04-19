@@ -63,7 +63,7 @@ enum ControllerRequest {
 enum ControllerReply {
     Attached { tabor_socket: PathBuf, control_socket: PathBuf },
     App { groups: Vec<IpcTabGroup>, selected_tab_id: Option<IpcTabId> },
-    Use { tab: IpcTabState },
+    Use { tab: Box<IpcTabState> },
     Observation { observation: AgentObservation },
     Element { element: AgentElementDetail },
     Screenshot { path: PathBuf, width: u32, height: u32 },
@@ -319,7 +319,7 @@ fn handle_request(
                 .cloned()
                 .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No active tab"))?;
             *selected_tab_id = Some(tab.tab_id);
-            Ok(ControllerReply::Use { tab })
+            Ok(ControllerReply::Use { tab: Box::new(tab) })
         },
         ControllerRequest::UseTab { tab_id } => {
             let reply =

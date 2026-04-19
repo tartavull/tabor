@@ -1,0 +1,13 @@
+[package]
+name = "hayro-font"
+description = "A parser for CFF and Type1 fonts."
+keywords = ["pdf", "cff", "type1"]
+version = "0.1.0"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+log =  { workspace = true }
+phf = { workspace = true, features = ["macros"] }

@@ -41,6 +41,8 @@ pub mod image_view;
 pub(crate) mod keycodes;
 pub mod locale;
 pub mod open_documents;
+pub mod open_url;
+pub mod pdf_view;
 pub mod proc;
 pub mod web_commands;
 pub mod web_cursor;

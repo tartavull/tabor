@@ -1,0 +1,20 @@
+[package]
+name = "hayro-syntax"
+version = "0.2.0"
+description = "A low-level crate for reading PDF files."
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+log = { workspace = true }
+kurbo = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
+zune-jpeg = { workspace = true }
+jpeg2k = { workspace = true, optional = true }
+flate2 = { workspace = true }
+
+[features]
+default = []
+jpeg2000 = ["dep:jpeg2k"]

@@ -26,3 +26,7 @@ winit = { path = "vendor/winit" }
 download-cef = { path = "vendor/download-cef" }
 libloading = { path = "vendor/libloading" }
 cef = { path = "vendor/cef-crate" }
+hayro = { path = "vendor/hayro" }
+hayro-interpret = { path = "vendor/hayro-interpret" }
+hayro-syntax = { path = "vendor/hayro-syntax" }
+hayro-font = { path = "vendor/hayro-font" }

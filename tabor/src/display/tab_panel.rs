@@ -1989,6 +1989,7 @@ fn tab_panel_icon_char(tab: &TabPanelTab) -> Option<char> {
             tab.favicon.as_ref().map(|favicon| favicon.character).or(Some(TAB_PANEL_WEB_GLOBE_CHAR))
         },
         TabKind::Image { .. } => None,
+        TabKind::Pdf { .. } => None,
         TabKind::Terminal => None,
     }
 }
@@ -1998,6 +1999,7 @@ fn tab_panel_icon_char(tab: &TabPanelTab) -> Option<char> {
     match &tab.kind {
         TabKind::Web { .. } => Some(TAB_PANEL_WEB_GLOBE_CHAR),
         TabKind::Image { .. } => None,
+        TabKind::Pdf { .. } => None,
         TabKind::Terminal => None,
     }
 }

@@ -12,6 +12,9 @@ pub enum WindowKind {
     Image {
         source: String,
     },
+    Pdf {
+        source: String,
+    },
 }
 
 impl WindowKind {
@@ -21,6 +24,10 @@ impl WindowKind {
 
     pub fn is_image(&self) -> bool {
         matches!(self, Self::Image { .. })
+    }
+
+    pub fn is_pdf(&self) -> bool {
+        matches!(self, Self::Pdf { .. })
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -37,6 +44,7 @@ pub enum TabKind {
     Terminal,
     Web { url: String },
     Image { source: String },
+    Pdf { source: String },
 }
 
 impl From<&WindowKind> for TabKind {
@@ -45,6 +53,7 @@ impl From<&WindowKind> for TabKind {
             WindowKind::Terminal => Self::Terminal,
             WindowKind::Web { url } => Self::Web { url: url.clone() },
             WindowKind::Image { source } => Self::Image { source: source.clone() },
+            WindowKind::Pdf { source } => Self::Pdf { source: source.clone() },
         }
     }
 }

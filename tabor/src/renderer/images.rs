@@ -20,6 +20,7 @@ pub struct ImageSlice {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem;
 
@@ -43,6 +44,14 @@ mod macos {
         Main,
         Popup,
     }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    pub struct BitmapCacheKey {
+        pub namespace: u64,
+        pub entry: u64,
+    }
+
+    const MAX_BITMAP_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
     #[repr(C)]
     #[derive(Debug, Copy, Clone)]
@@ -171,6 +180,7 @@ mod macos {
     struct BitmapTexture {
         texture: GLuint,
         dimensions: Option<(usize, usize)>,
+        byte_size: usize,
     }
 
     impl BitmapTexture {
@@ -194,7 +204,7 @@ mod macos {
                 gl::BindTexture(gl::TEXTURE_RECTANGLE, 0);
             }
 
-            Self { texture, dimensions: None }
+            Self { texture, dimensions: None, byte_size: 0 }
         }
 
         fn upload(&mut self, width: usize, height: usize, rgba: &[u8]) {
@@ -228,6 +238,7 @@ mod macos {
                     self.dimensions = Some((width, height));
                 }
             }
+            self.byte_size = width.saturating_mul(height).saturating_mul(4);
         }
     }
 
@@ -246,6 +257,9 @@ mod macos {
         main_texture: SurfaceTexture,
         popup_texture: SurfaceTexture,
         bitmap_texture: BitmapTexture,
+        bitmap_texture_cache: HashMap<BitmapCacheKey, BitmapTexture>,
+        bitmap_cache_order: VecDeque<BitmapCacheKey>,
+        bitmap_cache_bytes: usize,
         program: ImageShaderProgram,
         vertices: Vec<Vertex>,
         cgl_context: CGLContextObj,
@@ -300,6 +314,9 @@ mod macos {
                 main_texture: SurfaceTexture::new(),
                 popup_texture: SurfaceTexture::new(),
                 bitmap_texture: BitmapTexture::new(),
+                bitmap_texture_cache: HashMap::new(),
+                bitmap_cache_order: VecDeque::new(),
+                bitmap_cache_bytes: 0,
                 program,
                 vertices: Vec::new(),
                 cgl_context,
@@ -445,6 +462,108 @@ mod macos {
             self.draw_vertices(size_info, self.bitmap_texture.texture);
         }
 
+        pub fn draw_cached_bitmap(
+            &mut self,
+            size_info: &SizeInfo,
+            cache_key: BitmapCacheKey,
+            width: usize,
+            height: usize,
+            rgba: &[u8],
+            quad: ImageRenderQuad,
+        ) {
+            if width == 0
+                || height == 0
+                || rgba.is_empty()
+                || quad.dest_width_px <= 0.0
+                || quad.dest_height_px <= 0.0
+            {
+                return;
+            }
+
+            let texture = self.ensure_cached_bitmap_texture(cache_key, width, height, rgba);
+            self.vertices.clear();
+            self.vertices.extend_from_slice(&[
+                Vertex {
+                    x: quad.dest_x_px,
+                    y: quad.dest_y_px,
+                    u: quad.uv_top_left.0,
+                    v: quad.uv_top_left.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px + quad.dest_width_px,
+                    y: quad.dest_y_px,
+                    u: quad.uv_top_right.0,
+                    v: quad.uv_top_right.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px,
+                    y: quad.dest_y_px + quad.dest_height_px,
+                    u: quad.uv_bottom_left.0,
+                    v: quad.uv_bottom_left.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px,
+                    y: quad.dest_y_px + quad.dest_height_px,
+                    u: quad.uv_bottom_left.0,
+                    v: quad.uv_bottom_left.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px + quad.dest_width_px,
+                    y: quad.dest_y_px,
+                    u: quad.uv_top_right.0,
+                    v: quad.uv_top_right.1,
+                },
+                Vertex {
+                    x: quad.dest_x_px + quad.dest_width_px,
+                    y: quad.dest_y_px + quad.dest_height_px,
+                    u: quad.uv_bottom_right.0,
+                    v: quad.uv_bottom_right.1,
+                },
+            ]);
+
+            self.draw_vertices(size_info, texture);
+        }
+
+        fn ensure_cached_bitmap_texture(
+            &mut self,
+            cache_key: BitmapCacheKey,
+            width: usize,
+            height: usize,
+            rgba: &[u8],
+        ) -> GLuint {
+            let texture = {
+                let entry =
+                    self.bitmap_texture_cache.entry(cache_key).or_insert_with(BitmapTexture::new);
+                let old_size = entry.byte_size;
+                if entry.dimensions != Some((width, height)) || old_size == 0 {
+                    entry.upload(width, height, rgba);
+                    self.bitmap_cache_bytes = self
+                        .bitmap_cache_bytes
+                        .saturating_sub(old_size)
+                        .saturating_add(entry.byte_size);
+                }
+                entry.texture
+            };
+
+            self.bitmap_cache_order.retain(|existing| existing != &cache_key);
+            self.bitmap_cache_order.push_back(cache_key);
+            while self.bitmap_cache_bytes > MAX_BITMAP_CACHE_BYTES {
+                let Some(evicted_key) = self.bitmap_cache_order.pop_front() else {
+                    break;
+                };
+                if evicted_key == cache_key {
+                    self.bitmap_cache_order.push_back(evicted_key);
+                    break;
+                }
+                if let Some(evicted) = self.bitmap_texture_cache.remove(&evicted_key) {
+                    self.bitmap_cache_bytes =
+                        self.bitmap_cache_bytes.saturating_sub(evicted.byte_size);
+                }
+            }
+
+            texture
+        }
+
         fn draw_vertices(&mut self, size_info: &SizeInfo, texture: GLuint) {
             if self.vertices.is_empty() {
                 unsafe {
@@ -547,7 +666,7 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{ImageRenderer, SurfaceSlot};
+pub use macos::{BitmapCacheKey, ImageRenderer, SurfaceSlot};
 
 #[cfg(not(target_os = "macos"))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

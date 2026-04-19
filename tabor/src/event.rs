@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -47,6 +51,8 @@ use tabor_terminal::selection::{Selection, SelectionType};
 use tabor_terminal::term::cell::Flags;
 use tabor_terminal::term::search::{Match, RegexSearch};
 use tabor_terminal::term::{ClipboardType, Term, TermMode};
+#[cfg(target_os = "macos")]
+use tabor_terminal::thread;
 use tabor_terminal::vte::ansi::NamedColor;
 
 #[cfg(unix)]
@@ -75,8 +81,13 @@ use crate::macos::cef;
 #[cfg(target_os = "macos")]
 use crate::macos::favicon::FaviconImage;
 #[cfg(target_os = "macos")]
-use crate::macos::image_view::{
-    ImageViewState, LoadedImage, OpenUrlKind, classify_open_url, load_image_source,
+use crate::macos::image_view::{ImageViewState, LoadedImage, load_image_source};
+#[cfg(target_os = "macos")]
+use crate::macos::open_url::{OpenUrlKind, classify_open_url};
+#[cfg(target_os = "macos")]
+use crate::macos::pdf_view::{
+    LoadedPdfSource, PdfRasterizedPage, PdfRenderRequest, PdfViewState, load_pdf_source,
+    rasterize_pdf_page,
 };
 #[cfg(target_os = "macos")]
 use crate::macos::web_commands::{
@@ -1736,6 +1747,14 @@ pub enum EventType {
         image: Result<LoadedImage, String>,
     },
     #[cfg(target_os = "macos")]
+    PdfLoaded {
+        pdf: Result<LoadedPdfSource, String>,
+    },
+    #[cfg(target_os = "macos")]
+    PdfPageRasterized {
+        raster: PdfRasterizedPage,
+    },
+    #[cfg(target_os = "macos")]
     CefSchedule(Duration),
     #[cfg(target_os = "macos")]
     CefTick,
@@ -2077,6 +2096,8 @@ pub struct ActionContext<'a, N, T> {
     #[cfg(target_os = "macos")]
     pub image_view: Option<&'a mut ImageViewState>,
     #[cfg(target_os = "macos")]
+    pub pdf_view: Option<&'a mut PdfViewState>,
+    #[cfg(target_os = "macos")]
     pub web_command_state: &'a mut WebCommandState,
     #[cfg(target_os = "macos")]
     pub event_loop: &'a ActiveEventLoop,
@@ -2194,6 +2215,82 @@ pub(crate) fn request_image_load(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn request_pdf_load(
+    event_proxy: &EventLoopProxy<Event>,
+    window_id: WindowId,
+    tab_id: TabId,
+    source: String,
+) {
+    let proxy = event_proxy.clone();
+    std::thread::spawn(move || {
+        let pdf = load_pdf_source(&source);
+        let event = Event::for_tab(EventType::PdfLoaded { pdf }, window_id, tab_id);
+        let _ = proxy.send_event(event);
+    });
+}
+
+#[cfg(target_os = "macos")]
+struct PdfRasterJob {
+    proxy: EventLoopProxy<Event>,
+    window_id: WindowId,
+    tab_id: TabId,
+    request: PdfRenderRequest,
+}
+
+#[cfg(target_os = "macos")]
+fn pdf_raster_sender() -> &'static mpsc::Sender<PdfRasterJob> {
+    static PDF_RASTER_SENDER: OnceLock<mpsc::Sender<PdfRasterJob>> = OnceLock::new();
+
+    PDF_RASTER_SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<PdfRasterJob>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        let worker_count = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().clamp(2, 4))
+            .unwrap_or(2);
+
+        for worker_index in 0..worker_count {
+            let receiver = receiver.clone();
+            thread::spawn_named(format!("pdf raster {worker_index}"), move || {
+                loop {
+                    let job = {
+                        let Ok(receiver) = receiver.lock() else {
+                            break;
+                        };
+                        match receiver.recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let raster = rasterize_pdf_page(&job.request);
+                    let event = Event::for_tab(
+                        EventType::PdfPageRasterized { raster },
+                        job.window_id,
+                        job.tab_id,
+                    );
+                    let _ = job.proxy.send_event(event);
+                }
+            });
+        }
+
+        sender
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_pdf_raster(
+    event_proxy: &EventLoopProxy<Event>,
+    window_id: WindowId,
+    tab_id: TabId,
+    request: PdfRenderRequest,
+) {
+    let job = PdfRasterJob { proxy: event_proxy.clone(), window_id, tab_id, request };
+    if pdf_raster_sender().send(job).is_err() {
+        warn!("Could not enqueue PDF raster job");
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn image_viewport_size(display: &Display) -> winit::dpi::PhysicalSize<u32> {
     winit::dpi::PhysicalSize::new(
         display.size_info.width() as u32,
@@ -2265,6 +2362,21 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     // Copy text selection.
     fn copy_selection(&mut self, ty: ClipboardType) {
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_pdf() {
+            let Some(pdf_view) = self.pdf_view.as_mut() else {
+                return;
+            };
+            let Some(text) = pdf_view.selection_text().filter(|text| !text.is_empty()) else {
+                return;
+            };
+            if ty == ClipboardType::Selection && self.config.selection.save_to_clipboard {
+                self.clipboard.store(ClipboardType::Clipboard, text.clone());
+            }
+            self.clipboard.store(ty, text);
+            return;
+        }
+
         let text = match self.terminal.selection_to_string().filter(|s| !s.is_empty()) {
             Some(text) => text,
             None => return,
@@ -2277,10 +2389,25 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     fn selection_is_empty(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_pdf() {
+            return self.pdf_view.as_ref().is_none_or(|pdf_view| !pdf_view.has_selection());
+        }
+
         self.terminal.selection.as_ref().is_none_or(Selection::is_empty)
     }
 
     fn clear_selection(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.tab_kind.is_pdf() {
+            if let Some(pdf_view) = self.pdf_view.as_mut() {
+                pdf_view.clear_selection();
+                *self.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+            }
+            return;
+        }
+
         // Clear the selection on the terminal.
         let selection = self.terminal.selection.take();
         // Mark the terminal as dirty when selection wasn't empty.
@@ -2325,7 +2452,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             };
         }
         #[cfg(target_os = "macos")]
-        if self.tab_kind.is_image() {
+        if self.tab_kind.is_image() || self.tab_kind.is_pdf() {
             return;
         }
 
@@ -3579,6 +3706,97 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
+    fn pdf_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        match button {
+            MouseButton::Left => self.mouse.left_button_state = state,
+            MouseButton::Middle => self.mouse.middle_button_state = state,
+            MouseButton::Right => self.mouse.right_button_state = state,
+            _ => (),
+        }
+
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+
+        if button != MouseButton::Left {
+            return;
+        }
+
+        let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+        match state {
+            ElementState::Pressed => {
+                pdf_view.begin_selection(cursor, image_viewport_size(self.display));
+                self.display.window.set_mouse_cursor(CursorIcon::Text);
+                self.mark_pdf_view_dirty();
+            },
+            ElementState::Released => {
+                pdf_view.end_selection();
+                if pdf_view.is_panning() {
+                    self.display.window.set_mouse_cursor(CursorIcon::Grabbing);
+                } else {
+                    self.display.window.set_mouse_cursor(CursorIcon::Default);
+                }
+                self.mark_pdf_view_dirty();
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pdf_mouse_move(&mut self, position: PhysicalPosition<f64>) {
+        let x = position.x.clamp(0.0, self.display.size_info.width() as f64 - 1.0) as usize;
+        let y = position.y.clamp(0.0, self.display.size_info.height() as f64 - 1.0) as usize;
+        self.mouse.x = x;
+        self.mouse.y = y;
+        self.mouse.inside_text_area = true;
+
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+
+        if pdf_view.is_panning() {
+            pdf_view.pan_to(position);
+            self.display.window.set_mouse_cursor(CursorIcon::Grabbing);
+            self.mark_pdf_view_dirty();
+            return;
+        }
+
+        if self.mouse.left_button_state == ElementState::Pressed
+            && pdf_view.update_selection(position, image_viewport_size(self.display))
+        {
+            self.display.window.set_mouse_cursor(CursorIcon::Text);
+            self.mark_pdf_view_dirty();
+            return;
+        }
+
+        self.display.window.set_mouse_cursor(CursorIcon::Default);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pdf_mouse_wheel(
+        &mut self,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+    ) {
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+
+        let (delta_x, delta_y) = match delta {
+            winit::event::MouseScrollDelta::LineDelta(columns, lines) => (
+                f64::from(columns) * f64::from(self.display.size_info.cell_width()),
+                f64::from(lines) * f64::from(self.display.size_info.cell_height()),
+            ),
+            winit::event::MouseScrollDelta::PixelDelta(delta) => match phase {
+                winit::event::TouchPhase::Started => (0.0, 0.0),
+                _ => (delta.x, delta.y),
+            },
+        };
+        if pdf_view.pan_by(delta_x, delta_y) {
+            self.mark_pdf_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn image_pinch_gesture(&mut self, delta: f64, phase: winit::event::TouchPhase) {
         let Some(image_view) = self.image_view.as_mut() else {
             return;
@@ -3591,6 +3809,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
+    fn pdf_pinch_gesture(&mut self, delta: f64, phase: winit::event::TouchPhase) {
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+
+        let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+        if pdf_view.pinch_gesture(delta, phase, cursor, image_viewport_size(self.display)) {
+            self.mark_pdf_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn image_smart_magnify(&mut self) {
         let Some(image_view) = self.image_view.as_mut() else {
             return;
@@ -3598,6 +3828,17 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
         if image_view.smart_magnify(image_viewport_size(self.display)) {
             self.mark_image_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pdf_smart_magnify(&mut self) {
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+
+        if pdf_view.smart_magnify() {
+            self.mark_pdf_view_dirty();
         }
     }
 
@@ -3627,7 +3868,32 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
+    fn pdf_touchpad_pressure(&mut self, _pressure: f32, stage: i64) {
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+
+        let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+        if pdf_view.touchpad_pressure(stage, cursor) {
+            let cursor_icon =
+                if pdf_view.is_panning() { CursorIcon::Grabbing } else { CursorIcon::Default };
+            self.display.window.set_mouse_cursor(cursor_icon);
+            self.mark_pdf_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn image_zoom_in(&mut self) {
+        if let Some(pdf_view) = self.pdf_view.as_mut() {
+            let cursor = PhysicalPosition::new(
+                f64::from(self.display.size_info.width()) / 2.0,
+                f64::from(self.display.size_info.height()) / 2.0,
+            );
+            if pdf_view.zoom_in(cursor, image_viewport_size(self.display)) {
+                self.mark_pdf_view_dirty();
+            }
+            return;
+        }
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_in(image_viewport_size(self.display));
             self.mark_image_view_dirty();
@@ -3636,6 +3902,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(target_os = "macos")]
     fn image_zoom_out(&mut self) {
+        if let Some(pdf_view) = self.pdf_view.as_mut() {
+            let cursor = PhysicalPosition::new(
+                f64::from(self.display.size_info.width()) / 2.0,
+                f64::from(self.display.size_info.height()) / 2.0,
+            );
+            if pdf_view.zoom_out(cursor, image_viewport_size(self.display)) {
+                self.mark_pdf_view_dirty();
+            }
+            return;
+        }
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_out(image_viewport_size(self.display));
             self.mark_image_view_dirty();
@@ -3644,6 +3920,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(target_os = "macos")]
     fn image_zoom_fit(&mut self) {
+        if let Some(pdf_view) = self.pdf_view.as_mut() {
+            if pdf_view.zoom_fit_width() {
+                self.mark_pdf_view_dirty();
+            }
+            return;
+        }
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_fit(image_viewport_size(self.display));
             self.mark_image_view_dirty();
@@ -3652,6 +3934,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(target_os = "macos")]
     fn image_zoom_fill(&mut self) {
+        if let Some(pdf_view) = self.pdf_view.as_mut() {
+            if pdf_view.zoom_fit_page() {
+                self.mark_pdf_view_dirty();
+            }
+            return;
+        }
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_fill(image_viewport_size(self.display));
             self.mark_image_view_dirty();
@@ -3660,6 +3948,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(target_os = "macos")]
     fn image_zoom_actual(&mut self) {
+        if let Some(pdf_view) = self.pdf_view.as_mut() {
+            if pdf_view.zoom_actual() {
+                self.mark_pdf_view_dirty();
+            }
+            return;
+        }
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_actual(image_viewport_size(self.display));
             self.mark_image_view_dirty();
@@ -3676,6 +3970,11 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
 
     #[cfg(target_os = "macos")]
     fn image_reset_view(&mut self) {
+        if let Some(pdf_view) = self.pdf_view.as_mut() {
+            pdf_view.reset_view();
+            self.mark_pdf_view_dirty();
+            return;
+        }
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.reset_view();
             self.mark_image_view_dirty();
@@ -3731,6 +4030,30 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
     fn mark_image_view_dirty(&mut self) {
         self.display.damage_tracker.frame().mark_fully_damaged();
         *self.dirty = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mark_pdf_view_dirty(&mut self) {
+        let viewport = image_viewport_size(self.display);
+        self.request_visible_pdf_rasters_for_viewport(viewport);
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        *self.dirty = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn request_visible_pdf_rasters_for_viewport(
+        &mut self,
+        viewport: winit::dpi::PhysicalSize<u32>,
+    ) {
+        let window_id = self.display.window.id();
+        let requests = self
+            .pdf_view
+            .as_mut()
+            .map(|pdf_view| pdf_view.take_visible_render_requests(viewport))
+            .unwrap_or_default();
+        for request in requests {
+            request_pdf_raster(self.event_proxy, window_id, self.tab_id, request);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -4027,7 +4350,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             }
 
             #[cfg(target_os = "macos")]
-            if self.tab_kind.is_web() {
+            if self.tab_kind.is_web() || self.tab_kind.is_pdf() {
                 self.with_web_command_state(|state, ctx| {
                     web_commands::find(state, ctx, query, false);
                 });
@@ -4035,7 +4358,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             }
 
             self.push_command_error(CommandError::Message(String::from(
-                "Find is only available in web tabs",
+                "Find is only available in web and PDF tabs",
             )));
             return;
         }
@@ -4149,7 +4472,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     )));
                 },
                 WindowKind::Terminal => self.open_web_url_new_tab(url),
-                WindowKind::Image { .. } => self.open_web_url_new_tab_replace_current(url),
+                WindowKind::Image { .. } | WindowKind::Pdf { .. } => {
+                    self.open_web_url_new_tab_replace_current(url)
+                },
             },
             OpenUrlKind::Image => match &mut *self.tab_kind {
                 WindowKind::Image { source } => {
@@ -4173,7 +4498,35 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     *self.dirty = true;
                 },
                 WindowKind::Terminal => self.open_web_url_new_tab(url),
-                WindowKind::Web { .. } => self.open_web_url_new_tab_replace_current(url),
+                WindowKind::Web { .. } | WindowKind::Pdf { .. } => {
+                    self.open_web_url_new_tab_replace_current(url)
+                },
+            },
+            OpenUrlKind::Pdf => match &mut *self.tab_kind {
+                WindowKind::Pdf { source } => {
+                    *source = url.clone();
+                    let Some(pdf_view) = self.pdf_view.as_mut() else {
+                        self.push_command_error(CommandError::Message(String::from(
+                            "PDF view is unavailable",
+                        )));
+                        return;
+                    };
+                    pdf_view.reset_source(url.clone());
+                    request_pdf_load(
+                        self.event_proxy,
+                        self.display.window.id(),
+                        self.tab_id,
+                        url.clone(),
+                    );
+                    self.command_history.record_url(url);
+                    self.display.pending_update.dirty = true;
+                    self.display.damage_tracker.frame().mark_fully_damaged();
+                    *self.dirty = true;
+                },
+                WindowKind::Terminal => self.open_web_url_new_tab(url),
+                WindowKind::Web { .. } | WindowKind::Image { .. } => {
+                    self.open_web_url_new_tab_replace_current(url)
+                },
             },
         }
 
@@ -4193,7 +4546,9 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 let event = Event::new(EventType::CreateTab(options), self.display.window.id());
                 let _ = self.event_proxy.send_event(event);
             },
-            WindowKind::Image { .. } => unreachable!("image tabs are macOS-only"),
+            WindowKind::Image { .. } | WindowKind::Pdf { .. } => {
+                unreachable!("native media tabs are macOS-only")
+            },
         }
     }
 
@@ -4204,6 +4559,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             options.window_kind = match classify_open_url(&url) {
                 OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
                 OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
+                OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
             };
         }
         #[cfg(not(target_os = "macos"))]
@@ -4227,6 +4583,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             options.window_kind = match classify_open_url(&url) {
                 OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
                 OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
+                OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
             };
         }
         #[cfg(not(target_os = "macos"))]
@@ -4286,7 +4643,26 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
             },
             WindowKind::Image { .. } => {
                 self.push_command_error(CommandError::Message(String::from(
-                    "Reload is only available in web tabs",
+                    "Reload is only available in web and PDF tabs",
+                )));
+            },
+            WindowKind::Pdf { source } => {
+                let source = source.clone();
+                if let Some(pdf_view) = self.pdf_view.as_mut() {
+                    pdf_view.reset_source(source.clone());
+                    request_pdf_load(
+                        self.event_proxy,
+                        self.display.window.id(),
+                        self.tab_id,
+                        source,
+                    );
+                    self.display.pending_update.dirty = true;
+                    self.display.damage_tracker.frame().mark_fully_damaged();
+                    *self.dirty = true;
+                    return;
+                }
+                self.push_command_error(CommandError::Message(String::from(
+                    "PDF view is unavailable",
                 )));
             },
         }
@@ -4312,6 +4688,11 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                 )));
             },
             WindowKind::Image { .. } => {
+                self.push_command_error(CommandError::Message(String::from(
+                    "Inspector is only available in web tabs",
+                )));
+            },
+            WindowKind::Pdf { .. } => {
                 self.push_command_error(CommandError::Message(String::from(
                     "Inspector is only available in web tabs",
                 )));
@@ -4764,10 +5145,22 @@ impl<'a, N: Notify + 'a, T: EventListener> WebActions for ActionContext<'a, N, T
     }
 
     fn start_find_prompt(&mut self) {
+        if self.tab_kind.is_pdf() {
+            self.open_command_bar("/");
+            return;
+        }
         self.web_start_find();
     }
 
     fn find(&mut self, query: &str, backwards: bool) {
+        if self.tab_kind.is_pdf() {
+            if let Some(pdf_view) = self.pdf_view.as_mut() {
+                if pdf_view.find(query, backwards, image_viewport_size(self.display)) {
+                    self.mark_pdf_view_dirty();
+                }
+            }
+            return;
+        }
         self.web_find(query, backwards);
     }
 
@@ -4784,10 +5177,18 @@ impl<'a, N: Notify + 'a, T: EventListener> WebActions for ActionContext<'a, N, T
     }
 
     fn copy_selection(&mut self) {
+        if self.tab_kind.is_pdf() {
+            input::ActionContext::copy_selection(self, ClipboardType::Clipboard);
+            return;
+        }
         self.web_copy_selection();
     }
 
     fn clear_selection(&mut self) {
+        if self.tab_kind.is_pdf() {
+            input::ActionContext::clear_selection(self);
+            return;
+        }
         self.web_clear_selection();
     }
 
@@ -5595,6 +5996,8 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::WebCursorRequest
                 | EventType::WebViewDirty
                 | EventType::ImageLoaded { .. }
+                | EventType::PdfLoaded { .. }
+                | EventType::PdfPageRasterized { .. }
                 | EventType::CefSchedule(_)
                 | EventType::CefTick
                 | EventType::CefWatchdog
@@ -5654,6 +6057,9 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                         }
 
                         self.ctx.display.pending_update.set_dimensions(size);
+                        if self.ctx.tab_kind.is_pdf() {
+                            self.ctx.request_visible_pdf_rasters_for_viewport(size);
+                        }
                     },
                     WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                         self.key_input(event);
@@ -5673,11 +6079,19 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                     },
                     WindowEvent::PinchGesture { delta, phase, .. } => {
                         self.ctx.window().set_mouse_visible(true);
-                        self.ctx.image_pinch_gesture(delta, phase);
+                        if self.ctx.window_kind().is_pdf() {
+                            self.ctx.pdf_pinch_gesture(delta, phase);
+                        } else {
+                            self.ctx.image_pinch_gesture(delta, phase);
+                        }
                     },
                     WindowEvent::DoubleTapGesture { .. } => {
                         self.ctx.window().set_mouse_visible(true);
-                        self.ctx.image_smart_magnify();
+                        if self.ctx.window_kind().is_pdf() {
+                            self.ctx.pdf_smart_magnify();
+                        } else {
+                            self.ctx.image_smart_magnify();
+                        }
                     },
                     WindowEvent::RotationGesture { delta, phase, .. } => {
                         self.ctx.window().set_mouse_visible(true);
@@ -5685,7 +6099,11 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                     },
                     WindowEvent::TouchpadPressure { pressure, stage, .. } => {
                         self.ctx.window().set_mouse_visible(true);
-                        self.ctx.image_touchpad_pressure(pressure, stage);
+                        if self.ctx.window_kind().is_pdf() {
+                            self.ctx.pdf_touchpad_pressure(pressure, stage);
+                        } else {
+                            self.ctx.image_touchpad_pressure(pressure, stage);
+                        }
                     },
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {

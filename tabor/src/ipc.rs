@@ -60,6 +60,7 @@ pub enum IpcTabKind {
     Terminal,
     Web { url: String },
     Image { source: String },
+    Pdf { source: String },
 }
 
 impl From<&WindowKind> for IpcTabKind {
@@ -68,6 +69,7 @@ impl From<&WindowKind> for IpcTabKind {
             WindowKind::Terminal => Self::Terminal,
             WindowKind::Web { url } => Self::Web { url: url.clone() },
             WindowKind::Image { source } => Self::Image { source: source.clone() },
+            WindowKind::Pdf { source } => Self::Pdf { source: source.clone() },
         }
     }
 }
@@ -154,6 +156,23 @@ pub enum IpcImageScaleMode {
     Manual,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcPdfLoadState {
+    Loading,
+    Ready,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcPdfZoomMode {
+    FitWidth,
+    FitPage,
+    Actual,
+    Manual,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IpcImageViewState {
     pub source: String,
@@ -165,6 +184,21 @@ pub struct IpcImageViewState {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcPdfViewState {
+    pub source: String,
+    pub state: IpcPdfLoadState,
+    pub page_count: usize,
+    pub current_page: usize,
+    pub zoom_mode: IpcPdfZoomMode,
+    pub zoom: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_query: Option<String>,
+    pub search_match_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -217,6 +251,8 @@ pub struct IpcTabState {
     pub browser_layout: Option<IpcBrowserLayoutState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_view: Option<IpcImageViewState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf_view: Option<IpcPdfViewState>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -999,7 +1035,7 @@ pub enum SocketReply {
     Pong,
     Capabilities { capabilities: IpcCapabilities },
     TabList { groups: Vec<IpcTabGroup> },
-    TabState { tab: IpcTabState },
+    TabState { tab: Box<IpcTabState> },
     TabCreated { tab_id: IpcTabId },
     GroupCreated { group_id: usize },
     TabPanel { panel: IpcTabPanelState },
@@ -1234,7 +1270,10 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             close_window: false,
         },
         IpcRequest::GetTabState { tab_id } => match ctx.tab_state(tab_id.into(), now) {
-            Some(tab) => IpcResponse { reply: SocketReply::TabState { tab }, close_window: false },
+            Some(tab) => IpcResponse {
+                reply: SocketReply::TabState { tab: Box::new(tab) },
+                close_window: false,
+            },
             None => IpcResponse {
                 reply: reply_error(IpcErrorCode::NotFound, "Tab not found"),
                 close_window: false,
@@ -1337,9 +1376,11 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
                 UrlTarget::Current => match ctx.active_tab_id() {
                     Some(tab_id) => match ctx.tab_kind(tab_id) {
-                        Some(IpcTabKind::Web { .. } | IpcTabKind::Image { .. }) => {
-                            ctx.open_url_in_tab(tab_id, url).map(|_| None)
-                        },
+                        Some(
+                            IpcTabKind::Web { .. }
+                            | IpcTabKind::Image { .. }
+                            | IpcTabKind::Pdf { .. },
+                        ) => ctx.open_url_in_tab(tab_id, url).map(|_| None),
                         Some(IpcTabKind::Terminal) => ctx.open_url_new_tab(url).map(Some),
                         None => Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found")),
                     },
@@ -1887,6 +1928,8 @@ mod tests {
     use std::collections::{HashMap, VecDeque};
 
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::macos::open_url::{OpenUrlKind, classify_open_url};
 
     #[derive(Clone)]
     struct MockTab {
@@ -1931,6 +1974,7 @@ mod tests {
     enum MockOpenUrlKind {
         Web,
         Image,
+        Pdf,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2137,6 +2181,7 @@ mod tests {
                         },
                     }),
                     IpcTabKind::Image { .. } => None,
+                    IpcTabKind::Pdf { .. } => None,
                 },
                 kind,
             };
@@ -2219,6 +2264,7 @@ mod tests {
                                 terminal_layout: None,
                                 browser_layout: tab.browser_layout.clone(),
                                 image_view: mock_image_view(&tab.kind),
+                                pdf_view: mock_pdf_view(&tab.kind),
                             })
                         })
                         .collect();
@@ -2245,6 +2291,7 @@ mod tests {
                 terminal_layout: None,
                 browser_layout: tab.browser_layout.clone(),
                 image_view: mock_image_view(&tab.kind),
+                pdf_view: mock_pdf_view(&tab.kind),
             })
         }
 
@@ -2271,6 +2318,9 @@ mod tests {
                 },
                 WindowKind::Image { source } => {
                     self.add_tab(IpcTabKind::Image { source }, group_id, group_name)
+                },
+                WindowKind::Pdf { source } => {
+                    self.add_tab(IpcTabKind::Pdf { source }, group_id, group_name)
                 },
             }
         }
@@ -2417,14 +2467,30 @@ mod tests {
                     *source = url;
                     Ok(())
                 },
+                (IpcTabKind::Pdf { source }, MockOpenUrlKind::Pdf) => {
+                    *source = url;
+                    Ok(())
+                },
                 (IpcTabKind::Terminal, _) => {
-                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web or image tab"))
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a media tab"))
                 },
                 (IpcTabKind::Web { .. }, MockOpenUrlKind::Image) => {
                     Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not an image tab"))
                 },
+                (IpcTabKind::Web { .. }, MockOpenUrlKind::Pdf) => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a PDF tab"))
+                },
                 (IpcTabKind::Image { .. }, MockOpenUrlKind::Web) => {
                     Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
+                },
+                (IpcTabKind::Image { .. }, MockOpenUrlKind::Pdf) => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a PDF tab"))
+                },
+                (IpcTabKind::Pdf { .. }, MockOpenUrlKind::Web) => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
+                },
+                (IpcTabKind::Pdf { .. }, MockOpenUrlKind::Image) => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not an image tab"))
                 },
             }
         }
@@ -2437,6 +2503,7 @@ mod tests {
                 match mock_open_url_kind(&url) {
                     MockOpenUrlKind::Web => IpcTabKind::Web { url },
                     MockOpenUrlKind::Image => IpcTabKind::Image { source: url },
+                    MockOpenUrlKind::Pdf => IpcTabKind::Pdf { source: url },
                 },
                 None,
                 None,
@@ -2451,6 +2518,9 @@ mod tests {
             match tab.kind {
                 IpcTabKind::Web { .. } => Ok(()),
                 IpcTabKind::Image { .. } => {
+                    Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
+                },
+                IpcTabKind::Pdf { .. } => {
                     Err(IpcError::new(IpcErrorCode::InvalidRequest, "Not a web tab"))
                 },
                 IpcTabKind::Terminal => {
@@ -2669,12 +2739,30 @@ mod tests {
         })
     }
 
+    fn mock_pdf_view(kind: &IpcTabKind) -> Option<IpcPdfViewState> {
+        let IpcTabKind::Pdf { source } = kind else {
+            return None;
+        };
+        Some(IpcPdfViewState {
+            source: source.clone(),
+            state: IpcPdfLoadState::Loading,
+            page_count: 0,
+            current_page: 1,
+            zoom_mode: IpcPdfZoomMode::FitWidth,
+            zoom: 1.0,
+            search_query: None,
+            search_match_count: 0,
+            error: None,
+        })
+    }
+
     fn mock_open_url_kind(url: &str) -> MockOpenUrlKind {
         #[cfg(target_os = "macos")]
         {
-            match crate::macos::image_view::classify_open_url(url) {
-                crate::macos::image_view::OpenUrlKind::Web => MockOpenUrlKind::Web,
-                crate::macos::image_view::OpenUrlKind::Image => MockOpenUrlKind::Image,
+            match classify_open_url(url) {
+                OpenUrlKind::Web => MockOpenUrlKind::Web,
+                OpenUrlKind::Image => MockOpenUrlKind::Image,
+                OpenUrlKind::Pdf => MockOpenUrlKind::Pdf,
             }
         }
 

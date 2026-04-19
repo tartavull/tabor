@@ -150,6 +150,12 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn image_mouse_wheel(&mut self, _delta: MouseScrollDelta, _phase: TouchPhase) {}
     #[cfg(target_os = "macos")]
+    fn pdf_mouse_input(&mut self, _state: ElementState, _button: MouseButton) {}
+    #[cfg(target_os = "macos")]
+    fn pdf_mouse_move(&mut self, _position: PhysicalPosition<f64>) {}
+    #[cfg(target_os = "macos")]
+    fn pdf_mouse_wheel(&mut self, _delta: MouseScrollDelta, _phase: TouchPhase) {}
+    #[cfg(target_os = "macos")]
     fn image_pinch_gesture(&mut self, _delta: f64, _phase: TouchPhase) {}
     #[cfg(target_os = "macos")]
     fn image_smart_magnify(&mut self) {}
@@ -157,6 +163,12 @@ pub trait ActionContext<T: EventListener> {
     fn image_rotation_gesture(&mut self, _delta: f32, _phase: TouchPhase) {}
     #[cfg(target_os = "macos")]
     fn image_touchpad_pressure(&mut self, _pressure: f32, _stage: i64) {}
+    #[cfg(target_os = "macos")]
+    fn pdf_pinch_gesture(&mut self, _delta: f64, _phase: TouchPhase) {}
+    #[cfg(target_os = "macos")]
+    fn pdf_smart_magnify(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn pdf_touchpad_pressure(&mut self, _pressure: f32, _stage: i64) {}
     #[cfg(target_os = "macos")]
     fn image_zoom_in(&mut self) {}
     #[cfg(target_os = "macos")]
@@ -433,6 +445,11 @@ impl<T: EventListener> Execute<T> for Action {
                 if ctx.window_kind().is_image() {
                     return;
                 }
+                #[cfg(target_os = "macos")]
+                if ctx.window_kind().is_pdf() {
+                    ctx.copy_selection(ClipboardType::Clipboard);
+                    return;
+                }
 
                 ctx.copy_selection(ClipboardType::Clipboard);
             },
@@ -447,7 +464,7 @@ impl<T: EventListener> Execute<T> for Action {
                     return;
                 }
                 #[cfg(target_os = "macos")]
-                if ctx.window_kind().is_image() {
+                if ctx.window_kind().is_image() || ctx.window_kind().is_pdf() {
                     return;
                 }
                 ctx.paste(&text, true);
@@ -584,6 +601,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         if self.ctx.window_kind().is_image() {
             #[cfg(target_os = "macos")]
             self.ctx.image_mouse_move(position);
+            return;
+        }
+        if self.ctx.window_kind().is_pdf() {
+            #[cfg(target_os = "macos")]
+            self.ctx.pdf_mouse_move(position);
             return;
         }
 
@@ -878,6 +900,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             self.ctx.image_mouse_wheel(delta, phase);
             return;
         }
+        if self.ctx.window_kind().is_pdf() {
+            #[cfg(target_os = "macos")]
+            self.ctx.pdf_mouse_wheel(delta, phase);
+            return;
+        }
 
         let multiplier = self.ctx.config().scrolling.multiplier;
         match delta {
@@ -1164,6 +1191,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             self.ctx.image_mouse_input(state, button);
             return;
         }
+        if self.ctx.window_kind().is_pdf() {
+            #[cfg(target_os = "macos")]
+            self.ctx.pdf_mouse_input(state, button);
+            return;
+        }
 
         match button {
             MouseButton::Left => self.ctx.mouse_mut().left_button_state = state,
@@ -1219,7 +1251,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let mode = BindingMode::new(
             self.ctx.terminal().mode(),
             self.ctx.search_active(),
-            self.ctx.window_kind().is_image(),
+            self.ctx.window_kind().is_image() || self.ctx.window_kind().is_pdf(),
         );
         let mouse_mode = self.ctx.mouse_mode();
         let mods = self.ctx.modifiers().state();
