@@ -34,7 +34,7 @@ use log::info;
 #[cfg(target_os = "macos")]
 use serde::Deserialize;
 use serde_json as json;
-use winit::dpi::PhysicalPosition;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
@@ -83,13 +83,14 @@ use crate::ipc;
 use crate::ipc::{
     AgentActResult, AgentAction, AgentElementDetail, AgentEvent, AgentObservation, AgentPdf,
     AgentScreenshot, IpcBrowserAccelerationInfo, IpcBrowserAccelerationState,
-    IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageLoadState,
-    IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage, IpcInspectorSession,
-    IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind,
-    IpcTabPanelState, IpcTabState, IpcTerminalLayoutState, IpcTerminalLayoutStrip,
-    IpcTerminalSessionState, IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode,
-    IpcWebViewMetrics, IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot,
-    IpcWindowDebugState, SocketReply, TabSelection, TerminalKeyInput,
+    IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageDebugSnapshot,
+    IpcImageLoadState, IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage,
+    IpcInspectorSession, IpcInspectorTarget, IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup,
+    IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
+    IpcTerminalLayoutStrip, IpcTerminalSessionState, IpcTouchPhase, IpcWebCloseMetrics,
+    IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
+    IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
+    TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -3866,6 +3867,261 @@ impl WindowContext {
             Err(IpcError::new(
                 IpcErrorCode::Unsupported,
                 "Window debug snapshots are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_image_snapshot(
+        &mut self,
+    ) -> Result<IpcImageDebugSnapshot, IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(tab_id) = self.tabs.active_id() else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+            };
+            let Some(tab) = self.tabs.get(tab_id) else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+            };
+            if !tab.kind.is_image() {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "Active tab is not an image tab",
+                ));
+            }
+            let Some(image_view) = tab.image_view.as_ref() else {
+                return Err(IpcError::new(IpcErrorCode::Internal, "Image view is unavailable"));
+            };
+            let viewport = PhysicalSize::new(
+                self.display.size_info.width() as u32,
+                self.display.size_info.height() as u32,
+            );
+            let background = self.config.colors.primary.background;
+            let image = image_view
+                .debug_snapshot(viewport, [background.r, background.g, background.b, 255])
+                .ok_or_else(|| {
+                    IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Active image tab is not ready for snapshots",
+                    )
+                })?;
+
+            let mut png = Cursor::new(Vec::new());
+            let width = image.width();
+            let height = image.height();
+            DynamicImage::ImageRgba8(image).write_to(&mut png, image::ImageFormat::Png).map_err(
+                |err| {
+                    IpcError::new(
+                        IpcErrorCode::Internal,
+                        format!("Failed to encode image snapshot PNG: {err}"),
+                    )
+                },
+            )?;
+
+            Ok(IpcImageDebugSnapshot { png_base64: BASE64.encode(png.into_inner()), width, height })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Image debug snapshots are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_image_pinch(
+        &mut self,
+        delta: f64,
+        phase: IpcTouchPhase,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let viewport = PhysicalSize::new(
+                self.display.size_info.width() as u32,
+                self.display.size_info.height() as u32,
+            );
+            let cursor = PhysicalPosition::new(
+                f64::from(viewport.width) / 2.0,
+                f64::from(viewport.height) / 2.0,
+            );
+            let changed = {
+                let Some(tab_id) = self.tabs.active_id() else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+                };
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+                };
+                if !tab.kind.is_image() {
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Active tab is not an image tab",
+                    ));
+                }
+                let Some(image_view) = tab.image_view.as_mut() else {
+                    return Err(IpcError::new(IpcErrorCode::Internal, "Image view is unavailable"));
+                };
+                image_view.pinch_gesture(delta, phase.into(), cursor, viewport)
+            };
+            if changed {
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (delta, phase);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Image debug gestures are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_image_smart_magnify(&mut self) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let viewport = PhysicalSize::new(
+                self.display.size_info.width() as u32,
+                self.display.size_info.height() as u32,
+            );
+            let changed = {
+                let Some(tab_id) = self.tabs.active_id() else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+                };
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+                };
+                if !tab.kind.is_image() {
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Active tab is not an image tab",
+                    ));
+                }
+                let Some(image_view) = tab.image_view.as_mut() else {
+                    return Err(IpcError::new(IpcErrorCode::Internal, "Image view is unavailable"));
+                };
+                image_view.smart_magnify(viewport)
+            };
+            if changed {
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Image debug gestures are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_image_rotate(
+        &mut self,
+        delta: f32,
+        phase: IpcTouchPhase,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let viewport = PhysicalSize::new(
+                self.display.size_info.width() as u32,
+                self.display.size_info.height() as u32,
+            );
+            let changed = {
+                let Some(tab_id) = self.tabs.active_id() else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+                };
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+                };
+                if !tab.kind.is_image() {
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Active tab is not an image tab",
+                    ));
+                }
+                let Some(image_view) = tab.image_view.as_mut() else {
+                    return Err(IpcError::new(IpcErrorCode::Internal, "Image view is unavailable"));
+                };
+                image_view.rotation_gesture(delta, phase.into(), viewport)
+            };
+            if changed {
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (delta, phase);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Image debug gestures are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_image_pressure(
+        &mut self,
+        pressure: f32,
+        stage: i64,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let viewport = PhysicalSize::new(
+                self.display.size_info.width() as u32,
+                self.display.size_info.height() as u32,
+            );
+            let cursor = PhysicalPosition::new(
+                f64::from(viewport.width) / 2.0,
+                f64::from(viewport.height) / 2.0,
+            );
+            let changed = {
+                let Some(tab_id) = self.tabs.active_id() else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+                };
+                let Some(tab) = self.tabs.get_mut(tab_id) else {
+                    return Err(IpcError::new(IpcErrorCode::NotFound, "Tab not found"));
+                };
+                if !tab.kind.is_image() {
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Active tab is not an image tab",
+                    ));
+                }
+                let Some(image_view) = tab.image_view.as_mut() else {
+                    return Err(IpcError::new(IpcErrorCode::Internal, "Image view is unavailable"));
+                };
+                let _ = pressure;
+                image_view.touchpad_pressure(stage, cursor)
+            };
+            if changed {
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (pressure, stage);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Image debug gestures are only available on macOS",
             ))
         }
     }

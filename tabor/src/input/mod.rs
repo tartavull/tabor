@@ -150,6 +150,14 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn image_mouse_wheel(&mut self, _delta: MouseScrollDelta, _phase: TouchPhase) {}
     #[cfg(target_os = "macos")]
+    fn image_pinch_gesture(&mut self, _delta: f64, _phase: TouchPhase) {}
+    #[cfg(target_os = "macos")]
+    fn image_smart_magnify(&mut self) {}
+    #[cfg(target_os = "macos")]
+    fn image_rotation_gesture(&mut self, _delta: f32, _phase: TouchPhase) {}
+    #[cfg(target_os = "macos")]
+    fn image_touchpad_pressure(&mut self, _pressure: f32, _stage: i64) {}
+    #[cfg(target_os = "macos")]
     fn image_zoom_in(&mut self) {}
     #[cfg(target_os = "macos")]
     fn image_zoom_out(&mut self) {}

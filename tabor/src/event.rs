@@ -484,6 +484,38 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_window_debug_snapshot(self.scheduler, highlight_notch_ears)
     }
 
+    fn window_debug_image_snapshot(&mut self) -> Result<ipc::IpcImageDebugSnapshot, ipc::IpcError> {
+        self.window.ipc_window_debug_image_snapshot()
+    }
+
+    fn window_debug_image_pinch(
+        &mut self,
+        delta: f64,
+        phase: ipc::IpcTouchPhase,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_image_pinch(delta, phase)
+    }
+
+    fn window_debug_image_smart_magnify(&mut self) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_image_smart_magnify()
+    }
+
+    fn window_debug_image_rotate(
+        &mut self,
+        delta: f32,
+        phase: ipc::IpcTouchPhase,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_image_rotate(delta, phase)
+    }
+
+    fn window_debug_image_pressure(
+        &mut self,
+        pressure: f32,
+        stage: i64,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_image_pressure(pressure, stage)
+    }
+
     fn window_debug_mouse_drag(
         &mut self,
         x0: f64,
@@ -1117,11 +1149,7 @@ impl Processor {
             event,
             WindowEvent::KeyboardInput { is_synthetic: true, .. }
                 | WindowEvent::ActivationTokenDone { .. }
-                | WindowEvent::DoubleTapGesture { .. }
-                | WindowEvent::TouchpadPressure { .. }
-                | WindowEvent::RotationGesture { .. }
                 | WindowEvent::CursorEntered { .. }
-                | WindowEvent::PinchGesture { .. }
                 | WindowEvent::AxisMotion { .. }
                 | WindowEvent::PanGesture { .. }
                 | WindowEvent::HoveredFileCancelled
@@ -3514,7 +3542,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let Some(image_view) = self.image_view.as_mut() else {
             return;
         };
-        if self.mouse.left_button_state == ElementState::Pressed && image_view.is_panning() {
+        if image_view.is_panning() {
             image_view.pan_to(position, image_viewport_size(self.display));
             self.display.window.set_mouse_cursor(CursorIcon::Grabbing);
             self.display.damage_tracker.frame().mark_fully_damaged();
@@ -3534,31 +3562,75 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             return;
         };
 
-        let step = match delta {
-            winit::event::MouseScrollDelta::LineDelta(_, lines) => f64::from(lines),
+        let (delta_x, delta_y) = match delta {
+            winit::event::MouseScrollDelta::LineDelta(columns, lines) => (
+                f64::from(columns) * f64::from(self.display.size_info.cell_width()),
+                f64::from(lines) * f64::from(self.display.size_info.cell_height()),
+            ),
             winit::event::MouseScrollDelta::PixelDelta(delta) => match phase {
-                winit::event::TouchPhase::Started => 0.0,
-                _ => delta.y / 120.0,
+                winit::event::TouchPhase::Started => (0.0, 0.0),
+                _ => (delta.x, delta.y),
             },
         };
-        if step == 0.0 {
-            return;
-        }
-
-        let factor = 1.15_f64.powf(step.abs());
-        let factor = if step.is_sign_positive() { factor } else { 1.0 / factor };
         let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
-        image_view.zoom_by(factor, cursor, image_viewport_size(self.display));
-        self.display.damage_tracker.frame().mark_fully_damaged();
-        *self.dirty = true;
+        if image_view.pan_by(delta_x, delta_y, cursor, image_viewport_size(self.display)) {
+            self.mark_image_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_pinch_gesture(&mut self, delta: f64, phase: winit::event::TouchPhase) {
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+
+        let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+        if image_view.pinch_gesture(delta, phase, cursor, image_viewport_size(self.display)) {
+            self.mark_image_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_smart_magnify(&mut self) {
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+
+        if image_view.smart_magnify(image_viewport_size(self.display)) {
+            self.mark_image_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_rotation_gesture(&mut self, delta: f32, phase: winit::event::TouchPhase) {
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+
+        if image_view.rotation_gesture(delta, phase, image_viewport_size(self.display)) {
+            self.mark_image_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_touchpad_pressure(&mut self, _pressure: f32, stage: i64) {
+        let Some(image_view) = self.image_view.as_mut() else {
+            return;
+        };
+
+        let cursor = PhysicalPosition::new(self.mouse.x as f64, self.mouse.y as f64);
+        if image_view.touchpad_pressure(stage, cursor) {
+            let cursor_icon =
+                if image_view.is_panning() { CursorIcon::Grabbing } else { CursorIcon::Default };
+            self.display.window.set_mouse_cursor(cursor_icon);
+        }
     }
 
     #[cfg(target_os = "macos")]
     fn image_zoom_in(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_in(image_viewport_size(self.display));
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 
@@ -3566,8 +3638,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn image_zoom_out(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_out(image_viewport_size(self.display));
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 
@@ -3575,8 +3646,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn image_zoom_fit(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_fit(image_viewport_size(self.display));
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 
@@ -3584,8 +3654,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn image_zoom_fill(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_fill(image_viewport_size(self.display));
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 
@@ -3593,8 +3662,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn image_zoom_actual(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.zoom_actual(image_viewport_size(self.display));
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 
@@ -3602,8 +3670,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn image_rotate_clockwise(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.rotate_clockwise(image_viewport_size(self.display));
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 
@@ -3611,8 +3678,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn image_reset_view(&mut self) {
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.reset_view();
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            *self.dirty = true;
+            self.mark_image_view_dirty();
         }
     }
 }
@@ -3661,6 +3727,12 @@ fn web_modifier_flags(mods: ModifiersState) -> NSEventModifierFlags {
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
+    #[cfg(target_os = "macos")]
+    fn mark_image_view_dirty(&mut self) {
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        *self.dirty = true;
+    }
+
     #[cfg(target_os = "macos")]
     fn with_web_command_state<R>(
         &mut self,
@@ -5008,6 +5080,8 @@ mod tests {
 
     use tempfile::tempdir;
     use url::Url;
+    use winit::dpi::PhysicalPosition;
+    use winit::event::{DeviceId, TouchPhase, WindowEvent};
 
     use crate::config::terminal::MultiColumnTerminalConfig;
     use crate::display::SizeInfo;
@@ -5015,7 +5089,7 @@ mod tests {
 
     use super::{
         CommandError, CommandHistory, CommandTarget, MultiColumnCommand, MultiColumnCommandScope,
-        command_url_prefix, parse_command_target, parse_multi_column_command,
+        Processor, command_url_prefix, parse_command_target, parse_multi_column_command,
         terminal_text_area_size,
     };
 
@@ -5244,6 +5318,33 @@ mod tests {
         let window_size = terminal_text_area_size(size_info, layout);
         assert_eq!(window_size.num_cols, 100);
         assert_eq!(window_size.num_lines, 80);
+    }
+
+    #[test]
+    fn skip_window_event_keeps_image_multitouch_gestures() {
+        assert!(!Processor::skip_window_event(&WindowEvent::PinchGesture {
+            device_id: DeviceId::dummy(),
+            delta: 0.25,
+            phase: TouchPhase::Moved,
+        }));
+        assert!(!Processor::skip_window_event(&WindowEvent::DoubleTapGesture {
+            device_id: DeviceId::dummy(),
+        }));
+        assert!(!Processor::skip_window_event(&WindowEvent::RotationGesture {
+            device_id: DeviceId::dummy(),
+            delta: 15.0,
+            phase: TouchPhase::Moved,
+        }));
+        assert!(!Processor::skip_window_event(&WindowEvent::TouchpadPressure {
+            device_id: DeviceId::dummy(),
+            pressure: 1.0,
+            stage: 1,
+        }));
+        assert!(Processor::skip_window_event(&WindowEvent::PanGesture {
+            device_id: DeviceId::dummy(),
+            delta: PhysicalPosition::new(1.0_f32, 2.0_f32),
+            phase: TouchPhase::Moved,
+        }));
     }
 }
 
@@ -5570,6 +5671,22 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                         self.ctx.window().set_mouse_visible(true);
                         self.mouse_wheel_input(delta, phase);
                     },
+                    WindowEvent::PinchGesture { delta, phase, .. } => {
+                        self.ctx.window().set_mouse_visible(true);
+                        self.ctx.image_pinch_gesture(delta, phase);
+                    },
+                    WindowEvent::DoubleTapGesture { .. } => {
+                        self.ctx.window().set_mouse_visible(true);
+                        self.ctx.image_smart_magnify();
+                    },
+                    WindowEvent::RotationGesture { delta, phase, .. } => {
+                        self.ctx.window().set_mouse_visible(true);
+                        self.ctx.image_rotation_gesture(delta, phase);
+                    },
+                    WindowEvent::TouchpadPressure { pressure, stage, .. } => {
+                        self.ctx.window().set_mouse_visible(true);
+                        self.ctx.image_touchpad_pressure(pressure, stage);
+                    },
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
                         self.ctx.terminal.is_focused = is_focused;
@@ -5673,11 +5790,7 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                     },
                     WindowEvent::KeyboardInput { is_synthetic: true, .. }
                     | WindowEvent::ActivationTokenDone { .. }
-                    | WindowEvent::DoubleTapGesture { .. }
-                    | WindowEvent::TouchpadPressure { .. }
-                    | WindowEvent::RotationGesture { .. }
                     | WindowEvent::CursorEntered { .. }
-                    | WindowEvent::PinchGesture { .. }
                     | WindowEvent::AxisMotion { .. }
                     | WindowEvent::PanGesture { .. }
                     | WindowEvent::HoveredFileCancelled

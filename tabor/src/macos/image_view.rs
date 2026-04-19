@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use image::ImageFormat;
+use image::imageops::{self, FilterType};
+use image::{ImageFormat, Rgba, RgbaImage};
 use url::Url;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::TouchPhase;
 
 const LOCAL_IMAGE_PROBE_BYTES: usize = 64;
 const MAX_REMOTE_IMAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -16,6 +18,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const ZOOM_STEP: f64 = 1.15;
 const MIN_MANUAL_ZOOM: f64 = 0.05;
 const MAX_MANUAL_ZOOM: f64 = 64.0;
+const ROTATION_SNAP_DEGREES: f32 = 90.0;
+const ROTATION_END_THRESHOLD_DEGREES: f32 = 45.0;
 const REMOTE_IMAGE_EXTENSIONS: &[&str] =
     &["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp"];
 
@@ -61,6 +65,7 @@ pub(crate) struct ImageViewState {
     pub rotation_quarter_turns: u8,
     bitmap: Option<LoadedImage>,
     drag: Option<DragState>,
+    gesture_state: GestureState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,6 +87,12 @@ struct DragState {
     pan_y: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GestureState {
+    accumulated_rotation_degrees: f32,
+    last_pressure_stage: i64,
+}
+
 impl ImageViewState {
     pub(crate) fn new(source: String) -> Self {
         Self {
@@ -95,6 +106,7 @@ impl ImageViewState {
             rotation_quarter_turns: 0,
             bitmap: None,
             drag: None,
+            gesture_state: GestureState::default(),
         }
     }
 
@@ -112,6 +124,7 @@ impl ImageViewState {
         self.bitmap = Some(image);
         self.load_state = ImageLoadState::Ready;
         self.drag = None;
+        self.clear_gesture_state();
         self.clamp_pan(viewport);
     }
 
@@ -121,6 +134,7 @@ impl ImageViewState {
         self.drag = None;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
+        self.clear_gesture_state();
     }
 
     pub(crate) fn bitmap(&self) -> Option<&LoadedImage> {
@@ -134,6 +148,7 @@ impl ImageViewState {
         self.pan_y = 0.0;
         self.rotation_quarter_turns = 0;
         self.drag = None;
+        self.clear_gesture_state();
     }
 
     pub(crate) fn render_quad(&self, viewport: PhysicalSize<u32>) -> Option<ImageRenderQuad> {
@@ -156,6 +171,38 @@ impl ImageViewState {
             uv_bottom_left: uv.2,
             uv_bottom_right: uv.3,
         })
+    }
+
+    pub(crate) fn debug_snapshot(
+        &self,
+        viewport: PhysicalSize<u32>,
+        background: [u8; 4],
+    ) -> Option<RgbaImage> {
+        let bitmap = self.bitmap()?;
+        let quad = self.render_quad(viewport)?;
+        let source = RgbaImage::from_raw(bitmap.width, bitmap.height, bitmap.rgba.to_vec())?;
+        let rotated = match self.rotation_quarter_turns % 4 {
+            0 => source,
+            1 => imageops::rotate90(&source),
+            2 => imageops::rotate180(&source),
+            _ => imageops::rotate270(&source),
+        };
+        let dest_width = quad.dest_width_px.round().max(1.0) as u32;
+        let dest_height = quad.dest_height_px.round().max(1.0) as u32;
+        let rendered = if rotated.width() == dest_width && rotated.height() == dest_height {
+            rotated
+        } else {
+            imageops::resize(&rotated, dest_width, dest_height, FilterType::Triangle)
+        };
+
+        let mut canvas = RgbaImage::from_pixel(viewport.width, viewport.height, Rgba(background));
+        imageops::overlay(
+            &mut canvas,
+            &rendered,
+            quad.dest_x_px.round() as i64,
+            quad.dest_y_px.round() as i64,
+        );
+        Some(canvas)
     }
 
     pub(crate) fn zoom_factor(&self, viewport: PhysicalSize<u32>) -> Option<f64> {
@@ -191,6 +238,35 @@ impl ImageViewState {
         self.pan_x = drag.pan_x + cursor.x - drag.cursor.x;
         self.pan_y = drag.pan_y + cursor.y - drag.cursor.y;
         self.clamp_pan(viewport);
+    }
+
+    pub(crate) fn pan_by(
+        &mut self,
+        delta_x: f64,
+        delta_y: f64,
+        cursor: PhysicalPosition<f64>,
+        viewport: PhysicalSize<u32>,
+    ) -> bool {
+        if self.bitmap.is_none() || (!delta_x.is_finite() && !delta_y.is_finite()) {
+            return false;
+        }
+
+        let delta_x = if delta_x.is_finite() { delta_x } else { 0.0 };
+        let delta_y = if delta_y.is_finite() { delta_y } else { 0.0 };
+        if delta_x.abs() <= f64::EPSILON && delta_y.abs() <= f64::EPSILON {
+            return false;
+        }
+
+        self.pan_x += delta_x;
+        self.pan_y += delta_y;
+        self.clamp_pan(viewport);
+        if let Some(drag) = self.drag.as_mut() {
+            drag.cursor = cursor;
+            drag.pan_x = self.pan_x;
+            drag.pan_y = self.pan_y;
+        }
+
+        true
     }
 
     pub(crate) fn end_pan(&mut self) {
@@ -236,9 +312,133 @@ impl ImageViewState {
     }
 
     pub(crate) fn rotate_clockwise(&mut self, viewport: PhysicalSize<u32>) {
-        self.rotation_quarter_turns = (self.rotation_quarter_turns + 1) % 4;
+        self.rotate_quarter_turns(1, viewport);
+    }
+
+    pub(crate) fn rotate_quarter_turns(&mut self, turns: i32, viewport: PhysicalSize<u32>) {
+        let turns = turns.rem_euclid(4);
+        if turns == 0 {
+            return;
+        }
+
+        self.rotation_quarter_turns =
+            (i32::from(self.rotation_quarter_turns) + turns).rem_euclid(4) as u8;
         self.drag = None;
         self.clamp_pan(viewport);
+    }
+
+    pub(crate) fn smart_magnify(&mut self, viewport: PhysicalSize<u32>) -> bool {
+        if self.bitmap.is_none() {
+            return false;
+        }
+
+        match self.scale_mode {
+            ImageScaleMode::Actual => self.zoom_fit(viewport),
+            ImageScaleMode::Fit | ImageScaleMode::Fill | ImageScaleMode::Manual => {
+                self.zoom_actual(viewport);
+            },
+        }
+
+        true
+    }
+
+    pub(crate) fn pinch_gesture(
+        &mut self,
+        delta: f64,
+        phase: TouchPhase,
+        cursor: PhysicalPosition<f64>,
+        viewport: PhysicalSize<u32>,
+    ) -> bool {
+        if phase == TouchPhase::Cancelled || !delta.is_finite() {
+            return false;
+        }
+
+        let Some(old_zoom) = self.zoom_factor(viewport) else {
+            return false;
+        };
+
+        let new_zoom = old_zoom + delta;
+        if new_zoom <= 0.0 || (new_zoom - old_zoom).abs() <= f64::EPSILON {
+            return false;
+        }
+
+        self.zoom_by(new_zoom / old_zoom, cursor, viewport);
+        true
+    }
+
+    pub(crate) fn rotation_gesture(
+        &mut self,
+        delta: f32,
+        phase: TouchPhase,
+        viewport: PhysicalSize<u32>,
+    ) -> bool {
+        match phase {
+            TouchPhase::Started => {
+                self.gesture_state.accumulated_rotation_degrees = 0.0;
+            },
+            TouchPhase::Moved | TouchPhase::Ended | TouchPhase::Cancelled => (),
+        }
+
+        if !delta.is_finite() {
+            if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+                self.gesture_state.accumulated_rotation_degrees = 0.0;
+            }
+            return false;
+        }
+
+        self.gesture_state.accumulated_rotation_degrees += delta;
+        let mut quarter_turns = 0;
+
+        while self.gesture_state.accumulated_rotation_degrees <= -ROTATION_SNAP_DEGREES {
+            quarter_turns += 1;
+            self.gesture_state.accumulated_rotation_degrees += ROTATION_SNAP_DEGREES;
+        }
+        while self.gesture_state.accumulated_rotation_degrees >= ROTATION_SNAP_DEGREES {
+            quarter_turns -= 1;
+            self.gesture_state.accumulated_rotation_degrees -= ROTATION_SNAP_DEGREES;
+        }
+
+        if phase == TouchPhase::Ended {
+            if self.gesture_state.accumulated_rotation_degrees <= -ROTATION_END_THRESHOLD_DEGREES {
+                quarter_turns += 1;
+            } else if self.gesture_state.accumulated_rotation_degrees
+                >= ROTATION_END_THRESHOLD_DEGREES
+            {
+                quarter_turns -= 1;
+            }
+            self.gesture_state.accumulated_rotation_degrees = 0.0;
+        } else if phase == TouchPhase::Cancelled {
+            self.gesture_state.accumulated_rotation_degrees = 0.0;
+            return false;
+        }
+
+        if quarter_turns == 0 {
+            return false;
+        }
+
+        self.rotate_quarter_turns(quarter_turns, viewport);
+        true
+    }
+
+    pub(crate) fn touchpad_pressure(&mut self, stage: i64, cursor: PhysicalPosition<f64>) -> bool {
+        if stage <= 0 {
+            let was_active = self.gesture_state.last_pressure_stage > 0 && self.drag.is_some();
+            self.gesture_state.last_pressure_stage = 0;
+            self.end_pan();
+            return was_active;
+        }
+
+        if self.bitmap.is_none() {
+            return false;
+        }
+
+        let previous = self.gesture_state.last_pressure_stage;
+        self.gesture_state.last_pressure_stage = stage;
+        if previous > 0 {
+            return false;
+        }
+
+        self.begin_pan(cursor)
     }
 
     pub(crate) fn zoom_by(
@@ -265,18 +465,12 @@ impl ImageViewState {
         self.clamp_pan(viewport);
     }
 
-    pub(crate) fn clamp_pan(&mut self, viewport: PhysicalSize<u32>) {
+    pub(crate) fn clamp_pan(&mut self, _viewport: PhysicalSize<u32>) {
         let Some(_) = self.bitmap() else {
             self.pan_x = 0.0;
             self.pan_y = 0.0;
             return;
         };
-
-        let display_size = self.display_size(viewport);
-        let max_pan_x = ((display_size.0 - f64::from(viewport.width)) / 2.0).max(0.0);
-        let max_pan_y = ((display_size.1 - f64::from(viewport.height)) / 2.0).max(0.0);
-        self.pan_x = self.pan_x.clamp(-max_pan_x, max_pan_x);
-        self.pan_y = self.pan_y.clamp(-max_pan_y, max_pan_y);
     }
 
     fn display_size(&self, viewport: PhysicalSize<u32>) -> (f64, f64) {
@@ -287,6 +481,10 @@ impl ImageViewState {
             rotated_dimensions(bitmap.width, bitmap.height, self.rotation_quarter_turns);
         let zoom = self.zoom_factor(viewport).unwrap_or(1.0);
         (f64::from(image_width) * zoom, f64::from(image_height) * zoom)
+    }
+
+    fn clear_gesture_state(&mut self) {
+        self.gesture_state = GestureState::default();
     }
 }
 
@@ -576,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn panning_clamps_to_visible_bounds() {
+    fn clamp_pan_preserves_offsets_for_larger_images() {
         let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
         state.bitmap = Some(LoadedImage {
             source: state.source.clone(),
@@ -593,7 +791,194 @@ mod tests {
         state.pan_y = -500.0;
         state.clamp_pan(viewport);
 
-        assert_eq!(state.pan_x, 100.0);
-        assert_eq!(state.pan_y, -100.0);
+        assert_eq!(state.pan_x, 500.0);
+        assert_eq!(state.pan_y, -500.0);
+    }
+
+    #[test]
+    fn clamp_pan_preserves_offsets_for_smaller_images() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 100,
+            height: 100,
+            rgba: Arc::from(vec![255; 100 * 100 * 4]),
+        });
+        state.scale_mode = ImageScaleMode::Actual;
+        let viewport = PhysicalSize::new(200, 200);
+
+        state.pan_x = 500.0;
+        state.pan_y = -500.0;
+        state.clamp_pan(viewport);
+
+        assert_eq!(state.pan_x, 500.0);
+        assert_eq!(state.pan_y, -500.0);
+    }
+
+    #[test]
+    fn pan_by_moves_image_and_preserves_active_drag_anchor() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 100,
+            height: 100,
+            rgba: Arc::from(vec![255; 100 * 100 * 4]),
+        });
+        state.scale_mode = ImageScaleMode::Manual;
+        state.manual_zoom = 4.0;
+        let viewport = PhysicalSize::new(200, 200);
+        let cursor = PhysicalPosition::new(100.0, 100.0);
+
+        assert!(state.begin_pan(cursor));
+        assert!(state.pan_by(30.0, -20.0, cursor, viewport));
+        assert_eq!(state.pan_x, 30.0);
+        assert_eq!(state.pan_y, -20.0);
+
+        state.pan_to(PhysicalPosition::new(120.0, 110.0), viewport);
+        assert_eq!(state.pan_x, 50.0);
+        assert_eq!(state.pan_y, -10.0);
+    }
+
+    #[test]
+    fn pinch_gesture_uses_additive_scale_deltas() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 100,
+            height: 100,
+            rgba: Arc::from(vec![255; 100 * 100 * 4]),
+        });
+        state.scale_mode = ImageScaleMode::Actual;
+        let viewport = PhysicalSize::new(150, 150);
+        let cursor = PhysicalPosition::new(75.0, 75.0);
+
+        assert!(!state.pinch_gesture(0.0, TouchPhase::Started, cursor, viewport));
+        assert!(state.pinch_gesture(0.2, TouchPhase::Moved, cursor, viewport));
+        assert!(state.pinch_gesture(0.3, TouchPhase::Moved, cursor, viewport));
+        assert!(!state.pinch_gesture(0.0, TouchPhase::Ended, cursor, viewport));
+
+        assert_eq!(state.scale_mode, ImageScaleMode::Manual);
+        assert!((state.manual_zoom - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn smart_magnify_toggles_fit_and_actual() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 200,
+            height: 100,
+            rgba: Arc::from(vec![255; 200 * 100 * 4]),
+        });
+        let viewport = PhysicalSize::new(300, 300);
+
+        assert!(state.smart_magnify(viewport));
+        assert_eq!(state.scale_mode, ImageScaleMode::Actual);
+        assert_eq!(state.zoom_factor(viewport), Some(1.0));
+
+        assert!(state.smart_magnify(viewport));
+        assert_eq!(state.scale_mode, ImageScaleMode::Fit);
+        assert_eq!(state.zoom_factor(viewport), Some(1.5));
+    }
+
+    #[test]
+    fn rotation_gesture_snaps_across_multiple_quarter_turns() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 100,
+            height: 100,
+            rgba: Arc::from(vec![255; 100 * 100 * 4]),
+        });
+        let viewport = PhysicalSize::new(200, 200);
+
+        assert!(!state.rotation_gesture(0.0, TouchPhase::Started, viewport));
+        assert!(state.rotation_gesture(-190.0, TouchPhase::Moved, viewport));
+        assert_eq!(state.rotation_quarter_turns, 2);
+        assert!((state.gesture_state.accumulated_rotation_degrees + 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rotation_gesture_rounds_leftover_delta_on_end() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 100,
+            height: 100,
+            rgba: Arc::from(vec![255; 100 * 100 * 4]),
+        });
+        let viewport = PhysicalSize::new(200, 200);
+
+        assert!(!state.rotation_gesture(0.0, TouchPhase::Started, viewport));
+        assert!(state.rotation_gesture(50.0, TouchPhase::Ended, viewport));
+        assert_eq!(state.rotation_quarter_turns, 3);
+        assert_eq!(state.gesture_state.accumulated_rotation_degrees, 0.0);
+    }
+
+    #[test]
+    fn touchpad_pressure_starts_and_ends_pan_once_per_press() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.bitmap = Some(LoadedImage {
+            source: state.source.clone(),
+            title: state.title.clone(),
+            width: 100,
+            height: 100,
+            rgba: Arc::from(vec![255; 100 * 100 * 4]),
+        });
+        let cursor = PhysicalPosition::new(100.0, 100.0);
+
+        state.scale_mode = ImageScaleMode::Manual;
+        state.manual_zoom = 3.0;
+        state.pan_x = 20.0;
+        state.rotation_quarter_turns = 1;
+
+        assert!(state.touchpad_pressure(1, cursor));
+        assert!(state.is_panning());
+        assert_eq!(state.scale_mode, ImageScaleMode::Manual);
+        assert_eq!(state.rotation_quarter_turns, 1);
+
+        state.rotation_quarter_turns = 1;
+        assert!(!state.touchpad_pressure(2, cursor));
+        assert_eq!(state.rotation_quarter_turns, 1);
+
+        assert!(state.touchpad_pressure(0, cursor));
+        assert!(!state.is_panning());
+        assert!(state.touchpad_pressure(1, cursor));
+        assert!(state.is_panning());
+    }
+
+    #[test]
+    fn reset_view_clears_transient_gesture_state() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.gesture_state.accumulated_rotation_degrees = 30.0;
+        state.gesture_state.last_pressure_stage = 2;
+
+        state.reset_view();
+
+        assert_eq!(state.gesture_state.accumulated_rotation_degrees, 0.0);
+        assert_eq!(state.gesture_state.last_pressure_stage, 0);
+    }
+
+    #[test]
+    fn source_and_error_reset_clear_transient_gesture_state() {
+        let mut state = ImageViewState::new(String::from("file:///tmp/test.png"));
+        state.gesture_state.accumulated_rotation_degrees = 30.0;
+        state.gesture_state.last_pressure_stage = 2;
+
+        state.reset_source(String::from("file:///tmp/next.png"));
+        assert_eq!(state.gesture_state.accumulated_rotation_degrees, 0.0);
+        assert_eq!(state.gesture_state.last_pressure_stage, 0);
+
+        state.gesture_state.accumulated_rotation_degrees = -30.0;
+        state.gesture_state.last_pressure_stage = 1;
+        state.set_error(String::from("decode failed"));
+        assert_eq!(state.gesture_state.accumulated_rotation_degrees, 0.0);
+        assert_eq!(state.gesture_state.last_pressure_stage, 0);
     }
 }

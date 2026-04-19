@@ -339,6 +339,33 @@ pub struct IpcWindowDebugSnapshot {
     pub state: IpcWindowDebugState,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcImageDebugSnapshot {
+    pub png_base64: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcTouchPhase {
+    Started,
+    Moved,
+    Ended,
+    Cancelled,
+}
+
+impl From<IpcTouchPhase> for winit::event::TouchPhase {
+    fn from(value: IpcTouchPhase) -> Self {
+        match value {
+            IpcTouchPhase::Started => Self::Started,
+            IpcTouchPhase::Moved => Self::Moved,
+            IpcTouchPhase::Ended => Self::Ended,
+            IpcTouchPhase::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcWindowDebugButton {
@@ -797,6 +824,20 @@ pub enum IpcRequest {
         #[serde(default)]
         highlight_notch_ears: bool,
     },
+    WindowDebugImageSnapshot,
+    WindowDebugImagePinch {
+        delta: f64,
+        phase: IpcTouchPhase,
+    },
+    WindowDebugImageSmartMagnify,
+    WindowDebugImageRotate {
+        delta: f32,
+        phase: IpcTouchPhase,
+    },
+    WindowDebugImagePressure {
+        pressure: f32,
+        stage: i64,
+    },
     WindowDebugMouseDrag {
         x0: f64,
         y0: f64,
@@ -874,6 +915,26 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
         IpcRequestHelp {
             name: "window_debug_snapshot",
             summary: "Capture a PNG snapshot of the active window with debug geometry.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_image_snapshot",
+            summary: "Capture a PNG snapshot of the active image view.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_image_pinch",
+            summary: "Inject a pinch gesture into the active image tab.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_image_smart_magnify",
+            summary: "Inject a smart magnify gesture into the active image tab.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_image_rotate",
+            summary: "Inject a rotation gesture into the active image tab.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_image_pressure",
+            summary: "Inject a touchpad pressure gesture into the active image tab.",
         },
         IpcRequestHelp {
             name: "window_debug_mouse_drag",
@@ -955,6 +1016,7 @@ pub enum SocketReply {
     AgentAct { result: AgentActResult },
     WindowDebugState { state: IpcWindowDebugState },
     WindowDebugSnapshot { snapshot: IpcWindowDebugSnapshot },
+    WindowDebugImageSnapshot { snapshot: IpcImageDebugSnapshot },
     RuntimeMetrics { metrics: IpcRuntimeMetrics },
     Error { error: IpcError },
 }
@@ -1130,6 +1192,19 @@ pub trait IpcContext {
         &mut self,
         highlight_notch_ears: bool,
     ) -> Result<IpcWindowDebugSnapshot, IpcError>;
+    fn window_debug_image_snapshot(&mut self) -> Result<IpcImageDebugSnapshot, IpcError>;
+    fn window_debug_image_pinch(
+        &mut self,
+        delta: f64,
+        phase: IpcTouchPhase,
+    ) -> Result<(), IpcError>;
+    fn window_debug_image_smart_magnify(&mut self) -> Result<(), IpcError>;
+    fn window_debug_image_rotate(
+        &mut self,
+        delta: f32,
+        phase: IpcTouchPhase,
+    ) -> Result<(), IpcError>;
+    fn window_debug_image_pressure(&mut self, pressure: f32, stage: i64) -> Result<(), IpcError>;
     fn window_debug_mouse_drag(
         &mut self,
         x0: f64,
@@ -1487,6 +1562,45 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::WindowDebugImageSnapshot => match ctx.window_debug_image_snapshot() {
+            Ok(snapshot) => IpcResponse {
+                reply: SocketReply::WindowDebugImageSnapshot { snapshot },
+                close_window: false,
+            },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
+        },
+        IpcRequest::WindowDebugImagePinch { delta, phase } => {
+            match ctx.window_debug_image_pinch(delta, phase) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WindowDebugImageSmartMagnify => match ctx.window_debug_image_smart_magnify() {
+            Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
+        },
+        IpcRequest::WindowDebugImageRotate { delta, phase } => {
+            match ctx.window_debug_image_rotate(delta, phase) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WindowDebugImagePressure { pressure, stage } => {
+            match ctx.window_debug_image_pressure(pressure, stage) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
         IpcRequest::WindowDebugMouseDrag { x0, y0, x1, y1, steps } => {
             match ctx.window_debug_mouse_drag(x0, y0, x1, y1, steps) {
                 Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
@@ -1802,12 +1916,14 @@ mod tests {
         last_command: Option<String>,
         last_window_drag: Option<(f64, f64, f64, f64, Option<usize>)>,
         last_window_button: Option<IpcWindowDebugButton>,
+        last_image_gesture: Option<MockImageGesture>,
         web_supported: bool,
         inspector_targets: Vec<IpcInspectorTarget>,
         inspector_sessions: HashMap<String, IpcInspectorSession>,
         inspector_messages: HashMap<String, VecDeque<String>>,
         window_debug_state: IpcWindowDebugState,
         window_debug_snapshot: IpcWindowDebugSnapshot,
+        image_debug_snapshot: IpcImageDebugSnapshot,
         runtime_metrics: IpcRuntimeMetrics,
     }
 
@@ -1815,6 +1931,14 @@ mod tests {
     enum MockOpenUrlKind {
         Web,
         Image,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum MockImageGesture {
+        Pinch { delta: f64, phase: IpcTouchPhase },
+        SmartMagnify,
+        Rotate { delta: f32, phase: IpcTouchPhase },
+        Pressure { pressure: f32, stage: i64 },
     }
 
     impl MockContext {
@@ -1831,6 +1955,7 @@ mod tests {
                 last_command: None,
                 last_window_drag: None,
                 last_window_button: None,
+                last_image_gesture: None,
                 web_supported,
                 inspector_targets: Vec::new(),
                 inspector_sessions: HashMap::new(),
@@ -1935,6 +2060,11 @@ mod tests {
                             height: 32.0,
                         },
                     },
+                },
+                image_debug_snapshot: IpcImageDebugSnapshot {
+                    png_base64: String::from("YmFy"),
+                    width: 800,
+                    height: 600,
                 },
                 runtime_metrics: IpcRuntimeMetrics {
                     webview: Some(IpcWebViewMetrics {
@@ -2462,6 +2592,42 @@ mod tests {
             Ok(self.window_debug_snapshot.clone())
         }
 
+        fn window_debug_image_snapshot(&mut self) -> Result<IpcImageDebugSnapshot, IpcError> {
+            Ok(self.image_debug_snapshot.clone())
+        }
+
+        fn window_debug_image_pinch(
+            &mut self,
+            delta: f64,
+            phase: IpcTouchPhase,
+        ) -> Result<(), IpcError> {
+            self.last_image_gesture = Some(MockImageGesture::Pinch { delta, phase });
+            Ok(())
+        }
+
+        fn window_debug_image_smart_magnify(&mut self) -> Result<(), IpcError> {
+            self.last_image_gesture = Some(MockImageGesture::SmartMagnify);
+            Ok(())
+        }
+
+        fn window_debug_image_rotate(
+            &mut self,
+            delta: f32,
+            phase: IpcTouchPhase,
+        ) -> Result<(), IpcError> {
+            self.last_image_gesture = Some(MockImageGesture::Rotate { delta, phase });
+            Ok(())
+        }
+
+        fn window_debug_image_pressure(
+            &mut self,
+            pressure: f32,
+            stage: i64,
+        ) -> Result<(), IpcError> {
+            self.last_image_gesture = Some(MockImageGesture::Pressure { pressure, stage });
+            Ok(())
+        }
+
         fn window_debug_mouse_drag(
             &mut self,
             x0: f64,
@@ -2814,5 +2980,50 @@ mod tests {
             IpcRequest::DetachInspector { session_id: session.session_id },
         );
         assert!(matches!(response.reply, SocketReply::Ok));
+    }
+
+    #[test]
+    fn ipc_handles_window_debug_image_requests() {
+        let mut ctx = MockContext::new(true);
+
+        let response = handle_request(&mut ctx, IpcRequest::WindowDebugImageSnapshot);
+        let SocketReply::WindowDebugImageSnapshot { snapshot } = response.reply else {
+            panic!("expected window_debug_image_snapshot reply");
+        };
+        assert_eq!(snapshot, ctx.image_debug_snapshot);
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugImagePinch { delta: 0.25, phase: IpcTouchPhase::Moved },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(
+            ctx.last_image_gesture,
+            Some(MockImageGesture::Pinch { delta: 0.25, phase: IpcTouchPhase::Moved })
+        );
+
+        let response = handle_request(&mut ctx, IpcRequest::WindowDebugImageSmartMagnify);
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(ctx.last_image_gesture, Some(MockImageGesture::SmartMagnify));
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugImageRotate { delta: -90.0, phase: IpcTouchPhase::Ended },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(
+            ctx.last_image_gesture,
+            Some(MockImageGesture::Rotate { delta: -90.0, phase: IpcTouchPhase::Ended })
+        );
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugImagePressure { pressure: 0.75, stage: 2 },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(
+            ctx.last_image_gesture,
+            Some(MockImageGesture::Pressure { pressure: 0.75, stage: 2 })
+        );
     }
 }
