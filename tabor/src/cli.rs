@@ -4,7 +4,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueHint};
+use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum, ValueHint};
 use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use tabor_config::SerdeReplace;
@@ -379,6 +379,9 @@ pub enum AgentCommand {
     /// Observe the selected web tab.
     Observe,
 
+    /// Read terminal buffer or viewport text from the selected terminal tab.
+    Read(AgentRead),
+
     /// Inspect one observed element by id.
     Inspect(AgentInspect),
 
@@ -429,6 +432,26 @@ pub struct AgentUse {
 pub struct AgentInspect {
     /// Element id returned by `tabor agent observe`.
     pub element_id: String,
+}
+
+#[cfg(unix)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TerminalReadScopeArg {
+    Viewport,
+    Buffer,
+    Selection,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct AgentRead {
+    /// Which terminal text surface to read.
+    #[clap(long, value_enum, default_value = "buffer")]
+    pub scope: TerminalReadScopeArg,
+
+    /// Maximum number of lines to return for buffer reads.
+    #[clap(long)]
+    pub max_lines: Option<usize>,
 }
 
 #[cfg(unix)]
@@ -573,6 +596,15 @@ pub enum MessageCommand {
 
     /// Open the Web Inspector for a web tab.
     OpenInspector(MsgOpenInspector),
+
+    /// Observe a terminal tab with viewport rows and visible-cell metadata.
+    TerminalObserve(MsgTerminalTarget),
+
+    /// Read terminal viewport, buffer, or selection text.
+    TerminalRead(MsgTerminalRead),
+
+    /// Capture a PNG of the visible terminal viewport.
+    TerminalScreenshot(MsgTerminalScreenshot),
 
     /// Get tab panel state.
     GetTabPanel,
@@ -773,6 +805,42 @@ pub struct MsgOpenInspector {
     /// Tab id formatted as <index>:<generation> (defaults to active tab).
     #[clap(long, value_parser = parse_tab_id, value_name = "INDEX:GEN")]
     pub tab_id: Option<TabIdArg>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct MsgTerminalTarget {
+    /// Tab id formatted as <index>:<generation> (defaults to active tab).
+    #[clap(long, value_parser = parse_tab_id, value_name = "INDEX:GEN")]
+    pub tab_id: Option<TabIdArg>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct MsgTerminalRead {
+    /// Tab id formatted as <index>:<generation> (defaults to active tab).
+    #[clap(long, value_parser = parse_tab_id, value_name = "INDEX:GEN")]
+    pub tab_id: Option<TabIdArg>,
+
+    /// Which terminal text surface to read.
+    #[clap(long, value_enum, default_value = "buffer")]
+    pub scope: TerminalReadScopeArg,
+
+    /// Maximum number of lines to return for buffer reads.
+    #[clap(long)]
+    pub max_lines: Option<usize>,
+}
+
+#[cfg(unix)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct MsgTerminalScreenshot {
+    /// Tab id formatted as <index>:<generation> (defaults to active tab).
+    #[clap(long, value_parser = parse_tab_id, value_name = "INDEX:GEN")]
+    pub tab_id: Option<TabIdArg>,
+
+    /// Write the PNG to this path. The raw IPC JSON is printed when omitted.
+    #[clap(long, value_hint = ValueHint::FilePath)]
+    pub path: Option<PathBuf>,
 }
 
 #[cfg(unix)]

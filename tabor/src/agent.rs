@@ -16,13 +16,15 @@ use tabor_terminal::term::ClipboardType;
 
 use crate::cli::{
     AgentAct, AgentClipboard, AgentClipboardCommand, AgentClipboardSet, AgentCommand, AgentEvents,
-    AgentInspect, AgentOptions, AgentPdf, AgentScreenshot, AgentUpload, AgentUse,
+    AgentInspect, AgentOptions, AgentPdf, AgentRead, AgentScreenshot, AgentUpload, AgentUse,
+    TerminalReadScopeArg,
 };
 use crate::clipboard::Clipboard;
 use crate::ipc::{
     AgentActResult, AgentAction, AgentDownload, AgentElementDetail, AgentEvent, AgentObservation,
-    IpcConnection, IpcRequest, IpcTabGroup, IpcTabId, IpcTabState, SocketReply,
-    resolve_socket_path,
+    IpcConnection, IpcRequest, IpcTabGroup, IpcTabId, IpcTabState, IpcTerminalObservation,
+    IpcTerminalRead, IpcTerminalReadScope, SocketReply, TerminalKeyInput, WebKeyModifiers,
+    WebKeyState, resolve_socket_path,
 };
 #[cfg(target_os = "macos")]
 use crate::macos;
@@ -30,6 +32,14 @@ use crate::macos;
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INTERNAL_SERVE_ARG: &str = "__tabor_agent_serve";
+
+fn ipc_terminal_read_scope(scope: TerminalReadScopeArg) -> IpcTerminalReadScope {
+    match scope {
+        TerminalReadScopeArg::Viewport => IpcTerminalReadScope::Viewport,
+        TerminalReadScopeArg::Buffer => IpcTerminalReadScope::Buffer,
+        TerminalReadScopeArg::Selection => IpcTerminalReadScope::Selection,
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct ControllerState {
@@ -46,6 +56,7 @@ enum ControllerRequest {
     UseActive,
     UseTab { tab_id: IpcTabId },
     Observe,
+    Read { scope: IpcTerminalReadScope, max_lines: Option<usize> },
     Inspect { element_id: String },
     Screenshot { path: Option<PathBuf>, full_page: bool, element_id: Option<String> },
     Events { since: Option<u64>, max: usize, kinds: Vec<String> },
@@ -65,6 +76,8 @@ enum ControllerReply {
     App { groups: Vec<IpcTabGroup>, selected_tab_id: Option<IpcTabId> },
     Use { tab: Box<IpcTabState> },
     Observation { observation: AgentObservation },
+    TerminalObservation { observation: IpcTerminalObservation },
+    TerminalRead { read: IpcTerminalRead },
     Element { element: AgentElementDetail },
     Screenshot { path: PathBuf, width: u32, height: u32 },
     Events { last_event_id: u64, events: Vec<AgentEvent> },
@@ -102,6 +115,13 @@ pub fn run(options: AgentOptions) -> Result<(), Box<dyn Error>> {
         },
         AgentCommand::Observe => {
             let reply = send_request(options.socket, ControllerRequest::Observe)?;
+            print_reply(&reply)?;
+        },
+        AgentCommand::Read(AgentRead { scope, max_lines }) => {
+            let reply = send_request(
+                options.socket,
+                ControllerRequest::Read { scope: ipc_terminal_read_scope(scope), max_lines },
+            )?;
             print_reply(&reply)?;
         },
         AgentCommand::Inspect(AgentInspect { element_id }) => {
@@ -331,25 +351,69 @@ fn handle_request(
             Ok(ControllerReply::Use { tab })
         },
         ControllerRequest::Observe => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            match &tab.kind {
+                crate::ipc::IpcTabKind::Terminal => {
+                    let reply = send_tabor_request(
+                        tabor_socket,
+                        tabor,
+                        &IpcRequest::TerminalObserve { tab_id: Some(tab.tab_id) },
+                    )?;
+                    let SocketReply::TerminalObservation { observation } = reply else {
+                        return Err(IoError::other("unexpected terminal observe reply").into());
+                    };
+                    Ok(ControllerReply::TerminalObservation { observation })
+                },
+                crate::ipc::IpcTabKind::Web { .. } => {
+                    let reply = send_tabor_request(
+                        tabor_socket,
+                        tabor,
+                        &IpcRequest::AgentObserve { tab_id: Some(tab.tab_id) },
+                    )?;
+                    let SocketReply::AgentObservation { observation } = reply else {
+                        return Err(IoError::other("unexpected observe reply").into());
+                    };
+                    Ok(ControllerReply::Observation { observation })
+                },
+                _ => Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Observe is only supported for terminal and web tabs",
+                )
+                .into()),
+            }
+        },
+        ControllerRequest::Read { scope, max_lines } => {
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            if !matches!(&tab.kind, crate::ipc::IpcTabKind::Terminal) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Read is only supported for terminal tabs",
+                )
+                .into());
+            }
             let reply = send_tabor_request(
                 tabor_socket,
                 tabor,
-                &IpcRequest::AgentObserve { tab_id: Some(tab_id) },
+                &IpcRequest::TerminalRead { tab_id: Some(tab.tab_id), scope, max_lines },
             )?;
-            let SocketReply::AgentObservation { observation } = reply else {
-                return Err(IoError::other("unexpected observe reply").into());
+            let SocketReply::TerminalRead { read } = reply else {
+                return Err(IoError::other("unexpected terminal read reply").into());
             };
-            Ok(ControllerReply::Observation { observation })
+            Ok(ControllerReply::TerminalRead { read })
         },
         ControllerRequest::Inspect { element_id } => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Inspect is only supported for web tabs",
+                )
+                .into());
+            }
             let reply = send_tabor_request(
                 tabor_socket,
                 tabor,
-                &IpcRequest::AgentInspect { tab_id: Some(tab_id), element_id },
+                &IpcRequest::AgentInspect { tab_id: Some(tab.tab_id), element_id },
             )?;
             let SocketReply::AgentElement { element } = reply else {
                 return Err(IoError::other("unexpected inspect reply").into());
@@ -357,15 +421,51 @@ fn handle_request(
             Ok(ControllerReply::Element { element })
         },
         ControllerRequest::Screenshot { path, full_page, element_id } => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
-            let reply = send_tabor_request(
-                tabor_socket,
-                tabor,
-                &IpcRequest::AgentScreenshot { tab_id: Some(tab_id), full_page },
-            )?;
-            let SocketReply::AgentScreenshot { screenshot } = reply else {
-                return Err(IoError::other("unexpected screenshot reply").into());
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let screenshot = match &tab.kind {
+                crate::ipc::IpcTabKind::Terminal => {
+                    if full_page {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidInput,
+                            "full-page screenshots are only supported for web tabs",
+                        )
+                        .into());
+                    }
+                    if element_id.is_some() {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidInput,
+                            "element screenshots are only supported for web tabs",
+                        )
+                        .into());
+                    }
+                    let reply = send_tabor_request(
+                        tabor_socket,
+                        tabor,
+                        &IpcRequest::TerminalScreenshot { tab_id: Some(tab.tab_id) },
+                    )?;
+                    let SocketReply::TerminalScreenshot { screenshot } = reply else {
+                        return Err(IoError::other("unexpected terminal screenshot reply").into());
+                    };
+                    screenshot
+                },
+                crate::ipc::IpcTabKind::Web { .. } => {
+                    let reply = send_tabor_request(
+                        tabor_socket,
+                        tabor,
+                        &IpcRequest::AgentScreenshot { tab_id: Some(tab.tab_id), full_page },
+                    )?;
+                    let SocketReply::AgentScreenshot { screenshot } = reply else {
+                        return Err(IoError::other("unexpected screenshot reply").into());
+                    };
+                    screenshot
+                },
+                _ => {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        "Screenshot is only supported for terminal and web tabs",
+                    )
+                    .into());
+                },
             };
             let mut png = BASE64.decode(screenshot.data_base64.as_bytes())?;
             let image = image::load_from_memory(&png)?;
@@ -374,7 +474,7 @@ fn handle_request(
             let mut height = if screenshot.height == 0 { image_height } else { screenshot.height };
 
             if let Some(element_id) = element_id {
-                let element = inspect_element(tabor_socket, tabor, tab_id, element_id)?;
+                let element = inspect_element(tabor_socket, tabor, tab.tab_id, element_id)?;
                 let bbox =
                     element.bbox.ok_or_else(|| IoError::other("element has no bounding box"))?;
                 let x = bbox.x.max(0) as u32;
@@ -397,13 +497,19 @@ fn handle_request(
             Ok(ControllerReply::Screenshot { path, width, height })
         },
         ControllerRequest::Events { since, max, kinds } => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Events are only supported for web tabs",
+                )
+                .into());
+            }
             let reply = send_tabor_request(
                 tabor_socket,
                 tabor,
                 &IpcRequest::AgentEvents {
-                    tab_id: Some(tab_id),
+                    tab_id: Some(tab.tab_id),
                     since,
                     max: Some(max),
                     kinds: (!kinds.is_empty()).then_some(kinds),
@@ -415,12 +521,18 @@ fn handle_request(
             Ok(ControllerReply::Events { last_event_id, events })
         },
         ControllerRequest::Pdf { path } => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "PDF export is only supported for web tabs",
+                )
+                .into());
+            }
             let reply = send_tabor_request(
                 tabor_socket,
                 tabor,
-                &IpcRequest::AgentPdf { tab_id: Some(tab_id) },
+                &IpcRequest::AgentPdf { tab_id: Some(tab.tab_id) },
             )?;
             let SocketReply::AgentPdf { pdf } = reply else {
                 return Err(IoError::other("unexpected pdf reply").into());
@@ -430,13 +542,19 @@ fn handle_request(
             Ok(ControllerReply::Pdf { path })
         },
         ControllerRequest::Upload { element_id, paths } => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Upload is only supported for web tabs",
+                )
+                .into());
+            }
             let reply = send_tabor_request(
                 tabor_socket,
                 tabor,
                 &IpcRequest::AgentUpload {
-                    tab_id: Some(tab_id),
+                    tab_id: Some(tab.tab_id),
                     element_id,
                     paths: paths
                         .into_iter()
@@ -450,12 +568,18 @@ fn handle_request(
             Ok(ControllerReply::Upload { element })
         },
         ControllerRequest::Downloads => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Downloads are only supported for web tabs",
+                )
+                .into());
+            }
             let reply = send_tabor_request(
                 tabor_socket,
                 tabor,
-                &IpcRequest::AgentDownloads { tab_id: Some(tab_id) },
+                &IpcRequest::AgentDownloads { tab_id: Some(tab.tab_id) },
             )?;
             let SocketReply::AgentDownloads { downloads } = reply else {
                 return Err(IoError::other("unexpected downloads reply").into());
@@ -463,17 +587,30 @@ fn handle_request(
             Ok(ControllerReply::Downloads { downloads })
         },
         ControllerRequest::Act { actions, observe } => {
-            let tab_id = selected_tab_id
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
-            let reply = send_tabor_request(
-                tabor_socket,
-                tabor,
-                &IpcRequest::AgentAct { tab_id: Some(tab_id), actions, observe },
-            )?;
-            let SocketReply::AgentAct { result } = reply else {
-                return Err(IoError::other("unexpected act reply").into());
-            };
-            Ok(ControllerReply::Act { result })
+            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            match &tab.kind {
+                crate::ipc::IpcTabKind::Terminal => {
+                    let result =
+                        run_terminal_actions(tabor_socket, tabor, tab.tab_id, actions, observe)?;
+                    Ok(ControllerReply::Act { result })
+                },
+                crate::ipc::IpcTabKind::Web { .. } => {
+                    let reply = send_tabor_request(
+                        tabor_socket,
+                        tabor,
+                        &IpcRequest::AgentAct { tab_id: Some(tab.tab_id), actions, observe },
+                    )?;
+                    let SocketReply::AgentAct { result } = reply else {
+                        return Err(IoError::other("unexpected act reply").into());
+                    };
+                    Ok(ControllerReply::Act { result })
+                },
+                _ => Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Act is only supported for terminal and web tabs",
+                )
+                .into()),
+            }
         },
         ControllerRequest::ClipboardGet => {
             let mut clipboard = Clipboard::default();
@@ -486,6 +623,136 @@ fn handle_request(
             Ok(ControllerReply::Clipboard { text })
         },
         ControllerRequest::Close => Ok(ControllerReply::Closed),
+    }
+}
+
+fn selected_tab_state(
+    tabor_socket: &Path,
+    tabor: &mut IpcConnection,
+    selected_tab_id: Option<IpcTabId>,
+) -> Result<Box<IpcTabState>, Box<dyn Error>> {
+    let tab_id =
+        selected_tab_id.ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
+    let reply = send_tabor_request(tabor_socket, tabor, &IpcRequest::GetTabState { tab_id })?;
+    let SocketReply::TabState { tab } = reply else {
+        return Err(IoError::other("unexpected tab state reply").into());
+    };
+    Ok(tab)
+}
+
+fn run_terminal_actions(
+    tabor_socket: &Path,
+    tabor: &mut IpcConnection,
+    tab_id: IpcTabId,
+    actions: Vec<AgentAction>,
+    observe: bool,
+) -> Result<AgentActResult, Box<dyn Error>> {
+    let mut results = Vec::with_capacity(actions.len());
+
+    for (index, action) in actions.into_iter().enumerate() {
+        let outcome = dispatch_terminal_action(tabor_socket, tabor, tab_id, action);
+        match outcome {
+            Ok(()) => results.push(crate::ipc::AgentActionReport { index, ok: true, error: None }),
+            Err(err) => {
+                results.push(crate::ipc::AgentActionReport {
+                    index,
+                    ok: false,
+                    error: Some(err.to_string()),
+                });
+                return Ok(AgentActResult {
+                    results,
+                    observation: None,
+                    terminal_observation: None,
+                });
+            },
+        }
+    }
+
+    let terminal_observation = if observe {
+        let reply = send_tabor_request(
+            tabor_socket,
+            tabor,
+            &IpcRequest::TerminalObserve { tab_id: Some(tab_id) },
+        )?;
+        let SocketReply::TerminalObservation { observation } = reply else {
+            return Err(IoError::other("unexpected terminal observe reply").into());
+        };
+        Some(observation)
+    } else {
+        None
+    };
+
+    Ok(AgentActResult { results, observation: None, terminal_observation })
+}
+
+fn dispatch_terminal_action(
+    tabor_socket: &Path,
+    tabor: &mut IpcConnection,
+    tab_id: IpcTabId,
+    action: AgentAction,
+) -> Result<(), Box<dyn Error>> {
+    match action {
+        AgentAction::Type { text } | AgentAction::Paste { text } => expect_ok(send_tabor_request(
+            tabor_socket,
+            tabor,
+            &IpcRequest::SendInput { tab_id: Some(tab_id), text },
+        )?),
+        AgentAction::Press { key, modifiers } => {
+            dispatch_terminal_key(
+                tabor_socket,
+                tabor,
+                tab_id,
+                key.clone(),
+                modifiers,
+                WebKeyState::Down,
+            )?;
+            dispatch_terminal_key(tabor_socket, tabor, tab_id, key, modifiers, WebKeyState::Up)
+        },
+        AgentAction::KeyDown { key, modifiers } => {
+            dispatch_terminal_key(tabor_socket, tabor, tab_id, key, modifiers, WebKeyState::Down)
+        },
+        AgentAction::KeyUp { key, modifiers } => {
+            dispatch_terminal_key(tabor_socket, tabor, tab_id, key, modifiers, WebKeyState::Up)
+        },
+        AgentAction::Wait { ms: Some(ms), .. } => {
+            std::thread::sleep(Duration::from_millis(ms));
+            Ok(())
+        },
+        AgentAction::Wait { .. } => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            "Terminal wait only supports explicit ms delays",
+        )
+        .into()),
+        other => Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("Terminal tabs do not support action {other:?}"),
+        )
+        .into()),
+    }
+}
+
+fn dispatch_terminal_key(
+    tabor_socket: &Path,
+    tabor: &mut IpcConnection,
+    tab_id: IpcTabId,
+    key: String,
+    modifiers: WebKeyModifiers,
+    state: WebKeyState,
+) -> Result<(), Box<dyn Error>> {
+    expect_ok(send_tabor_request(
+        tabor_socket,
+        tabor,
+        &IpcRequest::TerminalKey {
+            tab_id: Some(tab_id),
+            input: TerminalKeyInput { key, text: None, modifiers, repeat: false, state },
+        },
+    )?)
+}
+
+fn expect_ok(reply: SocketReply) -> Result<(), Box<dyn Error>> {
+    match reply {
+        SocketReply::Ok => Ok(()),
+        other => Err(IoError::other(format!("unexpected reply: {other:?}")).into()),
     }
 }
 

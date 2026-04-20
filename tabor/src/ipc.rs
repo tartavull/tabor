@@ -99,6 +99,110 @@ pub struct IpcTerminalLayoutStrip {
     pub logical_line_count: usize,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcTerminalPoint {
+    pub line: i32,
+    pub column: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcTerminalVisualPoint {
+    pub line: usize,
+    pub column: usize,
+    pub y_offset_px: i16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcTerminalCursorShape {
+    Hidden,
+    Block,
+    Underline,
+    Beam,
+    HollowBlock,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTerminalViewportLine {
+    pub strip_index: usize,
+    pub logical_line: i32,
+    pub visual_line: usize,
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTerminalSelection {
+    pub start: IpcTerminalPoint,
+    pub end: IpcTerminalPoint,
+    pub is_block: bool,
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IpcTerminalCursor {
+    pub logical_point: IpcTerminalPoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_point: Option<IpcTerminalVisualPoint>,
+    pub shape: IpcTerminalCursorShape,
+    pub color: String,
+    pub width: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcTerminalCell {
+    pub character: char,
+    pub logical_point: IpcTerminalPoint,
+    pub visual_point: IpcTerminalVisualPoint,
+    pub fg: String,
+    pub bg: String,
+    pub underline: String,
+    pub bg_alpha: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcTerminalObservation {
+    pub tab_id: IpcTabId,
+    pub title: String,
+    pub program_name: String,
+    pub session: IpcTerminalSessionState,
+    pub display_offset: usize,
+    pub layout: IpcTerminalLayoutState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewport_lines: Vec<IpcTerminalViewportLine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<IpcTerminalCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<IpcTerminalSelection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<IpcTerminalCell>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcTerminalReadScope {
+    Viewport,
+    Buffer,
+    Selection,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct IpcTerminalRead {
+    pub tab_id: IpcTabId,
+    pub scope: IpcTerminalReadScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<IpcTerminalLayoutState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewport_lines: Vec<IpcTerminalViewportLine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<IpcTerminalSelection>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IpcBrowserAccelerationState {
@@ -486,11 +590,13 @@ pub struct AgentActionReport {
     pub error: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AgentActResult {
     pub results: Vec<AgentActionReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<AgentObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_observation: Option<IpcTerminalObservation>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -851,6 +957,18 @@ pub enum IpcRequest {
         actions: Vec<AgentAction>,
         observe: bool,
     },
+    TerminalObserve {
+        tab_id: Option<IpcTabId>,
+    },
+    TerminalRead {
+        tab_id: Option<IpcTabId>,
+        scope: IpcTerminalReadScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_lines: Option<usize>,
+    },
+    TerminalScreenshot {
+        tab_id: Option<IpcTabId>,
+    },
     TerminalKey {
         tab_id: Option<IpcTabId>,
         input: TerminalKeyInput,
@@ -943,6 +1061,18 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
             summary: "List tracked downloads for a web tab.",
         },
         IpcRequestHelp { name: "agent_act", summary: "Run batched web agent actions." },
+        IpcRequestHelp {
+            name: "terminal_observe",
+            summary: "Read rich viewport state for a terminal tab.",
+        },
+        IpcRequestHelp {
+            name: "terminal_read",
+            summary: "Read terminal viewport, buffer, or selection text.",
+        },
+        IpcRequestHelp {
+            name: "terminal_screenshot",
+            summary: "Capture a PNG of the visible terminal viewport.",
+        },
         IpcRequestHelp { name: "terminal_key", summary: "Dispatch terminal key input." },
         IpcRequestHelp {
             name: "window_debug_state",
@@ -1011,6 +1141,9 @@ impl IpcRequest {
             | IpcRequest::AgentUpload { tab_id, .. }
             | IpcRequest::AgentDownloads { tab_id }
             | IpcRequest::AgentAct { tab_id, .. }
+            | IpcRequest::TerminalObserve { tab_id }
+            | IpcRequest::TerminalRead { tab_id, .. }
+            | IpcRequest::TerminalScreenshot { tab_id }
             | IpcRequest::TerminalKey { tab_id, .. } => *tab_id,
             IpcRequest::OpenUrl { target: UrlTarget::TabId { tab_id }, .. } => Some(*tab_id),
             IpcRequest::SelectTab { selection: TabSelection::ById { tab_id } } => Some(*tab_id),
@@ -1050,6 +1183,9 @@ pub enum SocketReply {
     AgentPdf { pdf: AgentPdf },
     AgentDownloads { downloads: Vec<AgentDownload> },
     AgentAct { result: AgentActResult },
+    TerminalObservation { observation: IpcTerminalObservation },
+    TerminalRead { read: IpcTerminalRead },
+    TerminalScreenshot { screenshot: AgentScreenshot },
     WindowDebugState { state: IpcWindowDebugState },
     WindowDebugSnapshot { snapshot: IpcWindowDebugSnapshot },
     WindowDebugImageSnapshot { snapshot: IpcImageDebugSnapshot },
@@ -1222,6 +1358,14 @@ pub trait IpcContext {
         session_id: String,
         max: Option<usize>,
     ) -> Result<Vec<IpcInspectorMessage>, IpcError>;
+    fn terminal_observe(&mut self, tab_id: TabId) -> Result<IpcTerminalObservation, IpcError>;
+    fn terminal_read(
+        &mut self,
+        tab_id: TabId,
+        scope: IpcTerminalReadScope,
+        max_lines: Option<usize>,
+    ) -> Result<IpcTerminalRead, IpcError>;
+    fn terminal_screenshot(&mut self, tab_id: TabId) -> Result<AgentScreenshot, IpcError>;
     fn terminal_key(&mut self, tab_id: TabId, input: TerminalKeyInput) -> Result<(), IpcError>;
     fn window_debug_state(&mut self) -> Result<IpcWindowDebugState, IpcError>;
     fn window_debug_snapshot(
@@ -1559,6 +1703,68 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
             match ctx.poll_inspector_messages(session_id, max) {
                 Ok(messages) => IpcResponse {
                     reply: SocketReply::InspectorMessages { messages },
+                    close_window: false,
+                },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::TerminalObserve { tab_id } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.terminal_observe(tab_id) {
+                Ok(observation) => IpcResponse {
+                    reply: SocketReply::TerminalObservation { observation },
+                    close_window: false,
+                },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::TerminalRead { tab_id, scope, max_lines } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.terminal_read(tab_id, scope, max_lines) {
+                Ok(read) => {
+                    IpcResponse { reply: SocketReply::TerminalRead { read }, close_window: false }
+                },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::TerminalScreenshot { tab_id } => {
+            let tab_id = match tab_id.or_else(|| ctx.active_tab_id().map(IpcTabId::from)) {
+                Some(tab_id) => tab_id.into(),
+                None => {
+                    return IpcResponse {
+                        reply: reply_error(IpcErrorCode::NotFound, "No active tab"),
+                        close_window: false,
+                    };
+                },
+            };
+
+            match ctx.terminal_screenshot(tab_id) {
+                Ok(screenshot) => IpcResponse {
+                    reply: SocketReply::TerminalScreenshot { screenshot },
                     close_window: false,
                 },
                 Err(err) => {
@@ -2640,6 +2846,112 @@ mod tests {
             Ok(drained)
         }
 
+        fn terminal_observe(&mut self, tab_id: TabId) -> Result<IpcTerminalObservation, IpcError> {
+            let tab = self
+                .tabs
+                .get(&tab_id)
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+            if !matches!(tab.kind, IpcTabKind::Terminal) {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "Tab is not a terminal tab",
+                ));
+            }
+            Ok(mock_terminal_observation(tab_id, tab))
+        }
+
+        fn terminal_read(
+            &mut self,
+            tab_id: TabId,
+            scope: IpcTerminalReadScope,
+            _max_lines: Option<usize>,
+        ) -> Result<IpcTerminalRead, IpcError> {
+            let tab = self
+                .tabs
+                .get(&tab_id)
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+            if !matches!(tab.kind, IpcTabKind::Terminal) {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "Tab is not a terminal tab",
+                ));
+            }
+
+            let viewport_lines = vec![
+                IpcTerminalViewportLine {
+                    strip_index: 0,
+                    logical_line: 0,
+                    visual_line: 0,
+                    text: String::from("top"),
+                },
+                IpcTerminalViewportLine {
+                    strip_index: 0,
+                    logical_line: 1,
+                    visual_line: 1,
+                    text: String::from("bottom"),
+                },
+            ];
+            let selection = Some(IpcTerminalSelection {
+                start: IpcTerminalPoint { line: 0, column: 0 },
+                end: IpcTerminalPoint { line: 0, column: 2 },
+                is_block: false,
+                text: String::from("top"),
+            });
+
+            Ok(match scope {
+                IpcTerminalReadScope::Viewport => IpcTerminalRead {
+                    tab_id: tab_id.into(),
+                    scope,
+                    display_offset: Some(0),
+                    layout: Some(mock_terminal_layout()),
+                    viewport_lines,
+                    lines: Vec::new(),
+                    selection,
+                },
+                IpcTerminalReadScope::Buffer => IpcTerminalRead {
+                    tab_id: tab_id.into(),
+                    scope,
+                    display_offset: None,
+                    layout: None,
+                    viewport_lines: Vec::new(),
+                    lines: vec![String::from("alpha"), String::from("beta"), String::from("gamma")],
+                    selection: None,
+                },
+                IpcTerminalReadScope::Selection => IpcTerminalRead {
+                    tab_id: tab_id.into(),
+                    scope,
+                    display_offset: None,
+                    layout: None,
+                    viewport_lines: Vec::new(),
+                    lines: Vec::new(),
+                    selection,
+                },
+            })
+        }
+
+        fn terminal_screenshot(&mut self, tab_id: TabId) -> Result<AgentScreenshot, IpcError> {
+            let tab = self
+                .tabs
+                .get(&tab_id)
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+            if !matches!(tab.kind, IpcTabKind::Terminal) {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "Tab is not a terminal tab",
+                ));
+            }
+            Ok(AgentScreenshot {
+                data_base64: String::from(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF9sAAAAASUVORK5CYII=",
+                ),
+                width: 1,
+                height: 1,
+                dpr: Some(2.0),
+                scroll_x: None,
+                scroll_y: None,
+            })
+        }
+
         fn terminal_key(
             &mut self,
             tab_id: TabId,
@@ -2770,6 +3082,70 @@ mod tests {
         {
             let _ = url;
             MockOpenUrlKind::Web
+        }
+    }
+
+    fn mock_terminal_layout() -> IpcTerminalLayoutState {
+        IpcTerminalLayoutState {
+            mode: TerminalViewMode::Normal,
+            target_columns: 80,
+            strip_count: 1,
+            strips: vec![IpcTerminalLayoutStrip {
+                start_column: 0,
+                column_count: 80,
+                y_offset_px: 0,
+                visual_line_count: 2,
+                logical_start_line: 0,
+                logical_line_count: 2,
+            }],
+        }
+    }
+
+    fn mock_terminal_observation(tab_id: TabId, tab: &MockTab) -> IpcTerminalObservation {
+        IpcTerminalObservation {
+            tab_id: tab_id.into(),
+            title: tab.title.clone(),
+            program_name: tab.program_name.clone(),
+            session: IpcTerminalSessionState::Live,
+            display_offset: 0,
+            layout: mock_terminal_layout(),
+            viewport_lines: vec![
+                IpcTerminalViewportLine {
+                    strip_index: 0,
+                    logical_line: 0,
+                    visual_line: 0,
+                    text: String::from("top"),
+                },
+                IpcTerminalViewportLine {
+                    strip_index: 0,
+                    logical_line: 1,
+                    visual_line: 1,
+                    text: String::from("bottom"),
+                },
+            ],
+            cursor: Some(IpcTerminalCursor {
+                logical_point: IpcTerminalPoint { line: 1, column: 3 },
+                visual_point: Some(IpcTerminalVisualPoint { line: 1, column: 3, y_offset_px: 0 }),
+                shape: IpcTerminalCursorShape::Block,
+                color: String::from("#ffffff"),
+                width: 1,
+            }),
+            selection: Some(IpcTerminalSelection {
+                start: IpcTerminalPoint { line: 0, column: 0 },
+                end: IpcTerminalPoint { line: 0, column: 2 },
+                is_block: false,
+                text: String::from("top"),
+            }),
+            cells: vec![IpcTerminalCell {
+                character: 't',
+                logical_point: IpcTerminalPoint { line: 0, column: 0 },
+                visual_point: IpcTerminalVisualPoint { line: 0, column: 0, y_offset_px: 0 },
+                fg: String::from("#ffffff"),
+                bg: String::from("#000000"),
+                underline: String::from("#ffffff"),
+                bg_alpha: 1.0,
+                flags: vec![String::from("bold")],
+            }],
         }
     }
 
@@ -3011,6 +3387,44 @@ mod tests {
         );
         assert!(matches!(response.reply, SocketReply::Ok));
         assert_eq!(ctx.last_window_button, Some(IpcWindowDebugButton::Zoom));
+    }
+
+    #[test]
+    fn ipc_handles_terminal_observe_read_and_screenshot() {
+        let mut ctx = MockContext::new(false);
+        let tab_id = ctx.active_tab_id().unwrap();
+
+        let response =
+            handle_request(&mut ctx, IpcRequest::TerminalObserve { tab_id: Some(tab_id.into()) });
+        let SocketReply::TerminalObservation { observation } = response.reply else {
+            panic!("expected terminal_observation reply");
+        };
+        assert_eq!(observation.tab_id, tab_id.into());
+        assert_eq!(observation.viewport_lines.len(), 2);
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::TerminalRead {
+                tab_id: Some(tab_id.into()),
+                scope: IpcTerminalReadScope::Buffer,
+                max_lines: Some(2),
+            },
+        );
+        let SocketReply::TerminalRead { read } = response.reply else {
+            panic!("expected terminal_read reply");
+        };
+        assert_eq!(read.scope, IpcTerminalReadScope::Buffer);
+        assert_eq!(read.lines[0], "alpha");
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::TerminalScreenshot { tab_id: Some(tab_id.into()) },
+        );
+        let SocketReply::TerminalScreenshot { screenshot } = response.reply else {
+            panic!("expected terminal_screenshot reply");
+        };
+        assert_eq!(screenshot.width, 1);
+        assert_eq!(screenshot.height, 1);
     }
 
     #[test]

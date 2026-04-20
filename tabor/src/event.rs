@@ -469,6 +469,29 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_poll_inspector_messages(session_id, max)
     }
 
+    fn terminal_observe(
+        &mut self,
+        tab_id: TabId,
+    ) -> Result<ipc::IpcTerminalObservation, ipc::IpcError> {
+        self.window.ipc_terminal_observe(tab_id)
+    }
+
+    fn terminal_read(
+        &mut self,
+        tab_id: TabId,
+        scope: ipc::IpcTerminalReadScope,
+        max_lines: Option<usize>,
+    ) -> Result<ipc::IpcTerminalRead, ipc::IpcError> {
+        self.window.ipc_terminal_read(tab_id, scope, max_lines)
+    }
+
+    fn terminal_screenshot(
+        &mut self,
+        tab_id: TabId,
+    ) -> Result<ipc::AgentScreenshot, ipc::IpcError> {
+        self.window.ipc_terminal_screenshot(tab_id, self.scheduler)
+    }
+
     fn terminal_key(
         &mut self,
         tab_id: TabId,
@@ -2980,20 +3003,6 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 self.cancel_search();
             }
             self.clear_command_footer_feedback();
-            #[cfg(target_os = "macos")]
-            if self.modifiers.state().super_key() {
-                let mut options = WindowOptions::default();
-                options.window_kind = WindowKind::Web { url: String::new() };
-                options.command_input = Some(String::from("o "));
-                #[cfg(not(windows))]
-                {
-                    options.terminal_options.working_directory = self.current_working_directory();
-                }
-
-                let event = Event::new(EventType::CreateTab(options), self.display.window.id());
-                let _ = self.event_proxy.send_event(event);
-                return;
-            }
             self.command_state.start();
             #[cfg(target_os = "macos")]
             if self.tab_kind.is_web() {

@@ -70,7 +70,8 @@ use crate::cli::{
     MessageOptions, MsgCloseTab, MsgCreateGroup, MsgCreateTab, MsgDispatchAction, MsgGetTabState,
     MsgInspector, MsgInspectorAttach, MsgInspectorDetach, MsgInspectorPoll, MsgInspectorSend,
     MsgMoveTab, MsgOpenInspector, MsgOpenUrl, MsgReloadWeb, MsgRunCommandBar, MsgSelectTab,
-    MsgSendInput, MsgSetGroupName, MsgSetTabPanel, MsgSetTabTitle, MsgSetWebUrl, TabIdArg,
+    MsgSendInput, MsgSetGroupName, MsgSetTabPanel, MsgSetTabTitle, MsgSetWebUrl, MsgTerminalRead,
+    MsgTerminalScreenshot, MsgTerminalTarget, TabIdArg, TerminalReadScopeArg,
 };
 use crate::cli::{Options, Subcommands};
 use crate::config::UiConfig;
@@ -82,6 +83,10 @@ use crate::event::{Event, Processor};
 use crate::macos::locale;
 #[cfg(unix)]
 use crate::window_kind::WindowKind;
+#[cfg(unix)]
+use base64::Engine;
+#[cfg(unix)]
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(windows)]
@@ -162,6 +167,41 @@ where
 fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
     fn ipc_tab_id(tab_id: TabIdArg) -> ipc::IpcTabId {
         ipc::IpcTabId { index: tab_id.index, generation: tab_id.generation }
+    }
+
+    fn ipc_terminal_read_scope(scope: TerminalReadScopeArg) -> ipc::IpcTerminalReadScope {
+        match scope {
+            TerminalReadScopeArg::Viewport => ipc::IpcTerminalReadScope::Viewport,
+            TerminalReadScopeArg::Buffer => ipc::IpcTerminalReadScope::Buffer,
+            TerminalReadScopeArg::Selection => ipc::IpcTerminalReadScope::Selection,
+        }
+    }
+
+    fn write_terminal_screenshot(
+        reply: Option<ipc::SocketReply>,
+        path: PathBuf,
+    ) -> Result<(), Box<dyn Error>> {
+        match reply {
+            Some(ipc::SocketReply::TerminalScreenshot { screenshot }) => {
+                let png = BASE64.decode(screenshot.data_base64.as_bytes())?;
+                fs::write(&path, png)?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "terminal_screenshot",
+                        "path": path,
+                        "width": screenshot.width,
+                        "height": screenshot.height,
+                    }))?
+                );
+                Ok(())
+            },
+            Some(ipc::SocketReply::Error { error }) => Err(error.message.into()),
+            Some(other) => {
+                Err(format!("unexpected reply for terminal screenshot: {other:?}").into())
+            },
+            None => Err("missing reply for terminal screenshot".into()),
+        }
     }
 
     fn print_reply(reply: Option<ipc::SocketReply>) -> Result<(), Box<dyn Error>> {
@@ -315,6 +355,33 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
                 &socket,
                 ipc::IpcRequest::OpenInspector { tab_id: tab_id.map(ipc_tab_id) },
             )?;
+        },
+        crate::cli::MessageCommand::TerminalObserve(MsgTerminalTarget { tab_id }) => {
+            send_request(
+                &socket,
+                ipc::IpcRequest::TerminalObserve { tab_id: tab_id.map(ipc_tab_id) },
+            )?;
+        },
+        crate::cli::MessageCommand::TerminalRead(MsgTerminalRead { tab_id, scope, max_lines }) => {
+            send_request(
+                &socket,
+                ipc::IpcRequest::TerminalRead {
+                    tab_id: tab_id.map(ipc_tab_id),
+                    scope: ipc_terminal_read_scope(scope),
+                    max_lines,
+                },
+            )?;
+        },
+        crate::cli::MessageCommand::TerminalScreenshot(MsgTerminalScreenshot { tab_id, path }) => {
+            let reply = ipc::send_message(
+                socket.clone(),
+                ipc::IpcRequest::TerminalScreenshot { tab_id: tab_id.map(ipc_tab_id) },
+            )?;
+            if let Some(path) = path {
+                write_terminal_screenshot(reply, path)?;
+            } else {
+                print_reply(reply)?;
+            }
         },
         crate::cli::MessageCommand::GetTabPanel => {
             send_request(&socket, ipc::IpcRequest::GetTabPanel)?;

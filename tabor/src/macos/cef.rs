@@ -2,15 +2,16 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString, OsStr};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use log::debug;
+use log::{debug, info};
 
 use cef::{
     self, App, BrowserProcessHandler, CefString, ImplApp, ImplBrowser, ImplBrowserProcessHandler,
@@ -35,6 +36,7 @@ type MessagePumpNotifier = Arc<dyn Fn(Duration) + Send + Sync + 'static>;
 
 const METRICS_NONE: u64 = u64::MAX;
 const MAX_MESSAGE_PUMP_DELAY_MS: u64 = 10_000;
+const CEF_CACHE_LOCK_FILE_NAME: &str = ".tabor-cef-instance.lock";
 
 static MESSAGE_PUMP_NOTIFIER: OnceLock<MessagePumpNotifier> = OnceLock::new();
 static CEF_PUMP_SCHEDULED: AtomicU64 = AtomicU64::new(0);
@@ -203,8 +205,23 @@ cef::wrap_app! {
 struct CefRuntime {
     _args: Args,
     _framework_dir: PathBuf,
+    _cache_root: CefCacheRoot,
     _app: cef::App,
     _sandbox: Option<cef::sandbox::Sandbox>,
+}
+
+struct CefCacheRoot {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+    _lock: File,
+}
+
+impl Drop for CefCacheRoot {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 thread_local! {
@@ -224,6 +241,63 @@ fn fake_media_enabled() -> bool {
 
 fn configured_cache_root() -> PathBuf {
     env::var("TABOR_CEF_CACHE_PATH").map(PathBuf::from).unwrap_or_else(|_| super::cef_cache_dir())
+}
+
+fn prepare_cache_root(base_root: PathBuf) -> Result<CefCacheRoot, Box<dyn Error>> {
+    fs::create_dir_all(&base_root)?;
+    let primary_lock = open_cache_root_lock(&base_root)?;
+    if try_lock_cache_root(&primary_lock)? {
+        return Ok(CefCacheRoot { path: base_root, cleanup_on_drop: false, _lock: primary_lock });
+    }
+
+    let isolated_root = isolated_cache_root(&base_root);
+    if isolated_root.exists() {
+        fs::remove_dir_all(&isolated_root)?;
+    }
+    fs::create_dir_all(&isolated_root)?;
+    let isolated_lock = open_cache_root_lock(&isolated_root)?;
+    if !try_lock_cache_root(&isolated_lock)? {
+        return Err(io::Error::other(format!(
+            "Unable to acquire isolated CEF cache root {}; primary root {} is already in use",
+            isolated_root.display(),
+            base_root.display()
+        ))
+        .into());
+    }
+
+    info!(
+        "Primary CEF cache root {} is busy; using isolated cache {}",
+        base_root.display(),
+        isolated_root.display()
+    );
+
+    Ok(CefCacheRoot { path: isolated_root, cleanup_on_drop: true, _lock: isolated_lock })
+}
+
+fn isolated_cache_root(base_root: &Path) -> PathBuf {
+    let name = base_root.file_name().and_then(|name| name.to_str()).unwrap_or("cef");
+    let isolated_name = format!("{name}-instance-{}", std::process::id());
+    base_root.parent().unwrap_or_else(|| Path::new("/tmp")).join(isolated_name)
+}
+
+fn open_cache_root_lock(cache_root: &Path) -> io::Result<File> {
+    fs::create_dir_all(cache_root)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache_root.join(CEF_CACHE_LOCK_FILE_NAME))
+}
+
+fn try_lock_cache_root(lock_file: &File) -> io::Result<bool> {
+    let result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock { Ok(false) } else { Err(err) }
 }
 
 fn cef_no_sandbox_setting() -> i32 {
@@ -295,8 +369,8 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
         ..Settings::default()
     };
 
-    let cache_root = configured_cache_root();
-    settings.cache_path = CefString::from(cache_root.to_string_lossy().as_ref());
+    let cache_root = prepare_cache_root(configured_cache_root())?;
+    settings.cache_path = CefString::from(cache_root.path.to_string_lossy().as_ref());
     settings.root_cache_path = settings.cache_path.clone();
     if let Ok(path) = env::var("TABOR_CEF_LOG_PATH") {
         let log_path = if path.is_empty() || path == "1" {
@@ -347,6 +421,7 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
         *cell.borrow_mut() = Some(CefRuntime {
             _args: args,
             _framework_dir: framework_dir,
+            _cache_root: cache_root,
             _app: app,
             _sandbox: sandbox,
         });
@@ -439,6 +514,14 @@ pub fn is_initialized_global() -> bool {
 }
 
 pub(crate) fn framework_dir() -> Option<PathBuf> {
+    if let Ok(exe) = env::current_exe() {
+        return framework_dir_for_exe(&exe);
+    }
+
+    env_configured_framework_dir().or_else(vendor_framework_dir)
+}
+
+fn env_configured_framework_dir() -> Option<PathBuf> {
     if let Ok(path) = env::var("TABOR_CEF_FRAMEWORK_DIR") {
         if let Some(framework) = resolve_framework_dir(Path::new(&path)) {
             return Some(framework);
@@ -451,15 +534,10 @@ pub(crate) fn framework_dir() -> Option<PathBuf> {
         }
     }
 
-    // When running from a macOS `.app`, prefer a bundled framework so web tabs work even when
-    // launched outside a shell environment (Finder/Spotlight/open).
-    if let Some(bundle_root) = main_bundle_path() {
-        let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
-        if let Some(framework) = resolve_framework_dir(&frameworks_dir) {
-            return Some(framework);
-        }
-    }
+    None
+}
 
+fn vendor_framework_dir() -> Option<PathBuf> {
     let arch_tag = if env::consts::ARCH == "aarch64" { "macosarm64" } else { "macosx64" };
 
     let vendor_root =
@@ -490,6 +568,24 @@ pub(crate) fn framework_dir() -> Option<PathBuf> {
 
     candidates.sort();
     candidates.pop()
+}
+
+fn framework_dir_for_exe(exe: &Path) -> Option<PathBuf> {
+    if let Some(framework) = bundled_framework_dir_for_exe(exe) {
+        return Some(framework);
+    }
+
+    if bundle_paths_for_exe(exe).is_some() {
+        return None;
+    }
+
+    env_configured_framework_dir().or_else(vendor_framework_dir)
+}
+
+fn bundled_framework_dir_for_exe(exe: &Path) -> Option<PathBuf> {
+    let bundle_root = bundle_paths_for_exe(exe)?.main_bundle;
+    let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
+    resolve_framework_dir(&frameworks_dir)
 }
 
 fn resolve_framework_dir(path: &Path) -> Option<PathBuf> {
@@ -727,10 +823,6 @@ fn helper_parent_main_bundle(current_bundle: &Path) -> Option<PathBuf> {
     Some(main_bundle.to_path_buf())
 }
 
-fn main_bundle_path() -> Option<PathBuf> {
-    bundle_paths().map(|paths| paths.main_bundle)
-}
-
 fn helper_subprocess_path(main_bundle: &Path) -> Option<PathBuf> {
     let frameworks_dir = main_bundle.join("Contents").join("Frameworks");
     CEF_HELPER_NAMES
@@ -825,5 +917,120 @@ mod tests {
             configured_cache_root(),
             home_dir.join("Library").join("Application Support").join("Tabor").join("cef")
         );
+    }
+
+    #[test]
+    fn prepare_cache_root_uses_stable_profile_when_unlocked() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let base_root = temp_dir.path().join("cef");
+
+        let cache_root = prepare_cache_root(base_root.clone()).expect("prepare cache root");
+
+        assert_eq!(cache_root.path, base_root);
+        assert!(!cache_root.cleanup_on_drop);
+    }
+
+    #[test]
+    fn prepare_cache_root_falls_back_when_primary_profile_is_locked() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let base_root = temp_dir.path().join("cef");
+        fs::create_dir_all(&base_root).expect("failed to create base root");
+
+        let primary_lock = open_cache_root_lock(&base_root).expect("open primary lock");
+        assert!(try_lock_cache_root(&primary_lock).expect("lock primary cache root"));
+
+        let cache_root = prepare_cache_root(base_root.clone()).expect("prepare isolated cache");
+
+        assert_ne!(cache_root.path, base_root);
+        assert!(cache_root.cleanup_on_drop);
+        assert_eq!(cache_root.path, isolated_cache_root(&base_root));
+    }
+
+    #[test]
+    fn isolated_cache_root_is_removed_on_drop() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let base_root = temp_dir.path().join("cef");
+        fs::create_dir_all(&base_root).expect("failed to create base root");
+
+        let primary_lock = open_cache_root_lock(&base_root).expect("open primary lock");
+        assert!(try_lock_cache_root(&primary_lock).expect("lock primary cache root"));
+
+        let isolated_path = {
+            let cache_root = prepare_cache_root(base_root).expect("prepare isolated cache");
+            let path = cache_root.path.clone();
+            assert!(path.ends_with(format!("cef-instance-{}", std::process::id())));
+            path
+        };
+
+        assert!(!isolated_path.exists());
+    }
+
+    #[test]
+    fn bundled_app_framework_dir_ignores_env_override() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let app_root = temp_dir.path().join("Tabor.app");
+        let exe = app_root.join("Contents").join("MacOS").join("tabor");
+        let bundled_framework = app_root
+            .join("Contents")
+            .join("Frameworks")
+            .join("Chromium Embedded Framework.framework");
+        let external_framework =
+            temp_dir.path().join("external").join("Chromium Embedded Framework.framework");
+        fs::create_dir_all(exe.parent().unwrap()).expect("failed to create bundle executable dir");
+        fs::write(&exe, b"").expect("failed to create fake executable");
+        fs::create_dir_all(&bundled_framework).expect("failed to create bundled framework dir");
+        fs::create_dir_all(&external_framework).expect("failed to create external framework dir");
+
+        let bundled_framework = bundled_framework.canonicalize().expect("canonical bundle dir");
+        let _framework_override =
+            EnvVarGuard::set("TABOR_CEF_FRAMEWORK_DIR", &external_framework.display().to_string());
+        let _path_override =
+            EnvVarGuard::set("TABOR_CEF_PATH", &external_framework.display().to_string());
+        let _cef_path = EnvVarGuard::set("CEF_PATH", &external_framework.display().to_string());
+
+        assert_eq!(framework_dir_for_exe(&exe), Some(bundled_framework));
+    }
+
+    #[test]
+    fn bundled_app_framework_dir_fails_closed_without_bundled_framework() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let app_root = temp_dir.path().join("Tabor.app");
+        let exe = app_root.join("Contents").join("MacOS").join("tabor");
+        let external_framework =
+            temp_dir.path().join("external").join("Chromium Embedded Framework.framework");
+        fs::create_dir_all(exe.parent().unwrap()).expect("failed to create bundle executable dir");
+        fs::write(&exe, b"").expect("failed to create fake executable");
+        fs::create_dir_all(&external_framework).expect("failed to create external framework dir");
+
+        let _framework_override =
+            EnvVarGuard::set("TABOR_CEF_FRAMEWORK_DIR", &external_framework.display().to_string());
+        let _path_override =
+            EnvVarGuard::set("TABOR_CEF_PATH", &external_framework.display().to_string());
+        let _cef_path = EnvVarGuard::set("CEF_PATH", &external_framework.display().to_string());
+
+        assert_eq!(framework_dir_for_exe(&exe), None);
+    }
+
+    #[test]
+    fn non_app_framework_dir_uses_env_override() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let exe = temp_dir.path().join("bin").join("tabor");
+        let external_framework =
+            temp_dir.path().join("external").join("Chromium Embedded Framework.framework");
+        fs::create_dir_all(exe.parent().unwrap()).expect("failed to create executable dir");
+        fs::write(&exe, b"").expect("failed to create fake executable");
+        fs::create_dir_all(&external_framework).expect("failed to create external framework dir");
+
+        let external_framework = external_framework.canonicalize().expect("canonical external dir");
+        let _framework_override =
+            EnvVarGuard::set("TABOR_CEF_FRAMEWORK_DIR", &external_framework.display().to_string());
+        let _path_override =
+            EnvVarGuard::set("TABOR_CEF_PATH", &external_framework.display().to_string());
+        let _cef_path = EnvVarGuard::set("CEF_PATH", &external_framework.display().to_string());
+
+        assert_eq!(framework_dir_for_exe(&exe), Some(external_framework));
     }
 }

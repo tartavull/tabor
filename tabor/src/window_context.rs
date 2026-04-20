@@ -45,14 +45,15 @@ use winit::window::WindowId;
 use tabor_terminal::event::{Event as TerminalEvent, Notify, OnResize};
 use tabor_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use tabor_terminal::grid::{Dimensions, Scroll};
-use tabor_terminal::index::Direction;
+use tabor_terminal::index::{Column, Direction, Line, Point};
 use tabor_terminal::sync::FairMutex;
 #[cfg(target_os = "macos")]
 use tabor_terminal::term::MIN_COLUMNS;
+use tabor_terminal::term::cell::Flags;
 use tabor_terminal::term::test::TermSize;
 use tabor_terminal::term::{ResizeAnchor, Term, TermMode};
 use tabor_terminal::tty;
-use tabor_terminal::vte::ansi::NamedColor;
+use tabor_terminal::vte::ansi::{CursorShape, NamedColor};
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
@@ -63,6 +64,8 @@ use crate::config::UiConfig;
 use crate::daemon::{foreground_process_name, foreground_process_path};
 use crate::display::browser_layout::{BrowserViewMode, BrowserViewportLayout};
 use crate::display::color::Rgb;
+use crate::display::content::RenderableContentContext;
+use crate::display::hint::HintState;
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
 use crate::display::{Display, DisplayUpdateOptions, SizeInfo};
@@ -87,11 +90,13 @@ use crate::ipc::{
     IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageDebugSnapshot,
     IpcImageLoadState, IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage,
     IpcInspectorSession, IpcInspectorTarget, IpcPdfViewState, IpcRuntimeMetrics, IpcTabActivity,
-    IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalLayoutState,
-    IpcTerminalLayoutStrip, IpcTerminalSessionState, IpcTouchPhase, IpcWebCloseMetrics,
-    IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
-    IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState, SocketReply, TabSelection,
-    TerminalKeyInput,
+    IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalCell,
+    IpcTerminalCursor, IpcTerminalCursorShape, IpcTerminalLayoutState, IpcTerminalLayoutStrip,
+    IpcTerminalObservation, IpcTerminalPoint, IpcTerminalRead, IpcTerminalReadScope,
+    IpcTerminalSelection, IpcTerminalSessionState, IpcTerminalViewportLine, IpcTerminalVisualPoint,
+    IpcTouchPhase, IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
+    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
+    SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -5607,6 +5612,411 @@ impl WindowContext {
                 })
                 .collect(),
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_terminal_observe(
+        &mut self,
+        tab_id: TabId,
+    ) -> Result<IpcTerminalObservation, IpcError> {
+        let multi_column_defaults = self.multi_column_defaults();
+        let tab = self
+            .tabs
+            .get(tab_id)
+            .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+        Self::terminal_observation_for_tab(
+            &self.display,
+            &self.config,
+            multi_column_defaults,
+            tab,
+            tab_id,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_terminal_read(
+        &mut self,
+        tab_id: TabId,
+        scope: IpcTerminalReadScope,
+        max_lines: Option<usize>,
+    ) -> Result<IpcTerminalRead, IpcError> {
+        let multi_column_defaults = self.multi_column_defaults();
+        let tab = self
+            .tabs
+            .get(tab_id)
+            .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+        Self::terminal_read_for_tab(
+            &self.display,
+            &self.config,
+            multi_column_defaults,
+            tab,
+            tab_id,
+            scope,
+            max_lines,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_terminal_screenshot(
+        &mut self,
+        tab_id: TabId,
+        scheduler: &mut Scheduler,
+    ) -> Result<AgentScreenshot, IpcError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (tab_id, scheduler);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "Terminal screenshots are only available on macOS",
+            ))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(active_tab_id) = self.tabs.active_id() else {
+                return Err(IpcError::new(IpcErrorCode::NotFound, "No active tab"));
+            };
+            if active_tab_id != tab_id {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidRequest,
+                    "Terminal screenshots require the target tab to be active",
+                ));
+            }
+
+            let multi_column_defaults = self.multi_column_defaults();
+            let (size_info, strip_geometries) = {
+                let tab = self
+                    .tabs
+                    .get(tab_id)
+                    .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+                if !tab.kind.is_terminal() {
+                    return Err(IpcError::new(
+                        IpcErrorCode::InvalidRequest,
+                        "Tab is not a terminal tab",
+                    ));
+                }
+                let layout = Self::terminal_viewport_for_tab(
+                    &self.display,
+                    &self.config,
+                    multi_column_defaults,
+                    tab,
+                );
+                let size_info =
+                    self.display.size_info_for_status_lines(usize::from(tab.kind.has_status_bar()));
+                (size_info, layout.strip_geometries())
+            };
+
+            self.draw_inner(scheduler, false);
+
+            let (image_width, image_height, pixels) = self.display.window_snapshot_rgba();
+            let image =
+                RgbaImage::from_raw(image_width, image_height, pixels).ok_or_else(|| {
+                    IpcError::new(
+                        IpcErrorCode::Internal,
+                        "Failed to construct terminal screenshot image",
+                    )
+                })?;
+
+            let cell_width = (size_info.cell_width() as usize).max(1);
+            let cell_height = (size_info.cell_height() as usize).max(1);
+            let left_column =
+                strip_geometries.iter().map(|strip| strip.start_column).min().unwrap_or(0);
+            let right_column = strip_geometries
+                .iter()
+                .map(|strip| strip.start_column + strip.column_count)
+                .max()
+                .unwrap_or(0);
+            let top_px = strip_geometries
+                .iter()
+                .map(|strip| (size_info.padding_y() as usize).saturating_sub(strip.y_offset_px))
+                .min()
+                .unwrap_or(size_info.padding_y() as usize);
+            let bottom_px = strip_geometries
+                .iter()
+                .map(|strip| {
+                    (size_info.padding_y() as usize).saturating_sub(strip.y_offset_px)
+                        + strip.visual_line_count * cell_height
+                })
+                .max()
+                .unwrap_or(top_px);
+
+            let left_px = size_info.padding_x() as usize + left_column * cell_width;
+            let right_px = size_info.padding_x() as usize + right_column * cell_width;
+
+            let crop_x =
+                left_px.min(image_width as usize).min(image_width.saturating_sub(1) as usize);
+            let crop_y =
+                top_px.min(image_height as usize).min(image_height.saturating_sub(1) as usize);
+            let crop_width =
+                right_px.saturating_sub(left_px).max(1).min(image_width as usize - crop_x);
+            let crop_height =
+                bottom_px.saturating_sub(top_px).max(1).min(image_height as usize - crop_y);
+
+            let cropped = image::imageops::crop_imm(
+                &image,
+                crop_x as u32,
+                crop_y as u32,
+                crop_width as u32,
+                crop_height as u32,
+            )
+            .to_image();
+            let mut cursor = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(cropped)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .map_err(|err| {
+                    IpcError::new(
+                        IpcErrorCode::Internal,
+                        format!("Failed to encode terminal screenshot: {err}"),
+                    )
+                })?;
+
+            Ok(AgentScreenshot {
+                data_base64: BASE64.encode(cursor.into_inner()),
+                width: crop_width as u32,
+                height: crop_height as u32,
+                dpr: Some(self.display.window.scale_factor),
+                scroll_x: None,
+                scroll_y: None,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminal_observation_for_tab(
+        display: &Display,
+        config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
+        tab: &TabState,
+        tab_id: TabId,
+    ) -> Result<IpcTerminalObservation, IpcError> {
+        if !tab.kind.is_terminal() {
+            return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a terminal tab"));
+        }
+
+        let layout = Self::terminal_viewport_for_tab(display, config, multi_column_defaults, tab);
+        let layout_state = Self::ipc_terminal_layout(display, config, multi_column_defaults, tab)
+            .expect("terminal tabs should have terminal layout");
+        let size_info = display.size_info_for_status_lines(usize::from(tab.kind.has_status_bar()));
+        let terminal = tab.terminal.lock();
+        let terminal_content = terminal.renderable_content();
+        let logical_cursor = terminal_content.cursor.point;
+        let selection_range = terminal_content.selection;
+        let display_offset = terminal_content.display_offset;
+        let viewport_lines =
+            Self::terminal_viewport_lines(&terminal, &layout_state, display_offset);
+        let selection = Self::terminal_selection(selection_range, &terminal);
+        let mut hint_state = HintState::new(config.hints.alphabet());
+        let mut content = crate::display::content::RenderableContent::new(
+            config,
+            &mut hint_state,
+            &terminal,
+            RenderableContentContext {
+                colors: display.colors,
+                size: size_info,
+                layout,
+                search: None,
+                focused_match: None,
+                cursor_hidden: tab.cursor_blink_timed_out,
+                ime_preedit_active: false,
+            },
+        );
+
+        let cells = content
+            .by_ref()
+            .map(|cell| IpcTerminalCell {
+                character: cell.character,
+                logical_point: Self::terminal_point(cell.logical_point),
+                visual_point: IpcTerminalVisualPoint {
+                    line: cell.point.line,
+                    column: cell.point.column.0,
+                    y_offset_px: cell.y_offset_px,
+                },
+                fg: Self::rgb_hex(cell.fg),
+                bg: Self::rgb_hex(cell.bg),
+                underline: Self::rgb_hex(cell.underline),
+                bg_alpha: cell.bg_alpha,
+                flags: Self::terminal_flag_names(cell.flags),
+            })
+            .collect();
+        let renderable_cursor = content.cursor();
+        let cursor = Some(IpcTerminalCursor {
+            logical_point: Self::terminal_point(logical_cursor),
+            visual_point: (renderable_cursor.shape() != CursorShape::Hidden).then_some(
+                IpcTerminalVisualPoint {
+                    line: renderable_cursor.point().line,
+                    column: renderable_cursor.point().column.0,
+                    y_offset_px: renderable_cursor.y_offset_px(),
+                },
+            ),
+            shape: Self::terminal_cursor_shape(renderable_cursor.shape()),
+            color: Self::rgb_hex(renderable_cursor.color()),
+            width: renderable_cursor.width().get(),
+        });
+
+        Ok(IpcTerminalObservation {
+            tab_id: tab_id.into(),
+            title: tab.title.clone(),
+            program_name: tab.program_name.clone(),
+            session: Self::ipc_terminal_session(tab)
+                .expect("terminal tabs should have terminal session"),
+            display_offset,
+            layout: layout_state,
+            viewport_lines,
+            cursor,
+            selection,
+            cells,
+        })
+    }
+
+    #[cfg(unix)]
+    fn terminal_read_for_tab(
+        display: &Display,
+        config: &UiConfig,
+        multi_column_defaults: MultiColumnDefaults,
+        tab: &TabState,
+        tab_id: TabId,
+        scope: IpcTerminalReadScope,
+        max_lines: Option<usize>,
+    ) -> Result<IpcTerminalRead, IpcError> {
+        if !tab.kind.is_terminal() {
+            return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a terminal tab"));
+        }
+
+        let layout_state = Self::ipc_terminal_layout(display, config, multi_column_defaults, tab)
+            .expect("terminal tabs should have terminal layout");
+        let terminal = tab.terminal.lock();
+        let display_offset = terminal.grid().display_offset();
+        let selection =
+            Self::terminal_selection(terminal.renderable_content().selection, &terminal);
+
+        let read = match scope {
+            IpcTerminalReadScope::Viewport => IpcTerminalRead {
+                tab_id: tab_id.into(),
+                scope,
+                display_offset: Some(display_offset),
+                layout: Some(layout_state.clone()),
+                viewport_lines: Self::terminal_viewport_lines(
+                    &terminal,
+                    &layout_state,
+                    display_offset,
+                ),
+                lines: Vec::new(),
+                selection,
+            },
+            IpcTerminalReadScope::Buffer => IpcTerminalRead {
+                tab_id: tab_id.into(),
+                scope,
+                display_offset: None,
+                layout: None,
+                viewport_lines: Vec::new(),
+                lines: terminal.export_preview_lines(max_lines.unwrap_or(200)),
+                selection: None,
+            },
+            IpcTerminalReadScope::Selection => IpcTerminalRead {
+                tab_id: tab_id.into(),
+                scope,
+                display_offset: None,
+                layout: None,
+                viewport_lines: Vec::new(),
+                lines: Vec::new(),
+                selection,
+            },
+        };
+
+        Ok(read)
+    }
+
+    #[cfg(unix)]
+    fn terminal_viewport_lines(
+        terminal: &Term<EventProxy>,
+        layout: &IpcTerminalLayoutState,
+        display_offset: usize,
+    ) -> Vec<IpcTerminalViewportLine> {
+        layout
+            .strips
+            .iter()
+            .enumerate()
+            .flat_map(|(strip_index, strip)| {
+                (0..strip.logical_line_count).map(move |line_index| {
+                    let viewport_line = strip.logical_start_line + line_index;
+                    let logical_line = viewport_line as i32 - display_offset as i32;
+                    let point = Point::new(Line(logical_line), Column(0));
+                    let text = terminal.bounds_to_string(
+                        point,
+                        Point::new(Line(logical_line), terminal.last_column()),
+                    );
+                    IpcTerminalViewportLine {
+                        strip_index,
+                        logical_line,
+                        visual_line: line_index,
+                        text,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn terminal_selection(
+        selection_range: Option<tabor_terminal::selection::SelectionRange>,
+        terminal: &Term<EventProxy>,
+    ) -> Option<IpcTerminalSelection> {
+        let range = selection_range?;
+        let text = terminal.selection_to_string()?;
+        Some(IpcTerminalSelection {
+            start: Self::terminal_point(range.start),
+            end: Self::terminal_point(range.end),
+            is_block: range.is_block,
+            text,
+        })
+    }
+
+    #[cfg(unix)]
+    fn terminal_point(point: Point) -> IpcTerminalPoint {
+        IpcTerminalPoint { line: point.line.0, column: point.column.0 }
+    }
+
+    #[cfg(unix)]
+    fn terminal_cursor_shape(shape: CursorShape) -> IpcTerminalCursorShape {
+        match shape {
+            CursorShape::Hidden => IpcTerminalCursorShape::Hidden,
+            CursorShape::Block => IpcTerminalCursorShape::Block,
+            CursorShape::Underline => IpcTerminalCursorShape::Underline,
+            CursorShape::Beam => IpcTerminalCursorShape::Beam,
+            CursorShape::HollowBlock => IpcTerminalCursorShape::HollowBlock,
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminal_flag_names(flags: Flags) -> Vec<String> {
+        const FLAG_NAMES: &[(Flags, &str)] = &[
+            (Flags::INVERSE, "inverse"),
+            (Flags::BOLD, "bold"),
+            (Flags::ITALIC, "italic"),
+            (Flags::UNDERLINE, "underline"),
+            (Flags::WRAPLINE, "wrapline"),
+            (Flags::WIDE_CHAR, "wide_char"),
+            (Flags::WIDE_CHAR_SPACER, "wide_char_spacer"),
+            (Flags::DIM, "dim"),
+            (Flags::HIDDEN, "hidden"),
+            (Flags::STRIKEOUT, "strikeout"),
+            (Flags::LEADING_WIDE_CHAR_SPACER, "leading_wide_char_spacer"),
+            (Flags::DOUBLE_UNDERLINE, "double_underline"),
+            (Flags::UNDERCURL, "undercurl"),
+            (Flags::DOTTED_UNDERLINE, "dotted_underline"),
+            (Flags::DASHED_UNDERLINE, "dashed_underline"),
+        ];
+
+        FLAG_NAMES
+            .iter()
+            .filter_map(|(flag, name)| flags.contains(*flag).then_some((*name).to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn rgb_hex(color: Rgb) -> String {
+        let (r, g, b) = color.as_tuple();
+        format!("#{r:02x}{g:02x}{b:02x}")
     }
 
     #[cfg(unix)]

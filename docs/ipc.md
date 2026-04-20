@@ -60,6 +60,9 @@ Common commands:
 - `tabor msg select-tab --active`
 - `tabor msg move-tab --tab-id 2:1 --target-group-id 1 --target-index 0`
 - `tabor msg open-inspector --tab-id 2:1`
+- `tabor msg terminal-observe --tab-id 1:1`
+- `tabor msg terminal-read --tab-id 1:1 --scope buffer --max-lines 200`
+- `tabor msg terminal-screenshot --tab-id 1:1 --path /tmp/terminal.png`
 
 Raw JSON remains available through `tabor msg send`:
 
@@ -67,11 +70,20 @@ Raw JSON remains available through `tabor msg send`:
 {"type":"list_tabs"}
 ```
 
-## Stateful Web Automation With `tabor agent`
+Terminal-specific typed IPC commands:
+- `tabor msg terminal-observe [--tab-id 1:1]`
+- `tabor msg terminal-read [--tab-id 1:1] [--scope viewport|buffer|selection] [--max-lines 200]`
+- `tabor msg terminal-screenshot [--tab-id 1:1] [--path FILE]`
+
+`terminal-observe` returns visible terminal rows plus cursor, selection, and
+visible-cell metadata. `terminal-read` returns plain-text viewport rows,
+scrollback buffer lines, or the selected text depending on `scope`.
+
+## Stateful Tab Automation With `tabor agent`
 
 `tabor agent` is the primary automation surface. It attaches to the live Tabor
 instance you already opened, lists the existing tabs, selects one of them, and
-then drives that web tab with compact observations and batched actions.
+then drives that tab with compact observations and batched actions.
 
 There is no isolated browser-session flag in this workflow. The agent operates
 on live tabs in the attached Tabor instance.
@@ -84,6 +96,7 @@ tabor agent attach
 tabor agent app
 tabor agent use --active
 tabor agent observe
+tabor agent read --scope buffer --max-lines 200
 tabor agent act '[{"type":"click","id":"a"},{"type":"wait","load":"networkidle"}]'
 tabor agent inspect a
 tabor agent screenshot
@@ -103,7 +116,9 @@ Lists the live tab inventory plus the currently selected agent tab:
 
 ### `observe`
 
-Returns compact state for the selected web tab:
+Returns compact state for the selected tab.
+
+For web tabs:
 
 ```json
 {
@@ -124,9 +139,17 @@ Returns compact state for the selected web tab:
 
 Only visible interactive elements are returned by default.
 
+For terminal tabs, the reply is a terminal observation with:
+- terminal session state
+- layout strips and display offset
+- visible viewport rows
+- cursor and selection metadata
+- visible rendered cells with colors and flags
+
 ### `inspect`
 
-Expands a single observed element when the compact observation is not enough:
+Expands a single observed element when the compact observation is not enough.
+This is only supported for web tabs:
 
 ```bash
 tabor agent inspect a
@@ -135,6 +158,7 @@ tabor agent inspect a
 ### Artifact and event commands
 
 - `tabor agent screenshot [--path FILE] [--full-page] [--element-id ID]`
+- `tabor agent read [--scope viewport|buffer|selection] [--max-lines N]`
 - `tabor agent events [--since N] [--max N] [--kind console] [--kind network]`
 - `tabor agent pdf [--path FILE]`
 - `tabor agent upload <element-id> <file>...`
@@ -172,6 +196,14 @@ Supported actions:
 - `{"type":"wait","load":"networkidle","timeout_ms":5000}`
 - `{"type":"wait","ms":250}`
 
+On terminal tabs, `act` supports the terminal-safe subset only:
+- `type`
+- `paste`
+- `press`
+- `key_down`
+- `key_up`
+- `wait` with explicit `ms`
+
 Example:
 
 ```bash
@@ -205,6 +237,9 @@ The raw request types exposed through `tabor msg send` are:
 - `agent_upload`
 - `agent_downloads`
 - `agent_act`
+- `terminal_observe`
+- `terminal_read`
+- `terminal_screenshot`
 
 Examples:
 
@@ -217,6 +252,9 @@ Examples:
 {"type":"agent_upload","tab_id":{"index":2,"generation":1},"element_id":"a","paths":["/tmp/file.txt"]}
 {"type":"agent_downloads","tab_id":{"index":2,"generation":1}}
 {"type":"agent_act","tab_id":{"index":2,"generation":1},"actions":[{"type":"click","id":"a"}],"observe":true}
+{"type":"terminal_observe","tab_id":{"index":1,"generation":1}}
+{"type":"terminal_read","tab_id":{"index":1,"generation":1},"scope":"buffer","max_lines":200}
+{"type":"terminal_screenshot","tab_id":{"index":1,"generation":1}}
 ```
 
 ## Remote Inspector (macOS)
