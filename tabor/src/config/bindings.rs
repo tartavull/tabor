@@ -265,6 +265,9 @@ pub enum Action {
     /// Reset the active image view transform.
     ImageResetView,
 
+    /// Toggle the active PDF tab's dark-mode inversion override.
+    PdfToggleDarkInvertOverride,
+
     /// Allow receiving char input.
     ReceiveChar,
 
@@ -656,6 +659,7 @@ pub fn platform_key_bindings() -> Vec<KeyBinding> {
         "/",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageZoomFit;
         "!",    ModifiersState::SHIFT, +BindingMode::IMAGE;                    Action::ImageZoomFill;
         "r",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::ImageRotateClockwise;
+        "i",    ModifiersState::empty(), +BindingMode::IMAGE;                  Action::PdfToggleDarkInvertOverride;
     )
 }
 

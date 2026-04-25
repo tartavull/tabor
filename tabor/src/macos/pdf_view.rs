@@ -33,6 +33,14 @@ const MAX_PAGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PENDING_RENDER_REQUESTS: usize = 8;
 const MAX_PREFETCH_RENDER_REQUESTS_PER_PASS: usize = 4;
 const RENDER_SCALE_BUCKET: f64 = 0.125;
+const AUTO_INVERT_MAX_CHECKED_PAGES: usize = 3;
+const AUTO_INVERT_MAX_SAMPLED_PIXELS: usize = 16_384;
+const AUTO_INVERT_WHITE_LUMINANCE_THRESHOLD: f64 = 0.92;
+const AUTO_INVERT_DARK_LUMINANCE_THRESHOLD: f64 = 0.25;
+const AUTO_INVERT_MIN_DARK_RATIO: f64 = 0.005;
+const AUTO_INVERT_MAX_DARK_RATIO: f64 = 0.35;
+const AUTO_INVERT_MIN_WHITE_RATIO: f64 = 0.70;
+const AUTO_INVERT_MIN_AVERAGE_LUMINANCE: f64 = 0.75;
 
 static NEXT_PDF_RENDER_REVISION: AtomicU64 = AtomicU64::new(1);
 
@@ -49,6 +57,12 @@ pub(crate) enum PdfLoadState {
     Loading,
     Ready,
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PdfDarkModeOverride {
+    Auto,
+    Forced(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +161,20 @@ struct GestureState {
     last_pressure_stage: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PdfAutoInvertMetrics {
+    average_luminance: f64,
+    white_ratio: f64,
+    dark_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfAutoInvertDecision {
+    Invert,
+    KeepNormal,
+    Inconclusive,
+}
+
 #[derive(Clone)]
 pub(crate) struct PdfRenderRequest {
     pub revision: u64,
@@ -173,6 +201,10 @@ pub(crate) struct PdfViewState {
     pub manual_zoom: f64,
     pub scroll_x: f64,
     pub scroll_y: f64,
+    dark_mode_enabled: bool,
+    dark_mode_override: PdfDarkModeOverride,
+    auto_invert_decision: Option<bool>,
+    checked_auto_invert_pages: Vec<usize>,
     render_revision: u64,
     fit_page_anchor_index: usize,
     document: Option<PdfDocument>,
@@ -200,6 +232,10 @@ impl PdfViewState {
             manual_zoom: 1.0,
             scroll_x: 0.0,
             scroll_y: 0.0,
+            dark_mode_enabled: false,
+            dark_mode_override: PdfDarkModeOverride::Auto,
+            auto_invert_decision: None,
+            checked_auto_invert_pages: Vec::new(),
             render_revision: next_pdf_render_revision(),
             fit_page_anchor_index: 0,
             document: None,
@@ -222,9 +258,9 @@ impl PdfViewState {
         self.source = source;
         self.title = pdf_title_for_source(&self.source);
         self.load_state = PdfLoadState::Loading;
-        self.render_revision = next_pdf_render_revision();
         self.document = None;
-        self.clear_render_cache();
+        self.reset_auto_invert_state();
+        self.invalidate_render_cache();
         self.text_pages.clear();
         self.reset_view();
         self.clear_search();
@@ -254,7 +290,8 @@ impl PdfViewState {
         self.document = Some(PdfDocument { pdf, text_document, page_metrics });
         self.text_pages = vec![None; self.page_count()];
         self.load_state = PdfLoadState::Ready;
-        self.clear_render_cache();
+        self.reset_auto_invert_state();
+        self.invalidate_render_cache();
         self.reset_view();
         self.clear_search();
         Ok(())
@@ -263,7 +300,7 @@ impl PdfViewState {
     pub(crate) fn set_error(&mut self, message: String) {
         self.load_state = PdfLoadState::Error(message);
         self.document = None;
-        self.clear_render_cache();
+        self.invalidate_render_cache();
         self.text_pages.clear();
         self.selection = None;
         self.pending_selection_anchor = None;
@@ -280,6 +317,62 @@ impl PdfViewState {
         self.cache_order.clear();
         self.cached_page_bytes = 0;
         self.pending_renders.clear();
+    }
+
+    fn invalidate_render_cache(&mut self) {
+        self.render_revision = next_pdf_render_revision();
+        self.clear_render_cache();
+    }
+
+    fn reset_auto_invert_state(&mut self) {
+        self.dark_mode_override = PdfDarkModeOverride::Auto;
+        self.auto_invert_decision = None;
+        self.checked_auto_invert_pages.clear();
+    }
+
+    fn requested_dark_inversion(&self) -> bool {
+        match self.dark_mode_override {
+            PdfDarkModeOverride::Auto => self.auto_invert_decision.unwrap_or(false),
+            PdfDarkModeOverride::Forced(value) => value,
+        }
+    }
+
+    fn effective_dark_inversion(&self) -> bool {
+        self.dark_mode_enabled && self.requested_dark_inversion()
+    }
+
+    pub(crate) fn footer_invert_status(&self) -> &'static str {
+        match self.dark_mode_override {
+            PdfDarkModeOverride::Auto if self.auto_invert_decision.unwrap_or(false) => "auto-on",
+            PdfDarkModeOverride::Auto => "auto-off",
+            PdfDarkModeOverride::Forced(true) => "on",
+            PdfDarkModeOverride::Forced(false) => "off",
+        }
+    }
+
+    pub(crate) fn set_dark_mode_enabled(&mut self, dark_mode_enabled: bool) -> bool {
+        let effective_before = self.effective_dark_inversion();
+        self.dark_mode_enabled = dark_mode_enabled;
+        if self.effective_dark_inversion() == effective_before {
+            return false;
+        }
+
+        self.invalidate_render_cache();
+        true
+    }
+
+    pub(crate) fn toggle_dark_mode_override(&mut self) -> bool {
+        let effective_before = self.effective_dark_inversion();
+        self.dark_mode_override = match self.dark_mode_override {
+            PdfDarkModeOverride::Auto => {
+                PdfDarkModeOverride::Forced(!self.requested_dark_inversion())
+            },
+            PdfDarkModeOverride::Forced(_) => PdfDarkModeOverride::Auto,
+        };
+        if self.effective_dark_inversion() != effective_before {
+            self.invalidate_render_cache();
+        }
+        true
     }
 
     pub(crate) fn current_page(&self, viewport: PhysicalSize<u32>) -> usize {
@@ -348,6 +441,28 @@ impl PdfViewState {
         Some(zoom.clamp(MIN_MANUAL_ZOOM, MAX_MANUAL_ZOOM))
     }
 
+    fn horizontal_pan_limits(&self, viewport: PhysicalSize<u32>) -> Option<(f64, f64)> {
+        let document = self.document.as_ref()?;
+        let scale = self.zoom_factor(viewport)?;
+        let content_width = document
+            .page_metrics
+            .iter()
+            .fold(0.0f64, |max_width, metrics| max_width.max(metrics.width * scale));
+        let half_overflow = (content_width - f64::from(viewport.width)).max(0.0) / 2.0;
+        Some((-half_overflow, half_overflow))
+    }
+
+    fn clamped_scroll_x(&self, viewport: PhysicalSize<u32>) -> f64 {
+        let Some((min_scroll_x, max_scroll_x)) = self.horizontal_pan_limits(viewport) else {
+            return 0.0;
+        };
+        self.scroll_x.clamp(min_scroll_x, max_scroll_x)
+    }
+
+    fn clamp_horizontal_scroll(&mut self, viewport: PhysicalSize<u32>) {
+        self.scroll_x = self.clamped_scroll_x(viewport);
+    }
+
     fn page_draws(&self, viewport: PhysicalSize<u32>) -> Vec<PageDrawInfo> {
         let Some(document) = self.document.as_ref() else {
             return Vec::new();
@@ -356,6 +471,7 @@ impl PdfViewState {
             return Vec::new();
         };
 
+        let scroll_x = self.clamped_scroll_x(viewport);
         let mut y = self.scroll_y;
         document
             .page_metrics
@@ -364,7 +480,7 @@ impl PdfViewState {
             .map(|(page_index, metrics)| {
                 let width = metrics.width * scale;
                 let height = metrics.height * scale;
-                let x = (f64::from(viewport.width) - width) / 2.0 + self.scroll_x;
+                let x = (f64::from(viewport.width) - width) / 2.0 + scroll_x;
                 let draw = PageDrawInfo { page_index, x, y, width, height, scale };
                 y += height + PAGE_GAP * scale;
                 draw
@@ -458,13 +574,14 @@ impl PdfViewState {
         true
     }
 
-    pub(crate) fn pan_to(&mut self, cursor: PhysicalPosition<f64>) {
+    pub(crate) fn pan_to(&mut self, cursor: PhysicalPosition<f64>, viewport: PhysicalSize<u32>) {
         let Some(drag) = self.pan_drag else {
             return;
         };
 
         self.scroll_x = drag.scroll_x + cursor.x - drag.cursor.x;
         self.scroll_y = drag.scroll_y + cursor.y - drag.cursor.y;
+        self.clamp_horizontal_scroll(viewport);
     }
 
     pub(crate) fn end_pan(&mut self) {
@@ -475,7 +592,12 @@ impl PdfViewState {
         self.pan_drag.is_some()
     }
 
-    pub(crate) fn pan_by(&mut self, delta_x: f64, delta_y: f64) -> bool {
+    pub(crate) fn pan_by(
+        &mut self,
+        delta_x: f64,
+        delta_y: f64,
+        viewport: PhysicalSize<u32>,
+    ) -> bool {
         if self.document.is_none() || (!delta_x.is_finite() && !delta_y.is_finite()) {
             return false;
         }
@@ -488,6 +610,7 @@ impl PdfViewState {
 
         self.scroll_x += delta_x;
         self.scroll_y += delta_y;
+        self.clamp_horizontal_scroll(viewport);
         true
     }
 
@@ -524,40 +647,43 @@ impl PdfViewState {
         self.zoom_by(1.0 / ZOOM_STEP, cursor, viewport)
     }
 
-    pub(crate) fn zoom_fit_width(&mut self) -> bool {
+    pub(crate) fn zoom_fit_width(&mut self, viewport: PhysicalSize<u32>) -> bool {
         if self.document.is_none() {
             return false;
         }
         self.zoom_mode = PdfZoomMode::FitWidth;
+        self.clamp_horizontal_scroll(viewport);
         true
     }
 
-    pub(crate) fn zoom_fit_page(&mut self) -> bool {
+    pub(crate) fn zoom_fit_page(&mut self, viewport: PhysicalSize<u32>) -> bool {
         if self.document.is_none() {
             return false;
         }
         self.zoom_mode = PdfZoomMode::FitPage;
+        self.clamp_horizontal_scroll(viewport);
         true
     }
 
-    pub(crate) fn zoom_actual(&mut self) -> bool {
+    pub(crate) fn zoom_actual(&mut self, viewport: PhysicalSize<u32>) -> bool {
         if self.document.is_none() {
             return false;
         }
         self.zoom_mode = PdfZoomMode::Actual;
         self.manual_zoom = 1.0;
+        self.clamp_horizontal_scroll(viewport);
         true
     }
 
-    pub(crate) fn smart_magnify(&mut self) -> bool {
+    pub(crate) fn smart_magnify(&mut self, viewport: PhysicalSize<u32>) -> bool {
         if self.document.is_none() {
             return false;
         }
 
         match self.zoom_mode {
-            PdfZoomMode::Actual => self.zoom_fit_width(),
+            PdfZoomMode::Actual => self.zoom_fit_width(viewport),
             PdfZoomMode::FitWidth | PdfZoomMode::FitPage | PdfZoomMode::Manual => {
-                self.zoom_actual()
+                self.zoom_actual(viewport)
             },
         }
     }
@@ -696,6 +822,14 @@ impl PdfViewState {
         let key = raster.key();
         self.pending_renders.remove(&key);
         if let Some(bitmap) = raster.bitmap {
+            let effective_before = self.effective_dark_inversion();
+            self.observe_auto_invert_page(raster.page_index, &bitmap);
+            let effective_after = self.effective_dark_inversion();
+            if effective_after != effective_before {
+                self.invalidate_render_cache();
+            }
+
+            let bitmap = if effective_after { invert_pdf_bitmap(bitmap) } else { bitmap };
             self.insert_cached_page(key, bitmap);
             return true;
         }
@@ -865,6 +999,7 @@ impl PdfViewState {
             }
         }
 
+        self.clamp_horizontal_scroll(viewport);
         true
     }
 
@@ -1018,6 +1153,27 @@ impl PdfViewState {
         self.last_search_query = None;
         self.search_matches.clear();
         self.active_search_match = None;
+    }
+
+    fn observe_auto_invert_page(&mut self, page_index: usize, bitmap: &CachedPageBitmap) {
+        if self.auto_invert_decision.is_some()
+            || self.checked_auto_invert_pages.len() >= AUTO_INVERT_MAX_CHECKED_PAGES
+            || self.checked_auto_invert_pages.contains(&page_index)
+        {
+            return;
+        }
+
+        self.checked_auto_invert_pages.push(page_index);
+        match auto_invert_decision(bitmap) {
+            PdfAutoInvertDecision::Invert => self.auto_invert_decision = Some(true),
+            PdfAutoInvertDecision::KeepNormal => self.auto_invert_decision = Some(false),
+            PdfAutoInvertDecision::Inconclusive
+                if self.checked_auto_invert_pages.len() >= AUTO_INVERT_MAX_CHECKED_PAGES =>
+            {
+                self.auto_invert_decision = Some(false);
+            },
+            PdfAutoInvertDecision::Inconclusive => (),
+        }
     }
 }
 
@@ -1240,6 +1396,70 @@ fn quantize_render_scale(scale: f64) -> f64 {
     (scale / RENDER_SCALE_BUCKET).round().max(1.0) * RENDER_SCALE_BUCKET
 }
 
+fn auto_invert_metrics(bitmap: &CachedPageBitmap) -> Option<PdfAutoInvertMetrics> {
+    let total_pixels = bitmap.rgba.len() / 4;
+    if total_pixels == 0 {
+        return None;
+    }
+
+    let sample_count = total_pixels.min(AUTO_INVERT_MAX_SAMPLED_PIXELS);
+    let mut luminance_sum = 0.0;
+    let mut white_pixels = 0usize;
+    let mut dark_pixels = 0usize;
+    for sample_index in 0..sample_count {
+        let pixel_index = sample_index * total_pixels / sample_count;
+        let offset = pixel_index * 4;
+        let alpha = f64::from(bitmap.rgba[offset + 3]);
+        let r = f64::from(bitmap.rgba[offset]) + (255.0 - alpha);
+        let g = f64::from(bitmap.rgba[offset + 1]) + (255.0 - alpha);
+        let b = f64::from(bitmap.rgba[offset + 2]) + (255.0 - alpha);
+        let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+        luminance_sum += luminance;
+        if luminance >= AUTO_INVERT_WHITE_LUMINANCE_THRESHOLD {
+            white_pixels += 1;
+        }
+        if luminance <= AUTO_INVERT_DARK_LUMINANCE_THRESHOLD {
+            dark_pixels += 1;
+        }
+    }
+
+    let sample_count = sample_count as f64;
+    Some(PdfAutoInvertMetrics {
+        average_luminance: luminance_sum / sample_count,
+        white_ratio: white_pixels as f64 / sample_count,
+        dark_ratio: dark_pixels as f64 / sample_count,
+    })
+}
+
+fn auto_invert_decision(bitmap: &CachedPageBitmap) -> PdfAutoInvertDecision {
+    let Some(metrics) = auto_invert_metrics(bitmap) else {
+        return PdfAutoInvertDecision::Inconclusive;
+    };
+    if metrics.dark_ratio < AUTO_INVERT_MIN_DARK_RATIO {
+        return PdfAutoInvertDecision::Inconclusive;
+    }
+    if metrics.white_ratio >= AUTO_INVERT_MIN_WHITE_RATIO
+        && metrics.dark_ratio <= AUTO_INVERT_MAX_DARK_RATIO
+        && metrics.average_luminance >= AUTO_INVERT_MIN_AVERAGE_LUMINANCE
+    {
+        return PdfAutoInvertDecision::Invert;
+    }
+
+    PdfAutoInvertDecision::KeepNormal
+}
+
+fn invert_pdf_bitmap(bitmap: CachedPageBitmap) -> CachedPageBitmap {
+    let mut rgba = bitmap.rgba.to_vec();
+    for pixel in rgba.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        pixel[0] = alpha.saturating_sub(pixel[0]);
+        pixel[1] = alpha.saturating_sub(pixel[1]);
+        pixel[2] = alpha.saturating_sub(pixel[2]);
+    }
+
+    CachedPageBitmap { width: bitmap.width, height: bitmap.height, rgba: Arc::from(rgba) }
+}
+
 pub(crate) fn rasterize_pdf_page(request: &PdfRenderRequest) -> PdfRasterizedPage {
     let bitmap = request.pdf.pages().get(request.page_index).map(|page| {
         let pixmap = hayro::render(
@@ -1298,6 +1518,7 @@ mod tests {
     use super::*;
     use std::path::Path;
     use url::Url;
+
     fn fixture_pdf_source() -> LoadedPdfSource {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-browser.pdf");
         let bytes = std::fs::read(&path).expect("read fixture pdf");
@@ -1307,6 +1528,39 @@ mod tests {
             source,
             bytes: Arc::from(bytes),
         }
+    }
+
+    fn solid_bitmap(width: u32, height: u32, rgba: [u8; 4]) -> CachedPageBitmap {
+        let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
+        for _ in 0..(width as usize * height as usize) {
+            bytes.extend_from_slice(&rgba);
+        }
+        CachedPageBitmap { width, height, rgba: Arc::from(bytes) }
+    }
+
+    fn white_page_with_dark_text_bitmap() -> CachedPageBitmap {
+        let width = 200u32;
+        let height = 200u32;
+        let mut bytes = vec![255u8; width as usize * height as usize * 4];
+        for pixel in bytes.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        for y in 24..176 {
+            if y % 18 >= 5 {
+                continue;
+            }
+            for x in 28..172 {
+                let offset = ((y * width + x) * 4) as usize;
+                bytes[offset] = 0;
+                bytes[offset + 1] = 0;
+                bytes[offset + 2] = 0;
+            }
+        }
+        CachedPageBitmap { width, height, rgba: Arc::from(bytes) }
+    }
+
+    fn assert_decision(bitmap: CachedPageBitmap, decision: PdfAutoInvertDecision) {
+        assert_eq!(auto_invert_decision(&bitmap), decision);
     }
 
     #[test]
@@ -1323,12 +1577,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_invert_detects_white_page_with_dark_text() {
+        assert_decision(white_page_with_dark_text_bitmap(), PdfAutoInvertDecision::Invert);
+    }
+
+    #[test]
+    fn auto_invert_rejects_dark_page() {
+        assert_decision(solid_bitmap(200, 200, [0, 0, 0, 255]), PdfAutoInvertDecision::KeepNormal);
+    }
+
+    #[test]
+    fn auto_invert_treats_blank_white_page_as_inconclusive() {
+        assert_decision(
+            solid_bitmap(200, 200, [255, 255, 255, 255]),
+            PdfAutoInvertDecision::Inconclusive,
+        );
+    }
+
+    #[test]
+    fn auto_invert_rejects_mixed_contrast_page() {
+        let width = 200u32;
+        let height = 200u32;
+        let mut bytes = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            let pixel = if y < height / 2 { [255, 255, 255, 255] } else { [0, 0, 0, 255] };
+            for _ in 0..width {
+                bytes.extend_from_slice(&pixel);
+            }
+        }
+        assert_decision(
+            CachedPageBitmap { width, height, rgba: Arc::from(bytes) },
+            PdfAutoInvertDecision::KeepNormal,
+        );
+    }
+
+    #[test]
     fn fit_page_zoom_uses_anchor_page_without_recursive_layout() {
         let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
         state.set_loaded(fixture_pdf_source()).expect("load fixture into pdf view");
-        assert!(state.zoom_fit_page());
-
         let viewport = PhysicalSize::new(1280, 800);
+        assert!(state.zoom_fit_page(viewport));
         let zoom = state.zoom_factor(viewport).expect("fit page zoom factor");
         assert!(zoom.is_finite());
         assert!(zoom > 0.0);
@@ -1336,17 +1624,100 @@ mod tests {
     }
 
     #[test]
-    fn pan_by_moves_pages_in_the_same_direction_as_scroll_input() {
+    fn pan_by_preserves_horizontal_centering_when_document_fits_viewport() {
         let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
         state.set_loaded(fixture_pdf_source()).expect("load fixture into pdf view");
 
         let viewport = PhysicalSize::new(1280, 800);
         let before = state.page_draws(viewport);
-        assert!(state.pan_by(18.0, 24.0));
+        assert!(state.pan_by(18.0, 24.0, viewport));
         let after = state.page_draws(viewport);
 
-        assert!((after[0].x - before[0].x - 18.0).abs() < 0.001);
+        assert!((after[0].x - before[0].x).abs() < 0.001);
         assert!((after[0].y - before[0].y - 24.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn pan_by_clamps_horizontal_offsets_when_document_overflows_viewport() {
+        let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
+        state.set_loaded(fixture_pdf_source()).expect("load fixture into pdf view");
+
+        let viewport = PhysicalSize::new(400, 800);
+        assert!(state.zoom_actual(viewport));
+        let before = state.page_draws(viewport);
+        assert!(before[0].width > f64::from(viewport.width));
+
+        assert!(state.pan_by(10_000.0, 0.0, viewport));
+        let right_clamped = state.page_draws(viewport);
+        assert!((right_clamped[0].x - 0.0).abs() < 0.001);
+
+        assert!(state.pan_by(-20_000.0, 0.0, viewport));
+        let left_clamped = state.page_draws(viewport);
+        let expected_left = f64::from(viewport.width) - before[0].width;
+        assert!((left_clamped[0].x - expected_left).abs() < 0.001);
+    }
+
+    #[test]
+    fn auto_invert_locks_after_first_decisive_page() {
+        let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
+        state.set_loaded(fixture_pdf_source()).expect("load fixture into pdf view");
+
+        let inconclusive = solid_bitmap(100, 100, [255, 255, 255, 255]);
+        let decisive = white_page_with_dark_text_bitmap();
+        state.observe_auto_invert_page(0, &inconclusive);
+        assert_eq!(state.auto_invert_decision, None);
+
+        state.observe_auto_invert_page(1, &decisive);
+        assert_eq!(state.auto_invert_decision, Some(true));
+
+        state.observe_auto_invert_page(2, &solid_bitmap(100, 100, [0, 0, 0, 255]));
+        assert_eq!(state.auto_invert_decision, Some(true));
+    }
+
+    #[test]
+    fn auto_invert_defaults_to_off_after_three_inconclusive_pages() {
+        let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
+        state.set_loaded(fixture_pdf_source()).expect("load fixture into pdf view");
+
+        let blank = solid_bitmap(100, 100, [255, 255, 255, 255]);
+        state.observe_auto_invert_page(0, &blank);
+        state.observe_auto_invert_page(1, &blank);
+        state.observe_auto_invert_page(2, &blank);
+        assert_eq!(state.auto_invert_decision, Some(false));
+    }
+
+    #[test]
+    fn theme_change_invalidates_cache_when_effective_inversion_changes() {
+        let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
+        state.auto_invert_decision = Some(true);
+        state.cached_pages.insert(
+            PageRenderKey { page_index: 0, width_px: 10, height_px: 10 },
+            solid_bitmap(10, 10, [255, 255, 255, 255]),
+        );
+        state.cache_order.push_back(PageRenderKey { page_index: 0, width_px: 10, height_px: 10 });
+        let old_revision = state.render_revision;
+
+        assert!(state.set_dark_mode_enabled(true));
+        assert!(state.cached_pages.is_empty());
+        assert!(state.cache_order.is_empty());
+        assert_ne!(state.render_revision, old_revision);
+    }
+
+    #[test]
+    fn toggle_dark_mode_override_cycles_forced_and_auto() {
+        let mut state = PdfViewState::new(fixture_pdf_source().source.clone());
+        state.dark_mode_enabled = true;
+        state.auto_invert_decision = Some(true);
+        let auto_revision = state.render_revision;
+
+        assert!(state.toggle_dark_mode_override());
+        assert_eq!(state.dark_mode_override, PdfDarkModeOverride::Forced(false));
+        assert_ne!(state.render_revision, auto_revision);
+        let forced_revision = state.render_revision;
+
+        assert!(state.toggle_dark_mode_override());
+        assert_eq!(state.dark_mode_override, PdfDarkModeOverride::Auto);
+        assert_ne!(state.render_revision, forced_revision);
     }
 
     #[test]

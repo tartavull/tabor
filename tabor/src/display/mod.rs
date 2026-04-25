@@ -6,6 +6,8 @@ use std::fmt::{self, Formatter};
 use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
 use std::ops::Deref;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glutin::config::GetGlConfig;
@@ -31,6 +33,8 @@ use tabor_terminal::grid::Dimensions as TermDimensions;
 use tabor_terminal::index::{Column, Direction, Line, Point};
 use tabor_terminal::selection::Selection;
 use tabor_terminal::term::cell::Flags;
+#[cfg(target_os = "macos")]
+use tabor_terminal::term::kitty_graphics::{KittyGraphicsImage, KittyGraphicsPlacement};
 use tabor_terminal::term::{
     self, LineDamageBounds, MIN_COLUMNS, MIN_SCREEN_LINES, ResizeAnchor, Term, TermDamage, TermMode,
 };
@@ -61,12 +65,14 @@ use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
 use crate::event::{CommandFooterMessage, CommandState, Event, EventType, Mouse, SearchState};
 #[cfg(target_os = "macos")]
-use crate::macos::image_view::ImageViewState;
+use crate::macos::image_view::{ImageRenderQuad, ImageViewState};
 #[cfg(target_os = "macos")]
 use crate::macos::pdf_view::PdfViewState;
 #[cfg(target_os = "macos")]
 use crate::macos::webview::{WebPopupSurfaceRef, WebView};
 use crate::message_bar::{MessageBuffer, MessageType};
+#[cfg(target_os = "macos")]
+use crate::renderer::BitmapCacheKey;
 use crate::renderer::images::ImageSlice;
 #[cfg(target_os = "macos")]
 use crate::renderer::images::SurfaceSlot;
@@ -211,6 +217,204 @@ impl FooterBarViewportBand {
 
     fn damage_rect(self) -> (i32, i32, i32, i32) {
         (self.x as i32, self.y as i32, self.width as i32, self.height as i32)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct KittyImageRender {
+    image: Arc<KittyGraphicsImage>,
+    placement: KittyGraphicsPlacement,
+    quad: ImageRenderQuad,
+}
+
+#[cfg(target_os = "macos")]
+fn kitty_image_renders<T>(
+    terminal: &Term<T>,
+    display_offset: usize,
+    terminal_viewport: TerminalViewportLayout,
+    size_info: &SizeInfo,
+) -> Vec<KittyImageRender> {
+    let mut renders = Vec::new();
+    let graphics = terminal.kitty_graphics();
+
+    for placement in graphics.placements() {
+        let Some(image) = graphics.image(placement.image_storage_id).cloned() else {
+            continue;
+        };
+        if image.generation != placement.image_generation {
+            continue;
+        }
+        let viewport_line = placement.point.line.0 + display_offset as i32;
+        if viewport_line + placement.cell_rows as i32 <= 0 {
+            continue;
+        }
+
+        let visual_anchor_line = viewport_line.max(0);
+        let Ok(visual_anchor_line_usize) = usize::try_from(visual_anchor_line) else {
+            continue;
+        };
+        let vertical_offset_px =
+            (viewport_line - visual_anchor_line) as f32 * size_info.cell_height();
+        let viewport_point = Point::new(visual_anchor_line_usize, placement.point.column);
+
+        let Some(visual_point) =
+            terminal_viewport.visual_point_for_logical_viewport(viewport_point)
+        else {
+            continue;
+        };
+        let Some(quad) = kitty_image_quad(
+            &image,
+            placement,
+            visual_point,
+            vertical_offset_px,
+            terminal_viewport,
+            size_info,
+        ) else {
+            continue;
+        };
+
+        renders.push(KittyImageRender { image, placement: placement.clone(), quad });
+    }
+
+    renders.sort_by_key(|render| render.placement.z_index);
+    renders
+}
+
+#[cfg(target_os = "macos")]
+fn kitty_image_quad(
+    image: &KittyGraphicsImage,
+    placement: &KittyGraphicsPlacement,
+    visual_point: Point<usize>,
+    vertical_offset_px: f32,
+    terminal_viewport: TerminalViewportLayout,
+    size_info: &SizeInfo,
+) -> Option<ImageRenderQuad> {
+    let source_x = placement.source_x_px.min(image.width_px);
+    let source_y = placement.source_y_px.min(image.height_px);
+    let source_width = placement.source_width_px.min(image.width_px.saturating_sub(source_x));
+    let source_height = placement.source_height_px.min(image.height_px.saturating_sub(source_y));
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+
+    let cell_width = size_info.cell_width();
+    let cell_height = size_info.cell_height();
+    let (dest_width, dest_height) =
+        kitty_image_display_size(placement, source_width, source_height, cell_width, cell_height);
+    if dest_width <= 0.0 || dest_height <= 0.0 {
+        return None;
+    }
+
+    let strip_y_offset =
+        terminal_viewport.y_offset_px_for_visual_column(visual_point.column.0) as f32;
+    let dest_x = size_info.padding_x()
+        + visual_point.column.0 as f32 * cell_width
+        + placement.offset_x_px as f32;
+    let dest_y = size_info.padding_y()
+        + strip_y_offset
+        + visual_point.line as f32 * cell_height
+        + vertical_offset_px
+        + placement.offset_y_px as f32;
+
+    let bounds_left = size_info.padding_x();
+    let bounds_top = size_info.padding_y();
+    let bounds_right = size_info.padding_x() + size_info.columns() as f32 * cell_width;
+    let bounds_bottom = size_info.padding_y() + size_info.screen_lines() as f32 * cell_height;
+
+    clipped_image_quad(
+        dest_x,
+        dest_y,
+        dest_width,
+        dest_height,
+        source_x as f32,
+        source_y as f32,
+        source_width as f32,
+        source_height as f32,
+        bounds_left,
+        bounds_top,
+        bounds_right,
+        bounds_bottom,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn kitty_image_display_size(
+    placement: &KittyGraphicsPlacement,
+    source_width: u32,
+    source_height: u32,
+    cell_width: f32,
+    cell_height: f32,
+) -> (f32, f32) {
+    let source_width = source_width.max(1) as f32;
+    let source_height = source_height.max(1) as f32;
+
+    match (placement.columns, placement.rows) {
+        (Some(columns), Some(rows)) => (columns as f32 * cell_width, rows as f32 * cell_height),
+        (Some(columns), None) => {
+            let width = columns as f32 * cell_width;
+            (width, width * source_height / source_width)
+        },
+        (None, Some(rows)) => {
+            let height = rows as f32 * cell_height;
+            (height * source_width / source_height, height)
+        },
+        (None, None) => (source_width, source_height),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn clipped_image_quad(
+    dest_x: f32,
+    dest_y: f32,
+    dest_width: f32,
+    dest_height: f32,
+    source_x: f32,
+    source_y: f32,
+    source_width: f32,
+    source_height: f32,
+    bounds_left: f32,
+    bounds_top: f32,
+    bounds_right: f32,
+    bounds_bottom: f32,
+) -> Option<ImageRenderQuad> {
+    let x0 = dest_x.max(bounds_left);
+    let y0 = dest_y.max(bounds_top);
+    let x1 = (dest_x + dest_width).min(bounds_right);
+    let y1 = (dest_y + dest_height).min(bounds_bottom);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    let u0 = source_x + source_width * ((x0 - dest_x) / dest_width);
+    let u1 = source_x + source_width * ((x1 - dest_x) / dest_width);
+    let v0 = source_y + source_height * ((y0 - dest_y) / dest_height);
+    let v1 = source_y + source_height * ((y1 - dest_y) / dest_height);
+
+    Some(ImageRenderQuad {
+        dest_x_px: x0,
+        dest_y_px: y0,
+        dest_width_px: x1 - x0,
+        dest_height_px: y1 - y0,
+        uv_top_left: (u0, v0),
+        uv_top_right: (u1, v0),
+        uv_bottom_left: (u0, v1),
+        uv_bottom_right: (u1, v1),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn draw_kitty_images(renderer: &mut Renderer, size_info: &SizeInfo, renders: &[KittyImageRender]) {
+    for render in renders {
+        renderer.draw_cached_image_bitmap(
+            size_info,
+            BitmapCacheKey { namespace: render.image.storage_id, entry: render.image.generation },
+            render.image.width_px as usize,
+            render.image.height_px as usize,
+            render.image.rgba.as_ref(),
+            render.quad,
+        );
     }
 }
 
@@ -1162,13 +1366,16 @@ impl Display {
             },
         );
         let logical_size = self.terminal_viewport.logical_size(&new_size);
+        let logical_window_size = WindowSize::from(logical_size);
+        terminal
+            .set_cell_size_pixels(logical_window_size.cell_width, logical_window_size.cell_height);
 
         // Resize the active terminal when its logical dimensions have changed.
         if terminal.screen_lines() != logical_size.screen_lines()
             || terminal.columns() != logical_size.columns()
         {
             // Resize PTY.
-            pty_resize_handle.on_resize(logical_size.into());
+            pty_resize_handle.on_resize(logical_window_size);
 
             // Resize terminal.
             terminal.resize_with_anchor(logical_size, ResizeAnchor::Top);
@@ -1311,6 +1518,12 @@ impl Display {
         let foreground_color = content.color(NamedColor::Foreground as usize);
         let background_color = content.color(NamedColor::Background as usize);
         let display_offset = content.display_offset();
+        #[cfg(target_os = "macos")]
+        let kitty_image_renders =
+            kitty_image_renders(&terminal, display_offset, terminal_viewport, &size_info);
+        #[cfg(target_os = "macos")]
+        let kitty_image_overlay_start =
+            kitty_image_renders.partition_point(|render| render.placement.z_index < 0);
 
         // Invalidate highlighted hints if grid has changed.
         self.validate_hint_highlights(display_offset);
@@ -1352,6 +1565,15 @@ impl Display {
         self.make_current();
 
         self.renderer.clear(background_color, config.window_opacity());
+        #[cfg(target_os = "macos")]
+        {
+            self.renderer.set_viewport(&size_info);
+            draw_kitty_images(
+                &mut self.renderer,
+                &size_info,
+                &kitty_image_renders[..kitty_image_overlay_start],
+            );
+        }
         let mut lines = RenderLines::new();
 
         // Optimize loop hint comparator.
@@ -1413,6 +1635,12 @@ impl Display {
                 self.renderer.set_text_projection(&size_info);
             }
         }
+        #[cfg(target_os = "macos")]
+        draw_kitty_images(
+            &mut self.renderer,
+            &size_info,
+            &kitty_image_renders[kitty_image_overlay_start..],
+        );
         let cursor = content.cursor();
 
         // Drop terminal as early as possible to free lock.
@@ -2077,10 +2305,11 @@ impl Display {
             }
         } else if !command_active {
             let footer = format!(
-                "{}  [page {}/{}]",
+                "{}  [page {}/{}] [invert:{}]",
                 pdf_view.source,
                 pdf_view.current_page(viewport),
                 pdf_view.page_count(),
+                pdf_view.footer_invert_status(),
             );
             let footer_text: String = StrShortener::new(
                 &footer,

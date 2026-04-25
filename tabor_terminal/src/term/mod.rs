@@ -19,6 +19,7 @@ use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
 use crate::term::cell::{Cell, Flags, LineLength};
 use crate::term::color::Colors;
+use crate::term::kitty_graphics::{KittyCellSize, KittyGraphicsState};
 use crate::vi_mode::{ViModeCursor, ViMotion};
 use crate::vte::ansi::{
     self, Attr, CharsetIndex, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
@@ -28,6 +29,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+pub mod kitty_graphics;
 pub mod search;
 
 /// Minimum number of columns.
@@ -294,6 +296,15 @@ pub struct Term<T> {
     /// primary grid. Otherwise it is the alternate screen buffer.
     inactive_grid: Grid<Cell>,
 
+    /// Kitty graphics state for the active screen buffer.
+    kitty_graphics: KittyGraphicsState,
+
+    /// Kitty graphics state for the inactive screen buffer.
+    inactive_kitty_graphics: KittyGraphicsState,
+
+    /// Last advertised terminal cell size in physical pixels.
+    kitty_cell_size: KittyCellSize,
+
     /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
     active_charset: CharsetIndex,
 
@@ -425,6 +436,8 @@ impl<T> Term<T> {
         self.selection = None;
         self.grid = snapshot.grid;
         self.inactive_grid = snapshot.inactive_grid;
+        self.kitty_graphics.clear();
+        self.inactive_kitty_graphics.clear();
         self.mode = snapshot.mode;
         self.colors = snapshot.colors;
         self.cursor_style = None;
@@ -480,6 +493,9 @@ impl<T> Term<T> {
             config,
             grid,
             tabs,
+            kitty_graphics: Default::default(),
+            inactive_kitty_graphics: Default::default(),
+            kitty_cell_size: Default::default(),
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
             active_charset: Default::default(),
@@ -538,6 +554,45 @@ impl<T> Term<T> {
     /// Resets the terminal damage information.
     pub fn reset_damage(&mut self) {
         self.damage.reset(self.columns());
+    }
+
+    /// Update the physical pixel dimensions of one terminal cell.
+    pub fn set_cell_size_pixels(&mut self, width_px: u16, height_px: u16) {
+        self.kitty_cell_size =
+            KittyCellSize { width_px: width_px.max(1), height_px: height_px.max(1) };
+    }
+
+    /// Active Kitty graphics state.
+    pub fn kitty_graphics(&self) -> &KittyGraphicsState {
+        &self.kitty_graphics
+    }
+
+    /// Process a Kitty graphics APC payload after the ESC _ G prefix.
+    pub fn process_kitty_graphics_apc(&mut self, bytes: &[u8])
+    where
+        T: EventListener,
+    {
+        let cursor = self.grid.cursor.point;
+        let result = self.kitty_graphics.handle_apc(bytes, cursor, self.kitty_cell_size);
+        for response in result.responses.into_iter().filter(|response| !response.is_empty()) {
+            self.event_proxy.send_event(Event::PtyWrite(response));
+        }
+        if let Some(cursor_move) = result.cursor_move {
+            self.move_after_kitty_placement(cursor_move.columns, cursor_move.rows);
+        }
+        if result.changed {
+            self.mark_fully_damaged();
+        }
+    }
+
+    fn move_after_kitty_placement(&mut self, columns: usize, rows: usize) {
+        self.damage_cursor();
+        let line = self.grid.cursor.point.line + rows;
+        let column = self.grid.cursor.point.column + columns;
+        self.grid.cursor.point.line = cmp::min(line, self.bottommost_line());
+        self.grid.cursor.point.column = cmp::min(column, self.last_column());
+        self.grid.cursor.input_needs_wrap = false;
+        self.damage_cursor();
     }
 
     #[inline]
@@ -811,6 +866,8 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
+        self.kitty_graphics.resize(self.grid.topmost_line(), num_lines, num_cols);
+        self.inactive_kitty_graphics.resize(self.inactive_grid.topmost_line(), num_lines, num_cols);
     }
 
     fn anchor_grid_to_bottom(grid: &mut Grid<Cell>) -> usize {
@@ -857,6 +914,7 @@ impl<T> Term<T> {
 
             // Reset alternate screen contents.
             self.inactive_grid.reset_region(..);
+            self.inactive_kitty_graphics.clear();
         }
 
         mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
@@ -865,6 +923,7 @@ impl<T> Term<T> {
         self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
+        mem::swap(&mut self.kitty_graphics, &mut self.inactive_kitty_graphics);
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
         self.mark_fully_damaged();
@@ -895,6 +954,7 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        self.kitty_graphics.scroll_down(region.clone(), lines);
         self.mark_fully_damaged();
     }
 
@@ -914,6 +974,7 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        self.kitty_graphics.scroll_up(region.clone(), lines, self.grid.topmost_line());
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -935,6 +996,7 @@ impl<T> Term<T> {
 
         // Clear grid.
         self.grid.reset_region(..);
+        self.kitty_graphics.clear_placements();
         self.mark_fully_damaged();
     }
 
@@ -1937,6 +1999,7 @@ impl<T: EventListener> Handler for Term<T> {
                 }
 
                 self.selection = None;
+                self.kitty_graphics.clear_placements();
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
                 self.grid.clear_history();
@@ -1984,6 +2047,8 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.kitty_graphics.clear();
+        self.inactive_kitty_graphics.clear();
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;

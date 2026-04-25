@@ -2039,7 +2039,14 @@ impl WindowContext {
         };
         #[cfg(target_os = "macos")]
         let pdf_view = match &window_kind {
-            WindowKind::Pdf { source } => Some(PdfViewState::new(source.clone())),
+            WindowKind::Pdf { source } => {
+                let mut pdf_view = PdfViewState::new(source.clone());
+                pdf_view.set_dark_mode_enabled(matches!(
+                    config.window.theme(),
+                    Some(winit::window::Theme::Dark)
+                ));
+                Some(pdf_view)
+            },
             WindowKind::Terminal | WindowKind::Web { .. } | WindowKind::Image { .. } => None,
         };
         #[cfg(target_os = "macos")]
@@ -6346,6 +6353,50 @@ impl WindowContext {
         self.event_queue.push(event.into());
 
         self.dirty = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn refresh_pdf_dark_mode(&mut self, event_proxy: &EventLoopProxy<Event>) {
+        let dark_mode_enabled =
+            matches!(self.config.window.theme(), Some(winit::window::Theme::Dark));
+        let viewport = winit::dpi::PhysicalSize::new(
+            self.display.size_info.width() as u32,
+            self.display.size_info.height() as u32,
+        );
+        let mut changed = false;
+        let mut raster_requests = Vec::new();
+        for tab in self.tabs.iter_mut() {
+            let Some(pdf_view) = tab.pdf_view.as_mut() else {
+                continue;
+            };
+            if !pdf_view.set_dark_mode_enabled(dark_mode_enabled) {
+                continue;
+            }
+
+            changed = true;
+            raster_requests.extend(
+                pdf_view
+                    .take_visible_render_requests(viewport)
+                    .into_iter()
+                    .map(|request| (tab.id, request)),
+            );
+        }
+
+        for (tab_id, request) in raster_requests {
+            request_pdf_raster(event_proxy, self.display.window.id(), tab_id, request);
+        }
+
+        if !changed {
+            return;
+        }
+
+        self.display.pending_update.dirty = true;
+        self.display.damage_tracker.frame().mark_fully_damaged();
+        self.refresh_tab_panel();
+        self.dirty = true;
+        if self.display.window.has_frame {
+            self.display.window.request_redraw();
+        }
     }
 
     /// Get reference to the window's configuration.

@@ -184,6 +184,8 @@ pub trait ActionContext<T: EventListener> {
     #[cfg(target_os = "macos")]
     fn image_reset_view(&mut self) {}
     #[cfg(target_os = "macos")]
+    fn pdf_toggle_dark_invert_override(&mut self) {}
+    #[cfg(target_os = "macos")]
     fn select_next_tab(&mut self) {}
     #[cfg(target_os = "macos")]
     fn select_previous_tab(&mut self) {}
@@ -294,6 +296,8 @@ impl<T: EventListener> Execute<T> for Action {
             Action::ImageRotateClockwise => ctx.image_rotate_clockwise(),
             #[cfg(target_os = "macos")]
             Action::ImageResetView => ctx.image_reset_view(),
+            #[cfg(target_os = "macos")]
+            Action::PdfToggleDarkInvertOverride => ctx.pdf_toggle_dark_invert_override(),
             action @ (Action::ViMotion(_) | Action::Vi(_))
                 if !ctx.terminal().mode().contains(TermMode::VI) =>
             {

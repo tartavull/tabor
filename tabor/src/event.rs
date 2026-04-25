@@ -948,6 +948,8 @@ impl Processor {
                     } else {
                         window_context.add_window_config(self.config.clone(), &options);
                     }
+                    #[cfg(target_os = "macos")]
+                    window_context.refresh_pdf_dark_mode(&self.proxy);
                 }
 
                 if window_id.is_none() {
@@ -1416,6 +1418,8 @@ impl ApplicationHandler<Event> for Processor {
 
                     for window_context in self.windows.values_mut() {
                         window_context.update_config(self.config.clone());
+                        #[cfg(target_os = "macos")]
+                        window_context.refresh_pdf_dark_mode(&self.proxy);
                     }
                 }
             },
@@ -3763,7 +3767,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         };
 
         if pdf_view.is_panning() {
-            pdf_view.pan_to(position);
+            pdf_view.pan_to(position, image_viewport_size(self.display));
             self.display.window.set_mouse_cursor(CursorIcon::Grabbing);
             self.mark_pdf_view_dirty();
             return;
@@ -3800,7 +3804,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                 _ => (delta.x, delta.y),
             },
         };
-        if pdf_view.pan_by(delta_x, delta_y) {
+        if pdf_view.pan_by(delta_x, delta_y, image_viewport_size(self.display)) {
             self.mark_pdf_view_dirty();
         }
     }
@@ -3846,7 +3850,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             return;
         };
 
-        if pdf_view.smart_magnify() {
+        if pdf_view.smart_magnify(image_viewport_size(self.display)) {
             self.mark_pdf_view_dirty();
         }
     }
@@ -3930,7 +3934,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[cfg(target_os = "macos")]
     fn image_zoom_fit(&mut self) {
         if let Some(pdf_view) = self.pdf_view.as_mut() {
-            if pdf_view.zoom_fit_width() {
+            if pdf_view.zoom_fit_width(image_viewport_size(self.display)) {
                 self.mark_pdf_view_dirty();
             }
             return;
@@ -3944,7 +3948,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[cfg(target_os = "macos")]
     fn image_zoom_fill(&mut self) {
         if let Some(pdf_view) = self.pdf_view.as_mut() {
-            if pdf_view.zoom_fit_page() {
+            if pdf_view.zoom_fit_page(image_viewport_size(self.display)) {
                 self.mark_pdf_view_dirty();
             }
             return;
@@ -3958,7 +3962,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     #[cfg(target_os = "macos")]
     fn image_zoom_actual(&mut self) {
         if let Some(pdf_view) = self.pdf_view.as_mut() {
-            if pdf_view.zoom_actual() {
+            if pdf_view.zoom_actual(image_viewport_size(self.display)) {
                 self.mark_pdf_view_dirty();
             }
             return;
@@ -3987,6 +3991,16 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         if let Some(image_view) = self.image_view.as_mut() {
             image_view.reset_view();
             self.mark_image_view_dirty();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pdf_toggle_dark_invert_override(&mut self) {
+        let Some(pdf_view) = self.pdf_view.as_mut() else {
+            return;
+        };
+        if pdf_view.toggle_dark_mode_override() {
+            self.mark_pdf_view_dirty();
         }
     }
 }

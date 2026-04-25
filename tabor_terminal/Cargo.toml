@@ -16,6 +16,8 @@ serde = ["dep:serde", "bitflags/serde", "vte/serde"]
 
 [dependencies]
 base64 = "0.22.0"
+flate2 = "1.1"
+image = { version = "0.25.2", default-features = false, features = ["png"] }
 bitflags = "2.4.1"
 home = "0.5.5"
 libc = "0.2"

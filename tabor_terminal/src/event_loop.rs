@@ -160,7 +160,8 @@ where
             }
 
             // Parse the incoming bytes.
-            state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            let State { parser, kitty_parser, .. } = state;
+            kitty_parser.advance(parser, &mut **terminal, &buf[..unprocessed]);
 
             processed += unprocessed;
             unprocessed = 0;
@@ -410,6 +411,7 @@ pub struct State {
     write_list: VecDeque<Cow<'static, [u8]>>,
     writing: Option<Writing>,
     parser: ansi::Processor,
+    kitty_parser: KittyApcParser,
 }
 
 impl State {
@@ -438,6 +440,119 @@ impl State {
     #[inline]
     fn set_current(&mut self, new: Option<Writing>) {
         self.writing = new;
+    }
+}
+
+const MAX_KITTY_APC_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct KittyApcParser {
+    state: KittyApcParserState,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum KittyApcParserState {
+    #[default]
+    Ground,
+    Escape,
+    ApcPrefix,
+    Kitty {
+        esc: bool,
+    },
+    IgnoreApc {
+        esc: bool,
+    },
+}
+
+impl KittyApcParser {
+    fn advance<U: EventListener>(
+        &mut self,
+        parser: &mut ansi::Processor,
+        terminal: &mut Term<U>,
+        bytes: &[u8],
+    ) {
+        for &byte in bytes {
+            self.advance_byte(parser, terminal, byte);
+        }
+    }
+
+    fn advance_byte<U: EventListener>(
+        &mut self,
+        parser: &mut ansi::Processor,
+        terminal: &mut Term<U>,
+        byte: u8,
+    ) {
+        match self.state {
+            KittyApcParserState::Ground => match byte {
+                0x1b => self.state = KittyApcParserState::Escape,
+                _ => parser.advance(terminal, &[byte]),
+            },
+            KittyApcParserState::Escape => {
+                if byte == b'_' {
+                    self.state = KittyApcParserState::ApcPrefix;
+                } else {
+                    parser.advance(terminal, &[0x1b, byte]);
+                    self.state = KittyApcParserState::Ground;
+                }
+            },
+            KittyApcParserState::ApcPrefix => match byte {
+                b'G' => {
+                    self.payload.clear();
+                    self.state = KittyApcParserState::Kitty { esc: false };
+                },
+                0x1b => self.state = KittyApcParserState::IgnoreApc { esc: true },
+                0x9c => self.state = KittyApcParserState::Ground,
+                _ => self.state = KittyApcParserState::IgnoreApc { esc: false },
+            },
+            KittyApcParserState::Kitty { esc } => {
+                if esc {
+                    if byte == b'\\' {
+                        terminal.process_kitty_graphics_apc(&self.payload);
+                        self.payload.clear();
+                        self.state = KittyApcParserState::Ground;
+                    } else {
+                        self.push_payload_byte(0x1b);
+                        if byte == 0x1b {
+                            self.state = KittyApcParserState::Kitty { esc: true };
+                        } else {
+                            self.push_payload_byte(byte);
+                            self.state = KittyApcParserState::Kitty { esc: false };
+                        }
+                    }
+                } else if byte == 0x1b {
+                    self.state = KittyApcParserState::Kitty { esc: true };
+                } else if byte == 0x9c {
+                    terminal.process_kitty_graphics_apc(&self.payload);
+                    self.payload.clear();
+                    self.state = KittyApcParserState::Ground;
+                } else {
+                    self.push_payload_byte(byte);
+                }
+            },
+            KittyApcParserState::IgnoreApc { esc } => {
+                if esc {
+                    self.state = if byte == b'\\' {
+                        KittyApcParserState::Ground
+                    } else {
+                        KittyApcParserState::IgnoreApc { esc: byte == 0x1b }
+                    };
+                } else if byte == 0x1b {
+                    self.state = KittyApcParserState::IgnoreApc { esc: true };
+                } else if byte == 0x9c {
+                    self.state = KittyApcParserState::Ground;
+                }
+            },
+        }
+    }
+
+    fn push_payload_byte(&mut self, byte: u8) {
+        if self.payload.len() < MAX_KITTY_APC_BYTES {
+            self.payload.push(byte);
+        } else {
+            self.payload.clear();
+            self.state = KittyApcParserState::IgnoreApc { esc: false };
+        }
     }
 }
 
