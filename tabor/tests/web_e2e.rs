@@ -1096,6 +1096,37 @@ fn web_popup_smoke() {
 }
 
 #[test]
+fn web_target_blank_link_opens_tabor_tab() {
+    let server = PopupServer::start();
+    let harness = TaborHarness::start();
+
+    let opener_url = server.url("/target-blank-opener.html");
+    let target_url = server.url("/target-blank-target.html");
+    let reply = harness.run_json(["msg", "create-tab", "--web", opener_url.as_str()]);
+    assert_eq!(reply.get("type").and_then(Value::as_str), Some("tab_created"));
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    wait_for_agent_observation(&harness, "target-blank-opener", Duration::from_secs(8))
+        .unwrap_or_else(|| panic!("timed out waiting for target blank opener at {opener_url}"));
+
+    click_target_blank_opener(&harness);
+
+    let active_target =
+        wait_for_active_web_url_value(&harness, target_url.as_str(), Duration::from_secs(8))
+            .unwrap_or_else(|| panic!("timed out waiting for target blank tab at {target_url}"));
+    assert!(
+        tab_kind_is(&active_target, "web"),
+        "expected target blank URL to become a Tabor web tab: {active_target}"
+    );
+
+    let tabs = harness.run_json(["msg", "list-tabs"]);
+    let urls = flatten_tabs(&tabs).into_iter().filter_map(tab_web_url).collect::<Vec<_>>();
+    assert!(urls.contains(&opener_url.as_str()), "missing opener web tab: {tabs}");
+    assert!(urls.contains(&target_url.as_str()), "missing target web tab: {tabs}");
+}
+
+#[test]
 fn accelerated_web_multi_column_stays_gpu_backed_after_resize_and_scroll() {
     let harness = TaborHarness::start();
     let fixture = fixture_url();
@@ -4065,6 +4096,14 @@ fn click_popup_opener(harness: &TaborHarness) {
     assert!(agent_action_results_all_ok(&reply), "popup click failed: {reply}");
 }
 
+fn click_target_blank_opener(harness: &TaborHarness) {
+    let observation = harness.run_json(["agent", "observe"]);
+    let button_id = find_observed_element_id(&observation, "Open target blank");
+    let actions = json!([{ "type": "click", "id": button_id }]).to_string();
+    let reply = harness.run_json(["agent", "act", actions.as_str()]);
+    assert!(agent_action_results_all_ok(&reply), "target blank click failed: {reply}");
+}
+
 fn opener_html() -> &'static str {
     r#"<!doctype html>
 <title>popup-opener</title>
@@ -4138,6 +4177,38 @@ window.onload = () => {
 "#
 }
 
+const TARGET_BLANK_OPENER_HTML: &str = r#"<!doctype html>
+<title>target-blank-opener</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  #open-target {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 220px;
+    height: 120px;
+    border: 0;
+    font: 16px/1 sans-serif;
+    background: #116149;
+    color: #fff;
+  }
+</style>
+<button id="open-target" type="button">Open target blank</button>
+<script>
+window.onload = () => {
+  const button = document.getElementById("open-target");
+  button.addEventListener("click", () => {
+    window.open(window.location.origin + "/target-blank-target.html", "_blank");
+  });
+};
+</script>
+"#;
+
+const TARGET_BLANK_TARGET_HTML: &str = r#"<!doctype html>
+<title>target-blank-target</title>
+<h1>target blank target</h1>
+"#;
+
 fn popup_icon() -> Vec<u8> {
     BASE64
         .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=")
@@ -4170,6 +4241,16 @@ fn handle_popup_connection(
         "/opener.html" => {
             ("HTTP/1.1 200 OK", "text/html; charset=utf-8", opener.as_bytes().to_vec())
         },
+        "/target-blank-opener.html" => (
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            TARGET_BLANK_OPENER_HTML.as_bytes().to_vec(),
+        ),
+        "/target-blank-target.html" => (
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            TARGET_BLANK_TARGET_HTML.as_bytes().to_vec(),
+        ),
         "/popup-icon.png" => ("HTTP/1.1 200 OK", "image/png", icon.to_vec()),
         _ => ("HTTP/1.1 404 Not Found", "text/plain; charset=utf-8", b"not found".to_vec()),
     };

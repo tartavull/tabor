@@ -52,6 +52,7 @@ mod string;
 mod tab_panel;
 mod tab_panel_icons;
 mod tabs;
+mod text_edit;
 mod web_url;
 mod window_context;
 mod window_kind;

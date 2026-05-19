@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::time::Instant;
 
 use winit::dpi::PhysicalPosition;
@@ -14,10 +15,13 @@ use crossfont::GlyphKey;
 use tabor_terminal::grid::Dimensions;
 use tabor_terminal::index::{Column, Point};
 use tabor_terminal::term::MIN_COLUMNS;
+use tabor_terminal::vte::ansi::CursorShape;
 
 use crate::config::UiConfig;
 use crate::display::SizeInfo;
 use crate::display::color::Rgb;
+use crate::display::content::RenderableCursor;
+use crate::display::cursor::IntoRects;
 use crate::renderer::rects::RenderRect;
 use crate::renderer::{GlyphCache, Renderer};
 use crate::tab_panel::{TabPanelCommand, TabPanelGroup, TabPanelTab};
@@ -28,6 +32,7 @@ use crate::tab_panel_icons::{
 #[cfg(target_os = "macos")]
 use crate::tab_panel_icons::{TabPanelIconKind, rasterized_tab_panel_icon_glyph};
 use crate::tabs::TabId;
+use crate::text_edit::TextEditState;
 use crate::window_kind::TabKind;
 
 const RESIZE_HANDLE_WIDTH_PX: f64 = 6.0;
@@ -119,8 +124,7 @@ pub struct TabPanel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EditState {
     target: TabPanelEditTarget,
-    text: String,
-    cursor: usize,
+    input: TextEditState,
 }
 
 impl TabPanel {
@@ -292,8 +296,7 @@ impl TabPanel {
     }
 
     fn begin_edit(&mut self, target: TabPanelEditTarget, text: String) -> bool {
-        let cursor = text.chars().count();
-        let next = EditState { target, text, cursor };
+        let next = EditState::new(target, text);
         let changed = self.edit.as_ref() != Some(&next);
         self.edit = Some(next);
         self.drag = None;
@@ -323,7 +326,7 @@ impl TabPanel {
 
     fn take_edit_commit(&mut self) -> TabPanelEditCommit {
         let edit = self.edit.take().expect("edit state required");
-        TabPanelEditCommit { target: edit.target, text: edit.text }
+        TabPanelEditCommit { target: edit.target, text: edit.input.into_text() }
     }
 
     pub fn cursor_moved(
@@ -717,21 +720,33 @@ impl TabPanel {
         let header_fg = mix(fg, base, 0.2);
         let now = Instant::now();
         let dragging = self.drag.as_ref().is_some_and(|drag| drag.dragging);
+        let mut edit_cursors = Vec::new();
 
         for item in &layout.items {
             match &item.kind {
                 PanelItemKind::GroupHeader { group_index } => {
                     if let Some(group) = self.groups.get(*group_index) {
                         let indent = GROUP_HEADER_INDENT_COLS;
-                        let label = match &self.edit {
-                            Some(edit) if edit.target == TabPanelEditTarget::Group(group.id) => {
-                                render_edit_text(&edit.text, edit.cursor)
-                            },
-                            _ => group.label.clone(),
-                        };
-                        let title = format!("{}:", label);
                         let max_cols = self.width_cols.saturating_sub(indent + 1);
-                        let text = truncate_to_columns(&title, max_cols);
+                        let (text, edit_cursor_column) = match &self.edit {
+                            Some(edit) if edit.target == TabPanelEditTarget::Group(group.id) => {
+                                let render = editable_group_title(&edit.input, max_cols);
+                                (render.text, Some(render.cursor_column))
+                            },
+                            _ => {
+                                let title = format!("{}:", group.label);
+                                (truncate_to_columns(&title, max_cols), None)
+                            },
+                        };
+                        if let Some(cursor_column) = edit_cursor_column {
+                            push_edit_cursor(
+                                &mut edit_cursors,
+                                item.line,
+                                indent + cursor_column,
+                                self.width_cols,
+                                header_fg,
+                            );
+                        }
                         let bg = header_bg;
                         let point = Point::new(item.line, Column(indent));
                         renderer.draw_string(
@@ -765,26 +780,45 @@ impl TabPanel {
                     let text_col = tab_text_col(tab);
                     let close_col = self.width_cols.saturating_sub(1);
                     let max_cols = self.width_cols.saturating_sub(text_col + 1);
-                    let title = match &self.edit {
-                        Some(edit) if edit.target == TabPanelEditTarget::Tab(tab.tab_id) => {
-                            render_edit_text(&edit.text, edit.cursor)
-                        },
-                        _ => tab.title.clone(),
-                    };
-                    let show_close = !dragging && !is_ghost && self.hover.tab == Some(tab.tab_id);
+                    let is_editing_tab = self
+                        .edit
+                        .as_ref()
+                        .is_some_and(|edit| edit.target == TabPanelEditTarget::Tab(tab.tab_id));
+                    let show_close = !is_editing_tab
+                        && !dragging
+                        && !is_ghost
+                        && self.hover.tab == Some(tab.tab_id);
                     let tab_icon = tab_panel_icon_char(tab);
                     let show_inline_close_icon = show_close && tab_icon.is_some();
                     let show_inline_close_indicator =
                         show_close && tab.activity.is_some() && !show_inline_close_icon;
                     let show_inline_close = show_inline_close_icon || show_inline_close_indicator;
                     let show_trailing_close = show_close && !show_inline_close;
-                    let label = if let Some(icon) = tab_icon {
-                        let icon = if show_inline_close_icon { TAB_PANEL_CLOSE_CHAR } else { icon };
-                        format!("{}  {}", icon, title)
-                    } else {
-                        title
+                    let (text, edit_cursor_column) = match &self.edit {
+                        Some(edit) if edit.target == TabPanelEditTarget::Tab(tab.tab_id) => {
+                            let render = editable_tab_label(
+                                tab_icon,
+                                show_inline_close_icon,
+                                &edit.input,
+                                max_cols,
+                            );
+                            (render.text, Some(render.cursor_column))
+                        },
+                        _ => {
+                            let title = tab.title.clone();
+                            let label = if let Some(icon) = tab_icon {
+                                let icon = if show_inline_close_icon {
+                                    TAB_PANEL_CLOSE_CHAR
+                                } else {
+                                    icon
+                                };
+                                format!("{}  {}", icon, title)
+                            } else {
+                                title
+                            };
+                            (truncate_to_columns(&label, max_cols), None)
+                        },
                     };
-                    let text = truncate_to_columns(&label, max_cols);
                     let bg = if is_ghost {
                         ghost_bg
                     } else if tab.is_active {
@@ -827,6 +861,15 @@ impl TabPanel {
                         &panel_size_info,
                         glyph_cache,
                     );
+                    if let Some(cursor_column) = edit_cursor_column {
+                        push_edit_cursor(
+                            &mut edit_cursors,
+                            item.line,
+                            text_col + cursor_column,
+                            self.width_cols,
+                            text_fg,
+                        );
+                    }
 
                     if show_trailing_close && close_col > text_col {
                         let point = Point::new(item.line, Column(close_col));
@@ -884,6 +927,15 @@ impl TabPanel {
                     }
                 }
             }
+        }
+
+        if !edit_cursors.is_empty() {
+            let metrics = glyph_cache.font_metrics();
+            let cursor_rects: Vec<_> = edit_cursors
+                .into_iter()
+                .flat_map(|cursor| cursor.rects(&panel_size_info, config.cursor.thickness()))
+                .collect();
+            renderer.draw_rects(&panel_size_info, &metrics, cursor_rects);
         }
 
         renderer.set_viewport(size_info);
@@ -1647,84 +1699,36 @@ impl TabPanel {
 }
 
 impl EditState {
-    fn move_left(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
+    fn new(target: TabPanelEditTarget, text: String) -> Self {
+        Self { target, input: TextEditState::new(text) }
+    }
 
-        self.cursor -= 1;
-        true
+    fn move_left(&mut self) -> bool {
+        self.input.move_left()
     }
 
     fn move_right(&mut self) -> bool {
-        let len = self.text.chars().count();
-        if self.cursor >= len {
-            return false;
-        }
-
-        self.cursor += 1;
-        true
+        self.input.move_right()
     }
 
     fn move_home(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-
-        self.cursor = 0;
-        true
+        self.input.move_home()
     }
 
     fn move_end(&mut self) -> bool {
-        let len = self.text.chars().count();
-        if self.cursor == len {
-            return false;
-        }
-
-        self.cursor = len;
-        true
+        self.input.move_end()
     }
 
     fn backspace(&mut self) -> bool {
-        if self.cursor == 0 {
-            return false;
-        }
-
-        let start = char_to_byte_idx(&self.text, self.cursor - 1);
-        let end = char_to_byte_idx(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
-        self.cursor -= 1;
-        true
+        self.input.backspace()
     }
 
     fn delete(&mut self) -> bool {
-        let len = self.text.chars().count();
-        if self.cursor >= len {
-            return false;
-        }
-
-        let start = char_to_byte_idx(&self.text, self.cursor);
-        let end = char_to_byte_idx(&self.text, self.cursor + 1);
-        self.text.replace_range(start..end, "");
-        true
+        self.input.delete()
     }
 
     fn insert_text(&mut self, text: &str) -> bool {
-        let mut filtered = String::new();
-        for ch in text.chars() {
-            if !ch.is_control() {
-                filtered.push(ch);
-            }
-        }
-
-        if filtered.is_empty() {
-            return false;
-        }
-
-        let idx = char_to_byte_idx(&self.text, self.cursor);
-        self.text.insert_str(idx, &filtered);
-        self.cursor += filtered.chars().count();
-        true
+        self.input.insert_text(text)
     }
 }
 
@@ -1921,32 +1925,79 @@ pub struct TabPanelMouseUpdate {
     pub command: Option<TabPanelCommand>,
 }
 
-fn render_edit_text(text: &str, cursor: usize) -> String {
-    let cursor = cursor.min(text.chars().count());
-    let mut output = String::new();
-    let mut index = 0;
-
-    for ch in text.chars() {
-        if index == cursor {
-            output.push('|');
-        }
-        output.push(ch);
-        index += 1;
-    }
-
-    if cursor == index {
-        output.push('|');
-    }
-
-    output
+struct EditRender {
+    text: String,
+    cursor_column: usize,
 }
 
-fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
-    if char_idx == 0 {
-        return 0;
+fn editable_group_title(input: &TextEditState, max_cols: usize) -> EditRender {
+    if max_cols == 0 {
+        return EditRender { text: String::new(), cursor_column: 0 };
     }
 
-    text.char_indices().nth(char_idx).map(|(idx, _)| idx).unwrap_or_else(|| text.len())
+    let edit_cols = max_cols.saturating_sub(1);
+    let layout = input.layout(edit_cols);
+    let mut text = layout.visible_text;
+    if layout.visible_columns < max_cols {
+        text.push(':');
+    }
+
+    EditRender { text, cursor_column: layout.cursor_column }
+}
+
+fn editable_tab_label(
+    tab_icon: Option<char>,
+    show_inline_close_icon: bool,
+    input: &TextEditState,
+    max_cols: usize,
+) -> EditRender {
+    if max_cols == 0 {
+        return EditRender { text: String::new(), cursor_column: 0 };
+    }
+
+    let mut prefix = String::new();
+    if let Some(icon) = tab_icon {
+        let icon = if show_inline_close_icon { TAB_PANEL_CLOSE_CHAR } else { icon };
+        prefix.push(icon);
+        prefix.push_str("  ");
+    }
+
+    let prefix_cols = text_columns(&prefix);
+    if prefix_cols >= max_cols {
+        return EditRender {
+            text: truncate_to_columns(&prefix, max_cols),
+            cursor_column: max_cols,
+        };
+    }
+
+    let layout = input.layout(max_cols - prefix_cols);
+    let mut text = prefix;
+    text.push_str(&layout.visible_text);
+    EditRender { text, cursor_column: prefix_cols + layout.cursor_column }
+}
+
+fn push_edit_cursor(
+    cursors: &mut Vec<RenderableCursor>,
+    line: usize,
+    column: usize,
+    panel_columns: usize,
+    color: Rgb,
+) {
+    if column >= panel_columns {
+        return;
+    }
+
+    let width = NonZeroU32::new(1).unwrap();
+    cursors.push(RenderableCursor::new(
+        Point::new(line, Column(column)),
+        CursorShape::Beam,
+        color,
+        width,
+    ));
+}
+
+fn text_columns(text: &str) -> usize {
+    text.chars().map(|ch| ch.width().unwrap_or(0)).sum()
 }
 
 fn truncate_to_columns(text: &str, max_cols: usize) -> String {
@@ -2384,5 +2435,40 @@ mod tests {
         tab.activity = Some(TabActivity::default());
 
         assert_eq!(tab_text_col(&tab), 4);
+    }
+
+    #[test]
+    fn editing_tab_label_keeps_caret_out_of_text() {
+        let mut input = TextEditState::new(String::from("codex"));
+        input.move_left();
+        input.move_left();
+
+        let render = editable_tab_label(None, false, &input, 20);
+
+        assert_eq!(render.text, "codex");
+        assert_eq!(render.cursor_column, 3);
+        assert!(!render.text.contains("|"));
+    }
+
+    #[test]
+    fn editing_group_title_keeps_colon_outside_edit_text() {
+        let mut input = TextEditState::new(String::from("codex"));
+        input.move_left();
+
+        let render = editable_group_title(&input, 20);
+
+        assert_eq!(render.text, "codex:");
+        assert_eq!(render.cursor_column, 4);
+        assert!(!render.text.contains("|"));
+    }
+
+    #[test]
+    fn editing_tab_label_scrolls_without_inserting_caret_space() {
+        let input = TextEditState::new(String::from("abcdefghij"));
+
+        let render = editable_tab_label(None, false, &input, 5);
+
+        assert_eq!(render.text, "fghij");
+        assert_eq!(render.cursor_column, 5);
     }
 }

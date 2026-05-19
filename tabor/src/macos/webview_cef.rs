@@ -11,10 +11,11 @@ use cef::{
     CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler, FocusHandler,
     ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
     ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplDownloadHandler,
-    ImplDownloadItem, ImplFocusHandler, ImplFrame, ImplListValue, ImplMediaAccessCallback,
-    ImplPermissionHandler, ImplPermissionPromptCallback, ImplProcessMessage, ImplRenderHandler,
-    ImplTask, PermissionHandler, PermissionRequestResult, RenderHandler, Task, WrapClient,
-    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler, WrapFocusHandler,
+    ImplDownloadItem, ImplFocusHandler, ImplFrame, ImplLifeSpanHandler, ImplListValue,
+    ImplMediaAccessCallback, ImplPermissionHandler, ImplPermissionPromptCallback,
+    ImplProcessMessage, ImplRenderHandler, ImplTask, LifeSpanHandler, PermissionHandler,
+    PermissionRequestResult, RenderHandler, Task, WrapClient, WrapDevToolsMessageObserver,
+    WrapDisplayHandler, WrapDownloadHandler, WrapFocusHandler, WrapLifeSpanHandler,
     WrapPermissionHandler, WrapRenderHandler, WrapTask, rc::Rc,
 };
 use log::debug;
@@ -38,7 +39,7 @@ use super::webview::{
 use crate::display::SizeInfo;
 use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::window::Window;
-use crate::event::Event;
+use crate::event::{Event, EventType, WebCommand};
 use crate::ipc::{AgentDownload, WebNetworkEntry};
 use crate::tabs::TabId;
 #[cfg(target_pointer_width = "32")]
@@ -792,6 +793,46 @@ cef::wrap_display_handler! {
     }
 }
 
+cef::wrap_life_span_handler! {
+    struct TaborLifeSpanHandler {
+        proxy: EventLoopProxy<Event>,
+        window_id: WindowId,
+        tab_id: TabId,
+    }
+
+    impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&cef::CefString>,
+            _target_frame_name: Option<&cef::CefString>,
+            _target_disposition: cef::WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&cef::PopupFeatures>,
+            _window_info: Option<&mut cef::WindowInfo>,
+            _client: Option<&mut Option<cef::Client>>,
+            _settings: Option<&mut cef::BrowserSettings>,
+            _extra_info: Option<&mut Option<cef::DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let Some(target_url) = target_url else {
+                return 0;
+            };
+            let url = target_url.to_string();
+            if url.is_empty() || url.eq_ignore_ascii_case("about:blank") {
+                return 0;
+            }
+
+            let command = WebCommand::OpenUrl { url, new_tab: true };
+            let event = Event::for_tab(EventType::WebCommand(command), self.window_id, self.tab_id);
+            let _ = self.proxy.send_event(event);
+            1
+        }
+    }
+}
+
 cef::wrap_render_handler! {
     struct TaborRenderHandler {
         paint_state: StdRc<RefCell<PaintState>>,
@@ -1295,6 +1336,7 @@ cef::wrap_client! {
         render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
         focus_handler: cef::FocusHandler,
+        life_span_handler: cef::LifeSpanHandler,
         editable_focus_notifier: WebEditableFocusNotifier,
         permission_handler: cef::PermissionHandler,
     }
@@ -1314,6 +1356,10 @@ cef::wrap_client! {
 
         fn focus_handler(&self) -> Option<cef::FocusHandler> {
             Some(self.focus_handler.clone())
+        }
+
+        fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
+            Some(self.life_span_handler.clone())
         }
 
         fn on_process_message_received(
@@ -1339,6 +1385,7 @@ cef::wrap_client! {
         render_handler: cef::RenderHandler,
         download_handler: cef::DownloadHandler,
         focus_handler: cef::FocusHandler,
+        life_span_handler: cef::LifeSpanHandler,
         editable_focus_notifier: WebEditableFocusNotifier,
     }
 
@@ -1357,6 +1404,10 @@ cef::wrap_client! {
 
         fn focus_handler(&self) -> Option<cef::FocusHandler> {
             Some(self.focus_handler.clone())
+        }
+
+        fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> {
+            Some(self.life_span_handler.clone())
         }
 
         fn on_process_message_received(
@@ -1497,6 +1548,7 @@ impl WebView {
             let download_handler = TaborDownloadHandler::new(automation_state.clone());
             let focus_policy = WebFocusPolicy::new();
             let focus_handler = TaborFocusHandler::new(focus_policy.clone());
+            let life_span_handler = TaborLifeSpanHandler::new(proxy.clone(), window.id(), tab_id);
             let editable_focus_notifier =
                 WebEditableFocusNotifier::new(proxy.clone(), window.id(), tab_id);
             #[cfg(not(feature = "passkey-webauthn"))]
@@ -1507,6 +1559,7 @@ impl WebView {
                     render_handler,
                     download_handler,
                     focus_handler,
+                    life_span_handler,
                     editable_focus_notifier,
                     permission_handler,
                 )
@@ -1517,6 +1570,7 @@ impl WebView {
                 render_handler,
                 download_handler,
                 focus_handler,
+                life_span_handler,
                 editable_focus_notifier,
             );
 
