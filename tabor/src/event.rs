@@ -790,6 +790,11 @@ impl Processor {
 
     #[cfg(unix)]
     fn restore_workspace_if_present(&mut self) {
+        #[cfg(target_os = "macos")]
+        if !lifecycle::should_restore_workspace_after_start() {
+            return;
+        }
+
         let layout = match workspace::load_workspace_layout() {
             Ok(Some(layout)) => layout,
             Ok(None) => return,

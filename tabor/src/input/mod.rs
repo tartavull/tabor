@@ -119,6 +119,7 @@ pub trait ActionContext<T: EventListener> {
     fn event_loop(&self) -> &ActiveEventLoop;
     #[cfg(target_os = "macos")]
     fn quit_application(&mut self) {
+        crate::lifecycle::record_exit_requested("quit_action");
         self.event_loop().exit();
     }
     #[cfg(not(target_os = "macos"))]
