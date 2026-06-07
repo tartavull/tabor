@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io::{BufReader, Error as IoError, ErrorKind, Read};
@@ -420,7 +420,12 @@ fn legacy_snapshot_to_preview_lines(snapshot: TermSnapshot) -> Vec<String> {
 
 pub(crate) fn allocate_terminal_id() -> Result<u64, Box<dyn Error>> {
     let mut state = load_persisted_state()?;
-    let id = allocate_terminal_id_from_state(&mut state);
+    let reserved_terminal_ids = load_workspace_layout()
+        .ok()
+        .flatten()
+        .map(|layout| workspace_layout_terminal_ids(&layout))
+        .unwrap_or_default();
+    let id = allocate_terminal_id_from_state(&mut state, &reserved_terminal_ids);
     write_persisted_state(&state)?;
     Ok(id)
 }
@@ -707,12 +712,14 @@ fn apply_metadata_update_to_state(
 }
 
 fn upsert_terminal_state(state: &mut PersistedWorkspaceState, terminal: PersistedTerminalState) {
-    if let Some(existing) = state.terminals.iter_mut().find(|saved| saved.id == terminal.id) {
+    let terminal_id = terminal.id;
+    if let Some(existing) = state.terminals.iter_mut().find(|saved| saved.id == terminal_id) {
         *existing = terminal;
     } else {
         state.terminals.push(terminal);
     }
     state.terminals.sort_by_key(|terminal| terminal.id);
+    state.next_terminal_id = state.next_terminal_id.max(terminal_id.saturating_add(1));
 }
 
 fn update_terminal_metadata_sync(
@@ -927,10 +934,36 @@ fn remove_terminal_files(terminal_id: u64) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn allocate_terminal_id_from_state(state: &mut PersistedWorkspaceState) -> u64 {
-    let next = state.next_terminal_id.max(1);
+fn allocate_terminal_id_from_state(
+    state: &mut PersistedWorkspaceState,
+    reserved_terminal_ids: &HashSet<u64>,
+) -> u64 {
+    let used_terminal_ids = state
+        .terminals
+        .iter()
+        .map(|terminal| terminal.id)
+        .chain(reserved_terminal_ids.iter().copied())
+        .collect::<HashSet<_>>();
+    let mut next = state.next_terminal_id.max(1);
+    while used_terminal_ids.contains(&next) {
+        next = next.checked_add(1).expect("terminal id space exhausted");
+    }
     state.next_terminal_id = next.saturating_add(1);
     next
+}
+
+fn workspace_layout_terminal_ids(layout: &WorkspaceLayout) -> HashSet<u64> {
+    layout
+        .groups
+        .iter()
+        .flat_map(|group| group.tabs.iter())
+        .filter_map(|tab| match &tab.kind {
+            WorkspaceTabKind::Terminal { terminal_id, .. } => Some(*terminal_id),
+            WorkspaceTabKind::Web { .. }
+            | WorkspaceTabKind::Image { .. }
+            | WorkspaceTabKind::Pdf { .. } => None,
+        })
+        .collect()
 }
 
 fn workspace_layout_file() -> PathBuf {
@@ -1112,6 +1145,115 @@ mod tests {
         assert_eq!(load_preview_lines_file(7).expect("load preview"), Some(preview_lines));
         assert!(!checkpoint_file(7).exists());
         assert!(!journal_file(7).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn allocate_terminal_id_skips_ids_reserved_by_workspace_layout() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let tempdir = tempdir().expect("tempdir");
+        let home_dir = tempdir.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+
+        write_persisted_state(&PersistedWorkspaceState {
+            next_terminal_id: 50,
+            terminals: Vec::new(),
+        })
+        .expect("write stale state");
+        save_workspace_layout(&WorkspaceLayout {
+            protocol_version: WORKSPACE_PROTOCOL_VERSION,
+            active_tab_id: None,
+            groups: vec![WorkspaceGroupLayout {
+                name: None,
+                tabs: vec![
+                    WorkspaceTabLayout {
+                        persistent_id: String::from("g0-t0"),
+                        custom_title: None,
+                        terminal_view_mode:
+                            crate::display::terminal_layout::TerminalViewMode::Normal,
+                        terminal_multi_column_count_override: None,
+                        kind: WorkspaceTabKind::Terminal {
+                            terminal_id: 50,
+                            launch_options: tty::Options::default(),
+                        },
+                    },
+                    WorkspaceTabLayout {
+                        persistent_id: String::from("g0-t1"),
+                        custom_title: None,
+                        terminal_view_mode:
+                            crate::display::terminal_layout::TerminalViewMode::Normal,
+                        terminal_multi_column_count_override: None,
+                        kind: WorkspaceTabKind::Terminal {
+                            terminal_id: 51,
+                            launch_options: tty::Options::default(),
+                        },
+                    },
+                ],
+            }],
+        })
+        .expect("write workspace layout");
+
+        assert_eq!(allocate_terminal_id().expect("allocate terminal id"), 52);
+        assert_eq!(load_persisted_state().expect("load state").next_terminal_id, 53);
+    }
+
+    #[test]
+    fn allocate_terminal_id_skips_ids_already_in_state() {
+        let mut state = PersistedWorkspaceState {
+            next_terminal_id: 50,
+            terminals: vec![
+                PersistedTerminalState {
+                    id: 50,
+                    launch_options: tty::Options::default(),
+                    title: Some(String::from("shell")),
+                    program_name: String::from("shell"),
+                    working_directory: None,
+                    exit_code: None,
+                    clean_exit: false,
+                    snapshot: None,
+                },
+                PersistedTerminalState {
+                    id: 51,
+                    launch_options: tty::Options::default(),
+                    title: Some(String::from("shell")),
+                    program_name: String::from("shell"),
+                    working_directory: None,
+                    exit_code: None,
+                    clean_exit: false,
+                    snapshot: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            allocate_terminal_id_from_state(&mut state, &std::collections::HashSet::new()),
+            52
+        );
+        assert_eq!(state.next_terminal_id, 53);
+    }
+
+    #[test]
+    fn upsert_terminal_state_advances_next_terminal_id() {
+        let mut state = PersistedWorkspaceState { next_terminal_id: 50, terminals: Vec::new() };
+
+        upsert_terminal_state(
+            &mut state,
+            PersistedTerminalState {
+                id: 51,
+                launch_options: tty::Options::default(),
+                title: Some(String::from("shell")),
+                program_name: String::from("shell"),
+                working_directory: None,
+                exit_code: None,
+                clean_exit: false,
+                snapshot: None,
+            },
+        );
+
+        assert_eq!(state.next_terminal_id, 52);
     }
 
     #[cfg(target_os = "macos")]

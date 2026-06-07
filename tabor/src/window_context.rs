@@ -1,8 +1,8 @@
 //! Terminal window context.
 
-use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
 #[cfg(target_os = "macos")]
@@ -3091,6 +3091,7 @@ impl WindowContext {
 
         let mut active_tab_id = None;
         let multi_column_defaults = self.multi_column_defaults();
+        let mut restored_terminal_ids = HashSet::new();
         for (restored_group_count, (_, group)) in
             non_empty_workspace_group_layouts(layout).enumerate()
         {
@@ -3102,8 +3103,17 @@ impl WindowContext {
             for tab_layout in &group.tabs {
                 let (window_kind, pty_config, terminal_spawn_mode, restored_terminal) =
                     match &tab_layout.kind {
-                        WorkspaceTabKind::Terminal { terminal_id, launch_options } => {
-                            let restored_terminal = persisted_terminals.get(terminal_id).cloned();
+                        WorkspaceTabKind::Terminal {
+                            terminal_id: saved_terminal_id,
+                            launch_options,
+                        } => {
+                            let terminal_id = if restored_terminal_ids.insert(*saved_terminal_id) {
+                                *saved_terminal_id
+                            } else {
+                                workspace::allocate_terminal_id()?
+                            };
+                            let restored_terminal =
+                                persisted_terminals.get(saved_terminal_id).cloned();
                             let mut pty_config = restored_terminal
                                 .as_ref()
                                 .map(|terminal| terminal.launch_options.clone())
@@ -3117,13 +3127,16 @@ impl WindowContext {
                             let preview_lines = restored_terminal
                                 .as_ref()
                                 .and_then(|terminal| {
-                                    workspace::load_terminal_preview_lines(*terminal_id, terminal)
-                                        .ok()
+                                    workspace::load_terminal_preview_lines(
+                                        *saved_terminal_id,
+                                        terminal,
+                                    )
+                                    .ok()
                                 })
                                 .flatten();
                             let terminal_spawn_mode = Some(TerminalSpawnMode::RestoredLocalShell(
                                 Box::new(RestoredTerminalSpawn {
-                                    terminal_id: *terminal_id,
+                                    terminal_id,
                                     launch_options: restored_terminal
                                         .as_ref()
                                         .map(|terminal| terminal.launch_options.clone())

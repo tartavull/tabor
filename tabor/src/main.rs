@@ -39,6 +39,8 @@ mod event;
 mod input;
 #[cfg(unix)]
 mod ipc;
+#[cfg(target_os = "macos")]
+mod lifecycle;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -114,9 +116,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(exit_code);
     }
 
-    dispatch_options(Options::new())?;
+    let options = Options::new();
+    #[cfg(target_os = "macos")]
+    let record_lifecycle = options.subcommands.is_none();
+    #[cfg(target_os = "macos")]
+    if record_lifecycle {
+        lifecycle::install_panic_hook();
+        lifecycle::record_process_start();
+    }
 
-    Ok(())
+    let result = dispatch_options(options);
+    #[cfg(target_os = "macos")]
+    if record_lifecycle {
+        match &result {
+            Ok(()) => lifecycle::record_process_return("ok"),
+            Err(err) => lifecycle::record_process_return(&format!("error: {err}")),
+        }
+    }
+
+    result
 }
 
 fn dispatch_options(options: Options) -> Result<(), Box<dyn Error>> {

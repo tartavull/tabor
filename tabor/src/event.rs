@@ -75,6 +75,8 @@ use crate::display::{Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 #[cfg(unix)]
 use crate::ipc::{self, IpcRequest, SocketReply};
+#[cfg(target_os = "macos")]
+use crate::lifecycle;
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 #[cfg(target_os = "macos")]
 use crate::macos::cef;
@@ -1175,6 +1177,8 @@ impl Processor {
                 window_context.write_ref_test_results();
             }
 
+            #[cfg(target_os = "macos")]
+            lifecycle::record_exit_requested("last_window_closed");
             event_loop.exit();
         }
     }
@@ -1213,6 +1217,8 @@ impl ApplicationHandler<Event> for Processor {
         if let Some(window_options) = self.initial_window_options.take() {
             if let Err(err) = self.create_initial_window(event_loop, window_options) {
                 self.initial_window_error = Some(err);
+                #[cfg(target_os = "macos")]
+                lifecycle::record_exit_requested("initial_window_creation_failed");
                 event_loop.exit();
                 return;
             }
@@ -1437,6 +1443,8 @@ impl ApplicationHandler<Event> for Processor {
                     // Handle initial window creation in daemon mode.
                     if let Err(err) = self.create_initial_window(event_loop, options) {
                         self.initial_window_error = Some(err);
+                        #[cfg(target_os = "macos")]
+                        lifecycle::record_exit_requested("daemon_initial_window_creation_failed");
                         event_loop.exit();
                     } else {
                         #[cfg(target_os = "macos")]
@@ -1555,6 +1563,8 @@ impl ApplicationHandler<Event> for Processor {
                             window_context.write_ref_test_results();
                         }
 
+                        #[cfg(target_os = "macos")]
+                        lifecycle::record_exit_requested("last_terminal_tab_exited");
                         event_loop.exit();
                     }
                 }
@@ -1645,6 +1655,8 @@ impl ApplicationHandler<Event> for Processor {
             info!("Exiting the event loop");
         }
 
+        #[cfg(target_os = "macos")]
+        lifecycle::record_event_loop_exiting();
         #[cfg(unix)]
         {
             self.persist_workspace_snapshot();
@@ -5946,10 +5958,16 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                         }
                     },
                     TerminalEvent::Bell => {
-                        // Set window urgency hint when window is not focused.
-                        let focused = self.ctx.terminal.is_focused;
-                        if !focused && self.ctx.terminal.mode().contains(TermMode::URGENCY_HINTS) {
-                            self.ctx.window().set_urgent(true);
+                        // macOS critical attention bounces the Dock icon until focus returns.
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            // Set window urgency hint when window is not focused.
+                            let focused = self.ctx.terminal.is_focused;
+                            if !focused
+                                && self.ctx.terminal.mode().contains(TermMode::URGENCY_HINTS)
+                            {
+                                self.ctx.window().set_urgent(true);
+                            }
                         }
 
                         // Ring visual bell.
