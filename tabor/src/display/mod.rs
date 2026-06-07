@@ -1367,6 +1367,7 @@ impl Display {
             },
         );
         let logical_size = self.terminal_viewport.logical_size(&new_size);
+        let damage_lines = self.terminal_viewport.visual_damage_lines();
         let logical_window_size = WindowSize::from(logical_size);
         terminal
             .set_cell_size_pixels(logical_window_size.cell_width, logical_window_size.cell_height);
@@ -1382,10 +1383,8 @@ impl Display {
             terminal.resize_with_anchor(logical_size, ResizeAnchor::Top);
         }
 
-        if self.size_info.screen_lines() != new_size.screen_lines
-            || self.size_info.columns() != new_size.columns()
-        {
-            self.damage_tracker.resize(new_size.screen_lines(), new_size.columns());
+        if self.damage_tracker.dimensions() != (damage_lines, new_size.columns()) {
+            self.damage_tracker.resize(damage_lines, new_size.columns());
         }
 
         // Check if dimensions have changed.
@@ -3426,6 +3425,35 @@ mod tests {
 
         assert_eq!(vi_mode_line_indicator_line(layout, &size, Point::new(Line(11), Column(0))), 0);
         assert_eq!(vi_mode_line_indicator_line(layout, &size, Point::new(Line(0), Column(0))), 11);
+    }
+
+    #[test]
+    fn ear_aware_terminal_damage_accepts_reclaimed_top_lines() {
+        let size =
+            SizeInfo::new_with_vertical_padding(300., 120., 10., 20., 0., 0., 40., 0., false);
+        let layout = TerminalViewportLayout::new(
+            &size,
+            TerminalViewMode::MultiColumn,
+            &MultiColumnTerminalConfig::default(),
+            Some(3),
+            Some(EarAwareTopRegions {
+                reclaim_top_px: 40,
+                left: Some(AuxiliaryTopRegion { x: 0, width: 100 }),
+                right: Some(AuxiliaryTopRegion { x: 200, width: 100 }),
+            }),
+        );
+        let visual = layout.visual_point_for_logical_viewport(Point::new(15, Column(0))).unwrap();
+
+        assert_eq!(size.screen_lines(), 4);
+        assert_eq!(layout.visual_damage_lines(), 6);
+        assert_eq!(visual.line, 5);
+
+        let mut damage_tracker = DamageTracker::new(layout.visual_damage_lines(), size.columns());
+        damage_tracker.frame().damage_line(LineDamageBounds::new(
+            visual.line,
+            visual.column.0,
+            visual.column.0,
+        ));
     }
 
     #[cfg(target_os = "macos")]

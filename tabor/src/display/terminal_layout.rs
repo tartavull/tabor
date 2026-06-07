@@ -211,6 +211,13 @@ impl TerminalViewportLayout {
         )
     }
 
+    pub fn visual_damage_lines(&self) -> usize {
+        (0..self.strip_count)
+            .map(|strip_index| self.visual_strip_line_capacity(strip_index))
+            .max()
+            .unwrap_or(self.visual_lines)
+    }
+
     pub fn is_multi_column(&self) -> bool {
         self.mode == TerminalViewMode::MultiColumn
     }
@@ -780,6 +787,7 @@ mod tests {
 
         assert_eq!(layout.logical_size(&size_info).columns(), 10);
         assert_eq!(layout.logical_size(&size_info).screen_lines(), 16);
+        assert_eq!(layout.visual_damage_lines(), 6);
         assert_eq!(
             layout.strip_geometries(),
             vec![

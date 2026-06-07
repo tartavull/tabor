@@ -41,6 +41,10 @@ impl DamageTracker {
         tracker
     }
 
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.screen_lines, self.columns)
+    }
+
     #[inline]
     #[must_use]
     pub fn frame(&mut self) -> &mut FrameDamage {
