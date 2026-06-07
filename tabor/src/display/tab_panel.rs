@@ -42,12 +42,14 @@ const GROUP_HEADER_INDENT_COLS: usize = 1;
 const TAB_INDENT_COLS: usize = 1;
 const ACTIVITY_INDICATOR_COLS: usize = 3;
 const WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
-const WINDOW_CONTROL_MARGIN_X_PX: f64 = 12.0;
+const WINDOW_CONTROL_MARGIN_X_PX: f64 = 16.0;
+const WINDOW_CONTROL_TOP_PX: f64 = 14.0;
 const WINDOW_CONTROL_SPACING_PX: f64 = 8.0;
 const WINDOW_CONTROL_SIZE_PX: f64 = 12.0;
-const WINDOW_CONTROL_CLOSE_COLOR: Rgb = Rgb::new(255, 95, 86);
-const WINDOW_CONTROL_MINIMIZE_COLOR: Rgb = Rgb::new(255, 189, 46);
-const WINDOW_CONTROL_FULLSCREEN_COLOR: Rgb = Rgb::new(39, 201, 63);
+const WINDOW_CONTROL_GLYPH_OPACITY: f32 = 0.55;
+const WINDOW_CONTROL_CLOSE_COLOR: Rgb = Rgb::new(239, 108, 96);
+const WINDOW_CONTROL_MINIMIZE_COLOR: Rgb = Rgb::new(247, 191, 80);
+const WINDOW_CONTROL_FULLSCREEN_COLOR: Rgb = Rgb::new(97, 200, 87);
 
 #[derive(Default, Clone, Copy)]
 pub struct PanelDimensions {
@@ -152,9 +154,9 @@ impl TabPanel {
         self.pressed_window_control = None;
     }
 
-    pub fn set_native_window_controls_inset_px(&mut self, inset: f32) {
+    pub fn set_windowed_window_controls_band_px(&mut self, band_height: f32) {
         self.window_controls =
-            PanelWindowControls::new(PanelWindowControlsMode::NativeInset, inset.max(0.0));
+            PanelWindowControls::new(PanelWindowControlsMode::WindowedCustom, band_height.max(0.0));
         self.pressed_window_control = None;
     }
 
@@ -364,7 +366,9 @@ impl TabPanel {
         }
 
         let hit = if resize_hit { None } else { self.hit_test(position, &panel_size_info) };
-        let next_hover = HoverState::from_hit(&hit);
+        let window_controls_region_hovered =
+            !resize_hit && self.window_control_region_contains(position, &panel_size_info);
+        let next_hover = HoverState::from_hit(&hit, window_controls_region_hovered);
         let drag_started = self.update_drag(position);
         let needs_redraw = drag_started
             || next_hover != self.hover
@@ -548,6 +552,8 @@ impl TabPanel {
         let base = config.colors.primary.background;
         let fg = config.colors.primary.foreground;
         let panel_bg = Self::background_color(config);
+        let window_control_outline = fg;
+        let window_control_outline_alpha = window_control_outline_alpha(panel_bg);
         let header_bg = mix(base, fg, 0.08);
         let active_bg = mix(base, fg, 0.18);
         let ghost_bg = mix(base, fg, 0.14);
@@ -569,9 +575,17 @@ impl TabPanel {
         }
 
         for rect in self.window_control_rects(size_info) {
-            let hovered = self.hover.window_control == Some(rect.kind);
+            let hovered = self.hover.window_controls_region || self.hover.window_control.is_some();
             let pressed = self.pressed_window_control == Some(rect.kind);
-            push_window_control_circle_rects(rects, rect, hovered, pressed);
+            push_window_control_circle_rects(
+                rects,
+                rect,
+                hovered,
+                pressed,
+                panel_bg,
+                window_control_outline,
+                window_control_outline_alpha,
+            );
         }
 
         let line_height = panel_size_info.cell_height();
@@ -1005,7 +1019,7 @@ impl TabPanel {
     }
 
     fn window_control_rects(&self, size_info: &SizeInfo) -> Vec<WindowControlRect> {
-        if self.window_controls.mode != PanelWindowControlsMode::FullscreenCustom {
+        if !self.window_controls.mode.renders_custom_controls() {
             return Vec::new();
         }
 
@@ -1016,7 +1030,13 @@ impl TabPanel {
 
         let size = window_control_metric_px(band_height, WINDOW_CONTROL_SIZE_PX)
             .min((band_height - 4.0).max(WINDOW_CONTROL_SIZE_PX));
-        let top = ((band_height - size) / 2.0).max(0.0);
+        let top = match self.window_controls.mode {
+            PanelWindowControlsMode::WindowedCustom => {
+                window_control_metric_px(band_height, WINDOW_CONTROL_TOP_PX)
+            },
+            PanelWindowControlsMode::FullscreenCustom => ((band_height - size) / 2.0).max(0.0),
+            PanelWindowControlsMode::None => 0.0,
+        };
         let mut x = window_control_metric_px(band_height, WINDOW_CONTROL_MARGIN_X_PX);
         let spacing = window_control_metric_px(band_height, WINDOW_CONTROL_SPACING_PX);
 
@@ -1283,6 +1303,25 @@ impl TabPanel {
             .into_iter()
             .find(|rect| rect.contains(position))
             .map(|rect| rect.kind)
+    }
+
+    fn window_control_region_contains(
+        &self,
+        position: PhysicalPosition<f64>,
+        size_info: &SizeInfo,
+    ) -> bool {
+        let rects = self.window_control_rects(size_info);
+        let (Some(first), Some(last)) = (rects.first(), rects.last()) else {
+            return false;
+        };
+
+        let top = rects.iter().map(|rect| rect.y).fold(f64::INFINITY, f64::min);
+        let bottom = rects.iter().map(|rect| rect.y + rect.size).fold(0.0, f64::max);
+
+        position.x >= first.x
+            && position.x <= last.x + last.size
+            && position.y >= top
+            && position.y <= bottom
     }
 
     fn layout(&self, size_info: &SizeInfo) -> PanelLayout {
@@ -1735,20 +1774,24 @@ impl EditState {
 #[derive(Clone, Default, PartialEq, Eq)]
 struct HoverState {
     tab: Option<TabId>,
+    window_controls_region: bool,
     window_control: Option<WindowControlKind>,
 }
 
 impl HoverState {
-    fn from_hit(hit: &Option<PanelHit>) -> Self {
+    fn from_hit(hit: &Option<PanelHit>, window_controls_region: bool) -> Self {
         match hit {
-            Some(PanelHit::Tab { tab_id }) => {
-                HoverState { tab: Some(*tab_id), window_control: None }
+            Some(PanelHit::Tab { tab_id }) => HoverState {
+                tab: Some(*tab_id),
+                window_controls_region: false,
+                window_control: None,
             },
             Some(PanelHit::WindowControl { kind }) => {
-                HoverState { tab: None, window_control: Some(*kind) }
+                HoverState { tab: None, window_controls_region: true, window_control: Some(*kind) }
             },
-            Some(PanelHit::Group { .. }) => HoverState::default(),
-            None => HoverState::default(),
+            Some(PanelHit::Group { .. }) | None => {
+                HoverState { window_controls_region, ..HoverState::default() }
+            },
         }
     }
 }
@@ -1766,11 +1809,11 @@ impl PanelWindowControls {
 
     fn panel_content_inset_px(self, panel_cell_height: f32) -> f32 {
         match self.mode {
-            PanelWindowControlsMode::NativeInset if self.band_height_px > 0.0 => {
+            PanelWindowControlsMode::WindowedCustom if self.band_height_px > 0.0 => {
                 self.band_height_px.max(panel_cell_height)
             },
             PanelWindowControlsMode::None
-            | PanelWindowControlsMode::NativeInset
+            | PanelWindowControlsMode::WindowedCustom
             | PanelWindowControlsMode::FullscreenCustom => 0.0,
         }
     }
@@ -1780,8 +1823,14 @@ impl PanelWindowControls {
 enum PanelWindowControlsMode {
     #[default]
     None,
-    NativeInset,
+    WindowedCustom,
     FullscreenCustom,
+}
+
+impl PanelWindowControlsMode {
+    fn renders_custom_controls(self) -> bool {
+        matches!(self, Self::WindowedCustom | Self::FullscreenCustom)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2094,20 +2143,21 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     Rgb::new(mix_channel(a.r, b.r), mix_channel(a.g, b.g), mix_channel(a.b, b.b))
 }
 
-fn window_control_color(kind: WindowControlKind, hovered: bool, pressed: bool) -> Rgb {
+fn window_control_color(kind: WindowControlKind, pressed: bool) -> Rgb {
     let base = match kind {
         WindowControlKind::Close => WINDOW_CONTROL_CLOSE_COLOR,
         WindowControlKind::Minimize => WINDOW_CONTROL_MINIMIZE_COLOR,
         WindowControlKind::ToggleFullscreen => WINDOW_CONTROL_FULLSCREEN_COLOR,
     };
 
-    if pressed {
-        mix(base, Rgb::new(0, 0, 0), 0.2)
-    } else if hovered {
-        mix(base, Rgb::new(255, 255, 255), 0.18)
-    } else {
-        base
-    }
+    if pressed { mix(base, Rgb::new(0, 0, 0), 0.2) } else { base }
+}
+
+fn window_control_outline_alpha(panel_bg: Rgb) -> f32 {
+    let luminance = 0.299 * f32::from(panel_bg.r)
+        + 0.587 * f32::from(panel_bg.g)
+        + 0.114 * f32::from(panel_bg.b);
+    if luminance > 186.0 { 0.28 } else { 0.24 }
 }
 
 fn window_control_metric_px(band_height: f64, reference_px: f64) -> f64 {
@@ -2118,44 +2168,79 @@ fn window_control_hit_padding_px(size: f64) -> f64 {
     (size * 0.2).round().max(3.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_window_control_circle_rects(
     rects: &mut Vec<RenderRect>,
     rect: WindowControlRect,
     hovered: bool,
     pressed: bool,
+    panel_bg: Rgb,
+    outline: Rgb,
+    outline_alpha: f32,
 ) {
-    let fill = window_control_color(rect.kind, hovered, pressed);
-    let border = mix(fill, Rgb::new(0, 0, 0), if pressed { 0.34 } else { 0.22 });
-    let inner_radius = (rect.size / 2.0 - 1.0).max(2.0);
-    let outer_radius = inner_radius + 0.85;
+    let radius = (rect.size / 2.0 - 0.5).max(2.0);
 
-    push_circle_scanlines(rects, rect, outer_radius, border, 1.0);
-    push_circle_scanlines(rects, rect, inner_radius, fill, 1.0);
+    if !hovered && !pressed {
+        push_circle_scanlines(rects, rect, radius, outline, outline_alpha);
+        push_circle_scanlines(rects, rect, (radius - 1.25).max(1.0), panel_bg, 1.0);
+        return;
+    }
 
-    let highlight = mix(fill, Rgb::new(255, 255, 255), if pressed { 0.08 } else { 0.34 });
-    let highlight_center_y = rect.y + rect.size * if pressed { 0.32 } else { 0.28 };
-    push_ellipse_scanlines(
-        rects,
-        rect.x + rect.size / 2.0,
-        highlight_center_y,
-        (inner_radius - 1.2).max(1.0),
-        (inner_radius * 0.62).max(1.0),
-        highlight,
-        if pressed { 0.12 } else { 0.32 },
-        rect.y + rect.size / 2.0,
-    );
+    let fill = window_control_color(rect.kind, pressed);
+    push_circle_scanlines(rects, rect, radius, fill, 1.0);
+    push_window_control_glyph_rects(rects, rect, Rgb::new(0, 0, 0), WINDOW_CONTROL_GLYPH_OPACITY);
+}
 
-    let lower_shadow = mix(fill, Rgb::new(0, 0, 0), if pressed { 0.18 } else { 0.1 });
-    push_ellipse_scanlines(
-        rects,
-        rect.x + rect.size / 2.0,
-        rect.y + rect.size * 0.7,
-        (inner_radius - 1.4).max(1.0),
-        (inner_radius * 0.4).max(1.0),
-        lower_shadow,
-        if pressed { 0.14 } else { 0.08 },
-        rect.y + rect.size,
-    );
+fn push_window_control_glyph_rects(
+    rects: &mut Vec<RenderRect>,
+    rect: WindowControlRect,
+    color: Rgb,
+    alpha: f32,
+) {
+    let size = rect.size;
+    match rect.kind {
+        WindowControlKind::Close => {
+            let inset = size * 0.28;
+            let end = size - inset;
+            let half_stroke = (size * 0.14).max(1.0) / 2.0;
+            push_window_control_mask_scanlines(rects, rect, color, alpha, |x, y| {
+                distance_to_segment(x, y, inset, inset, end, end) <= half_stroke
+                    || distance_to_segment(x, y, inset, end, end, inset) <= half_stroke
+            });
+        },
+        WindowControlKind::Minimize => {
+            let width = size * 0.52;
+            let left = (size - width) / 2.0;
+            let top = size * 0.5 - (size * 0.08).max(0.6);
+            let height = (size * 0.16).max(1.0);
+            push_window_control_mask_scanlines(rects, rect, color, alpha, |x, y| {
+                x >= left && x <= left + width && y >= top && y <= top + height
+            });
+        },
+        WindowControlKind::ToggleFullscreen => {
+            push_window_control_mask_scanlines(rects, rect, color, alpha, |x, y| {
+                point_in_triangle(
+                    x,
+                    y,
+                    size * 0.28,
+                    size * 0.22,
+                    size * 0.76,
+                    size * 0.22,
+                    size * 0.28,
+                    size * 0.70,
+                ) || point_in_triangle(
+                    x,
+                    y,
+                    size * 0.42,
+                    size * 0.78,
+                    size * 0.78,
+                    size * 0.42,
+                    size * 0.78,
+                    size * 0.78,
+                )
+            });
+        },
+    }
 }
 
 fn push_circle_scanlines(
@@ -2195,48 +2280,79 @@ fn push_circle_scanlines(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_ellipse_scanlines(
+fn push_window_control_mask_scanlines(
     rects: &mut Vec<RenderRect>,
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
+    rect: WindowControlRect,
     color: Rgb,
     alpha: f32,
-    max_y: f64,
+    contains: impl Fn(f64, f64) -> bool,
 ) {
-    let top = (center_y - radius_y).floor() as i32;
-    let bottom = max_y.ceil() as i32;
+    let left = rect.x.floor() as i32;
+    let right = (rect.x + rect.size).ceil() as i32;
+    let top = rect.y.floor() as i32;
+    let bottom = (rect.y + rect.size).ceil() as i32;
 
     for row in top..bottom {
-        let scan_y = row as f64 + 0.5;
-        let dy = (scan_y - center_y).abs();
-        if dy > radius_y {
-            continue;
+        let mut run_start = None;
+        for col in left..right {
+            let x = col as f64 + 0.5 - rect.x;
+            let y = row as f64 + 0.5 - rect.y;
+            let inside = x >= 0.0 && x <= rect.size && y >= 0.0 && y <= rect.size && contains(x, y);
+
+            match (run_start, inside) {
+                (None, true) => run_start = Some(col),
+                (Some(start), false) => {
+                    rects.push(RenderRect::new(
+                        start as f32,
+                        row as f32,
+                        (col - start) as f32,
+                        1.0,
+                        color,
+                        alpha,
+                    ));
+                    run_start = None;
+                },
+                _ => (),
+            }
         }
 
-        let row_alpha = alpha * (1.0 - (dy / radius_y) as f32 * 0.6);
-        if row_alpha <= 0.0 {
-            continue;
+        if let Some(start) = run_start {
+            rects.push(RenderRect::new(
+                start as f32,
+                row as f32,
+                (right - start) as f32,
+                1.0,
+                color,
+                alpha,
+            ));
         }
-
-        let half = radius_x * (1.0 - (dy * dy) / (radius_y * radius_y)).sqrt();
-        let x0 = (center_x - half).ceil();
-        let x1 = (center_x + half).floor();
-        if x1 < x0 {
-            continue;
-        }
-
-        rects.push(RenderRect::new(
-            x0 as f32,
-            row as f32,
-            (x1 - x0 + 1.0) as f32,
-            1.0,
-            color,
-            row_alpha.clamp(0.0, 1.0),
-        ));
     }
+}
+
+fn distance_to_segment(x: f64, y: f64, start_x: f64, start_y: f64, end_x: f64, end_y: f64) -> f64 {
+    let dx = end_x - start_x;
+    let dy = end_y - start_y;
+    if dx == 0.0 && dy == 0.0 {
+        return ((x - start_x).powi(2) + (y - start_y).powi(2)).sqrt();
+    }
+
+    let t = (((x - start_x) * dx + (y - start_y) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    let nearest_x = start_x + t * dx;
+    let nearest_y = start_y + t * dy;
+    ((x - nearest_x).powi(2) + (y - nearest_y).powi(2)).sqrt()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn point_in_triangle(x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> bool {
+    let sign = |px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64| {
+        (px - rx) * (qy - ry) - (qx - rx) * (py - ry)
+    };
+    let d1 = sign(x, y, ax, ay, bx, by);
+    let d2 = sign(x, y, bx, by, cx, cy);
+    let d3 = sign(x, y, cx, cy, ax, ay);
+    let has_negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_negative && has_positive)
 }
 
 const DRAG_THRESHOLD_PX: f64 = 4.0;
@@ -2384,7 +2500,7 @@ mod tests {
             controls[0].size, 24.0,
             "expected retina controls to render at native 24 px size"
         );
-        assert_eq!(controls[0].x, 24.0, "expected retina controls to use native left margin");
+        assert_eq!(controls[0].x, 32.0, "expected retina controls to use the Otto left margin");
         assert_eq!(
             controls[1].x - controls[0].x - controls[0].size,
             16.0,

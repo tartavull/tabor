@@ -71,13 +71,11 @@ const WINDOW_ICON: &[u8] = include_bytes!("../../extra/logo/compat/tabor-term.pn
 const IDI_ICON: u16 = 0x101;
 
 #[cfg(target_os = "macos")]
-const MACOS_TRAFFIC_LIGHT_MARGIN_X: f64 = 12.0;
-#[cfg(target_os = "macos")]
-const MACOS_TRAFFIC_LIGHT_MARGIN_Y: f64 = 8.0;
-#[cfg(target_os = "macos")]
 pub(crate) const MACOS_FULLSCREEN_WINDOW_CONTROL_REFERENCE_BAND_PX: f64 = 37.0;
 #[cfg(target_os = "macos")]
-const MACOS_FULLSCREEN_WINDOW_CONTROL_MARGIN_X_PX: f64 = 12.0;
+const MACOS_FULLSCREEN_WINDOW_CONTROL_MARGIN_X_PX: f64 = 16.0;
+#[cfg(target_os = "macos")]
+const MACOS_WINDOWED_WINDOW_CONTROL_TOP_PX: f64 = 14.0;
 #[cfg(target_os = "macos")]
 const MACOS_FULLSCREEN_WINDOW_CONTROL_SPACING_PX: f64 = 8.0;
 #[cfg(target_os = "macos")]
@@ -170,14 +168,6 @@ struct MacosNotchEarWindows {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-struct MacosWindowControlFrames {
-    close_frame: NSRect,
-    mini_frame: NSRect,
-    zoom_frame: NSRect,
-}
-
-#[cfg(target_os = "macos")]
 struct MacosWindowControlOverlays {
     close: Retained<NSButton>,
     mini: Retained<NSButton>,
@@ -187,8 +177,14 @@ struct MacosWindowControlOverlays {
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct MacosWindowControlsState {
-    original_frames: Option<MacosWindowControlFrames>,
-    fullscreen_overlays: Option<MacosWindowControlOverlays>,
+    custom_overlays: Option<MacosWindowControlOverlays>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum MacosWindowControlOverlayPlacement {
+    Windowed,
+    Fullscreen,
 }
 
 #[cfg(target_os = "macos")]
@@ -477,16 +473,24 @@ impl Window {
                 if window_config.tab_panel.enabled {
                     window
                         .with_title_hidden(true)
+                        .with_titlebar_buttons_hidden(true)
                         .with_titlebar_transparent(true)
                         .with_fullsize_content_view(true)
                 } else {
                     window
                 }
             },
-            Decorations::Transparent => window
-                .with_title_hidden(true)
-                .with_titlebar_transparent(true)
-                .with_fullsize_content_view(true),
+            Decorations::Transparent => {
+                let window = window
+                    .with_title_hidden(true)
+                    .with_titlebar_transparent(true)
+                    .with_fullsize_content_view(true);
+                if window_config.tab_panel.enabled {
+                    window.with_titlebar_buttons_hidden(true)
+                } else {
+                    window
+                }
+            },
             Decorations::Buttonless => window
                 .with_title_hidden(true)
                 .with_titlebar_buttons_hidden(true)
@@ -936,64 +940,17 @@ impl Window {
         view.window().unwrap().setHasShadow(has_shadows);
     }
 
-    /// Position macOS window controls inside the left panel.
     #[cfg(target_os = "macos")]
-    pub fn layout_macos_window_controls(
+    pub fn layout_macos_windowed_window_controls(
         &self,
         panel_width_px: f32,
-        padding_y_px: f32,
-    ) -> Option<f32> {
-        let _mtm = MainThreadMarker::new()?;
-        self.clear_macos_fullscreen_window_control_overlays();
-
-        let view = match self.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
-            _ => return None,
-        };
-
-        let window = view.window()?;
-
-        let close = window.standardWindowButton(NSWindowButton::CloseButton)?;
-        let mini = window.standardWindowButton(NSWindowButton::MiniaturizeButton)?;
-        let zoom = window.standardWindowButton(NSWindowButton::ZoomButton)?;
-        let button_container = unsafe { close.superview()? };
-
-        {
-            let mut controls = self.macos_window_controls.borrow_mut();
-            controls.original_frames.get_or_insert(MacosWindowControlFrames {
-                close_frame: close.frame(),
-                mini_frame: mini.frame(),
-                zoom_frame: zoom.frame(),
-            });
-        }
-
-        if panel_width_px <= 0.0 {
-            self.restore_macos_window_controls();
-            return None;
-        }
-
-        let scale_factor = self.scale_factor;
-
-        let close_frame = close.frame();
-        let mini_frame = mini.frame();
-        let zoom_frame = zoom.frame();
-
-        let button_height =
-            close_frame.size.height.max(mini_frame.size.height).max(zoom_frame.size.height);
-        let left_margin = MACOS_TRAFFIC_LIGHT_MARGIN_X;
-        let top_margin = (f64::from(padding_y_px) / scale_factor).max(MACOS_TRAFFIC_LIGHT_MARGIN_Y);
-        let top_inset_points = button_height + top_margin;
-        Self::position_macos_window_controls(
-            &button_container,
-            &close,
-            &mini,
-            &zoom,
-            left_margin,
-            top_margin,
-        );
-        button_container.layoutSubtreeIfNeeded();
-
-        Some((top_inset_points * scale_factor) as f32)
+        band_height_px: f32,
+    ) -> bool {
+        self.layout_macos_window_control_overlays(
+            panel_width_px,
+            band_height_px,
+            MacosWindowControlOverlayPlacement::Windowed,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -1002,13 +959,27 @@ impl Window {
         panel_width_px: f32,
         band_height_px: f32,
     ) -> bool {
+        self.layout_macos_window_control_overlays(
+            panel_width_px,
+            band_height_px,
+            MacosWindowControlOverlayPlacement::Fullscreen,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn layout_macos_window_control_overlays(
+        &self,
+        panel_width_px: f32,
+        band_height_px: f32,
+        placement: MacosWindowControlOverlayPlacement,
+    ) -> bool {
         let mtm = match MainThreadMarker::new() {
             Some(mtm) => mtm,
             None => return false,
         };
 
         if panel_width_px <= 0.0 || band_height_px <= 0.0 {
-            self.clear_macos_fullscreen_window_control_overlays();
+            self.clear_macos_window_control_overlays();
             return false;
         }
 
@@ -1023,20 +994,21 @@ impl Window {
         let Some(button_container) = (unsafe { view.superview() }) else {
             return false;
         };
-        let overlay_frames = Self::macos_fullscreen_window_control_overlay_frames(
+        let overlay_frames = Self::macos_window_control_overlay_frames(
             view,
             &button_container,
             band_height_px,
             self.scale_factor,
+            placement,
         );
         let Some([close_frame, mini_frame, zoom_frame]) = overlay_frames else {
-            self.clear_macos_fullscreen_window_control_overlays();
+            self.clear_macos_window_control_overlays();
             return false;
         };
 
         {
             let mut controls = self.macos_window_controls.borrow_mut();
-            let recreate = match controls.fullscreen_overlays.as_ref() {
+            let recreate = match controls.custom_overlays.as_ref() {
                 Some(overlays) => !Self::macos_window_control_overlays_match_container(
                     overlays,
                     &button_container,
@@ -1044,10 +1016,10 @@ impl Window {
                 None => true,
             };
             if recreate {
-                if let Some(overlays) = controls.fullscreen_overlays.take() {
+                if let Some(overlays) = controls.custom_overlays.take() {
                     Self::remove_macos_window_control_overlays(overlays);
                 }
-                controls.fullscreen_overlays = Some(Self::create_macos_window_control_overlays(
+                controls.custom_overlays = Some(Self::create_macos_window_control_overlays(
                     mtm,
                     &window,
                     &button_container,
@@ -1055,7 +1027,7 @@ impl Window {
             }
 
             let overlays =
-                controls.fullscreen_overlays.as_ref().expect("fullscreen overlays just created");
+                controls.custom_overlays.as_ref().expect("window control overlays just created");
             overlays.close.setFrame(close_frame);
             overlays.mini.setFrame(mini_frame);
             overlays.zoom.setFrame(zoom_frame);
@@ -1068,42 +1040,7 @@ impl Window {
 
     #[cfg(target_os = "macos")]
     pub fn restore_macos_window_controls(&self) {
-        let _mtm = match MainThreadMarker::new() {
-            Some(mtm) => mtm,
-            None => return,
-        };
-        self.clear_macos_fullscreen_window_control_overlays();
-
-        let Some(frames) = self.macos_window_controls.borrow().original_frames else {
-            return;
-        };
-
-        let view = match self.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => unsafe { handle.ns_view.cast::<NSView>().as_ref() },
-            _ => return,
-        };
-
-        let Some(window) = view.window() else {
-            return;
-        };
-
-        let Some(close) = window.standardWindowButton(NSWindowButton::CloseButton) else {
-            return;
-        };
-        let Some(mini) = window.standardWindowButton(NSWindowButton::MiniaturizeButton) else {
-            return;
-        };
-        let Some(zoom) = window.standardWindowButton(NSWindowButton::ZoomButton) else {
-            return;
-        };
-        let Some(button_container) = (unsafe { close.superview() }) else {
-            return;
-        };
-
-        close.setFrame(frames.close_frame);
-        mini.setFrame(frames.mini_frame);
-        zoom.setFrame(frames.zoom_frame);
-        button_container.layoutSubtreeIfNeeded();
+        self.clear_macos_window_control_overlays();
     }
 
     #[cfg(target_os = "macos")]
@@ -1186,60 +1123,6 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
-    fn position_macos_window_controls(
-        button_container: &NSView,
-        close: &NSButton,
-        mini: &NSButton,
-        zoom: &NSButton,
-        left_margin: f64,
-        top_margin: f64,
-    ) {
-        let close_frame = close.frame();
-        let mini_frame = mini.frame();
-        let zoom_frame = zoom.frame();
-        let mini_dx = mini_frame.origin.x - close_frame.origin.x;
-        let zoom_dx = zoom_frame.origin.x - close_frame.origin.x;
-
-        close.setFrameOrigin(NSPoint::new(
-            left_margin,
-            Self::macos_window_control_origin_y(
-                button_container,
-                top_margin,
-                close_frame.size.height,
-            ),
-        ));
-        mini.setFrameOrigin(NSPoint::new(
-            left_margin + mini_dx,
-            Self::macos_window_control_origin_y(
-                button_container,
-                top_margin,
-                mini_frame.size.height,
-            ),
-        ));
-        zoom.setFrameOrigin(NSPoint::new(
-            left_margin + zoom_dx,
-            Self::macos_window_control_origin_y(
-                button_container,
-                top_margin,
-                zoom_frame.size.height,
-            ),
-        ));
-    }
-
-    #[cfg(target_os = "macos")]
-    fn macos_window_control_origin_y(
-        button_container: &NSView,
-        top_margin: f64,
-        button_height: f64,
-    ) -> f64 {
-        if button_container.isFlipped() {
-            top_margin.max(0.0)
-        } else {
-            (button_container.bounds().size.height - top_margin - button_height).max(0.0)
-        }
-    }
-
-    #[cfg(target_os = "macos")]
     fn create_macos_window_control_overlays(
         mtm: MainThreadMarker,
         window: &AppKitWindow,
@@ -1292,12 +1175,12 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
-    fn clear_macos_fullscreen_window_control_overlays(&self) {
+    fn clear_macos_window_control_overlays(&self) {
         let Some(_mtm) = MainThreadMarker::new() else {
             return;
         };
 
-        let overlays = self.macos_window_controls.borrow_mut().fullscreen_overlays.take();
+        let overlays = self.macos_window_controls.borrow_mut().custom_overlays.take();
         if let Some(overlays) = overlays {
             Self::remove_macos_window_control_overlays(overlays);
         }
@@ -1323,11 +1206,12 @@ impl Window {
     }
 
     #[cfg(target_os = "macos")]
-    fn macos_fullscreen_window_control_overlay_frames(
+    fn macos_window_control_overlay_frames(
         view: &NSView,
         button_container: &NSView,
         band_height_px: f32,
         scale_factor: f64,
+        placement: MacosWindowControlOverlayPlacement,
     ) -> Option<[NSRect; 3]> {
         let band_height_px = f64::from(band_height_px).max(0.0);
         if band_height_px <= 0.0 || scale_factor <= 0.0 {
@@ -1340,7 +1224,18 @@ impl Window {
         )
         .min((band_height_px - 4.0).max(MACOS_FULLSCREEN_WINDOW_CONTROL_SIZE_PX));
         let padding_px = Self::macos_fullscreen_window_control_hit_padding_px(size_px);
-        let top_px = ((band_height_px - size_px) / 2.0).max(0.0) - padding_px;
+        let control_top_px = match placement {
+            MacosWindowControlOverlayPlacement::Windowed => {
+                Self::macos_fullscreen_window_control_metric_px(
+                    band_height_px,
+                    MACOS_WINDOWED_WINDOW_CONTROL_TOP_PX,
+                )
+            },
+            MacosWindowControlOverlayPlacement::Fullscreen => {
+                ((band_height_px - size_px) / 2.0).max(0.0)
+            },
+        };
+        let top_px = control_top_px - padding_px;
         let width_px = size_px + padding_px * 2.0;
         let height_px = size_px + padding_px * 2.0;
         let spacing_px = Self::macos_fullscreen_window_control_metric_px(
