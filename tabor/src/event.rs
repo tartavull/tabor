@@ -381,6 +381,14 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_open_url_new_tab(url, self.event_proxy)
     }
 
+    fn open_url_new_tab_in_group(
+        &mut self,
+        url: String,
+        group_id: usize,
+    ) -> Result<TabId, ipc::IpcError> {
+        self.window.ipc_open_url_new_tab_in_group(url, group_id, self.event_proxy)
+    }
+
     fn reload_web(&mut self, tab_id: TabId) -> Result<(), ipc::IpcError> {
         self.window.ipc_reload_web(
             tab_id,

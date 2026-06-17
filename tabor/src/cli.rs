@@ -154,7 +154,7 @@ pub struct TabIdArg {
 }
 
 #[cfg(unix)]
-fn parse_tab_id(input: &str) -> Result<TabIdArg, String> {
+pub(crate) fn parse_tab_id(input: &str) -> Result<TabIdArg, String> {
     let (index, generation) = input
         .split_once(':')
         .or_else(|| input.split_once(','))

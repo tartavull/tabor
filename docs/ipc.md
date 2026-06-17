@@ -16,6 +16,9 @@ startup.
   - `TABOR_SOCKET` environment variable (preferred).
   - `tabor --socket <PATH>` when launching Tabor.
   - Fallback: the newest live Tabor socket in the temp directory.
+- Terminal shells launched by Tabor receive `TABOR_TAB_ID=<index>:<generation>`.
+  `tabor msg open-url --new-tab` uses it to place the new tab in the source
+  terminal tab group.
 - `tabor msg` opens one socket connection per request.
 - `tabor agent attach` starts a per-socket local controller and keeps one
   persistent IPC connection open until `tabor agent close`.
@@ -41,6 +44,7 @@ Tab ids are also accepted by typed CLI commands as `<index>:<generation>`.
 `UrlTarget`:
 - `current`
 - `new_tab`
+- `new_tab_in_source_group` with `source_tab_id`
 - `tab_id` with `tab_id`
 
 Tab kind in tab state responses:
@@ -56,7 +60,7 @@ Common commands:
 - `tabor msg list-tabs`
 - `tabor msg get-tab-state --tab-id 1:1`
 - `tabor msg create-tab --web https://example.com`
-- `tabor msg open-url https://example.com --target current`
+- `tabor msg open-url https://example.com --new-tab`
 - `tabor msg select-tab --active`
 - `tabor msg move-tab --tab-id 2:1 --target-group-id 1 --target-index 0`
 - `tabor msg open-inspector --tab-id 2:1`

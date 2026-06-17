@@ -74,7 +74,7 @@ use crate::cli::{
     MsgInspector, MsgInspectorAttach, MsgInspectorDetach, MsgInspectorPoll, MsgInspectorSend,
     MsgMoveTab, MsgOpenInspector, MsgOpenUrl, MsgReloadWeb, MsgRunCommandBar, MsgSelectTab,
     MsgSendInput, MsgSetGroupName, MsgSetTabPanel, MsgSetTabTitle, MsgSetWebUrl, MsgTerminalRead,
-    MsgTerminalScreenshot, MsgTerminalTarget, TabIdArg, TerminalReadScopeArg,
+    MsgTerminalScreenshot, MsgTerminalTarget, TabIdArg, TerminalReadScopeArg, parse_tab_id,
 };
 use crate::cli::{Options, Subcommands};
 use crate::config::UiConfig;
@@ -186,6 +186,17 @@ where
 fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
     fn ipc_tab_id(tab_id: TabIdArg) -> ipc::IpcTabId {
         ipc::IpcTabId { index: tab_id.index, generation: tab_id.generation }
+    }
+
+    fn source_tab_id_from_env() -> Result<Option<ipc::IpcTabId>, Box<dyn Error>> {
+        match env::var(ipc::TABOR_TAB_ID_ENV) {
+            Ok(value) => parse_tab_id(&value)
+                .map(ipc_tab_id)
+                .map(Some)
+                .map_err(|err| format!("invalid {}: {}", ipc::TABOR_TAB_ID_ENV, err).into()),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(err) => Err(format!("invalid {}: {}", ipc::TABOR_TAB_ID_ENV, err).into()),
+        }
     }
 
     fn ipc_terminal_read_scope(scope: TerminalReadScopeArg) -> ipc::IpcTerminalReadScope {
@@ -352,7 +363,10 @@ fn msg(mut options: MessageOptions) -> Result<(), Box<dyn Error>> {
         },
         crate::cli::MessageCommand::OpenUrl(MsgOpenUrl { url, new_tab, tab_id }) => {
             let target = if new_tab {
-                ipc::UrlTarget::NewTab
+                match source_tab_id_from_env()? {
+                    Some(source_tab_id) => ipc::UrlTarget::NewTabInSourceGroup { source_tab_id },
+                    None => ipc::UrlTarget::NewTab,
+                }
             } else if let Some(tab_id) = tab_id {
                 ipc::UrlTarget::TabId { tab_id: ipc_tab_id(tab_id) }
             } else {

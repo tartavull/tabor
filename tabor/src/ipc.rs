@@ -33,6 +33,7 @@ use crate::window_kind::WindowKind;
 
 /// Environment variable name for the IPC socket path.
 const TABOR_SOCKET_ENV: &str = "TABOR_SOCKET";
+pub(crate) const TABOR_TAB_ID_ENV: &str = "TABOR_TAB_ID";
 
 const IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -718,6 +719,7 @@ pub enum UrlTarget {
     Current,
     NewTab,
     TabId { tab_id: IpcTabId },
+    NewTabInSourceGroup { source_tab_id: IpcTabId },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1146,6 +1148,10 @@ impl IpcRequest {
             | IpcRequest::TerminalScreenshot { tab_id }
             | IpcRequest::TerminalKey { tab_id, .. } => *tab_id,
             IpcRequest::OpenUrl { target: UrlTarget::TabId { tab_id }, .. } => Some(*tab_id),
+            IpcRequest::OpenUrl {
+                target: UrlTarget::NewTabInSourceGroup { source_tab_id },
+                ..
+            } => Some(*source_tab_id),
             IpcRequest::SelectTab { selection: TabSelection::ById { tab_id } } => Some(*tab_id),
             _ => None,
         }
@@ -1330,6 +1336,11 @@ pub trait IpcContext {
     fn restore_closed_tab(&mut self) -> Result<(), IpcError>;
     fn open_url_in_tab(&mut self, tab_id: TabId, url: String) -> Result<(), IpcError>;
     fn open_url_new_tab(&mut self, url: String) -> Result<TabId, IpcError>;
+    fn open_url_new_tab_in_group(
+        &mut self,
+        url: String,
+        group_id: usize,
+    ) -> Result<TabId, IpcError>;
     fn reload_web(&mut self, tab_id: TabId) -> Result<(), IpcError>;
     fn open_inspector(&mut self, tab_id: TabId) -> Result<(), IpcError>;
     fn tab_panel_state(&self) -> IpcTabPanelState;
@@ -1515,6 +1526,13 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
         IpcRequest::OpenUrl { url, target } => {
             let result = match target {
                 UrlTarget::NewTab => ctx.open_url_new_tab(url).map(Some),
+                UrlTarget::NewTabInSourceGroup { source_tab_id } => {
+                    let source_tab = ctx.tab_state(source_tab_id.into(), now).ok_or_else(|| {
+                        IpcError::new(IpcErrorCode::NotFound, "Source tab not found")
+                    });
+                    source_tab
+                        .and_then(|tab| ctx.open_url_new_tab_in_group(url, tab.group_id).map(Some))
+                },
                 UrlTarget::TabId { tab_id } => {
                     ctx.open_url_in_tab(tab_id.into(), url).map(|_| None)
                 },
@@ -2716,6 +2734,25 @@ mod tests {
             )
         }
 
+        fn open_url_new_tab_in_group(
+            &mut self,
+            url: String,
+            group_id: usize,
+        ) -> Result<TabId, IpcError> {
+            if !self.web_supported {
+                return Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are not supported"));
+            }
+            self.add_tab(
+                match mock_open_url_kind(&url) {
+                    MockOpenUrlKind::Web => IpcTabKind::Web { url },
+                    MockOpenUrlKind::Image => IpcTabKind::Image { source: url },
+                    MockOpenUrlKind::Pdf => IpcTabKind::Pdf { source: url },
+                },
+                Some(group_id),
+                None,
+            )
+        }
+
         fn reload_web(&mut self, tab_id: TabId) -> Result<(), IpcError> {
             let tab = self
                 .tabs
@@ -3288,6 +3325,34 @@ mod tests {
             panic!("expected tab_panel reply");
         };
         assert_eq!(panel.width, 200);
+    }
+
+    #[test]
+    fn ipc_opens_new_url_tab_in_source_group() {
+        let mut ctx = MockContext::new(true);
+        let source_tab_id = ctx.active_tab_id().expect("source tab");
+        let source_group_id =
+            ctx.tab_state(source_tab_id, Instant::now()).expect("source tab state").group_id;
+        let active_group_id = ctx.create_group(Some(String::from("active"))).expect("group");
+        let active_tab_id =
+            ctx.add_tab(IpcTabKind::Terminal, Some(active_group_id), None).expect("active tab");
+        assert_eq!(ctx.active_tab_id(), Some(active_tab_id));
+
+        let source_ipc_tab_id = source_tab_id.into();
+        let request = IpcRequest::OpenUrl {
+            url: String::from("https://example.com"),
+            target: UrlTarget::NewTabInSourceGroup { source_tab_id: source_ipc_tab_id },
+        };
+        assert_eq!(request.target_tab_id(), Some(source_ipc_tab_id));
+
+        let response = handle_request(&mut ctx, request);
+        let SocketReply::TabCreated { tab_id } = response.reply else {
+            panic!("expected tab_created reply");
+        };
+        let created = ctx.tab_state(tab_id.into(), Instant::now()).expect("created tab state");
+
+        assert_eq!(created.group_id, source_group_id);
+        assert_ne!(created.group_id, active_group_id);
     }
 
     #[test]

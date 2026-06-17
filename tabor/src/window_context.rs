@@ -338,6 +338,14 @@ struct LocalTerminalSpawnRequest<'a> {
     terminal_id: Option<u64>,
 }
 
+#[cfg(unix)]
+fn set_tabor_tab_id_env(options: &mut tty::Options, tab_id: TabId) {
+    options.env.insert(
+        String::from(ipc::TABOR_TAB_ID_ENV),
+        format!("{}:{}", tab_id.index, tab_id.generation),
+    );
+}
+
 fn terminal_view_mode_for_count(count: Option<usize>) -> TerminalViewMode {
     match count {
         Some(count) if count > 1 => TerminalViewMode::MultiColumn,
@@ -1980,7 +1988,7 @@ impl WindowContext {
         display: &Display,
         config: &UiConfig,
         multi_column_defaults: MultiColumnDefaults,
-        pty_config: tty::Options,
+        mut pty_config: tty::Options,
         proxy: &EventLoopProxy<Event>,
         window_kind: WindowKind,
         group_id: Option<usize>,
@@ -1988,6 +1996,10 @@ impl WindowContext {
         terminal_spawn_mode: Option<TerminalSpawnMode>,
     ) -> Result<TabId, Box<dyn Error>> {
         let tab_id = tabs.allocate_id();
+        #[cfg(unix)]
+        if window_kind.is_terminal() {
+            set_tabor_tab_id_env(&mut pty_config, tab_id);
+        }
         let event_proxy = EventProxy::new(proxy.clone(), display.window.id(), tab_id);
         let size_info =
             display.size_info_for_status_lines(usize::from(window_kind.has_status_bar()));
@@ -2109,6 +2121,7 @@ impl WindowContext {
                         if let Some(working_directory) = working_directory {
                             launch_options.working_directory = Some(working_directory);
                         }
+                        set_tabor_tab_id_env(&mut launch_options, tab_id);
                         let restored_title = title.unwrap_or_else(|| default_title.clone());
                         if let Some(preview_lines) = preview_lines {
                             terminal.lock().apply_preview_lines(&preview_lines);
@@ -3558,9 +3571,10 @@ impl WindowContext {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn open_url_new_tab(
+    fn open_url_new_tab_with_group(
         &mut self,
         url: String,
+        group_id: Option<usize>,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
         let mut options = WindowOptions::default();
@@ -3569,9 +3583,28 @@ impl WindowContext {
             OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
             OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
         };
-        let tab_id = self.create_tab(options, proxy)?;
+        let tab_id = self.create_tab_in_group(options, group_id, None, proxy)?;
         self.command_history.record_url(url);
         Ok(tab_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_url_new_tab(
+        &mut self,
+        url: String,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<TabId, Box<dyn Error>> {
+        self.open_url_new_tab_with_group(url, None, proxy)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_url_new_tab_in_group(
+        &mut self,
+        url: String,
+        group_id: usize,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<TabId, Box<dyn Error>> {
+        self.open_url_new_tab_with_group(url, Some(group_id), proxy)
     }
 
     #[cfg(target_os = "macos")]
@@ -3845,6 +3878,28 @@ impl WindowContext {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (url, proxy);
+            Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are only supported on macOS"))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_open_url_new_tab_in_group(
+        &mut self,
+        url: String,
+        group_id: usize,
+        proxy: &EventLoopProxy<Event>,
+    ) -> Result<TabId, IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let tab_id = self
+                .open_url_new_tab_in_group(url, group_id, proxy)
+                .map_err(|err| IpcError::new(IpcErrorCode::Internal, err.to_string()))?;
+            Ok(tab_id)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (url, group_id, proxy);
             Err(IpcError::new(IpcErrorCode::Unsupported, "Web tabs are only supported on macOS"))
         }
     }
