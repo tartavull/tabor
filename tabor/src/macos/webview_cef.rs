@@ -102,6 +102,7 @@ struct AutomationState {
     downloads: HashMap<u32, AgentDownload>,
     download_order: Vec<u32>,
     download_dir: PathBuf,
+    show_download_dialog: bool,
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -500,7 +501,13 @@ fn should_invalidate_after_frame_edit(command: FrameEditCommand) -> bool {
 impl AutomationState {
     fn new() -> Self {
         let download_dir = super::default_download_dir();
-        Self { downloads: HashMap::new(), download_order: Vec::new(), download_dir }
+        let show_download_dialog = super::should_show_download_dialog();
+        Self {
+            downloads: HashMap::new(),
+            download_order: Vec::new(),
+            download_dir,
+            show_download_dialog,
+        }
     }
 
     fn downloads(&self) -> Vec<AgentDownload> {
@@ -1058,9 +1065,10 @@ cef::wrap_download_handler! {
                 .unwrap_or_else(|| String::from("download.bin"));
             let state = self.automation_state.borrow_mut();
             let path = state.next_download_path(&suggested_name);
+            let show_dialog = if state.show_download_dialog { 1 } else { 0 };
             let _ = fs::create_dir_all(path.parent().unwrap_or(&state.download_dir));
             let download_path = CefString::from(path.to_string_lossy().as_ref());
-            callback.cont(Some(&download_path), 0);
+            callback.cont(Some(&download_path), show_dialog);
             1
         }
 

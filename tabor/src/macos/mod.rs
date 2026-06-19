@@ -234,7 +234,11 @@ pub(crate) fn default_download_dir() -> PathBuf {
     let base_dir = home::home_dir()
         .map(|path| path.join("Downloads"))
         .unwrap_or_else(|| runtime_tmp_dir().join("Downloads"));
-    ensure_directory(base_dir.join("Tabor"), "download directory")
+    ensure_directory(base_dir, "download directory")
+}
+
+pub(crate) fn should_show_download_dialog() -> bool {
+    !bundle_identifier().starts_with("com.pinkbot.tabor.test.")
 }
 
 #[cfg(test)]
@@ -679,6 +683,33 @@ mod tests {
         assert_eq!(distribution_channel(), DistributionChannel::Direct);
         assert_eq!(direct_app_support_dir(), app_support_dir);
         assert_eq!(cef_cache_dir(), app_support_dir.join("cef"));
+    }
+
+    #[test]
+    fn downloads_default_to_downloads_root() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let home_dir = temp_dir.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+
+        let _distribution = EnvVarGuard::set(DISTRIBUTION_CHANNEL_ENV, "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+        let _bundle_id = EnvVarGuard::set(BUNDLE_IDENTIFIER_ENV, DEFAULT_BUNDLE_IDENTIFIER);
+
+        assert_eq!(default_download_dir(), home_dir.join("Downloads"));
+    }
+
+    #[test]
+    fn download_dialog_is_enabled_outside_test_bundles() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+
+        let production_bundle = EnvVarGuard::set(BUNDLE_IDENTIFIER_ENV, DEFAULT_BUNDLE_IDENTIFIER);
+        assert!(should_show_download_dialog());
+        drop(production_bundle);
+
+        let _test_bundle =
+            EnvVarGuard::set(BUNDLE_IDENTIFIER_ENV, "com.pinkbot.tabor.test.web-e2e");
+        assert!(!should_show_download_dialog());
     }
 
     #[test]
