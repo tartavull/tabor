@@ -16,15 +16,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(feature = "passkey-webauthn")]
 use block2::RcBlock;
-use objc2::MainThreadMarker;
 use objc2::encode::{Encode, Encoding};
 use objc2::ffi;
 #[cfg(feature = "passkey-webauthn")]
 use objc2::ffi::NSInteger;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, ProtocolObject, Sel};
+use objc2::{MainThreadMarker, Message};
 use objc2::{msg_send, sel};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSButton, NSTextField, NSView, NSWindow,
+};
 use objc2_foundation::{
     NSActivityOptions, NSDictionary, NSObjectProtocol, NSProcessInfo, NSString, NSUserDefaults,
     ns_string,
@@ -225,6 +227,10 @@ fn test_bundle_root() -> Option<PathBuf> {
         return None;
     }
 
+    if let Some(path) = env::var_os("TABOR_TEST_STATE_ROOT") {
+        return Some(PathBuf::from(path));
+    }
+
     let mut hasher = DefaultHasher::new();
     bundle_id.hash(&mut hasher);
     Some(env::temp_dir().join(format!("tabor-test-{:016x}", hasher.finish())))
@@ -239,6 +245,91 @@ pub(crate) fn default_download_dir() -> PathBuf {
 
 pub(crate) fn should_show_download_dialog() -> bool {
     !bundle_identifier().starts_with("com.pinkbot.tabor.test.")
+}
+
+pub(crate) fn press_test_js_dialog_button(
+    button_title: &str,
+    prompt_text: Option<&str>,
+) -> Result<(), String> {
+    if !bundle_identifier().starts_with("com.pinkbot.tabor.test.") {
+        return Err(String::from(
+            "JavaScript dialog debug actions require a com.pinkbot.tabor.test.* bundle",
+        ));
+    }
+
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| String::from("JavaScript dialog debug actions require the main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    if let Some(window) = app.modalWindow() {
+        if press_js_dialog_button_in_window(&window, button_title, prompt_text)? {
+            return Ok(());
+        }
+    }
+
+    for window in app.windows() {
+        if window.sheetParent().is_some()
+            && press_js_dialog_button_in_window(&window, button_title, prompt_text)?
+        {
+            return Ok(());
+        }
+    }
+
+    Err(format!("No active JavaScript dialog has a {button_title:?} button"))
+}
+
+fn press_js_dialog_button_in_window(
+    window: &NSWindow,
+    button_title: &str,
+    prompt_text: Option<&str>,
+) -> Result<bool, String> {
+    let Some(content_view) = window.contentView() else {
+        return Ok(false);
+    };
+    let Some(button) = find_button_with_title(&content_view, button_title) else {
+        return Ok(false);
+    };
+
+    if let Some(prompt_text) = prompt_text {
+        let field = find_editable_text_field(&content_view)
+            .ok_or_else(|| String::from("Active JavaScript dialog has no editable prompt field"))?;
+        field.setStringValue(&NSString::from_str(prompt_text));
+    }
+
+    // SAFETY: The button belongs to the active test-only NSAlert and nil is a valid sender.
+    unsafe { button.performClick(None) };
+    Ok(true)
+}
+
+fn find_button_with_title(view: &NSView, title: &str) -> Option<Retained<NSButton>> {
+    let object: &AnyObject = view;
+    if let Some(button) = object.downcast_ref::<NSButton>() {
+        if button.title().to_string() == title {
+            return Some(button.retain());
+        }
+    }
+
+    for subview in view.subviews() {
+        if let Some(button) = find_button_with_title(&subview, title) {
+            return Some(button);
+        }
+    }
+    None
+}
+
+fn find_editable_text_field(view: &NSView) -> Option<Retained<NSTextField>> {
+    let object: &AnyObject = view;
+    if let Some(field) = object.downcast_ref::<NSTextField>() {
+        if field.isEditable() {
+            return Some(field.retain());
+        }
+    }
+
+    for subview in view.subviews() {
+        if let Some(field) = find_editable_text_field(&subview) {
+            return Some(field);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

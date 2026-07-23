@@ -1022,6 +1022,45 @@ fn agent_fixture_smoke() {
 }
 
 #[test]
+fn agent_actions_keep_background_web_tab_inactive() {
+    let harness = TaborHarness::start();
+    let fixture = fixture_url();
+
+    let web_tab = harness.run_json(["msg", "create-tab", "--web", fixture.as_str()]);
+    assert_eq!(web_tab.get("type").and_then(Value::as_str), Some("tab_created"));
+    let web_tab_id = tab_id_arg(&web_tab);
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--tab-id", web_tab_id.as_str()]);
+    let observation =
+        wait_for_agent_observation(&harness, "Agent Browser Fixture", Duration::from_secs(6))
+            .unwrap_or_else(|| panic!("timed out waiting for background agent observation"));
+    let email_id = find_observed_element_id(&observation, "Email");
+
+    harness.run_ok(["msg", "select-tab", "--previous"]);
+    let before = harness.run_json(["msg", "list-tabs"]);
+    let active_terminal_id = active_tab(&before)
+        .filter(|tab| tab_kind_is(tab, "terminal"))
+        .and_then(tab_id_pair)
+        .unwrap_or_else(|| panic!("expected the terminal tab to be active: {before}"));
+
+    let actions =
+        json!([{ "type": "fill", "id": email_id, "text": "background@example.com" }]).to_string();
+    let act = harness.run_json(["agent", "act", actions.as_str()]);
+    assert!(agent_action_results_all_ok(&act), "background agent act failed: {act}");
+
+    let email = harness.run_json(["agent", "inspect", email_id.as_str()]);
+    assert_eq!(agent_detail_value(&email), Some("background@example.com"));
+
+    let after = harness.run_json(["msg", "list-tabs"]);
+    assert_eq!(
+        active_tab(&after).and_then(tab_id_pair),
+        Some(active_terminal_id),
+        "background agent action changed the active tab: {after}"
+    );
+}
+
+#[test]
 fn web_popup_smoke() {
     let server = PopupServer::start();
     let harness = TaborHarness::start();
@@ -1972,7 +2011,7 @@ fn macos_opened_pdf_document_appears_as_native_pdf_tab() {
         .run_checked(["agent", "downloads"])
         .expect_err("expected PDF tab agent downloads to be rejected");
     assert!(
-        downloads_error.contains("Tab is not a web tab"),
+        downloads_error.contains("Downloads are only supported for web tabs"),
         "unexpected agent downloads error for PDF tab: {downloads_error}"
     );
 }
@@ -2047,7 +2086,7 @@ fn macos_opened_image_document_appears_as_native_image_tab() {
         .run_checked(["agent", "downloads"])
         .expect_err("expected image tab agent downloads to be rejected");
     assert!(
-        downloads_error.contains("Tab is not a web tab"),
+        downloads_error.contains("Downloads are only supported for web tabs"),
         "unexpected agent downloads error for image tab: {downloads_error}"
     );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tabor"
-version = "0.13.0"
+version = "0.14.0"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "A tabbed, cross-platform, OpenGL terminal emulator"
@@ -68,6 +68,8 @@ pdf-extract = "0.10.0"
 plist = "=1.7.0"
 objc2-foundation = { version = "0.3.1", default-features = false, features = [
     "std",
+    "NSArray",
+    "NSEnumerator",
     "NSGeometry",
     "NSString",
     "NSLocale",
@@ -78,6 +80,7 @@ objc2-foundation = { version = "0.3.1", default-features = false, features = [
 objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "std",
     "block2",
+    "NSAlert",
     "NSButton",
     "NSColor",
     "NSColorSpace",
@@ -89,6 +92,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "NSResponder",
     "NSRunningApplication",
     "NSScreen",
+    "NSTextField",
     "NSView",
     "NSWindow",
 ] }

@@ -64,6 +64,9 @@ _tabor() {
             tabor__agent,pdf)
                 cmd="tabor__agent__pdf"
                 ;;
+            tabor__agent,read)
+                cmd="tabor__agent__read"
+                ;;
             tabor__agent,screenshot)
                 cmd="tabor__agent__screenshot"
                 ;;
@@ -124,6 +127,9 @@ _tabor() {
             tabor__agent__help,pdf)
                 cmd="tabor__agent__help__pdf"
                 ;;
+            tabor__agent__help,read)
+                cmd="tabor__agent__help__read"
+                ;;
             tabor__agent__help,screenshot)
                 cmd="tabor__agent__help__screenshot"
                 ;;
@@ -183,6 +189,9 @@ _tabor() {
                 ;;
             tabor__help__agent,pdf)
                 cmd="tabor__help__agent__pdf"
+                ;;
+            tabor__help__agent,read)
+                cmd="tabor__help__agent__read"
                 ;;
             tabor__help__agent,screenshot)
                 cmd="tabor__help__agent__screenshot"
@@ -276,6 +285,15 @@ _tabor() {
                 ;;
             tabor__help__msg,set-web-url)
                 cmd="tabor__help__msg__set__web__url"
+                ;;
+            tabor__help__msg,terminal-observe)
+                cmd="tabor__help__msg__terminal__observe"
+                ;;
+            tabor__help__msg,terminal-read)
+                cmd="tabor__help__msg__terminal__read"
+                ;;
+            tabor__help__msg,terminal-screenshot)
+                cmd="tabor__help__msg__terminal__screenshot"
                 ;;
             tabor__help__msg__inspector,attach)
                 cmd="tabor__help__msg__inspector__attach"
@@ -379,6 +397,15 @@ _tabor() {
             tabor__msg,set-web-url)
                 cmd="tabor__msg__set__web__url"
                 ;;
+            tabor__msg,terminal-observe)
+                cmd="tabor__msg__terminal__observe"
+                ;;
+            tabor__msg,terminal-read)
+                cmd="tabor__msg__terminal__read"
+                ;;
+            tabor__msg,terminal-screenshot)
+                cmd="tabor__msg__terminal__screenshot"
+                ;;
             tabor__msg__help,close-tab)
                 cmd="tabor__msg__help__close__tab"
                 ;;
@@ -459,6 +486,15 @@ _tabor() {
                 ;;
             tabor__msg__help,set-web-url)
                 cmd="tabor__msg__help__set__web__url"
+                ;;
+            tabor__msg__help,terminal-observe)
+                cmd="tabor__msg__help__terminal__observe"
+                ;;
+            tabor__msg__help,terminal-read)
+                cmd="tabor__msg__help__terminal__read"
+                ;;
+            tabor__msg__help,terminal-screenshot)
+                cmd="tabor__msg__help__terminal__screenshot"
                 ;;
             tabor__msg__help__inspector,attach)
                 cmd="tabor__msg__help__inspector__attach"
@@ -627,7 +663,7 @@ _tabor() {
             return 0
             ;;
         tabor__agent)
-            opts="-s -h --socket --help attach app use observe inspect screenshot events pdf upload downloads act clipboard close help"
+            opts="-s -h --socket --help attach app use observe read inspect screenshot events pdf upload downloads act clipboard close help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -869,7 +905,7 @@ _tabor() {
             return 0
             ;;
         tabor__agent__help)
-            opts="attach app use observe inspect screenshot events pdf upload downloads act clipboard close help"
+            opts="attach app use observe read inspect screenshot events pdf upload downloads act clipboard close help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1064,6 +1100,20 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        tabor__agent__help__read)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         tabor__agent__help__screenshot)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -1163,6 +1213,28 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        tabor__agent__read)
+            opts="-h --scope --max-lines --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --scope)
+                    COMPREPLY=($(compgen -W "viewport buffer selection" -- "${cur}"))
+                    return 0
+                    ;;
+                --max-lines)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         tabor__agent__screenshot)
             opts="-h --path --full-page --element-id --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -1243,7 +1315,7 @@ _tabor() {
             return 0
             ;;
         tabor__help__agent)
-            opts="attach app use observe inspect screenshot events pdf upload downloads act clipboard close"
+            opts="attach app use observe read inspect screenshot events pdf upload downloads act clipboard close"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1424,6 +1496,20 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        tabor__help__agent__read)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         tabor__help__agent__screenshot)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -1495,7 +1581,7 @@ _tabor() {
             return 0
             ;;
         tabor__help__msg)
-            opts="config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests"
+            opts="config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector terminal-observe terminal-read terminal-screenshot get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1942,6 +2028,48 @@ _tabor() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        tabor__help__msg__terminal__observe)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__msg__terminal__read)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__help__msg__terminal__screenshot)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         tabor__help__workspace)
             opts="status stop"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -2029,7 +2157,7 @@ _tabor() {
             return 0
             ;;
         tabor__msg)
-            opts="-s -h --socket --help config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests help"
+            opts="-s -h --socket --help config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector terminal-observe terminal-read terminal-screenshot get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2306,7 +2434,7 @@ _tabor() {
             return 0
             ;;
         tabor__msg__help)
-            opts="config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests help"
+            opts="config get-config ping get-capabilities list-tabs get-tab-state create-tab create-group close-tab select-tab move-tab set-tab-title set-group-name restore-closed-tab open-url set-web-url reload-web open-inspector terminal-observe terminal-read terminal-screenshot get-tab-panel set-tab-panel dispatch-action send-input run-command-bar inspector send list-requests help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -2754,6 +2882,48 @@ _tabor() {
             return 0
             ;;
         tabor__msg__help__set__web__url)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__msg__help__terminal__observe)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__msg__help__terminal__read)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__msg__help__terminal__screenshot)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3256,6 +3426,83 @@ _tabor() {
             case "${prev}" in
                 --tab-id)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__msg__terminal__observe)
+            opts="-h --tab-id --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --tab-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__msg__terminal__read)
+            opts="-h --tab-id --scope --max-lines --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --tab-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --scope)
+                    COMPREPLY=($(compgen -W "viewport buffer selection" -- "${cur}"))
+                    return 0
+                    ;;
+                --max-lines)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        tabor__msg__terminal__screenshot)
+            opts="-h --tab-id --path --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --tab-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --path)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
                     return 0
                     ;;
                 *)

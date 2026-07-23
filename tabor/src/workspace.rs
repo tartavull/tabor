@@ -5,6 +5,7 @@ use std::io::{BufReader, Error as IoError, ErrorKind, Read};
 #[cfg(not(windows))]
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
@@ -28,7 +29,7 @@ pub(crate) const WORKSPACE_PROTOCOL_VERSION: u32 = 1;
 
 const PERSISTENCE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PREVIEW_IDLE_DEBOUNCE: Duration = Duration::from_secs(2);
-const MAX_PENDING_PREVIEW_BYTES_BEFORE_FLUSH: u64 = 16 * 1024;
+const PREVIEW_MAX_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_PERSISTED_PREVIEW_LINES: usize = 50;
 const TERMINAL_PREVIEW_VERSION: u32 = 1;
 const JOURNAL_RECORD_OUTPUT: u8 = 1;
@@ -123,8 +124,7 @@ pub(crate) struct WorkspaceLayout {
 
 #[derive(Clone)]
 pub(crate) struct TerminalOutputObserver {
-    terminal_id: u64,
-    sender: Sender<PersistenceCommand>,
+    output_dirty: Arc<AtomicBool>,
 }
 
 impl TerminalOutputObserver {
@@ -133,10 +133,7 @@ impl TerminalOutputObserver {
             return;
         }
 
-        let _ = self.sender.send(PersistenceCommand::Output {
-            terminal_id: self.terminal_id,
-            bytes: bytes.to_vec(),
-        });
+        self.output_dirty.store(true, Ordering::Release);
     }
 }
 
@@ -178,9 +175,10 @@ struct LiveTerminalState {
     master_fd: RawFd,
     #[cfg(not(windows))]
     shell_pid: u32,
-    pending_output_bytes: u64,
+    output_dirty: Arc<AtomicBool>,
     dirty: bool,
     last_activity: Instant,
+    last_preview_flush: Instant,
 }
 
 enum PersistenceCommand {
@@ -195,10 +193,7 @@ enum PersistenceCommand {
         master_fd: RawFd,
         #[cfg(not(windows))]
         shell_pid: u32,
-    },
-    Output {
-        terminal_id: u64,
-        bytes: Vec<u8>,
+        output_dirty: Arc<AtomicBool>,
     },
     Resize {
         terminal_id: u64,
@@ -258,6 +253,7 @@ pub(crate) fn register_live_terminal(
     } = registration;
 
     let sender = ensure_persistence_worker()?;
+    let output_dirty = Arc::new(AtomicBool::new(false));
     sender.send(PersistenceCommand::Register {
         terminal_id,
         terminal,
@@ -269,8 +265,9 @@ pub(crate) fn register_live_terminal(
         master_fd,
         #[cfg(not(windows))]
         shell_pid,
+        output_dirty: Arc::clone(&output_dirty),
     })?;
-    Ok(TerminalOutputObserver { terminal_id, sender })
+    Ok(TerminalOutputObserver { output_dirty })
 }
 
 pub(crate) fn record_terminal_resize(terminal_id: u64, _window_size: WindowSize) {
@@ -356,6 +353,30 @@ pub(crate) fn save_workspace_layout(layout: &WorkspaceLayout) -> Result<(), Box<
 pub(crate) fn load_persisted_terminals()
 -> Result<HashMap<u64, PersistedTerminalState>, Box<dyn Error>> {
     let state = load_persisted_state()?;
+    Ok(state.terminals.into_iter().map(|terminal| (terminal.id, terminal)).collect())
+}
+
+pub(crate) fn load_persisted_terminals_for_layout(
+    layout: &WorkspaceLayout,
+) -> Result<HashMap<u64, PersistedTerminalState>, Box<dyn Error>> {
+    let terminal_ids = workspace_layout_terminal_ids(layout);
+    let mut state = load_persisted_state()?;
+    let stale_terminal_ids = state
+        .terminals
+        .iter()
+        .map(|terminal| terminal.id)
+        .filter(|terminal_id| !terminal_ids.contains(terminal_id))
+        .collect::<Vec<_>>();
+
+    if !stale_terminal_ids.is_empty() {
+        state.terminals.retain(|terminal| terminal_ids.contains(&terminal.id));
+        write_persisted_state(&state)?;
+        for terminal_id in stale_terminal_ids {
+            remove_terminal_files(terminal_id)?;
+        }
+    }
+    remove_orphaned_terminal_directories(&terminal_ids)?;
+
     Ok(state.terminals.into_iter().map(|terminal| (terminal.id, terminal)).collect())
 }
 
@@ -498,6 +519,7 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
                     master_fd,
                     #[cfg(not(windows))]
                     shell_pid,
+                    output_dirty,
                 } => {
                     let metadata = PersistedTerminalState {
                         id: terminal_id,
@@ -518,22 +540,14 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
                             master_fd,
                             #[cfg(not(windows))]
                             shell_pid,
-                            pending_output_bytes: 0,
+                            output_dirty,
                             dirty: false,
                             last_activity: Instant::now(),
+                            last_preview_flush: Instant::now(),
                         },
                     );
                     upsert_terminal_state(&mut state, metadata);
                     state_dirty = true;
-                },
-                PersistenceCommand::Output { terminal_id, bytes, .. } => {
-                    let Some(live_terminal) = live.get_mut(&terminal_id) else {
-                        continue;
-                    };
-                    live_terminal.pending_output_bytes =
-                        live_terminal.pending_output_bytes.saturating_add(bytes.len() as u64);
-                    live_terminal.dirty = true;
-                    live_terminal.last_activity = Instant::now();
                 },
                 PersistenceCommand::Resize { terminal_id, .. } => {
                     let Some(live_terminal) = live.get_mut(&terminal_id) else {
@@ -575,7 +589,7 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
                 },
                 PersistenceCommand::Checkpoint { terminal_id, force } => {
                     if let Some(live_terminal) = live.get_mut(&terminal_id) {
-                        if flush_terminal_preview(live_terminal, force).is_ok() {
+                        if matches!(flush_terminal_preview(live_terminal, force), Ok(true)) {
                             upsert_terminal_state(&mut state, live_terminal.metadata.clone());
                             state_dirty = true;
                         }
@@ -601,15 +615,19 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
         }
 
         for terminal in live.values_mut() {
+            if terminal.output_dirty.swap(false, Ordering::Acquire) {
+                terminal.dirty = true;
+                terminal.last_activity = Instant::now();
+            }
             if !terminal.dirty {
                 continue;
             }
-            if terminal.pending_output_bytes < MAX_PENDING_PREVIEW_BYTES_BEFORE_FLUSH
-                && terminal.last_activity.elapsed() < PREVIEW_IDLE_DEBOUNCE
+            if terminal.last_activity.elapsed() < PREVIEW_IDLE_DEBOUNCE
+                && terminal.last_preview_flush.elapsed() < PREVIEW_MAX_FLUSH_INTERVAL
             {
                 continue;
             }
-            if flush_terminal_preview(terminal, false).is_ok() {
+            if matches!(flush_terminal_preview(terminal, false), Ok(true)) {
                 upsert_terminal_state(&mut state, terminal.metadata.clone());
                 state_dirty = true;
             }
@@ -633,11 +651,13 @@ fn persistence_loop(receiver: Receiver<PersistenceCommand>) {
 fn flush_terminal_preview(
     terminal: &mut LiveTerminalState,
     force: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     if !terminal.dirty && !force {
-        return Ok(());
+        return Ok(false);
     }
 
+    let previous_program_name = terminal.metadata.program_name.clone();
+    let previous_working_directory = terminal.metadata.working_directory.clone();
     #[cfg(not(windows))]
     refresh_live_terminal_metadata(terminal);
 
@@ -651,10 +671,11 @@ fn flush_terminal_preview(
     };
 
     write_terminal_preview_lines(terminal.metadata.id, &preview_lines)?;
-    terminal.pending_output_bytes = 0;
     terminal.dirty = false;
+    terminal.last_preview_flush = Instant::now();
     terminal.metadata.snapshot = None;
-    Ok(())
+    Ok(terminal.metadata.program_name != previous_program_name
+        || terminal.metadata.working_directory != previous_working_directory)
 }
 
 #[cfg(not(windows))]
@@ -884,19 +905,28 @@ fn write_persisted_state(state: &PersistedWorkspaceState) -> Result<(), Box<dyn 
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>> {
-    ensure_parent_dir(path)?;
-    let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(tmp_path, path)?;
+    write_bytes_atomic_if_changed(path, serde_json::to_vec_pretty(value)?)?;
     Ok(())
 }
 
 fn write_json_atomic_compact<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>> {
+    write_bytes_atomic_if_changed(path, serde_json::to_vec(value)?)?;
+    Ok(())
+}
+
+fn write_bytes_atomic_if_changed(path: &Path, bytes: Vec<u8>) -> Result<bool, Box<dyn Error>> {
+    match fs::read(path) {
+        Ok(existing) if existing == bytes => return Ok(false),
+        Ok(_) => {},
+        Err(err) if err.kind() == ErrorKind::NotFound => {},
+        Err(err) => return Err(err.into()),
+    }
+
     ensure_parent_dir(path)?;
     let tmp_path = path.with_extension("tmp");
-    fs::write(&tmp_path, serde_json::to_vec(value)?)?;
+    fs::write(&tmp_path, bytes)?;
     fs::rename(tmp_path, path)?;
-    Ok(())
+    Ok(true)
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -930,6 +960,26 @@ fn remove_terminal_files(terminal_id: u64) -> Result<(), Box<dyn Error>> {
     let dir = terminal_dir(terminal_id);
     if dir.exists() {
         fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+fn remove_orphaned_terminal_directories(terminal_ids: &HashSet<u64>) -> Result<(), Box<dyn Error>> {
+    let entries = match fs::read_dir(terminals_dir()) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let Some(terminal_id) = entry.file_name().to_str().and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        if !terminal_ids.contains(&terminal_id) {
+            fs::remove_dir_all(entry.path())?;
+        }
     }
     Ok(())
 }
@@ -988,6 +1038,12 @@ fn test_bundle_workspace_root() -> Option<PathBuf> {
         return None;
     }
 
+    if let Some(path) = std::env::var_os("TABOR_TEST_STATE_ROOT") {
+        let path = PathBuf::from(path).join("workspace");
+        let _ = fs::create_dir_all(&path);
+        return Some(path);
+    }
+
     let mut hasher = DefaultHasher::new();
     bundle_id.hash(&mut hasher);
     let path = PathBuf::from("/tmp").join(format!("ttw-{:016x}", hasher.finish()));
@@ -1030,6 +1086,50 @@ mod tests {
     use crate::macos::test_support::{EnvVarGuard, env_lock};
 
     use tempfile::tempdir;
+
+    fn persisted_terminal_state(id: u64) -> PersistedTerminalState {
+        PersistedTerminalState {
+            id,
+            launch_options: tty::Options::default(),
+            title: Some(String::from("shell")),
+            program_name: String::from("shell"),
+            working_directory: None,
+            exit_code: None,
+            clean_exit: false,
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn terminal_output_observer_coalesces_activity() {
+        let output_dirty = Arc::new(AtomicBool::new(false));
+        let observer = TerminalOutputObserver { output_dirty: Arc::clone(&output_dirty) };
+
+        observer.observe(b"first");
+        observer.observe(b"second");
+
+        assert!(output_dirty.swap(false, Ordering::Acquire));
+        assert!(!output_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn write_bytes_atomic_if_changed_skips_identical_content() {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("state.json");
+
+        assert!(
+            write_bytes_atomic_if_changed(&path, b"first".to_vec()).expect("write initial content")
+        );
+        assert!(
+            !write_bytes_atomic_if_changed(&path, b"first".to_vec())
+                .expect("skip identical content")
+        );
+        assert!(
+            write_bytes_atomic_if_changed(&path, b"second".to_vec())
+                .expect("replace changed content")
+        );
+        assert_eq!(std::fs::read(path).expect("read content"), b"second");
+    }
 
     #[test]
     fn workspace_tab_kind_deserializes_legacy_broker_id() {
@@ -1204,28 +1304,7 @@ mod tests {
     fn allocate_terminal_id_skips_ids_already_in_state() {
         let mut state = PersistedWorkspaceState {
             next_terminal_id: 50,
-            terminals: vec![
-                PersistedTerminalState {
-                    id: 50,
-                    launch_options: tty::Options::default(),
-                    title: Some(String::from("shell")),
-                    program_name: String::from("shell"),
-                    working_directory: None,
-                    exit_code: None,
-                    clean_exit: false,
-                    snapshot: None,
-                },
-                PersistedTerminalState {
-                    id: 51,
-                    launch_options: tty::Options::default(),
-                    title: Some(String::from("shell")),
-                    program_name: String::from("shell"),
-                    working_directory: None,
-                    exit_code: None,
-                    clean_exit: false,
-                    snapshot: None,
-                },
-            ],
+            terminals: vec![persisted_terminal_state(50), persisted_terminal_state(51)],
         };
 
         assert_eq!(
@@ -1239,21 +1318,57 @@ mod tests {
     fn upsert_terminal_state_advances_next_terminal_id() {
         let mut state = PersistedWorkspaceState { next_terminal_id: 50, terminals: Vec::new() };
 
-        upsert_terminal_state(
-            &mut state,
-            PersistedTerminalState {
-                id: 51,
-                launch_options: tty::Options::default(),
-                title: Some(String::from("shell")),
-                program_name: String::from("shell"),
-                working_directory: None,
-                exit_code: None,
-                clean_exit: false,
-                snapshot: None,
-            },
-        );
+        upsert_terminal_state(&mut state, persisted_terminal_state(51));
 
         assert_eq!(state.next_terminal_id, 52);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_persisted_terminals_for_layout_prunes_stale_state_and_directories() {
+        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+        let tempdir = tempdir().expect("tempdir");
+        let home_dir = tempdir.path().join("home");
+        std::fs::create_dir_all(&home_dir).expect("create home dir");
+
+        let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "direct");
+        let _home = EnvVarGuard::set("HOME", &home_dir.display().to_string());
+
+        write_persisted_state(&PersistedWorkspaceState {
+            next_terminal_id: 10,
+            terminals: vec![persisted_terminal_state(7), persisted_terminal_state(8)],
+        })
+        .expect("write state");
+        for terminal_id in [7, 8, 9] {
+            std::fs::create_dir_all(terminal_dir(terminal_id)).expect("create terminal dir");
+        }
+
+        let layout = WorkspaceLayout {
+            protocol_version: WORKSPACE_PROTOCOL_VERSION,
+            active_tab_id: Some(String::from("g0-t0")),
+            groups: vec![WorkspaceGroupLayout {
+                name: None,
+                tabs: vec![WorkspaceTabLayout {
+                    persistent_id: String::from("g0-t0"),
+                    custom_title: None,
+                    terminal_view_mode: crate::display::terminal_layout::TerminalViewMode::Normal,
+                    terminal_multi_column_count_override: None,
+                    kind: WorkspaceTabKind::Terminal {
+                        terminal_id: 7,
+                        launch_options: tty::Options::default(),
+                    },
+                }],
+            }],
+        };
+
+        let terminals =
+            load_persisted_terminals_for_layout(&layout).expect("load reconciled terminals");
+
+        assert_eq!(terminals.keys().copied().collect::<Vec<_>>(), vec![7]);
+        assert_eq!(load_persisted_state().expect("load state").terminals.len(), 1);
+        assert!(terminal_dir(7).exists());
+        assert!(!terminal_dir(8).exists());
+        assert!(!terminal_dir(9).exists());
     }
 
     #[cfg(target_os = "macos")]

@@ -95,8 +95,8 @@ use crate::ipc::{
     IpcTerminalObservation, IpcTerminalPoint, IpcTerminalRead, IpcTerminalReadScope,
     IpcTerminalSelection, IpcTerminalSessionState, IpcTerminalViewportLine, IpcTerminalVisualPoint,
     IpcTouchPhase, IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
-    IpcWindowDebugButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
-    SocketReply, TabSelection, TerminalKeyInput,
+    IpcWindowDebugButton, IpcWindowDebugJsDialogButton, IpcWindowDebugRect, IpcWindowDebugSnapshot,
+    IpcWindowDebugState, SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -4415,6 +4415,32 @@ impl WindowContext {
     }
 
     #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_press_js_dialog_button(
+        &self,
+        button: IpcWindowDebugJsDialogButton,
+        prompt_text: Option<String>,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let title = match button {
+                IpcWindowDebugJsDialogButton::Accept => "OK",
+                IpcWindowDebugJsDialogButton::Dismiss => "Cancel",
+            };
+            crate::macos::press_test_js_dialog_button(title, prompt_text.as_deref())
+                .map_err(|err| IpcError::new(IpcErrorCode::Unsupported, err))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (button, prompt_text);
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "JavaScript dialog debug actions are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
     pub(crate) fn ipc_window_debug_mouse_drag(
         &mut self,
         drag: WindowDebugMouseDrag,
@@ -5413,8 +5439,6 @@ impl WindowContext {
             let expression = format!("window.__taborAgent.act({actions_json}, {observe})");
             let script = agent_object_script(&mut tab.agent_runtime, &expression);
             let stream = Arc::clone(&stream);
-            web_view.set_visible(true);
-            web_view.set_focus(true);
             web_view.eval_js_string_with_user_gesture(&script, move |result| {
                 let reply = match result {
                     Some(raw) => match json::from_str::<AgentActResult>(&raw) {

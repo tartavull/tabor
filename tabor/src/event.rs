@@ -590,6 +590,14 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_window_debug_press_standard_button(button)
     }
 
+    fn window_debug_press_js_dialog_button(
+        &mut self,
+        button: ipc::IpcWindowDebugJsDialogButton,
+        prompt_text: Option<String>,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_press_js_dialog_button(button, prompt_text)
+    }
+
     fn runtime_metrics(&mut self) -> Result<ipc::IpcRuntimeMetrics, ipc::IpcError> {
         self.window.ipc_runtime_metrics()
     }
@@ -812,7 +820,8 @@ impl Processor {
             },
         };
 
-        let persisted_terminals = workspace::load_persisted_terminals().unwrap_or_default();
+        let persisted_terminals =
+            workspace::load_persisted_terminals_for_layout(&layout).unwrap_or_default();
 
         let Some(window_context) = self.windows.values_mut().next() else {
             return;

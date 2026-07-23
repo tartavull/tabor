@@ -123,6 +123,8 @@ if [[ "$identity" != "-" ]]; then
 
   if [[ "$timestamp_signing" == "1" ]]; then
     codesign_extra_flags+=(--timestamp)
+  else
+    codesign_extra_flags+=(--timestamp=none)
   fi
 fi
 

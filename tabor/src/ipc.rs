@@ -515,6 +515,13 @@ pub enum IpcWindowDebugButton {
     Zoom,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcWindowDebugJsDialogButton {
+    Accept,
+    Dismiss,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentObservation {
     pub revision: u64,
@@ -1005,6 +1012,11 @@ pub enum IpcRequest {
     WindowDebugPressStandardButton {
         button: IpcWindowDebugButton,
     },
+    WindowDebugPressJsDialogButton {
+        button: IpcWindowDebugJsDialogButton,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_text: Option<String>,
+    },
     RuntimeMetrics,
     SetConfig(IpcConfig),
     GetConfig(IpcGetConfig),
@@ -1111,6 +1123,10 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
         IpcRequestHelp {
             name: "window_debug_press_standard_button",
             summary: "Trigger a macOS standard window button on the active window.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_press_js_dialog_button",
+            summary: "Press a JavaScript dialog button in an isolated test bundle.",
         },
         IpcRequestHelp {
             name: "runtime_metrics",
@@ -1407,6 +1423,11 @@ pub trait IpcContext {
     fn window_debug_press_standard_button(
         &mut self,
         button: IpcWindowDebugButton,
+    ) -> Result<(), IpcError>;
+    fn window_debug_press_js_dialog_button(
+        &mut self,
+        button: IpcWindowDebugJsDialogButton,
+        prompt_text: Option<String>,
     ) -> Result<(), IpcError>;
     fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError>;
 }
@@ -1882,6 +1903,14 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::WindowDebugPressJsDialogButton { button, prompt_text } => {
+            match ctx.window_debug_press_js_dialog_button(button, prompt_text) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
         IpcRequest::RuntimeMetrics => match ctx.runtime_metrics() {
             Ok(metrics) => {
                 IpcResponse { reply: SocketReply::RuntimeMetrics { metrics }, close_window: false }
@@ -2183,6 +2212,7 @@ mod tests {
         last_command: Option<String>,
         last_window_drag: Option<(f64, f64, f64, f64, Option<usize>)>,
         last_window_button: Option<IpcWindowDebugButton>,
+        last_js_dialog_button: Option<(IpcWindowDebugJsDialogButton, Option<String>)>,
         last_image_gesture: Option<MockImageGesture>,
         web_supported: bool,
         inspector_targets: Vec<IpcInspectorTarget>,
@@ -2223,6 +2253,7 @@ mod tests {
                 last_command: None,
                 last_window_drag: None,
                 last_window_button: None,
+                last_js_dialog_button: None,
                 last_image_gesture: None,
                 web_supported,
                 inspector_targets: Vec::new(),
@@ -3067,6 +3098,15 @@ mod tests {
             Ok(())
         }
 
+        fn window_debug_press_js_dialog_button(
+            &mut self,
+            button: IpcWindowDebugJsDialogButton,
+            prompt_text: Option<String>,
+        ) -> Result<(), IpcError> {
+            self.last_js_dialog_button = Some((button, prompt_text));
+            Ok(())
+        }
+
         fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError> {
             Ok(self.runtime_metrics.clone())
         }
@@ -3452,6 +3492,19 @@ mod tests {
         );
         assert!(matches!(response.reply, SocketReply::Ok));
         assert_eq!(ctx.last_window_button, Some(IpcWindowDebugButton::Zoom));
+
+        let response = handle_request(
+            &mut ctx,
+            IpcRequest::WindowDebugPressJsDialogButton {
+                button: IpcWindowDebugJsDialogButton::Accept,
+                prompt_text: Some(String::from("typed")),
+            },
+        );
+        assert!(matches!(response.reply, SocketReply::Ok));
+        assert_eq!(
+            ctx.last_js_dialog_button,
+            Some((IpcWindowDebugJsDialogButton::Accept, Some(String::from("typed"))))
+        );
     }
 
     #[test]

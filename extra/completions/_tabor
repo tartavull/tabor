@@ -211,6 +211,30 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(terminal-observe)
+_arguments "${_arguments_options[@]}" : \
+'--tab-id=[Tab id formatted as <index>\:<generation> (defaults to active tab)]:INDEX:GEN:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(terminal-read)
+_arguments "${_arguments_options[@]}" : \
+'--tab-id=[Tab id formatted as <index>\:<generation> (defaults to active tab)]:INDEX:GEN:_default' \
+'--scope=[Which terminal text surface to read]:SCOPE:(viewport buffer selection)' \
+'--max-lines=[Maximum number of lines to return for buffer reads]:MAX_LINES:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(terminal-screenshot)
+_arguments "${_arguments_options[@]}" : \
+'--tab-id=[Tab id formatted as <index>\:<generation> (defaults to active tab)]:INDEX:GEN:_default' \
+'--path=[Write the PNG to this path. The raw IPC JSON is printed when omitted]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (get-tab-panel)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -448,6 +472,18 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(terminal-observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(terminal-read)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(terminal-screenshot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (get-tab-panel)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -562,6 +598,14 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (observe)
 _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(read)
+_arguments "${_arguments_options[@]}" : \
+'--scope=[Which terminal text surface to read]:SCOPE:(viewport buffer selection)' \
+'--max-lines=[Maximum number of lines to return for buffer reads]:MAX_LINES:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -710,6 +754,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(read)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -950,6 +998,18 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(terminal-observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(terminal-read)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(terminal-screenshot)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (get-tab-panel)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -1043,6 +1103,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (observe)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(read)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1165,6 +1229,7 @@ _tabor__agent_commands() {
 'app:List tabs and current agent state' \
 'use:Select the active tab or a specific tab for automation' \
 'observe:Observe the selected web tab' \
+'read:Read terminal buffer or viewport text from the selected terminal tab' \
 'inspect:Inspect one observed element by id' \
 'screenshot:Capture a screenshot from the selected web tab' \
 'events:Read buffered console, network, and page events' \
@@ -1258,6 +1323,7 @@ _tabor__agent__help_commands() {
 'app:List tabs and current agent state' \
 'use:Select the active tab or a specific tab for automation' \
 'observe:Observe the selected web tab' \
+'read:Read terminal buffer or viewport text from the selected terminal tab' \
 'inspect:Inspect one observed element by id' \
 'screenshot:Capture a screenshot from the selected web tab' \
 'events:Read buffered console, network, and page events' \
@@ -1339,6 +1405,11 @@ _tabor__agent__help__pdf_commands() {
     local commands; commands=()
     _describe -t commands 'tabor agent help pdf commands' commands "$@"
 }
+(( $+functions[_tabor__agent__help__read_commands] )) ||
+_tabor__agent__help__read_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent help read commands' commands "$@"
+}
 (( $+functions[_tabor__agent__help__screenshot_commands] )) ||
 _tabor__agent__help__screenshot_commands() {
     local commands; commands=()
@@ -1368,6 +1439,11 @@ _tabor__agent__observe_commands() {
 _tabor__agent__pdf_commands() {
     local commands; commands=()
     _describe -t commands 'tabor agent pdf commands' commands "$@"
+}
+(( $+functions[_tabor__agent__read_commands] )) ||
+_tabor__agent__read_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor agent read commands' commands "$@"
 }
 (( $+functions[_tabor__agent__screenshot_commands] )) ||
 _tabor__agent__screenshot_commands() {
@@ -1402,6 +1478,7 @@ _tabor__help__agent_commands() {
 'app:List tabs and current agent state' \
 'use:Select the active tab or a specific tab for automation' \
 'observe:Observe the selected web tab' \
+'read:Read terminal buffer or viewport text from the selected terminal tab' \
 'inspect:Inspect one observed element by id' \
 'screenshot:Capture a screenshot from the selected web tab' \
 'events:Read buffered console, network, and page events' \
@@ -1477,6 +1554,11 @@ _tabor__help__agent__pdf_commands() {
     local commands; commands=()
     _describe -t commands 'tabor help agent pdf commands' commands "$@"
 }
+(( $+functions[_tabor__help__agent__read_commands] )) ||
+_tabor__help__agent__read_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help agent read commands' commands "$@"
+}
 (( $+functions[_tabor__help__agent__screenshot_commands] )) ||
 _tabor__help__agent__screenshot_commands() {
     local commands; commands=()
@@ -1523,6 +1605,9 @@ _tabor__help__msg_commands() {
 'set-web-url:Set the URL for a web tab' \
 'reload-web:Reload a web tab' \
 'open-inspector:Open the Web Inspector for a web tab' \
+'terminal-observe:Observe a terminal tab with viewport rows and visible-cell metadata' \
+'terminal-read:Read terminal viewport, buffer, or selection text' \
+'terminal-screenshot:Capture a PNG of the visible terminal viewport' \
 'get-tab-panel:Get tab panel state' \
 'set-tab-panel:Set tab panel state' \
 'dispatch-action:Dispatch a configured action' \
@@ -1695,6 +1780,21 @@ _tabor__help__msg__set-web-url_commands() {
     local commands; commands=()
     _describe -t commands 'tabor help msg set-web-url commands' commands "$@"
 }
+(( $+functions[_tabor__help__msg__terminal-observe_commands] )) ||
+_tabor__help__msg__terminal-observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help msg terminal-observe commands' commands "$@"
+}
+(( $+functions[_tabor__help__msg__terminal-read_commands] )) ||
+_tabor__help__msg__terminal-read_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help msg terminal-read commands' commands "$@"
+}
+(( $+functions[_tabor__help__msg__terminal-screenshot_commands] )) ||
+_tabor__help__msg__terminal-screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor help msg terminal-screenshot commands' commands "$@"
+}
 (( $+functions[_tabor__help__workspace_commands] )) ||
 _tabor__help__workspace_commands() {
     local commands; commands=(
@@ -1739,6 +1839,9 @@ _tabor__msg_commands() {
 'set-web-url:Set the URL for a web tab' \
 'reload-web:Reload a web tab' \
 'open-inspector:Open the Web Inspector for a web tab' \
+'terminal-observe:Observe a terminal tab with viewport rows and visible-cell metadata' \
+'terminal-read:Read terminal viewport, buffer, or selection text' \
+'terminal-screenshot:Capture a PNG of the visible terminal viewport' \
 'get-tab-panel:Get tab panel state' \
 'set-tab-panel:Set tab panel state' \
 'dispatch-action:Dispatch a configured action' \
@@ -1817,6 +1920,9 @@ _tabor__msg__help_commands() {
 'set-web-url:Set the URL for a web tab' \
 'reload-web:Reload a web tab' \
 'open-inspector:Open the Web Inspector for a web tab' \
+'terminal-observe:Observe a terminal tab with viewport rows and visible-cell metadata' \
+'terminal-read:Read terminal viewport, buffer, or selection text' \
+'terminal-screenshot:Capture a PNG of the visible terminal viewport' \
 'get-tab-panel:Get tab panel state' \
 'set-tab-panel:Set tab panel state' \
 'dispatch-action:Dispatch a configured action' \
@@ -1995,6 +2101,21 @@ _tabor__msg__help__set-web-url_commands() {
     local commands; commands=()
     _describe -t commands 'tabor msg help set-web-url commands' commands "$@"
 }
+(( $+functions[_tabor__msg__help__terminal-observe_commands] )) ||
+_tabor__msg__help__terminal-observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor msg help terminal-observe commands' commands "$@"
+}
+(( $+functions[_tabor__msg__help__terminal-read_commands] )) ||
+_tabor__msg__help__terminal-read_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor msg help terminal-read commands' commands "$@"
+}
+(( $+functions[_tabor__msg__help__terminal-screenshot_commands] )) ||
+_tabor__msg__help__terminal-screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor msg help terminal-screenshot commands' commands "$@"
+}
 (( $+functions[_tabor__msg__inspector_commands] )) ||
 _tabor__msg__inspector_commands() {
     local commands; commands=(
@@ -2153,6 +2274,21 @@ _tabor__msg__set-tab-title_commands() {
 _tabor__msg__set-web-url_commands() {
     local commands; commands=()
     _describe -t commands 'tabor msg set-web-url commands' commands "$@"
+}
+(( $+functions[_tabor__msg__terminal-observe_commands] )) ||
+_tabor__msg__terminal-observe_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor msg terminal-observe commands' commands "$@"
+}
+(( $+functions[_tabor__msg__terminal-read_commands] )) ||
+_tabor__msg__terminal-read_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor msg terminal-read commands' commands "$@"
+}
+(( $+functions[_tabor__msg__terminal-screenshot_commands] )) ||
+_tabor__msg__terminal-screenshot_commands() {
+    local commands; commands=()
+    _describe -t commands 'tabor msg terminal-screenshot commands' commands "$@"
 }
 (( $+functions[_tabor__workspace_commands] )) ||
 _tabor__workspace_commands() {

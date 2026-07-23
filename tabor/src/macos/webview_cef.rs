@@ -7,21 +7,29 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc as StdRc;
 
+use block2::RcBlock;
 use cef::{
     CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler, FocusHandler,
     ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
     ImplDevToolsMessageObserver, ImplDictionaryValue, ImplDisplayHandler, ImplDownloadHandler,
-    ImplDownloadItem, ImplFocusHandler, ImplFrame, ImplLifeSpanHandler, ImplListValue,
-    ImplMediaAccessCallback, ImplPermissionHandler, ImplPermissionPromptCallback,
-    ImplProcessMessage, ImplRenderHandler, ImplTask, LifeSpanHandler, PermissionHandler,
-    PermissionRequestResult, RenderHandler, Task, WrapClient, WrapDevToolsMessageObserver,
-    WrapDisplayHandler, WrapDownloadHandler, WrapFocusHandler, WrapLifeSpanHandler,
-    WrapPermissionHandler, WrapRenderHandler, WrapTask, rc::Rc,
+    ImplDownloadItem, ImplFocusHandler, ImplFrame, ImplJsdialogCallback, ImplJsdialogHandler,
+    ImplLifeSpanHandler, ImplListValue, ImplMediaAccessCallback, ImplPermissionHandler,
+    ImplPermissionPromptCallback, ImplProcessMessage, ImplRenderHandler, ImplTask, JsdialogHandler,
+    LifeSpanHandler, PermissionHandler, PermissionRequestResult, RenderHandler, Task, WrapClient,
+    WrapDevToolsMessageObserver, WrapDisplayHandler, WrapDownloadHandler, WrapFocusHandler,
+    WrapJsdialogHandler, WrapLifeSpanHandler, WrapPermissionHandler, WrapRenderHandler, WrapTask,
+    rc::Rc,
 };
 use log::debug;
 use objc2::encode::{Encode, Encoding};
+use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, msg_send};
+use objc2::{MainThreadMarker, MainThreadOnly, msg_send};
+use objc2_app_kit::{
+    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSModalResponse, NSModalResponseAbort,
+    NSTextField, NSWindow,
+};
+use objc2_foundation::NSString;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, MouseButton};
@@ -1337,6 +1345,240 @@ cef::wrap_permission_handler! {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsDialogKind {
+    Alert,
+    Confirm,
+    Prompt,
+    BeforeUnload { is_reload: bool },
+}
+
+struct ActiveJsDialog {
+    generation: u64,
+    alert: Retained<NSAlert>,
+    prompt_field: Option<Retained<NSTextField>>,
+    callback: Option<cef::JsdialogCallback>,
+    _completion: RcBlock<dyn Fn(NSModalResponse)>,
+}
+
+struct JsDialogState {
+    parent_window: Retained<NSWindow>,
+    next_generation: u64,
+    active: Option<ActiveJsDialog>,
+}
+
+impl JsDialogState {
+    fn new(parent_window: Retained<NSWindow>) -> Self {
+        Self { parent_window, next_generation: 1, active: None }
+    }
+
+    fn take_generation(&mut self) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        generation
+    }
+}
+
+fn js_dialog_label(kind: JsDialogKind, origin_url: Option<&cef::CefString>) -> String {
+    let mut label = match kind {
+        JsDialogKind::Alert => String::from("JavaScript Alert"),
+        JsDialogKind::Confirm => String::from("JavaScript Confirm"),
+        JsDialogKind::Prompt => String::from("JavaScript Prompt"),
+        JsDialogKind::BeforeUnload { is_reload: true } => String::from("Reload this page?"),
+        JsDialogKind::BeforeUnload { is_reload: false } => String::from("Leave this page?"),
+    };
+
+    if let Some(origin_url) = origin_url {
+        let display_url = cef::format_url_for_security_display(Some(origin_url));
+        let display_url = CefString::from(&display_url).to_string();
+        if !display_url.is_empty() {
+            label.push_str(" - ");
+            label.push_str(&display_url);
+        }
+    }
+    label
+}
+
+fn complete_js_dialog(
+    state: &StdRc<RefCell<JsDialogState>>,
+    generation: u64,
+    response: NSModalResponse,
+) {
+    let mut active = {
+        let mut state = state.borrow_mut();
+        if state.active.as_ref().map(|active| active.generation) != Some(generation) {
+            return;
+        }
+        state.active.take().expect("generation matched an active JavaScript dialog")
+    };
+
+    let accepted = response == NSAlertFirstButtonReturn;
+    let prompt_text = active.prompt_field.as_ref().map(|field| field.stringValue().to_string());
+    let callback = active.callback.take().expect("active JavaScript dialog callback");
+    if let Some(prompt_text) = prompt_text {
+        let prompt_text = CefString::from(prompt_text.as_str());
+        callback.cont(i32::from(accepted), Some(&prompt_text));
+    } else {
+        callback.cont(i32::from(accepted), None);
+    }
+}
+
+fn cancel_js_dialog(state: &StdRc<RefCell<JsDialogState>>) {
+    let (parent_window, mut active) = {
+        let mut state = state.borrow_mut();
+        let Some(active) = state.active.take() else {
+            return;
+        };
+        (state.parent_window.clone(), active)
+    };
+
+    active.callback.take();
+    let sheet = active.alert.window();
+    parent_window.endSheet_returnCode(&sheet, NSModalResponseAbort);
+}
+
+fn present_js_dialog(
+    state: &StdRc<RefCell<JsDialogState>>,
+    kind: JsDialogKind,
+    origin_url: Option<&cef::CefString>,
+    message_text: &cef::CefString,
+    default_prompt_text: Option<&cef::CefString>,
+    callback: cef::JsdialogCallback,
+) -> bool {
+    let mtm = MainThreadMarker::new().expect("CEF JavaScript dialogs must run on the main thread");
+    if state.borrow().active.is_some() {
+        return false;
+    }
+
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    alert.setMessageText(&NSString::from_str(&js_dialog_label(kind, origin_url)));
+    alert.setInformativeText(&NSString::from_str(&message_text.to_string()));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    if !matches!(kind, JsDialogKind::Alert) {
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    }
+
+    let prompt_field = if matches!(kind, JsDialogKind::Prompt) {
+        let default_prompt_text = default_prompt_text
+            .expect("CEF prompt dialogs must provide default prompt text")
+            .to_string();
+        let field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            objc2_foundation::NSRect::new(
+                objc2_foundation::NSPoint::new(0.0, 0.0),
+                objc2_foundation::NSSize::new(300.0, 22.0),
+            ),
+        );
+        field.setStringValue(&NSString::from_str(&default_prompt_text));
+        alert.setAccessoryView(Some(&field));
+        alert.window().setInitialFirstResponder(Some(&field));
+        Some(field)
+    } else {
+        None
+    };
+
+    let (generation, parent_window) = {
+        let mut state = state.borrow_mut();
+        (state.take_generation(), state.parent_window.clone())
+    };
+    let weak_state = StdRc::downgrade(state);
+    let completion: RcBlock<dyn Fn(NSModalResponse)> = RcBlock::new(move |response| {
+        if let Some(state) = weak_state.upgrade() {
+            complete_js_dialog(&state, generation, response);
+        }
+    });
+
+    state.borrow_mut().active = Some(ActiveJsDialog {
+        generation,
+        alert: alert.clone(),
+        prompt_field: prompt_field.clone(),
+        callback: Some(callback),
+        _completion: completion.clone(),
+    });
+    alert.beginSheetModalForWindow_completionHandler(&parent_window, Some(&completion));
+    if let Some(prompt_field) = prompt_field {
+        alert.window().makeFirstResponder(Some(&prompt_field));
+    }
+    true
+}
+
+cef::wrap_jsdialog_handler! {
+    struct TaborJsDialogHandler {
+        state: StdRc<RefCell<JsDialogState>>,
+    }
+
+    impl JsdialogHandler {
+        fn on_jsdialog(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            origin_url: Option<&cef::CefString>,
+            dialog_type: cef::JsdialogType,
+            message_text: Option<&cef::CefString>,
+            default_prompt_text: Option<&cef::CefString>,
+            callback: Option<&mut cef::JsdialogCallback>,
+            suppress_message: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            let kind = match dialog_type {
+                cef::JsdialogType::ALERT => JsDialogKind::Alert,
+                cef::JsdialogType::CONFIRM => JsDialogKind::Confirm,
+                cef::JsdialogType::PROMPT => JsDialogKind::Prompt,
+                _ => return 0,
+            };
+            if self.state.borrow().active.is_some() {
+                if let Some(suppress_message) = suppress_message {
+                    *suppress_message = 1;
+                }
+                return 0;
+            }
+
+            let shown = present_js_dialog(
+                &self.state,
+                kind,
+                origin_url,
+                message_text.expect("CEF JavaScript dialogs must provide message text"),
+                default_prompt_text,
+                callback.expect("CEF JavaScript dialogs must provide a callback").clone(),
+            );
+            i32::from(shown)
+        }
+
+        fn on_before_unload_dialog(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            message_text: Option<&cef::CefString>,
+            is_reload: ::std::os::raw::c_int,
+            callback: Option<&mut cef::JsdialogCallback>,
+        ) -> ::std::os::raw::c_int {
+            let shown = present_js_dialog(
+                &self.state,
+                JsDialogKind::BeforeUnload { is_reload: is_reload != 0 },
+                None,
+                message_text.expect("CEF before-unload dialogs must provide message text"),
+                None,
+                callback.expect("CEF before-unload dialogs must provide a callback").clone(),
+            );
+            i32::from(shown)
+        }
+
+        fn on_reset_dialog_state(&self, _browser: Option<&mut cef::Browser>) {
+            cancel_js_dialog(&self.state);
+        }
+
+        fn on_dialog_closed(&self, _browser: Option<&mut cef::Browser>) {
+            cancel_js_dialog(&self.state);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TaborClientWebState {
+    jsdialog_handler: cef::JsdialogHandler,
+    test_use_default_js_dialog: bool,
+    editable_focus_notifier: WebEditableFocusNotifier,
+}
+
 #[cfg(not(feature = "passkey-webauthn"))]
 cef::wrap_client! {
     struct TaborClient {
@@ -1345,7 +1587,7 @@ cef::wrap_client! {
         download_handler: cef::DownloadHandler,
         focus_handler: cef::FocusHandler,
         life_span_handler: cef::LifeSpanHandler,
-        editable_focus_notifier: WebEditableFocusNotifier,
+        web_state: TaborClientWebState,
         permission_handler: cef::PermissionHandler,
     }
 
@@ -1370,6 +1612,11 @@ cef::wrap_client! {
             Some(self.life_span_handler.clone())
         }
 
+        fn jsdialog_handler(&self) -> Option<cef::JsdialogHandler> {
+            (!self.web_state.test_use_default_js_dialog)
+                .then(|| self.web_state.jsdialog_handler.clone())
+        }
+
         fn on_process_message_received(
             &self,
             _browser: Option<&mut cef::Browser>,
@@ -1377,7 +1624,11 @@ cef::wrap_client! {
             source_process: cef::ProcessId,
             message: Option<&mut cef::ProcessMessage>,
         ) -> ::std::os::raw::c_int {
-            handle_client_process_message(&self.editable_focus_notifier, source_process, message)
+            handle_client_process_message(
+                &self.web_state.editable_focus_notifier,
+                source_process,
+                message,
+            )
         }
 
         fn permission_handler(&self) -> Option<cef::PermissionHandler> {
@@ -1394,7 +1645,7 @@ cef::wrap_client! {
         download_handler: cef::DownloadHandler,
         focus_handler: cef::FocusHandler,
         life_span_handler: cef::LifeSpanHandler,
-        editable_focus_notifier: WebEditableFocusNotifier,
+        web_state: TaborClientWebState,
     }
 
     impl Client {
@@ -1418,6 +1669,11 @@ cef::wrap_client! {
             Some(self.life_span_handler.clone())
         }
 
+        fn jsdialog_handler(&self) -> Option<cef::JsdialogHandler> {
+            (!self.web_state.test_use_default_js_dialog)
+                .then(|| self.web_state.jsdialog_handler.clone())
+        }
+
         fn on_process_message_received(
             &self,
             _browser: Option<&mut cef::Browser>,
@@ -1425,7 +1681,11 @@ cef::wrap_client! {
             source_process: cef::ProcessId,
             message: Option<&mut cef::ProcessMessage>,
         ) -> ::std::os::raw::c_int {
-            handle_client_process_message(&self.editable_focus_notifier, source_process, message)
+            handle_client_process_message(
+                &self.web_state.editable_focus_notifier,
+                source_process,
+                message,
+            )
         }
     }
 }
@@ -1506,6 +1766,7 @@ pub struct WebView {
     paint_state: StdRc<RefCell<PaintState>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
     automation_state: StdRc<RefCell<AutomationState>>,
+    js_dialog_state: StdRc<RefCell<JsDialogState>>,
     last_mouse_event: Option<cef::MouseEvent>,
     mouse_button_flags: u32,
     _devtools_observer: cef::DevToolsMessageObserver,
@@ -1540,6 +1801,7 @@ impl WebView {
 
         let result = (|| {
             let parent = ns_view(window)?;
+            let parent_window = ns_window(parent)?;
             let screen_rect = cef_screen_rect(window, &layout);
             let paint_state =
                 StdRc::new(RefCell::new(PaintState::new(layout, screen_rect, window.scale_factor)));
@@ -1557,8 +1819,18 @@ impl WebView {
             let focus_policy = WebFocusPolicy::new();
             let focus_handler = TaborFocusHandler::new(focus_policy.clone());
             let life_span_handler = TaborLifeSpanHandler::new(proxy.clone(), window.id(), tab_id);
+            let js_dialog_state = StdRc::new(RefCell::new(JsDialogState::new(parent_window)));
+            let jsdialog_handler = TaborJsDialogHandler::new(js_dialog_state.clone());
+            let test_use_default_js_dialog = super::bundle_identifier()
+                .starts_with("com.pinkbot.tabor.test.")
+                && std::env::var_os("TABOR_TEST_USE_DEFAULT_JS_DIALOG").is_some();
             let editable_focus_notifier =
                 WebEditableFocusNotifier::new(proxy.clone(), window.id(), tab_id);
+            let web_state = TaborClientWebState {
+                jsdialog_handler,
+                test_use_default_js_dialog,
+                editable_focus_notifier,
+            };
             #[cfg(not(feature = "passkey-webauthn"))]
             let mut client = {
                 let permission_handler = TaborPermissionHandler::new();
@@ -1568,7 +1840,7 @@ impl WebView {
                     download_handler,
                     focus_handler,
                     life_span_handler,
-                    editable_focus_notifier,
+                    web_state,
                     permission_handler,
                 )
             };
@@ -1579,7 +1851,7 @@ impl WebView {
                 download_handler,
                 focus_handler,
                 life_span_handler,
-                editable_focus_notifier,
+                web_state,
             );
 
             let browser_settings = browser_settings();
@@ -1617,6 +1889,7 @@ impl WebView {
                 paint_state,
                 devtools_state,
                 automation_state,
+                js_dialog_state,
                 last_mouse_event: None,
                 mouse_button_flags: 0,
                 _devtools_observer: observer,
@@ -2451,6 +2724,9 @@ fn should_run_frame_edit_inline(on_ui_thread: bool, handling_send_event: bool) -
 
 impl Drop for WebView {
     fn drop(&mut self) {
+        if MainThreadMarker::new().is_some() {
+            cancel_js_dialog(&self.js_dialog_state);
+        }
         if cef::currently_on(cef::ThreadId::UI) == 1 {
             close_browser_resources(&self.browser);
         } else {
@@ -2863,6 +3139,11 @@ fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
         RawWindowHandle::AppKit(handle) => Ok(handle.ns_view.as_ptr() as *mut AnyObject),
         _ => Err(std::io::Error::other("WebView requires an AppKit window").into()),
     }
+}
+
+fn ns_window(view: *mut AnyObject) -> Result<Retained<NSWindow>, Box<dyn Error>> {
+    let window: Option<Retained<NSWindow>> = unsafe { msg_send![view, window] };
+    window.ok_or_else(|| std::io::Error::other("WebView parent NSView has no NSWindow").into())
 }
 
 fn cef_screen_rect(window: &Window, layout: &BrowserViewportLayout) -> cef::Rect {
