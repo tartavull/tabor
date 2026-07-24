@@ -343,7 +343,9 @@ if [[ "$require_team_codesign" == "1" && -n "$required_team_id" ]]; then
 fi
 
 if [[ -n "$entitlements" ]]; then
-  if ! /usr/bin/codesign -d --entitlements :- "$main_binary" 2>&1 | /usr/bin/grep -q "<dict>"; then
+  if ! /usr/bin/codesign -d --entitlements :- "$main_binary" 2>&1 \
+    | /usr/bin/grep -F "<dict>" >/dev/null
+  then
     echo "Entitlements were not embedded into '$main_binary'" >&2
     exit 1
   fi
@@ -351,7 +353,9 @@ fi
 
 if [[ -n "$helper_entitlements" ]]; then
   for helper_binary in "${helper_binaries[@]}"; do
-    if ! /usr/bin/codesign -d --entitlements :- "$helper_binary" 2>&1 | /usr/bin/grep -q "<dict>"; then
+    if ! /usr/bin/codesign -d --entitlements :- "$helper_binary" 2>&1 \
+      | /usr/bin/grep -F "<dict>" >/dev/null
+    then
       echo "Entitlements were not embedded into helper executable '$helper_binary'" >&2
       exit 1
     fi
@@ -362,7 +366,7 @@ if [[ -n "$cef_jit_entitlements" ]]; then
   for helper_binary in "${helper_binaries[@]}"; do
     has_jit_entitlement=0
     if /usr/bin/codesign -d --entitlements :- "$helper_binary" 2>&1 \
-      | /usr/bin/grep -Fq "<key>$jit_entitlement_key</key>"
+      | /usr/bin/grep -F "<key>$jit_entitlement_key</key>" >/dev/null
     then
       has_jit_entitlement=1
     fi
@@ -381,7 +385,7 @@ fi
 
 if [[ "$hardened_runtime" == "1" && -n "$renderer_helper_binary" ]]; then
   if ! /usr/bin/codesign -d --entitlements :- "$renderer_helper_binary" 2>&1 \
-    | /usr/bin/grep -Fq "<key>$jit_entitlement_key</key>"
+    | /usr/bin/grep -F "<key>$jit_entitlement_key</key>" >/dev/null
   then
     echo "Signed CEF renderer is missing the required $jit_entitlement_key entitlement." >&2
     exit 1
