@@ -13,6 +13,7 @@ fi
 app_path="${1%/}"
 contents_dir="$app_path/Contents"
 macos_dir="$contents_dir/MacOS"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ ! -d "$contents_dir" || ! -d "$macos_dir" ]]; then
   echo "Expected a macOS app bundle at '$app_path'" >&2
@@ -25,15 +26,22 @@ require_team_codesign="${TABOR_REQUIRE_TEAM_CODESIGN:-1}"
 identity="${TABOR_CODESIGN_IDENTITY:-}"
 entitlements="${TABOR_CODESIGN_ENTITLEMENTS:-}"
 helper_entitlements="${TABOR_CODESIGN_HELPER_ENTITLEMENTS:-}"
+cef_jit_entitlements=""
+direct_cef_jit_entitlements="$repo_root/extra/osx/Tabor.cef-jit.entitlements"
 provisioning_profile="${TABOR_CODESIGN_PROVISIONING_PROFILE:-}"
 passkey_entitlement_key="com.apple.developer.web-browser.public-key-credential"
+jit_entitlement_key="com.apple.security.cs.allow-jit"
 requires_passkey_profile=0
 require_provisioning_profile="${TABOR_CODESIGN_REQUIRE_PROVISIONING_PROFILE:-0}"
 distribution="${TABOR_CODESIGN_DISTRIBUTION:-direct}"
 hardened_runtime="${TABOR_CODESIGN_HARDENED_RUNTIME:-0}"
 timestamp_signing="${TABOR_CODESIGN_TIMESTAMP:-0}"
 codesign_extra_flags=()
+helper_apps=()
 helper_binaries=()
+cef_jit_helper_apps=()
+cef_jit_helper_binaries=()
+renderer_helper_binary=""
 
 if [[ "$require_team_codesign" != "1" ]]; then
   echo "TABOR_REQUIRE_TEAM_CODESIGN must remain 1. Unsigned or ad-hoc-signed macOS Tabor builds are forbidden." >&2
@@ -47,6 +55,10 @@ case "$distribution" in
     exit 1
     ;;
 esac
+
+if [[ "$distribution" == "direct" && "$hardened_runtime" == "1" && -z "$helper_entitlements" ]]; then
+  cef_jit_entitlements="$direct_cef_jit_entitlements"
+fi
 
 list_codesign_identities() {
   /usr/bin/security find-identity -v -p codesigning 2>/dev/null || true
@@ -128,7 +140,9 @@ if [[ "$identity" != "-" ]]; then
   fi
 fi
 
-# Entitlements are opt-in. Set TABOR_CODESIGN_ENTITLEMENTS explicitly when needed.
+# Main-app and generic helper entitlements are opt-in. Hardened direct
+# distribution applies the repo-owned JIT entitlement only to CEF helpers that
+# execute generated code.
 
 if [[ -n "$entitlements" && ! -f "$entitlements" ]]; then
   echo "Entitlements file not found: $entitlements" >&2
@@ -136,6 +150,10 @@ if [[ -n "$entitlements" && ! -f "$entitlements" ]]; then
 fi
 if [[ -n "$helper_entitlements" && ! -f "$helper_entitlements" ]]; then
   echo "Helper entitlements file not found: $helper_entitlements" >&2
+  exit 1
+fi
+if [[ -n "$cef_jit_entitlements" && ! -f "$cef_jit_entitlements" ]]; then
+  echo "CEF JIT entitlements file not found: $cef_jit_entitlements" >&2
   exit 1
 fi
 if [[ "$distribution" == "mac_app_store" && -z "$helper_entitlements" ]]; then
@@ -188,9 +206,31 @@ if [[ -d "$frameworks_dir" ]]; then
     fi
     helper_binary="$helper_app/Contents/MacOS/$helper_executable"
     if [[ -f "$helper_binary" ]]; then
+      helper_apps+=("$helper_app")
       helper_binaries+=("$helper_binary")
+      case "$helper_executable" in
+        *"Helper (GPU)")
+          cef_jit_helper_apps+=("$helper_app")
+          cef_jit_helper_binaries+=("$helper_binary")
+          ;;
+        *"Helper (Renderer)")
+          cef_jit_helper_apps+=("$helper_app")
+          cef_jit_helper_binaries+=("$helper_binary")
+          renderer_helper_binary="$helper_binary"
+          ;;
+      esac
     fi
   done < <(find "$frameworks_dir" -mindepth 1 -maxdepth 1 -type d -name '*.app' | sort)
+fi
+
+if [[ "$hardened_runtime" == "1" && -n "$renderer_helper_binary" ]]; then
+  renderer_entitlements="${helper_entitlements:-$cef_jit_entitlements}"
+  if ! /usr/libexec/PlistBuddy -c "Print :$jit_entitlement_key" "$renderer_entitlements" \
+    2>/dev/null | /usr/bin/grep -qx "true"
+  then
+    echo "Hardened CEF renderer signing requires $jit_entitlement_key=true in '$renderer_entitlements'." >&2
+    exit 1
+  fi
 fi
 
 codesign_file() {
@@ -220,6 +260,36 @@ is_entitlements_target() {
   return 1
 }
 
+is_helper_app() {
+  local path="$1"
+  local helper_app
+  for helper_app in "${helper_apps[@]}"; do
+    [[ "$path" == "$helper_app" ]] && return 0
+  done
+
+  return 1
+}
+
+is_cef_jit_helper_app() {
+  local path="$1"
+  local helper_app
+  for helper_app in "${cef_jit_helper_apps[@]}"; do
+    [[ "$path" == "$helper_app" ]] && return 0
+  done
+
+  return 1
+}
+
+is_cef_jit_helper_binary() {
+  local path="$1"
+  local helper_binary
+  for helper_binary in "${cef_jit_helper_binaries[@]}"; do
+    [[ "$path" == "$helper_binary" ]] && return 0
+  done
+
+  return 1
+}
+
 # Sign code files first so bundle signatures can be finalized without --deep.
 while IFS= read -r candidate; do
   is_entitlements_target "$candidate" && continue
@@ -231,6 +301,8 @@ done < <(find "$contents_dir" -type f \( -perm -u+x -o -name '*.dylib' -o -name 
 for helper_binary in "${helper_binaries[@]}"; do
   if [[ -n "$helper_entitlements" ]]; then
     codesign_file "$helper_binary" --entitlements "$helper_entitlements"
+  elif [[ -n "$cef_jit_entitlements" ]] && is_cef_jit_helper_binary "$helper_binary"; then
+    codesign_file "$helper_binary" --entitlements "$cef_jit_entitlements"
   else
     codesign_file "$helper_binary"
   fi
@@ -245,7 +317,13 @@ fi
 # Sign nested bundles from the deepest level up.
 while IFS= read -r bundle; do
   [[ "$bundle" == "$app_path" ]] && continue
-  codesign_file "$bundle"
+  if [[ -n "$helper_entitlements" ]] && is_helper_app "$bundle"; then
+    codesign_file "$bundle" --entitlements "$helper_entitlements"
+  elif [[ -n "$cef_jit_entitlements" ]] && is_cef_jit_helper_app "$bundle"; then
+    codesign_file "$bundle" --entitlements "$cef_jit_entitlements"
+  else
+    codesign_file "$bundle"
+  fi
 done < <(find "$contents_dir" -depth -type d \( -name '*.app' -o -name '*.appex' -o -name '*.framework' -o -name '*.xpc' \) | sort)
 
 codesign_file "$app_path"
@@ -278,4 +356,34 @@ if [[ -n "$helper_entitlements" ]]; then
       exit 1
     fi
   done
+fi
+
+if [[ -n "$cef_jit_entitlements" ]]; then
+  for helper_binary in "${helper_binaries[@]}"; do
+    has_jit_entitlement=0
+    if /usr/bin/codesign -d --entitlements :- "$helper_binary" 2>&1 \
+      | /usr/bin/grep -Fq "<key>$jit_entitlement_key</key>"
+    then
+      has_jit_entitlement=1
+    fi
+
+    if is_cef_jit_helper_binary "$helper_binary"; then
+      if [[ "$has_jit_entitlement" -ne 1 ]]; then
+        echo "Signed CEF helper is missing the required $jit_entitlement_key entitlement: '$helper_binary'." >&2
+        exit 1
+      fi
+    elif [[ "$has_jit_entitlement" -eq 1 ]]; then
+      echo "Unexpected $jit_entitlement_key entitlement on non-JIT CEF helper: '$helper_binary'." >&2
+      exit 1
+    fi
+  done
+fi
+
+if [[ "$hardened_runtime" == "1" && -n "$renderer_helper_binary" ]]; then
+  if ! /usr/bin/codesign -d --entitlements :- "$renderer_helper_binary" 2>&1 \
+    | /usr/bin/grep -Fq "<key>$jit_entitlement_key</key>"
+  then
+    echo "Signed CEF renderer is missing the required $jit_entitlement_key entitlement." >&2
+    exit 1
+  fi
 fi
