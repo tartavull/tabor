@@ -170,6 +170,10 @@ tabor agent inspect a
 - `tabor agent clipboard get`
 - `tabor agent clipboard set --text 'value'`
 
+Console, network, page, and log event capture starts when agent automation or an inspector uses
+the tab. Agent capture expires after 60 seconds of inactivity. Each tab retains at most 2,048
+events or 8 MiB, and event parameters larger than 256 KiB are replaced with truncation metadata.
+
 ### `act`
 
 `tabor agent act` accepts a JSON array of actions and executes them as a batch.

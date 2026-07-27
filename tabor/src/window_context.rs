@@ -1282,6 +1282,7 @@ fn select_favicon_base(page_url: &str, base_uri: &str, referrer: &str) -> String
 
 #[cfg(target_os = "macos")]
 fn ensure_agent_runtime(web_view: &mut WebView, state: &mut AgentRuntimeState) {
+    web_view.renew_agent_event_capture();
     if state.preload_registered {
         return;
     }
@@ -4716,6 +4717,7 @@ impl WindowContext {
                 return Err(IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"));
             };
 
+            web_view.retain_inspector_session();
             let last_event_id = web_view.latest_devtools_event_id();
             let session_id = self.cef_inspector.next_session_id(target_id);
             self.cef_inspector.sessions.insert(
@@ -4745,9 +4747,13 @@ impl WindowContext {
 
         #[cfg(target_os = "macos")]
         {
-            let existed = self.cef_inspector.sessions.remove(&session_id);
-            if existed.is_none() {
+            let Some(session) = self.cef_inspector.sessions.remove(&session_id) else {
                 return Err(IpcError::new(IpcErrorCode::NotFound, "Inspector session not found"));
+            };
+            if let Some(web_view) =
+                self.tabs.get_mut(session.tab_id).and_then(|tab| tab.web_view.as_mut())
+            {
+                web_view.release_inspector_session();
             }
             self.cef_inspector.remove_session(&session_id);
             Ok(())
@@ -5159,6 +5165,7 @@ impl WindowContext {
                 return;
             };
 
+            web_view.renew_agent_event_capture();
             let since = since.unwrap_or_default();
             let max = max.unwrap_or(200);
             let raw_limit = if kinds.is_some() { 2048 } else { max.max(1) };

@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc as StdRc;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use cef::{
@@ -48,7 +49,7 @@ use crate::display::SizeInfo;
 use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, WebCommand};
-use crate::ipc::{AgentDownload, WebNetworkEntry};
+use crate::ipc::AgentDownload;
 use crate::tabs::TabId;
 #[cfg(target_pointer_width = "32")]
 type CGFloat = f32;
@@ -91,19 +92,31 @@ unsafe impl Encode for CGRect {
 type DevToolsCallback = Box<dyn FnOnce(Result<JsonValue, String>)>;
 
 const MAX_DEVTOOLS_EVENTS: usize = 2048;
+const MAX_DEVTOOLS_EVENT_BYTES: usize = 256 * 1024;
+const MAX_DEVTOOLS_EVENTS_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_DEVTOOLS_CALLS: usize = 256;
+const DEVTOOLS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_EVENT_CAPTURE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct DevToolsEvent {
     id: u64,
     payload: String,
 }
 
+struct PendingDevToolsCall {
+    callback: DevToolsCallback,
+    started_at: Instant,
+}
+
 struct DevToolsState {
     next_message_id: i32,
-    pending: HashMap<i32, DevToolsCallback>,
-    entries: Vec<WebNetworkEntry>,
-    index: HashMap<String, usize>,
+    pending: HashMap<i32, PendingDevToolsCall>,
     events: VecDeque<DevToolsEvent>,
+    retained_event_bytes: usize,
     next_event_id: u64,
+    agent_event_capture_deadline: Option<Instant>,
+    inspector_sessions: usize,
+    agent_event_domains_enabled: bool,
 }
 
 struct AutomationState {
@@ -541,10 +554,12 @@ impl DevToolsState {
         Self {
             next_message_id: 1,
             pending: HashMap::new(),
-            entries: Vec::new(),
-            index: HashMap::new(),
             events: VecDeque::new(),
+            retained_event_bytes: 0,
             next_event_id: 1,
+            agent_event_capture_deadline: None,
+            inspector_sessions: 0,
+            agent_event_domains_enabled: false,
         }
     }
 
@@ -560,16 +575,43 @@ impl DevToolsState {
         if let Some(params) = params {
             object.insert("params".to_string(), params.clone());
         }
-        let payload = JsonValue::Object(object).to_string();
+        let mut payload = JsonValue::Object(object).to_string();
+        if payload.len() > MAX_DEVTOOLS_EVENT_BYTES {
+            payload = serde_json::json!({
+                "method": method,
+                "params": {
+                    "taborTruncated": true,
+                    "originalBytes": payload.len(),
+                },
+            })
+            .to_string();
+        }
+        self.push_event(payload);
+    }
+
+    fn record_truncated_event(&mut self, method: &str, original_bytes: usize) {
+        let payload = serde_json::json!({
+            "method": method,
+            "params": {
+                "taborTruncated": true,
+                "originalBytes": original_bytes,
+            },
+        })
+        .to_string();
         self.push_event(payload);
     }
 
     fn push_event(&mut self, payload: String) {
         let id = self.next_event_id;
         self.next_event_id = self.next_event_id.saturating_add(1);
+        self.retained_event_bytes = self.retained_event_bytes.saturating_add(payload.len());
         self.events.push_back(DevToolsEvent { id, payload });
-        while self.events.len() > MAX_DEVTOOLS_EVENTS {
-            self.events.pop_front();
+        while self.events.len() > MAX_DEVTOOLS_EVENTS
+            || self.retained_event_bytes > MAX_DEVTOOLS_EVENTS_BYTES
+        {
+            let event = self.events.pop_front().expect("DevTools event queue is not empty");
+            self.retained_event_bytes =
+                self.retained_event_bytes.saturating_sub(event.payload.len());
         }
     }
 
@@ -578,6 +620,10 @@ impl DevToolsState {
     }
 
     fn events_since(&self, last_id: u64, max: usize) -> (Vec<String>, u64) {
+        if max == 0 {
+            return (Vec::new(), last_id);
+        }
+
         let mut out = Vec::new();
         let mut newest = last_id;
         for event in &self.events {
@@ -609,135 +655,112 @@ impl DevToolsState {
         (out, newest)
     }
 
-    fn update_network_state(&mut self, method: &str, params: Option<&JsonValue>) {
-        match method {
-            "Network.requestWillBeSent" => {
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let url = params
-                    .and_then(|p| p.get("request"))
-                    .and_then(|r| r.get("url"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if url.is_empty() {
-                    return;
-                }
-                let method_name = params
-                    .and_then(|p| p.get("request"))
-                    .and_then(|r| r.get("method"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let resource_type = params
-                    .and_then(|p| p.get("type"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-
-                let request_id = request_id.unwrap_or_else(|| url.clone());
-                if self.index.contains_key(&request_id) {
-                    return;
-                }
-                let entry = WebNetworkEntry {
-                    request_id: request_id.clone(),
-                    url,
-                    method: method_name,
-                    status: None,
-                    resource_type,
-                    start_time: timestamp,
-                    end_time: None,
-                    error_text: None,
-                };
-                self.entries.push(entry);
-                self.index.insert(request_id, self.entries.len() - 1);
-            },
-            "Network.responseReceived" => {
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let Some(request_id) = request_id else {
-                    return;
-                };
-                let status = params
-                    .and_then(|p| p.get("response"))
-                    .and_then(|r| r.get("status"))
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v as u16);
-                let resource_type = params
-                    .and_then(|p| p.get("type"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-                let url = params
-                    .and_then(|p| p.get("response"))
-                    .and_then(|r| r.get("url"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-
-                let index = match self.index.get(&request_id) {
-                    Some(index) => *index,
-                    None => {
-                        let entry = WebNetworkEntry {
-                            request_id: request_id.clone(),
-                            url: url.unwrap_or_default(),
-                            method: None,
-                            status,
-                            resource_type,
-                            start_time: None,
-                            end_time: timestamp,
-                            error_text: None,
-                        };
-                        self.entries.push(entry);
-                        self.index.insert(request_id, self.entries.len() - 1);
-                        return;
-                    },
-                };
-
-                let entry = &mut self.entries[index];
-                entry.status = status.or(entry.status);
-                entry.resource_type = resource_type.or_else(|| entry.resource_type.clone());
-                entry.end_time = timestamp.or(entry.end_time);
-                if let Some(url) = url {
-                    entry.url = url;
-                }
-            },
-            "Network.loadingFinished" => {
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let Some(request_id) = request_id else {
-                    return;
-                };
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-                if let Some(index) = self.index.get(&request_id).copied() {
-                    self.entries[index].end_time = timestamp.or(self.entries[index].end_time);
-                }
-            },
-            "Network.loadingFailed" => {
-                let request_id = params
-                    .and_then(|p| p.get("requestId"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let Some(request_id) = request_id else {
-                    return;
-                };
-                let error_text = params
-                    .and_then(|p| p.get("errorText"))
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let timestamp = params.and_then(|p| p.get("timestamp")).and_then(|v| v.as_f64());
-                if let Some(index) = self.index.get(&request_id).copied() {
-                    self.entries[index].error_text = error_text;
-                    self.entries[index].end_time = timestamp.or(self.entries[index].end_time);
-                }
-            },
-            _ => {},
+    fn insert_pending(
+        &mut self,
+        callback: DevToolsCallback,
+        now: Instant,
+    ) -> Result<i32, DevToolsCallback> {
+        if self.pending.len() >= MAX_PENDING_DEVTOOLS_CALLS {
+            return Err(callback);
         }
+
+        let id = self.next_id();
+        self.pending.insert(id, PendingDevToolsCall { callback, started_at: now });
+        Ok(id)
     }
+
+    fn take_expired_callbacks(&mut self, now: Instant) -> Vec<DevToolsCallback> {
+        let expired_ids = self
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| {
+                (now.saturating_duration_since(pending.started_at) >= DEVTOOLS_CALL_TIMEOUT)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+
+        expired_ids
+            .into_iter()
+            .filter_map(|id| self.pending.remove(&id).map(|pending| pending.callback))
+            .collect()
+    }
+
+    fn renew_agent_event_capture(&mut self, now: Instant) -> bool {
+        self.agent_event_capture_deadline = Some(now + AGENT_EVENT_CAPTURE_IDLE_TIMEOUT);
+        if self.agent_event_domains_enabled {
+            return false;
+        }
+        self.agent_event_domains_enabled = true;
+        true
+    }
+
+    fn retain_inspector_session(&mut self) -> bool {
+        self.inspector_sessions += 1;
+        if self.agent_event_domains_enabled {
+            return false;
+        }
+        self.agent_event_domains_enabled = true;
+        true
+    }
+
+    fn release_inspector_session(&mut self, now: Instant) -> bool {
+        assert!(self.inspector_sessions > 0, "unbalanced DevTools inspector session release");
+        self.inspector_sessions -= 1;
+        self.expire_agent_event_capture(now)
+    }
+
+    fn should_record_events(&mut self, now: Instant) -> (bool, bool) {
+        let disable_domains = self.expire_agent_event_capture(now);
+        let agent_capture_active =
+            self.agent_event_capture_deadline.is_some_and(|deadline| now < deadline);
+        (agent_capture_active || self.inspector_sessions > 0, disable_domains)
+    }
+
+    fn expire_agent_event_capture(&mut self, now: Instant) -> bool {
+        if self.agent_event_capture_deadline.is_some_and(|deadline| now >= deadline) {
+            self.agent_event_capture_deadline = None;
+        }
+        if self.agent_event_capture_deadline.is_some()
+            || self.inspector_sessions > 0
+            || !self.agent_event_domains_enabled
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn mark_agent_event_domains_disabled(&mut self) {
+        self.agent_event_domains_enabled = false;
+    }
+}
+
+fn fail_expired_devtools_callbacks(state: &StdRc<RefCell<DevToolsState>>, now: Instant) {
+    let callbacks = state.borrow_mut().take_expired_callbacks(now);
+    for callback in callbacks {
+        callback(Err(String::from("DevTools method timed out")));
+    }
+}
+
+const AGENT_EVENT_DOMAINS: [&str; 4] = ["Network", "Page", "Runtime", "Log"];
+
+fn set_agent_event_domains(
+    browser: &cef::Browser,
+    state: &StdRc<RefCell<DevToolsState>>,
+    enabled: bool,
+) -> bool {
+    let Some(host) = browser.host() else {
+        return false;
+    };
+
+    let command = if enabled { "enable" } else { "disable" };
+    let mut all_dispatched = true;
+    for domain in AGENT_EVENT_DOMAINS {
+        let method = CefString::from(format!("{domain}.{command}").as_str());
+        let id = state.borrow_mut().next_id();
+        all_dispatched &= host.execute_dev_tools_method(id, Some(&method), None) != 0;
+    }
+    all_dispatched
 }
 
 cef::wrap_dev_tools_message_observer! {
@@ -753,10 +776,16 @@ cef::wrap_dev_tools_message_observer! {
             success: i32,
             result: Option<&[u8]>,
         ) {
-            let callback = {
+            let now = Instant::now();
+            let (callback, expired_callbacks) = {
                 let mut state = self.state.borrow_mut();
-                state.pending.remove(&message_id)
+                let expired_callbacks = state.take_expired_callbacks(now);
+                let callback = state.pending.remove(&message_id).map(|pending| pending.callback);
+                (callback, expired_callbacks)
             };
+            for callback in expired_callbacks {
+                callback(Err(String::from("DevTools method timed out")));
+            }
 
             let Some(callback) = callback else {
                 return;
@@ -775,10 +804,31 @@ cef::wrap_dev_tools_message_observer! {
 
         fn on_dev_tools_event(
             &self,
-            _browser: Option<&mut cef::Browser>,
+            browser: Option<&mut cef::Browser>,
             method: Option<&cef::CefString>,
             params: Option<&[u8]>,
         ) {
+            let now = Instant::now();
+            let (should_record, disable_domains, expired_callbacks) = {
+                let mut state = self.state.borrow_mut();
+                let expired_callbacks = state.take_expired_callbacks(now);
+                let (should_record, disable_domains) = state.should_record_events(now);
+                (should_record, disable_domains, expired_callbacks)
+            };
+            for callback in expired_callbacks {
+                callback(Err(String::from("DevTools method timed out")));
+            }
+            if disable_domains
+                && browser
+                    .as_deref()
+                    .is_some_and(|browser| set_agent_event_domains(browser, &self.state, false))
+            {
+                self.state.borrow_mut().mark_agent_event_domains_disabled();
+            }
+            if !should_record {
+                return;
+            }
+
             let Some(method) = method else {
                 return;
             };
@@ -786,10 +836,15 @@ cef::wrap_dev_tools_message_observer! {
             if method.is_empty() {
                 return;
             }
+            if let Some(params) = params {
+                if params.len() > MAX_DEVTOOLS_EVENT_BYTES {
+                    self.state.borrow_mut().record_truncated_event(&method, params.len());
+                    return;
+                }
+            }
             let params = params.and_then(|bytes| serde_json::from_slice::<JsonValue>(bytes).ok());
             let mut state = self.state.borrow_mut();
             state.record_event(&method, params.as_ref());
-            state.update_network_state(&method, params.as_ref());
         }
     }
 }
@@ -1898,8 +1953,6 @@ impl WebView {
             };
             web_view_constructed = true;
 
-            web_view.enable_devtools_domains();
-
             Ok(web_view)
         })();
 
@@ -2410,6 +2463,30 @@ impl WebView {
         state.latest_event_id()
     }
 
+    pub fn renew_agent_event_capture(&self) {
+        fail_expired_devtools_callbacks(&self.devtools_state, Instant::now());
+        let should_enable =
+            self.devtools_state.borrow_mut().renew_agent_event_capture(Instant::now());
+        if should_enable && !set_agent_event_domains(&self.browser, &self.devtools_state, true) {
+            self.devtools_state.borrow_mut().mark_agent_event_domains_disabled();
+        }
+    }
+
+    pub fn retain_inspector_session(&self) {
+        let should_enable = self.devtools_state.borrow_mut().retain_inspector_session();
+        if should_enable && !set_agent_event_domains(&self.browser, &self.devtools_state, true) {
+            self.devtools_state.borrow_mut().mark_agent_event_domains_disabled();
+        }
+    }
+
+    pub fn release_inspector_session(&self) {
+        let should_disable =
+            self.devtools_state.borrow_mut().release_inspector_session(Instant::now());
+        if should_disable && set_agent_event_domains(&self.browser, &self.devtools_state, false) {
+            self.devtools_state.borrow_mut().mark_agent_event_domains_disabled();
+        }
+    }
+
     pub fn set_file_input_files<F>(
         &self,
         element_id: &str,
@@ -2557,6 +2634,7 @@ impl WebView {
     }
 
     pub fn poll_title(&mut self) -> Option<String> {
+        self.maintain_devtools_state();
         let title = self.title_state.borrow().clone();
         let title = title?;
 
@@ -2610,25 +2688,13 @@ impl WebView {
         func(main, popup)
     }
 
-    fn enable_devtools_domains(&self) {
-        self.devtools_fire("DOM.enable", None);
-        self.devtools_fire("Network.enable", None);
-        self.devtools_fire("Page.enable", None);
-        self.devtools_fire("Runtime.enable", None);
-        self.devtools_fire("Log.enable", None);
-    }
-
-    fn devtools_fire(&self, method: &str, params: Option<cef::DictionaryValue>) {
-        let Some(host) = self.browser.host() else {
-            return;
-        };
-        let method = CefString::from(method);
-        let mut params = params;
-        let id = {
-            let mut state = self.devtools_state.borrow_mut();
-            state.next_id()
-        };
-        let _ = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
+    fn maintain_devtools_state(&self) {
+        let now = Instant::now();
+        fail_expired_devtools_callbacks(&self.devtools_state, now);
+        let should_disable = self.devtools_state.borrow_mut().expire_agent_event_capture(now);
+        if should_disable && set_agent_event_domains(&self.browser, &self.devtools_state, false) {
+            self.devtools_state.borrow_mut().mark_agent_event_domains_disabled();
+        }
     }
 
     fn devtools_execute<F>(&self, method: &str, params: Option<cef::DictionaryValue>, callback: F)
@@ -2642,18 +2708,21 @@ impl WebView {
 
         let method = CefString::from(method);
         let mut params = params;
-        let id = {
-            let mut state = self.devtools_state.borrow_mut();
-            let id = state.next_id();
-            state.pending.insert(id, Box::new(callback));
-            id
+        let now = Instant::now();
+        fail_expired_devtools_callbacks(&self.devtools_state, now);
+        let id = match self.devtools_state.borrow_mut().insert_pending(Box::new(callback), now) {
+            Ok(id) => id,
+            Err(callback) => {
+                callback(Err(String::from("Too many pending DevTools methods")));
+                return;
+            },
         };
 
         let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
         if ok == 0 {
             let callback = {
                 let mut state = self.devtools_state.borrow_mut();
-                state.pending.remove(&id)
+                state.pending.remove(&id).map(|pending| pending.callback)
             };
             if let Some(callback) = callback {
                 callback(Err(String::from("DevTools method dispatch failed")));
@@ -2676,11 +2745,11 @@ impl WebView {
 
         let method = CefString::from(method);
         let mut params = params;
-        let id = {
-            let mut state = self.devtools_state.borrow_mut();
-            let id = state.next_id();
-            state.pending.insert(id, Box::new(callback));
-            id
+        let now = Instant::now();
+        fail_expired_devtools_callbacks(&self.devtools_state, now);
+        let id = match self.devtools_state.borrow_mut().insert_pending(Box::new(callback), now) {
+            Ok(id) => id,
+            Err(_) => return Err(String::from("Too many pending DevTools methods")),
         };
 
         let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
@@ -2760,11 +2829,11 @@ where
 
     let method = CefString::from(method);
     let mut params = params;
-    let id = {
-        let mut state = state.borrow_mut();
-        let id = state.next_id();
-        state.pending.insert(id, Box::new(callback));
-        id
+    let now = Instant::now();
+    fail_expired_devtools_callbacks(state, now);
+    let id = match state.borrow_mut().insert_pending(Box::new(callback), now) {
+        Ok(id) => id,
+        Err(_) => return Err(String::from("Too many pending DevTools methods")),
     };
 
     let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
@@ -3192,9 +3261,11 @@ fn close_browser_resources(browser: &cef::Browser) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PaintState, WebFocusPolicy, WebViewDirtyNotifier, browser_device_scale_factor,
-        browser_screen_point, browser_settings, cef_mouse_button_flag, cef_mouse_event_flags,
-        handle_ime_composition_range_change, handle_text_selection_change,
+        AGENT_EVENT_CAPTURE_IDLE_TIMEOUT, DEVTOOLS_CALL_TIMEOUT, DevToolsState,
+        MAX_DEVTOOLS_EVENT_BYTES, MAX_DEVTOOLS_EVENTS, MAX_DEVTOOLS_EVENTS_BYTES,
+        MAX_PENDING_DEVTOOLS_CALLS, PaintState, WebFocusPolicy, WebViewDirtyNotifier,
+        browser_device_scale_factor, browser_screen_point, browser_settings, cef_mouse_button_flag,
+        cef_mouse_event_flags, handle_ime_composition_range_change, handle_text_selection_change,
         parse_web_editable_focus_message, scaled_browser_wheel_delta_y,
         should_invalidate_after_frame_edit, should_invalidate_after_key_input,
         should_run_frame_edit_inline,
@@ -3213,8 +3284,124 @@ mod tests {
     };
     use objc2_app_kit::NSEventModifierFlags;
     use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Instant;
     use winit::event::{ElementState, MouseButton};
     use winit::window::WindowId;
+
+    #[test]
+    fn devtools_event_stress_keeps_retention_bounded() {
+        let mut state = DevToolsState::new();
+
+        for request_id in 0..1_000_000 {
+            state.push_event(format!(
+                r#"{{"method":"Network.requestWillBeSent","params":{{"requestId":"{request_id}","request":{{"url":"chrome-extension://invalid/"}}}}}}"#
+            ));
+        }
+
+        assert_eq!(state.events.len(), MAX_DEVTOOLS_EVENTS);
+        assert!(state.retained_event_bytes <= MAX_DEVTOOLS_EVENTS_BYTES);
+        assert_eq!(state.latest_event_id(), 1_000_000);
+    }
+
+    #[test]
+    fn devtools_event_retention_is_bounded_by_bytes() {
+        let mut state = DevToolsState::new();
+        let payload = "x".repeat(64 * 1024);
+
+        for _ in 0..MAX_DEVTOOLS_EVENTS {
+            state.push_event(payload.clone());
+        }
+
+        assert!(state.events.len() < MAX_DEVTOOLS_EVENTS);
+        assert!(state.retained_event_bytes <= MAX_DEVTOOLS_EVENTS_BYTES);
+        assert_eq!(
+            state.retained_event_bytes,
+            state.events.iter().map(|event| event.payload.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn oversized_devtools_event_params_are_replaced_with_metadata() {
+        let mut state = DevToolsState::new();
+        let params = serde_json::json!({ "data": "x".repeat(MAX_DEVTOOLS_EVENT_BYTES) });
+
+        state.record_event("Runtime.consoleAPICalled", Some(&params));
+
+        let (events, _) = state.events_since(0, 1);
+        let event: serde_json::Value =
+            serde_json::from_str(&events[0]).expect("valid retained event");
+        assert_eq!(
+            event.pointer("/params/taborTruncated").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let original_bytes = event
+            .pointer("/params/originalBytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("truncated event records its original size");
+        assert!(original_bytes > MAX_DEVTOOLS_EVENT_BYTES as u64);
+    }
+
+    #[test]
+    fn pending_devtools_calls_are_capped_and_expire() {
+        let mut state = DevToolsState::new();
+        let now = Instant::now();
+
+        for _ in 0..MAX_PENDING_DEVTOOLS_CALLS {
+            assert!(state.insert_pending(Box::new(|_| {}), now).is_ok());
+        }
+        assert!(state.insert_pending(Box::new(|_| {}), now).is_err());
+
+        let timeout_result = Rc::new(RefCell::new(None));
+        let timeout_result_for_callback = Rc::clone(&timeout_result);
+        let started_at = now.checked_sub(DEVTOOLS_CALL_TIMEOUT).expect("valid test instant");
+        state.pending.clear();
+        assert!(
+            state
+                .insert_pending(
+                    Box::new(move |result| *timeout_result_for_callback.borrow_mut() = Some(result)),
+                    started_at,
+                )
+                .is_ok()
+        );
+
+        let callbacks = state.take_expired_callbacks(now);
+        assert_eq!(callbacks.len(), 1);
+        assert!(state.pending.is_empty());
+        for callback in callbacks {
+            callback(Err(String::from("DevTools method timed out")));
+        }
+        assert_eq!(
+            timeout_result
+                .borrow()
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(String::as_str),
+            Some("DevTools method timed out")
+        );
+    }
+
+    #[test]
+    fn agent_event_capture_expires_but_inspector_session_holds_it() {
+        let mut state = DevToolsState::new();
+        let now = Instant::now();
+
+        assert_eq!(state.should_record_events(now), (false, false));
+        assert!(state.renew_agent_event_capture(now));
+        assert_eq!(state.should_record_events(now), (true, false));
+        assert_eq!(
+            state.should_record_events(now + AGENT_EVENT_CAPTURE_IDLE_TIMEOUT),
+            (false, true)
+        );
+        state.mark_agent_event_domains_disabled();
+
+        assert!(state.retain_inspector_session());
+        assert_eq!(
+            state.should_record_events(now + AGENT_EVENT_CAPTURE_IDLE_TIMEOUT),
+            (true, false)
+        );
+        assert!(state.release_inspector_session(now + AGENT_EVENT_CAPTURE_IDLE_TIMEOUT));
+    }
 
     #[test]
     fn browser_settings_enable_javascript_clipboard_access() {

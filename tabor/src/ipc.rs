@@ -1215,18 +1215,6 @@ pub enum SocketReply {
     Error { error: IpcError },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct WebNetworkEntry {
-    pub request_id: String,
-    pub url: String,
-    pub method: Option<String>,
-    pub status: Option<u16>,
-    pub resource_type: Option<String>,
-    pub start_time: Option<f64>,
-    pub end_time: Option<f64>,
-    pub error_text: Option<String>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WebKeyState {

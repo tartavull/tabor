@@ -223,6 +223,18 @@ impl WebView {
         self.inner.latest_devtools_event_id()
     }
 
+    pub fn renew_agent_event_capture(&self) {
+        self.inner.renew_agent_event_capture();
+    }
+
+    pub fn retain_inspector_session(&self) {
+        self.inner.retain_inspector_session();
+    }
+
+    pub fn release_inspector_session(&self) {
+        self.inner.release_inspector_session();
+    }
+
     pub fn set_file_input_files<F>(
         &self,
         element_id: &str,

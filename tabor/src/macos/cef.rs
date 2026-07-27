@@ -154,17 +154,8 @@ cef::wrap_app! {
             let basic = cef::CefString::from("basic");
             command_line.append_switch_with_value(Some(&password_store), Some(&basic));
 
-            let disable_renderer_bg = cef::CefString::from("disable-renderer-backgrounding");
-            command_line.append_switch(Some(&disable_renderer_bg));
-
-            let disable_timer_throttle =
-                cef::CefString::from("disable-background-timer-throttling");
-            command_line.append_switch(Some(&disable_timer_throttle));
-
-            let disable_occluded =
-                cef::CefString::from("disable-backgrounding-occluded-windows");
-            command_line.append_switch(Some(&disable_occluded));
-
+            // Keep Chromium's normal background throttling enabled. Disabling it globally lets
+            // broken timers and request loops in hidden tabs run indefinitely at foreground speed.
             if fake_media_enabled() {
                 let fake_device = cef::CefString::from("use-fake-device-for-media-stream");
                 command_line.append_switch(Some(&fake_device));
