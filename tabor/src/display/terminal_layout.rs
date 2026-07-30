@@ -135,10 +135,8 @@ impl TerminalViewportLayout {
             let used_columns = strip_count * logical_columns;
             let leftover_columns = visual_columns.saturating_sub(used_columns);
             let gutter_slots = strip_count.saturating_sub(1);
-            let gutter_columns =
-                if gutter_slots == 0 { 0 } else { leftover_columns / gutter_slots };
-            let extra_gutter_columns =
-                if gutter_slots == 0 { 0 } else { leftover_columns % gutter_slots };
+            let gutter_columns = leftover_columns.checked_div(gutter_slots).unwrap_or(0);
+            let extra_gutter_columns = leftover_columns.checked_rem(gutter_slots).unwrap_or(0);
             let mut layout = Self {
                 mode,
                 order: config.order,
@@ -168,9 +166,8 @@ impl TerminalViewportLayout {
         let used_columns = strip_count * logical_columns;
         let leftover_columns = visual_columns.saturating_sub(used_columns);
         let gutter_slots = strip_count.saturating_sub(1);
-        let gutter_columns = if gutter_slots == 0 { 0 } else { leftover_columns / gutter_slots };
-        let extra_gutter_columns =
-            if gutter_slots == 0 { 0 } else { leftover_columns % gutter_slots };
+        let gutter_columns = leftover_columns.checked_div(gutter_slots).unwrap_or(0);
+        let extra_gutter_columns = leftover_columns.checked_rem(gutter_slots).unwrap_or(0);
         let mut layout = Self {
             mode,
             order: config.order,

@@ -40,7 +40,7 @@ fn is_remote_pdf_url(url: &str) -> bool {
     matches!(parsed.scheme(), "http" | "https")
         && parsed
             .path_segments()
-            .and_then(|segments| segments.last())
+            .and_then(|mut segments| segments.next_back())
             .and_then(|segment| segment.rsplit_once('.'))
             .is_some_and(|(_, ext)| {
                 REMOTE_PDF_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
