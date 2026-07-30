@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,7 @@ use crate::macos;
 
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const CONTROLLER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const INTERNAL_SERVE_ARG: &str = "__tabor_agent_serve";
 
 fn ipc_terminal_read_scope(scope: TerminalReadScopeArg) -> IpcTerminalReadScope {
@@ -89,6 +91,11 @@ enum ControllerReply {
     Closed,
     Pong,
     Error { error: String },
+}
+
+enum ClientOutcome {
+    Continue,
+    Close,
 }
 
 pub fn run(options: AgentOptions) -> Result<(), Box<dyn Error>> {
@@ -195,40 +202,55 @@ pub fn maybe_run_internal_from_argv() -> Result<bool, Box<dyn Error>> {
 fn ensure_attached(socket: Option<PathBuf>) -> Result<ControllerReply, Box<dyn Error>> {
     let tabor_socket = resolve_socket_path(socket)?;
     let state = controller_state_for(&tabor_socket);
+    let startup_lock = open_startup_lock(&state.state_file)?;
+    lock_startup(&startup_lock)?;
 
     if state.control_socket.exists() {
-        if matches!(ping_controller(&state), Ok(ControllerReply::Pong)) {
-            return Ok(ControllerReply::Attached {
-                tabor_socket: state.tabor_socket,
-                control_socket: state.control_socket,
-            });
+        match ping_controller(&state) {
+            Ok(Some(ControllerReply::Pong)) => {
+                persist_controller_state(&state)?;
+                return Ok(ControllerReply::Attached {
+                    tabor_socket: state.tabor_socket,
+                    control_socket: state.control_socket,
+                });
+            },
+            Ok(Some(_)) => return Err("unexpected controller ping reply".into()),
+            Ok(None) => remove_file_if_exists(&state.control_socket)?,
+            Err(err) => {
+                return Err(format!("tabor agent controller did not respond: {err}").into());
+            },
         }
-        let _ = fs::remove_file(&state.control_socket);
     }
 
-    let _ = fs::remove_file(&state.state_file);
+    remove_file_if_exists(&state.state_file)?;
 
     let current_exe = std::env::current_exe()?;
-    Command::new(current_exe)
-        .arg(INTERNAL_SERVE_ARG)
-        .arg("--socket")
-        .arg(&state.tabor_socket)
-        .arg("--control-socket")
-        .arg(&state.control_socket)
-        .arg("--state-file")
-        .arg(&state.state_file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let args = [
+        OsString::from(INTERNAL_SERVE_ARG),
+        OsString::from("--socket"),
+        state.tabor_socket.clone().into_os_string(),
+        OsString::from("--control-socket"),
+        state.control_socket.clone().into_os_string(),
+        OsString::from("--state-file"),
+        state.state_file.clone().into_os_string(),
+    ];
+    crate::daemon::spawn_daemon_from_dir(current_exe, args, None)?;
 
     let deadline = Instant::now() + CONTROLLER_START_TIMEOUT;
     while Instant::now() < deadline {
-        if matches!(ping_controller(&state), Ok(ControllerReply::Pong)) {
-            return Ok(ControllerReply::Attached {
-                tabor_socket: state.tabor_socket,
-                control_socket: state.control_socket,
-            });
+        match ping_controller(&state) {
+            Ok(Some(ControllerReply::Pong)) => {
+                persist_controller_state(&state)?;
+                return Ok(ControllerReply::Attached {
+                    tabor_socket: state.tabor_socket,
+                    control_socket: state.control_socket,
+                });
+            },
+            Ok(Some(_)) => return Err("unexpected controller ping reply".into()),
+            Ok(None) => {},
+            Err(err) => {
+                return Err(format!("new tabor agent controller did not respond: {err}").into());
+            },
         }
         std::thread::sleep(CONTROLLER_POLL_INTERVAL);
     }
@@ -256,15 +278,37 @@ fn send_request(
     }
 }
 
-fn ping_controller(state: &ControllerState) -> Result<ControllerReply, Box<dyn Error>> {
-    send_controller_request(state, ControllerRequest::Ping)
+fn ping_controller(state: &ControllerState) -> Result<Option<ControllerReply>, Box<dyn Error>> {
+    let stream = match UnixStream::connect(&state.control_socket) {
+        Ok(stream) => stream,
+        Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            return Ok(None);
+        },
+        Err(err) => return Err(err.into()),
+    };
+    send_controller_request_on_stream(
+        stream,
+        ControllerRequest::Ping,
+        Some(CONTROLLER_REQUEST_TIMEOUT),
+    )
+    .map(Some)
 }
 
 fn send_controller_request(
     state: &ControllerState,
     request: ControllerRequest,
 ) -> Result<ControllerReply, Box<dyn Error>> {
-    let mut stream = UnixStream::connect(&state.control_socket)?;
+    let stream = UnixStream::connect(&state.control_socket)?;
+    send_controller_request_on_stream(stream, request, None)
+}
+
+fn send_controller_request_on_stream(
+    mut stream: UnixStream,
+    request: ControllerRequest,
+    timeout: Option<Duration>,
+) -> Result<ControllerReply, Box<dyn Error>> {
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
     let json = serde_json::to_string(&request)?;
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -280,42 +324,136 @@ fn send_controller_request(
 }
 
 fn serve(options: InternalServeOptions) -> Result<(), Box<dyn Error>> {
-    if options.control_socket.exists() {
-        let _ = fs::remove_file(&options.control_socket);
-    }
-
     let listener = UnixListener::bind(&options.control_socket)?;
+    let socket_identity = socket_identity(&options.control_socket)?;
+    let result = serve_loop(&options, listener);
+
+    let cleanup_result = cleanup_controller_files(&options, socket_identity);
+
+    result.and(cleanup_result)
+}
+
+fn serve_loop(
+    options: &InternalServeOptions,
+    listener: UnixListener,
+) -> Result<(), Box<dyn Error>> {
     let mut tabor = IpcConnection::connect(Some(options.socket.clone()))?;
     let state = ControllerState {
         tabor_socket: options.socket.clone(),
         control_socket: options.control_socket.clone(),
         state_file: options.state_file.clone(),
     };
-    fs::write(&options.state_file, serde_json::to_string(&state)?)?;
+    persist_controller_state(&state)?;
 
     let mut selected_tab_id = None;
-    let mut should_exit = false;
-
-    while !should_exit {
-        let (mut stream, _) = listener.accept()?;
-        let request = read_request(&stream)?;
-        let reply = match handle_request(&options.socket, &mut tabor, &mut selected_tab_id, request)
-        {
-            Ok(reply) => {
-                if matches!(reply, ControllerReply::Closed) {
-                    should_exit = true;
-                }
-                reply
-            },
-            Err(err) => ControllerReply::Error { error: err.to_string() },
-        };
-        write_reply(&mut stream, &reply)?;
+    loop {
+        let (stream, _) = listener.accept()?;
+        if matches!(
+            serve_client(&options.socket, &mut tabor, &mut selected_tab_id, stream)?,
+            ClientOutcome::Close
+        ) {
+            break;
+        }
     }
 
-    let _ = fs::remove_file(&options.control_socket);
-    let _ = fs::remove_file(&options.state_file);
-
     Ok(())
+}
+
+fn serve_client(
+    tabor_socket: &Path,
+    tabor: &mut IpcConnection,
+    selected_tab_id: &mut Option<IpcTabId>,
+    mut stream: UnixStream,
+) -> Result<ClientOutcome, serde_json::Error> {
+    if stream.set_read_timeout(Some(CONTROLLER_REQUEST_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(CONTROLLER_REQUEST_TIMEOUT)).is_err()
+    {
+        return Ok(ClientOutcome::Continue);
+    }
+
+    let request = match read_request(&stream) {
+        Ok(request) => request,
+        Err(err) => {
+            let reply = serde_json::to_string(&ControllerReply::Error { error: err.to_string() })?;
+            let _ = write_reply(&mut stream, &reply);
+            return Ok(ClientOutcome::Continue);
+        },
+    };
+    let reply = match handle_request(tabor_socket, tabor, selected_tab_id, request) {
+        Ok(reply) => reply,
+        Err(err) => ControllerReply::Error { error: err.to_string() },
+    };
+    let should_exit = matches!(reply, ControllerReply::Closed);
+    let reply = serde_json::to_string(&reply)?;
+    let _ = write_reply(&mut stream, &reply);
+    Ok(if should_exit { ClientOutcome::Close } else { ClientOutcome::Continue })
+}
+
+fn persist_controller_state(state: &ControllerState) -> Result<(), Box<dyn Error>> {
+    let contents = serde_json::to_vec(state)?;
+    match fs::read(&state.state_file) {
+        Ok(existing) if existing == contents => return Ok(()),
+        Ok(_) => {},
+        Err(err) if err.kind() == ErrorKind::NotFound => {},
+        Err(err) => return Err(err.into()),
+    }
+
+    let temp_file = state.state_file.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp_file, contents)?;
+    fs::rename(temp_file, &state.state_file)?;
+    Ok(())
+}
+
+fn socket_identity(path: &Path) -> Result<(u64, u64), IoError> {
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn cleanup_controller_files(
+    options: &InternalServeOptions,
+    identity: (u64, u64),
+) -> Result<(), Box<dyn Error>> {
+    let startup_lock = open_startup_lock(&options.state_file)?;
+    lock_startup(&startup_lock)?;
+    if !matches!(
+        socket_identity(&options.control_socket),
+        Ok(current_identity) if current_identity == identity
+    ) {
+        return Ok(());
+    }
+    remove_file_if_exists(&options.control_socket)?;
+    remove_file_if_exists(&options.state_file)?;
+    Ok(())
+}
+
+fn open_startup_lock(state_file: &Path) -> Result<File, IoError> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_file.with_extension("lock"))
+}
+
+fn lock_startup(lock_file: &File) -> Result<(), IoError> {
+    loop {
+        if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+
+        let err = IoError::last_os_error();
+        if err.kind() != ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), IoError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn handle_request(
@@ -849,12 +987,10 @@ fn read_request(stream: &UnixStream) -> Result<ControllerRequest, Box<dyn Error>
     Ok(serde_json::from_str(&line)?)
 }
 
-fn write_reply(stream: &mut UnixStream, reply: &ControllerReply) -> Result<(), Box<dyn Error>> {
-    let json = serde_json::to_string(reply)?;
-    stream.write_all(json.as_bytes())?;
+fn write_reply(stream: &mut UnixStream, reply: &str) -> Result<(), IoError> {
+    stream.write_all(reply.as_bytes())?;
     stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
+    stream.flush()
 }
 
 fn load_state(socket: Option<PathBuf>) -> Result<ControllerState, IoError> {
