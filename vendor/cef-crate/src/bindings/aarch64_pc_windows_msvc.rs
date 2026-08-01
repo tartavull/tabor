@@ -541,6 +541,7 @@ pub struct Settings {
     pub chrome_policy_id: CefString,
     pub chrome_app_icon_id: ::std::os::raw::c_int,
     pub disable_signal_handlers: ::std::os::raw::c_int,
+    pub use_views_default_popup: ::std::os::raw::c_int,
 }
 impl Settings {
     fn get_raw(&self) -> _cef_settings_t {
@@ -580,6 +581,7 @@ impl From<_cef_settings_t> for Settings {
             chrome_policy_id: value.chrome_policy_id.into(),
             chrome_app_icon_id: value.chrome_app_icon_id,
             disable_signal_handlers: value.disable_signal_handlers,
+            use_views_default_popup: value.use_views_default_popup,
         }
     }
 }
@@ -616,6 +618,7 @@ impl From<Settings> for _cef_settings_t {
             chrome_policy_id: value.chrome_policy_id.into(),
             chrome_app_icon_id: value.chrome_app_icon_id,
             disable_signal_handlers: value.disable_signal_handlers,
+            use_views_default_popup: value.use_views_default_popup,
         }
     }
 }
@@ -707,6 +710,7 @@ pub struct BrowserSettings {
     pub background_color: u32,
     pub chrome_status_bubble: State,
     pub chrome_zoom_bubble: State,
+    pub ax_viewport_collapse: State,
 }
 impl BrowserSettings {
     fn get_raw(&self) -> _cef_browser_settings_t {
@@ -744,6 +748,7 @@ impl From<_cef_browser_settings_t> for BrowserSettings {
             background_color: value.background_color,
             chrome_status_bubble: value.chrome_status_bubble.into(),
             chrome_zoom_bubble: value.chrome_zoom_bubble.into(),
+            ax_viewport_collapse: value.ax_viewport_collapse.into(),
         }
     }
 }
@@ -778,6 +783,7 @@ impl From<BrowserSettings> for _cef_browser_settings_t {
             background_color: value.background_color,
             chrome_status_bubble: value.chrome_status_bubble.into(),
             chrome_zoom_bubble: value.chrome_zoom_bubble.into(),
+            ax_viewport_collapse: value.ax_viewport_collapse.into(),
         }
     }
 }
@@ -12755,6 +12761,8 @@ pub trait ImplBrowserHost: Clone + Sized + Rc {
     fn is_render_process_unresponsive(&self) -> ::std::os::raw::c_int;
     #[doc = "See [`_cef_browser_host_t::get_runtime_style`] for more documentation."]
     fn runtime_style(&self) -> RuntimeStyle;
+    #[doc = "See [`_cef_browser_host_t::set_ax_viewport_collapse`] for more documentation."]
+    fn set_ax_viewport_collapse(&self, enabled: ::std::os::raw::c_int);
     fn get_raw(&self) -> *mut _cef_browser_host_t;
 }
 impl ImplBrowserHost for BrowserHost {
@@ -13813,6 +13821,15 @@ impl ImplBrowserHost for BrowserHost {
                     result.wrap_result()
                 })
                 .unwrap_or_default()
+        }
+    }
+    fn set_ax_viewport_collapse(&self, enabled: ::std::os::raw::c_int) {
+        unsafe {
+            if let Some(f) = self.0.set_ax_viewport_collapse {
+                let arg_enabled = enabled;
+                let arg_self_ = self.into_raw();
+                f(arg_self_, arg_enabled);
+            }
         }
     }
     fn get_raw(&self) -> *mut _cef_browser_host_t {
@@ -31142,6 +31159,92 @@ impl From<V8ArrayBufferReleaseCallback> for *mut _cef_v8_array_buffer_release_ca
     }
 }
 
+/// See [`_cef_v8_backing_store_t`] for more documentation.
+#[derive(Clone)]
+pub struct V8BackingStore(RefGuard<_cef_v8_backing_store_t>);
+pub trait ImplV8BackingStore: Clone + Sized + Rc {
+    #[doc = "See [`_cef_v8_backing_store_t::data`] for more documentation."]
+    fn data(&self) -> *mut ::std::os::raw::c_void;
+    #[doc = "See [`_cef_v8_backing_store_t::byte_length`] for more documentation."]
+    fn byte_length(&self) -> usize;
+    #[doc = "See [`_cef_v8_backing_store_t::is_valid`] for more documentation."]
+    fn is_valid(&self) -> ::std::os::raw::c_int;
+    fn get_raw(&self) -> *mut _cef_v8_backing_store_t;
+}
+impl ImplV8BackingStore for V8BackingStore {
+    fn data(&self) -> *mut ::std::os::raw::c_void {
+        unsafe {
+            self.0
+                .data
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_else(|| std::mem::zeroed())
+        }
+    }
+    fn byte_length(&self) -> usize {
+        unsafe {
+            self.0
+                .byte_length
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn is_valid(&self) -> ::std::os::raw::c_int {
+        unsafe {
+            self.0
+                .is_valid
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn get_raw(&self) -> *mut _cef_v8_backing_store_t {
+        unsafe { RefGuard::into_raw(&self.0) }
+    }
+}
+impl Rc for _cef_v8_backing_store_t {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.base.as_base()
+    }
+}
+impl Rc for V8BackingStore {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.0.as_base()
+    }
+}
+impl ConvertParam<*mut _cef_v8_backing_store_t> for &V8BackingStore {
+    fn into_raw(self) -> *mut _cef_v8_backing_store_t {
+        ImplV8BackingStore::get_raw(self)
+    }
+}
+impl ConvertParam<*mut _cef_v8_backing_store_t> for &mut V8BackingStore {
+    fn into_raw(self) -> *mut _cef_v8_backing_store_t {
+        ImplV8BackingStore::get_raw(self)
+    }
+}
+impl ConvertReturnValue<V8BackingStore> for *mut _cef_v8_backing_store_t {
+    fn wrap_result(self) -> V8BackingStore {
+        V8BackingStore(unsafe { RefGuard::from_raw(self) })
+    }
+}
+impl From<V8BackingStore> for *mut _cef_v8_backing_store_t {
+    fn from(value: V8BackingStore) -> Self {
+        let object = ImplV8BackingStore::get_raw(&value);
+        std::mem::forget(value);
+        object
+    }
+}
+
 /// See [`_cef_v8_value_t`] for more documentation.
 #[derive(Clone)]
 pub struct V8Value(RefGuard<_cef_v8_value_t>);
@@ -33759,6 +33862,377 @@ impl ConvertReturnValue<App> for *mut _cef_app_t {
 impl From<App> for *mut _cef_app_t {
     fn from(value: App) -> Self {
         let object = ImplApp::get_raw(&value);
+        std::mem::forget(value);
+        object
+    }
+}
+
+/// See [`_cef_component_update_callback_t`] for more documentation.
+#[derive(Clone)]
+pub struct ComponentUpdateCallback(RefGuard<_cef_component_update_callback_t>);
+impl ComponentUpdateCallback {
+    pub fn new<T>(interface: T) -> Self
+    where
+        T: WrapComponentUpdateCallback,
+    {
+        unsafe {
+            let mut cef_object = std::mem::zeroed();
+            <T as ImplComponentUpdateCallback>::init_methods(&mut cef_object);
+            let object = RcImpl::new(cef_object, interface);
+            <T as WrapComponentUpdateCallback>::wrap_rc(&mut (*object).interface, object);
+            let object: *mut _cef_component_update_callback_t = object.cast();
+            object.wrap_result()
+        }
+    }
+}
+pub trait WrapComponentUpdateCallback: ImplComponentUpdateCallback {
+    fn wrap_rc(&mut self, object: *mut RcImpl<_cef_component_update_callback_t, Self>);
+}
+pub trait ImplComponentUpdateCallback: Clone + Sized + Rc {
+    #[doc = "See [`_cef_component_update_callback_t::on_complete`] for more documentation."]
+    fn on_complete(&self, component_id: Option<&CefString>, error: ComponentUpdateError) {}
+    fn init_methods(object: &mut _cef_component_update_callback_t) {
+        impl_cef_component_update_callback_t::init_methods::<Self, _cef_component_update_callback_t>(
+            object,
+        );
+    }
+    fn get_raw(&self) -> *mut _cef_component_update_callback_t;
+}
+#[doc = "Implement the [`WrapComponentUpdateCallback`] trait for the specified struct. You can declare more\nmembers for your struct, and in the `impl ComponentUpdateCallback` block you can override default\nmethods implemented by the [`ImplComponentUpdateCallback`] trait.\n\n# Example\n```rust\n# use cef::{*, rc::*};\n\nwrap_component_update_callback! {\n    struct MyComponentUpdateCallback {\n        payload: String,\n    }\n\n    impl ComponentUpdateCallback {\n        // ...\n    }\n}\n\nfn make_my_struct() -> ComponentUpdateCallback {\n    MyComponentUpdateCallback::new(\"payload\".to_string())\n}\n```"]
+#[macro_export]
+macro_rules ! wrap_component_update_callback { ($ vis : vis struct $ name : ident ; impl ComponentUpdateCallback { $ ($ (# [$ attrs_name : meta]) * fn $ method_name : ident (& $ self : ident $ (, $ arg_name : ident : $ arg_type : ty) * $ (,) ?) $ (-> $ return_type : ty) ? { $ ($ body : tt) * }) * }) => { wrap_component_update_callback ! { $ vis struct $ name { } impl ComponentUpdateCallback { $ ($ (# [$ attrs_name]) * fn $ method_name (& $ self $ (, $ arg_name : $ arg_type) *) $ (-> $ return_type) ? { $ ($ body) * }) * } } } ; ($ vis : vis struct $ name : ident $ (< $ ($ generic_type : ident : $ first_generic_type_bound : tt $ (+ $ generic_type_bound : tt) *) , + $ (,) ? >) ? { $ ($ field_vis : vis $ field_name : ident : $ field_type : ty) , * $ (,) ? } impl ComponentUpdateCallback { $ ($ (# [$ attrs_name : meta]) * fn $ method_name : ident (& $ self : ident $ (, $ arg_name : ident : $ arg_type : ty) * $ (,) ?) $ (-> $ return_type : ty) ? { $ ($ body : tt) * }) * }) => { $ vis struct $ name $ (< $ ($ generic_type ,) + >) ? $ (where $ ($ generic_type : $ first_generic_type_bound $ (+ $ generic_type_bound) * ,) +) ? { $ ($ field_vis $ field_name : $ field_type ,) * cef_object : * mut $ crate :: rc :: RcImpl < $ crate :: sys :: _cef_component_update_callback_t , Self > } impl $ (< $ ($ generic_type ,) + >) ? $ name $ (< $ ($ generic_type ,) + >) ? $ (where $ ($ generic_type : $ first_generic_type_bound $ (+ $ generic_type_bound) * ,) +) ? { # [allow (clippy :: new_ret_no_self)] pub fn new ($ ($ field_name : $ field_type) , *) -> ComponentUpdateCallback { ComponentUpdateCallback :: new (Self { $ ($ field_name ,) * cef_object : std :: ptr :: null_mut () , }) } } impl $ (< $ ($ generic_type ,) + >) ? WrapComponentUpdateCallback for $ name $ (< $ ($ generic_type ,) + >) ? $ (where $ ($ generic_type : $ first_generic_type_bound $ (+ $ generic_type_bound) * ,) +) ? { fn wrap_rc (& mut self , cef_object : * mut $ crate :: rc :: RcImpl < $ crate :: sys :: _cef_component_update_callback_t , Self >) { self . cef_object = cef_object ; } } impl $ (< $ ($ generic_type ,) + >) ? Clone for $ name $ (< $ ($ generic_type ,) + >) ? $ (where $ ($ generic_type : $ first_generic_type_bound $ (+ $ generic_type_bound) * ,) +) ? { fn clone (& self) -> Self { unsafe { let rc_impl = & mut * self . cef_object ; rc_impl . interface . add_ref () ; } Self { $ ($ field_name : self . $ field_name . clone () ,) * cef_object : self . cef_object , } } } impl $ (< $ ($ generic_type ,) + >) ? $ crate :: rc :: Rc for $ name $ (< $ ($ generic_type ,) + >) ? $ (where $ ($ generic_type : $ first_generic_type_bound $ (+ $ generic_type_bound) * ,) +) ? { fn as_base (& self) -> & $ crate :: sys :: cef_base_ref_counted_t { unsafe { let base = & * self . cef_object ; std :: mem :: transmute (& base . cef_object) } } } impl $ (< $ ($ generic_type ,) + >) ? ImplComponentUpdateCallback for $ name $ (< $ ($ generic_type ,) + >) ? $ (where $ ($ generic_type : $ first_generic_type_bound $ (+ $ generic_type_bound) * ,) +) ? { $ ($ (# [$ attrs_name]) * fn $ method_name (& $ self $ (, $ arg_name : $ arg_type) *) $ (-> $ return_type) ? { $ ($ body) * }) * fn get_raw (& self) -> * mut $ crate :: sys :: _cef_component_update_callback_t { self . cef_object . cast () } } } ; }
+mod impl_cef_component_update_callback_t {
+    use super::*;
+    pub fn init_methods<I: ImplComponentUpdateCallback, R: Rc>(
+        object: &mut _cef_component_update_callback_t,
+    ) {
+        object.on_complete = Some(on_complete::<I, R>);
+    }
+    extern "C" fn on_complete<I: ImplComponentUpdateCallback, R: Rc>(
+        self_: *mut _cef_component_update_callback_t,
+        component_id: *const cef_string_t,
+        error: cef_component_update_error_t,
+    ) {
+        let (arg_self_, arg_component_id, arg_error) = (self_, component_id, error);
+        let arg_self_: &RcImpl<R, I> = RcImpl::get(arg_self_.cast());
+        let arg_component_id = if arg_component_id.is_null() {
+            None
+        } else {
+            Some(arg_component_id.into())
+        };
+        let arg_component_id = arg_component_id.as_ref();
+        let arg_error = arg_error.into_raw();
+        ImplComponentUpdateCallback::on_complete(&arg_self_.interface, arg_component_id, arg_error)
+    }
+}
+impl ImplComponentUpdateCallback for ComponentUpdateCallback {
+    fn on_complete(&self, component_id: Option<&CefString>, error: ComponentUpdateError) {
+        unsafe {
+            if let Some(f) = self.0.on_complete {
+                let (arg_component_id, arg_error) = (component_id, error);
+                let arg_self_ = self.into_raw();
+                let arg_component_id = arg_component_id
+                    .map(|arg| arg.into_raw())
+                    .unwrap_or(std::ptr::null());
+                let arg_error = arg_error.into_raw();
+                f(arg_self_, arg_component_id, arg_error);
+            }
+        }
+    }
+    fn get_raw(&self) -> *mut _cef_component_update_callback_t {
+        unsafe { RefGuard::into_raw(&self.0) }
+    }
+}
+impl Rc for _cef_component_update_callback_t {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.base.as_base()
+    }
+}
+impl Rc for ComponentUpdateCallback {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.0.as_base()
+    }
+}
+impl ConvertParam<*mut _cef_component_update_callback_t> for &ComponentUpdateCallback {
+    fn into_raw(self) -> *mut _cef_component_update_callback_t {
+        ImplComponentUpdateCallback::get_raw(self)
+    }
+}
+impl ConvertParam<*mut _cef_component_update_callback_t> for &mut ComponentUpdateCallback {
+    fn into_raw(self) -> *mut _cef_component_update_callback_t {
+        ImplComponentUpdateCallback::get_raw(self)
+    }
+}
+impl ConvertReturnValue<ComponentUpdateCallback> for *mut _cef_component_update_callback_t {
+    fn wrap_result(self) -> ComponentUpdateCallback {
+        ComponentUpdateCallback(unsafe { RefGuard::from_raw(self) })
+    }
+}
+impl From<ComponentUpdateCallback> for *mut _cef_component_update_callback_t {
+    fn from(value: ComponentUpdateCallback) -> Self {
+        let object = ImplComponentUpdateCallback::get_raw(&value);
+        std::mem::forget(value);
+        object
+    }
+}
+
+/// See [`_cef_component_t`] for more documentation.
+#[derive(Clone)]
+pub struct Component(RefGuard<_cef_component_t>);
+pub trait ImplComponent: Clone + Sized + Rc {
+    #[doc = "See [`_cef_component_t::get_id`] for more documentation."]
+    fn id(&self) -> CefStringUserfree;
+    #[doc = "See [`_cef_component_t::get_name`] for more documentation."]
+    fn name(&self) -> CefStringUserfree;
+    #[doc = "See [`_cef_component_t::get_version`] for more documentation."]
+    fn version(&self) -> CefStringUserfree;
+    #[doc = "See [`_cef_component_t::get_state`] for more documentation."]
+    fn state(&self) -> ComponentState;
+    fn get_raw(&self) -> *mut _cef_component_t;
+}
+impl ImplComponent for Component {
+    fn id(&self) -> CefStringUserfree {
+        unsafe {
+            self.0
+                .get_id
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn name(&self) -> CefStringUserfree {
+        unsafe {
+            self.0
+                .get_name
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn version(&self) -> CefStringUserfree {
+        unsafe {
+            self.0
+                .get_version
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn state(&self) -> ComponentState {
+        unsafe {
+            self.0
+                .get_state
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn get_raw(&self) -> *mut _cef_component_t {
+        unsafe { RefGuard::into_raw(&self.0) }
+    }
+}
+impl Rc for _cef_component_t {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.base.as_base()
+    }
+}
+impl Rc for Component {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.0.as_base()
+    }
+}
+impl ConvertParam<*mut _cef_component_t> for &Component {
+    fn into_raw(self) -> *mut _cef_component_t {
+        ImplComponent::get_raw(self)
+    }
+}
+impl ConvertParam<*mut _cef_component_t> for &mut Component {
+    fn into_raw(self) -> *mut _cef_component_t {
+        ImplComponent::get_raw(self)
+    }
+}
+impl ConvertReturnValue<Component> for *mut _cef_component_t {
+    fn wrap_result(self) -> Component {
+        Component(unsafe { RefGuard::from_raw(self) })
+    }
+}
+impl From<Component> for *mut _cef_component_t {
+    fn from(value: Component) -> Self {
+        let object = ImplComponent::get_raw(&value);
+        std::mem::forget(value);
+        object
+    }
+}
+
+/// See [`_cef_component_updater_t`] for more documentation.
+#[derive(Clone)]
+pub struct ComponentUpdater(RefGuard<_cef_component_updater_t>);
+pub trait ImplComponentUpdater: Clone + Sized + Rc {
+    #[doc = "See [`_cef_component_updater_t::get_component_count`] for more documentation."]
+    fn component_count(&self) -> usize;
+    #[doc = "See [`_cef_component_updater_t::get_components`] for more documentation."]
+    fn components(&self, components: Option<&mut Vec<Option<Component>>>);
+    #[doc = "See [`_cef_component_updater_t::get_component_by_id`] for more documentation."]
+    fn component_by_id(&self, component_id: Option<&CefString>) -> Option<Component>;
+    #[doc = "See [`_cef_component_updater_t::update`] for more documentation."]
+    fn update(
+        &self,
+        component_id: Option<&CefString>,
+        priority: ComponentUpdatePriority,
+        callback: Option<&mut ComponentUpdateCallback>,
+    );
+    fn get_raw(&self) -> *mut _cef_component_updater_t;
+}
+impl ImplComponentUpdater for ComponentUpdater {
+    fn component_count(&self) -> usize {
+        unsafe {
+            self.0
+                .get_component_count
+                .map(|f| {
+                    let arg_self_ = self.into_raw();
+                    let result = f(arg_self_);
+                    result.wrap_result()
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn components(&self, components: Option<&mut Vec<Option<Component>>>) {
+        unsafe {
+            if let Some(f) = self.0.get_components {
+                let arg_components = components;
+                let arg_self_ = self.into_raw();
+                let mut out_components_count = arg_components
+                    .as_ref()
+                    .map(|arg| arg.len())
+                    .unwrap_or_default();
+                let arg_components_count = &mut out_components_count;
+                let out_components = arg_components;
+                let mut vec_components = out_components
+                    .as_ref()
+                    .map(|arg| {
+                        arg.iter()
+                            .map(|elem| {
+                                elem.as_ref()
+                                    .map(|elem| {
+                                        elem.add_ref();
+                                        elem.get_raw()
+                                    })
+                                    .unwrap_or(std::ptr::null_mut())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let arg_components = if vec_components.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    vec_components.as_mut_ptr()
+                };
+                f(arg_self_, arg_components_count, arg_components);
+                if let Some(out_components) = out_components {
+                    *out_components = vec_components
+                        .into_iter()
+                        .take(out_components_count)
+                        .map(|elem| {
+                            if elem.is_null() {
+                                None
+                            } else {
+                                Some(elem.wrap_result())
+                            }
+                        })
+                        .collect();
+                }
+            }
+        }
+    }
+    fn component_by_id(&self, component_id: Option<&CefString>) -> Option<Component> {
+        unsafe {
+            self.0
+                .get_component_by_id
+                .map(|f| {
+                    let arg_component_id = component_id;
+                    let arg_self_ = self.into_raw();
+                    let arg_component_id = arg_component_id
+                        .map(|arg| arg.into_raw())
+                        .unwrap_or(std::ptr::null());
+                    let result = f(arg_self_, arg_component_id);
+                    if result.is_null() {
+                        None
+                    } else {
+                        Some(result.wrap_result())
+                    }
+                })
+                .unwrap_or_default()
+        }
+    }
+    fn update(
+        &self,
+        component_id: Option<&CefString>,
+        priority: ComponentUpdatePriority,
+        callback: Option<&mut ComponentUpdateCallback>,
+    ) {
+        unsafe {
+            if let Some(f) = self.0.update {
+                let (arg_component_id, arg_priority, arg_callback) =
+                    (component_id, priority, callback);
+                let arg_self_ = self.into_raw();
+                let arg_component_id = arg_component_id
+                    .map(|arg| arg.into_raw())
+                    .unwrap_or(std::ptr::null());
+                let arg_priority = arg_priority.into_raw();
+                let arg_callback = arg_callback
+                    .map(|arg| {
+                        arg.add_ref();
+                        ImplComponentUpdateCallback::get_raw(arg)
+                    })
+                    .unwrap_or(std::ptr::null_mut());
+                f(arg_self_, arg_component_id, arg_priority, arg_callback);
+            }
+        }
+    }
+    fn get_raw(&self) -> *mut _cef_component_updater_t {
+        unsafe { RefGuard::into_raw(&self.0) }
+    }
+}
+impl Rc for _cef_component_updater_t {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.base.as_base()
+    }
+}
+impl Rc for ComponentUpdater {
+    fn as_base(&self) -> &_cef_base_ref_counted_t {
+        self.0.as_base()
+    }
+}
+impl ConvertParam<*mut _cef_component_updater_t> for &ComponentUpdater {
+    fn into_raw(self) -> *mut _cef_component_updater_t {
+        ImplComponentUpdater::get_raw(self)
+    }
+}
+impl ConvertParam<*mut _cef_component_updater_t> for &mut ComponentUpdater {
+    fn into_raw(self) -> *mut _cef_component_updater_t {
+        ImplComponentUpdater::get_raw(self)
+    }
+}
+impl ConvertReturnValue<ComponentUpdater> for *mut _cef_component_updater_t {
+    fn wrap_result(self) -> ComponentUpdater {
+        ComponentUpdater(unsafe { RefGuard::from_raw(self) })
+    }
+}
+impl From<ComponentUpdater> for *mut _cef_component_updater_t {
+    fn from(value: ComponentUpdater) -> Self {
+        let object = ImplComponentUpdater::get_raw(&value);
         std::mem::forget(value);
         object
     }
@@ -42161,18 +42635,6 @@ pub trait ImplTextfield: ImplView {
     fn select_range(&self, range: Option<&Range>);
     #[doc = "See [`_cef_textfield_t::get_cursor_position`] for more documentation."]
     fn cursor_position(&self) -> usize;
-    #[doc = "See [`_cef_textfield_t::set_text_color`] for more documentation."]
-    fn set_text_color(&self, color: u32);
-    #[doc = "See [`_cef_textfield_t::get_text_color`] for more documentation."]
-    fn text_color(&self) -> cef_color_t;
-    #[doc = "See [`_cef_textfield_t::set_selection_text_color`] for more documentation."]
-    fn set_selection_text_color(&self, color: u32);
-    #[doc = "See [`_cef_textfield_t::get_selection_text_color`] for more documentation."]
-    fn selection_text_color(&self) -> cef_color_t;
-    #[doc = "See [`_cef_textfield_t::set_selection_background_color`] for more documentation."]
-    fn set_selection_background_color(&self, color: u32);
-    #[doc = "See [`_cef_textfield_t::get_selection_background_color`] for more documentation."]
-    fn selection_background_color(&self) -> cef_color_t;
     #[doc = "See [`_cef_textfield_t::set_font_list`] for more documentation."]
     fn set_font_list(&self, font_list: Option<&CefString>);
     #[doc = "See [`_cef_textfield_t::apply_text_color`] for more documentation."]
@@ -42189,8 +42651,6 @@ pub trait ImplTextfield: ImplView {
     fn set_placeholder_text(&self, text: Option<&CefString>);
     #[doc = "See [`_cef_textfield_t::get_placeholder_text`] for more documentation."]
     fn placeholder_text(&self) -> CefStringUserfree;
-    #[doc = "See [`_cef_textfield_t::set_placeholder_text_color`] for more documentation."]
-    fn set_placeholder_text_color(&self, color: u32);
     #[doc = "See [`_cef_textfield_t::set_accessible_name`] for more documentation."]
     fn set_accessible_name(&self, name: Option<&CefString>);
     fn get_raw(&self) -> *mut _cef_textfield_t {
@@ -42541,69 +43001,6 @@ impl ImplTextfield for Textfield {
                 .unwrap_or_default()
         }
     }
-    fn set_text_color(&self, color: u32) {
-        unsafe {
-            if let Some(f) = self.0.set_text_color {
-                let arg_color = color;
-                let arg_self_ = self.into_raw();
-                f(arg_self_, arg_color);
-            }
-        }
-    }
-    fn text_color(&self) -> cef_color_t {
-        unsafe {
-            self.0
-                .get_text_color
-                .map(|f| {
-                    let arg_self_ = self.into_raw();
-                    let result = f(arg_self_);
-                    result.wrap_result()
-                })
-                .unwrap_or_default()
-        }
-    }
-    fn set_selection_text_color(&self, color: u32) {
-        unsafe {
-            if let Some(f) = self.0.set_selection_text_color {
-                let arg_color = color;
-                let arg_self_ = self.into_raw();
-                f(arg_self_, arg_color);
-            }
-        }
-    }
-    fn selection_text_color(&self) -> cef_color_t {
-        unsafe {
-            self.0
-                .get_selection_text_color
-                .map(|f| {
-                    let arg_self_ = self.into_raw();
-                    let result = f(arg_self_);
-                    result.wrap_result()
-                })
-                .unwrap_or_default()
-        }
-    }
-    fn set_selection_background_color(&self, color: u32) {
-        unsafe {
-            if let Some(f) = self.0.set_selection_background_color {
-                let arg_color = color;
-                let arg_self_ = self.into_raw();
-                f(arg_self_, arg_color);
-            }
-        }
-    }
-    fn selection_background_color(&self) -> cef_color_t {
-        unsafe {
-            self.0
-                .get_selection_background_color
-                .map(|f| {
-                    let arg_self_ = self.into_raw();
-                    let result = f(arg_self_);
-                    result.wrap_result()
-                })
-                .unwrap_or_default()
-        }
-    }
     fn set_font_list(&self, font_list: Option<&CefString>) {
         unsafe {
             if let Some(f) = self.0.set_font_list {
@@ -42704,15 +43101,6 @@ impl ImplTextfield for Textfield {
                     result.wrap_result()
                 })
                 .unwrap_or_default()
-        }
-    }
-    fn set_placeholder_text_color(&self, color: u32) {
-        unsafe {
-            if let Some(f) = self.0.set_placeholder_text_color {
-                let arg_color = color;
-                let arg_self_ = self.into_raw();
-                f(arg_self_, arg_color);
-            }
         }
     }
     fn set_accessible_name(&self, name: Option<&CefString>) {
@@ -44839,9 +45227,9 @@ impl ContentSettingTypes {
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_SITE_ENGAGEMENT`] for more documentation."]
     pub const SITE_ENGAGEMENT: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_SITE_ENGAGEMENT);
-    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_DURABLE_STORAGE`] for more documentation."]
-    pub const DURABLE_STORAGE: Self =
-        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_DURABLE_STORAGE);
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_PERSISTENT_STORAGE`] for more documentation."]
+    pub const PERSISTENT_STORAGE: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_PERSISTENT_STORAGE);
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_USB_CHOOSER_DATA`] for more documentation."]
     pub const USB_CHOOSER_DATA: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_USB_CHOOSER_DATA);
@@ -45029,10 +45417,8 @@ impl ContentSettingTypes {
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_ANTI_ABUSE`] for more documentation."]
     pub const ANTI_ABUSE: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_ANTI_ABUSE);
-    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_THIRD_PARTY_STORAGE_PARTITIONING`] for more documentation."]
-    pub const THIRD_PARTY_STORAGE_PARTITIONING: Self = Self(
-        cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_THIRD_PARTY_STORAGE_PARTITIONING,
-    );
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_THIRD_PARTY_STORAGE_PARTITIONING_DEPRECATED`] for more documentation."]
+    pub const THIRD_PARTY_STORAGE_PARTITIONING_DEPRECATED : Self = Self (cef_content_setting_types_t :: CEF_CONTENT_SETTING_TYPE_THIRD_PARTY_STORAGE_PARTITIONING_DEPRECATED) ;
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_HTTPS_ENFORCED`] for more documentation."]
     pub const HTTPS_ENFORCED: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_HTTPS_ENFORCED);
@@ -45042,12 +45428,13 @@ impl ContentSettingTypes {
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_COOKIE_CONTROLS_METADATA`] for more documentation."]
     pub const COOKIE_CONTROLS_METADATA: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_COOKIE_CONTROLS_METADATA);
-    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_HEURISTICS_GRANTS`] for more documentation."]
-    pub const TPCD_HEURISTICS_GRANTS: Self =
-        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_HEURISTICS_GRANTS);
-    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_METADATA_GRANTS`] for more documentation."]
-    pub const TPCD_METADATA_GRANTS: Self =
-        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_METADATA_GRANTS);
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_HEURISTICS_GRANTS_DEPRECATED`] for more documentation."]
+    pub const TPCD_HEURISTICS_GRANTS_DEPRECATED: Self = Self(
+        cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_HEURISTICS_GRANTS_DEPRECATED,
+    );
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_METADATA_GRANTS_DEPRECATED`] for more documentation."]
+    pub const TPCD_METADATA_GRANTS_DEPRECATED: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_METADATA_GRANTS_DEPRECATED);
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_TRIAL_DEPRECATED`] for more documentation."]
     pub const TPCD_TRIAL_DEPRECATED: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TPCD_TRIAL_DEPRECATED);
@@ -45097,9 +45484,9 @@ impl ContentSettingTypes {
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_POINTER_LOCK);
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_REVOKED_ABUSIVE_NOTIFICATION_PERMISSIONS`] for more documentation."]
     pub const REVOKED_ABUSIVE_NOTIFICATION_PERMISSIONS : Self = Self (cef_content_setting_types_t :: CEF_CONTENT_SETTING_TYPE_REVOKED_ABUSIVE_NOTIFICATION_PERMISSIONS) ;
-    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TRACKING_PROTECTION`] for more documentation."]
-    pub const TRACKING_PROTECTION: Self =
-        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TRACKING_PROTECTION);
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TRACKING_PROTECTION_DEPRECATED`] for more documentation."]
+    pub const TRACKING_PROTECTION_DEPRECATED: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_TRACKING_PROTECTION_DEPRECATED);
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_DISPLAY_MEDIA_SYSTEM_AUDIO`] for more documentation."]
     pub const DISPLAY_MEDIA_SYSTEM_AUDIO: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_DISPLAY_MEDIA_SYSTEM_AUDIO);
@@ -45154,6 +45541,18 @@ impl ContentSettingTypes {
     pub const SUSPICIOUS_NOTIFICATION_SHOW_ORIGINAL: Self = Self(
         cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_SUSPICIOUS_NOTIFICATION_SHOW_ORIGINAL,
     );
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_LOCAL_NETWORK`] for more documentation."]
+    pub const LOCAL_NETWORK: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_LOCAL_NETWORK);
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_LOOPBACK_NETWORK`] for more documentation."]
+    pub const LOOPBACK_NETWORK: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_LOOPBACK_NETWORK);
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_SUB_APPS_WITHOUT_PROMPTS`] for more documentation."]
+    pub const SUB_APPS_WITHOUT_PROMPTS: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_SUB_APPS_WITHOUT_PROMPTS);
+    #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_INLINE_CUE_MENU`] for more documentation."]
+    pub const INLINE_CUE_MENU: Self =
+        Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_INLINE_CUE_MENU);
     #[doc = "See [`cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_NUM_VALUES`] for more documentation."]
     pub const NUM_VALUES: Self =
         Self(cef_content_setting_types_t::CEF_CONTENT_SETTING_TYPE_NUM_VALUES);
@@ -45827,6 +46226,14 @@ impl Errorcode {
     #[doc = "See [`cef_errorcode_t::ERR_BLOCKED_BY_FINGERPRINTING_PROTECTION`] for more documentation."]
     pub const BLOCKED_BY_FINGERPRINTING_PROTECTION: Self =
         Self(cef_errorcode_t::ERR_BLOCKED_BY_FINGERPRINTING_PROTECTION);
+    #[doc = "See [`cef_errorcode_t::ERR_BLOCKED_IN_INCOGNITO_BY_ADMINISTRATOR`] for more documentation."]
+    pub const BLOCKED_IN_INCOGNITO_BY_ADMINISTRATOR: Self =
+        Self(cef_errorcode_t::ERR_BLOCKED_IN_INCOGNITO_BY_ADMINISTRATOR);
+    #[doc = "See [`cef_errorcode_t::ERR_LOCAL_NETWORK_PERMISSION_MISSING`] for more documentation."]
+    pub const LOCAL_NETWORK_PERMISSION_MISSING: Self =
+        Self(cef_errorcode_t::ERR_LOCAL_NETWORK_PERMISSION_MISSING);
+    #[doc = "See [`cef_errorcode_t::ERR_STRICT_ECH_REQUIRED`] for more documentation."]
+    pub const STRICT_ECH_REQUIRED: Self = Self(cef_errorcode_t::ERR_STRICT_ECH_REQUIRED);
     #[doc = "See [`cef_errorcode_t::ERR_CONNECTION_CLOSED`] for more documentation."]
     pub const CONNECTION_CLOSED: Self = Self(cef_errorcode_t::ERR_CONNECTION_CLOSED);
     #[doc = "See [`cef_errorcode_t::ERR_CONNECTION_RESET`] for more documentation."]
@@ -46002,6 +46409,8 @@ impl Errorcode {
     #[doc = "See [`cef_errorcode_t::ERR_PROXY_DELEGATE_CANCELED_CONNECT_RESPONSE`] for more documentation."]
     pub const PROXY_DELEGATE_CANCELED_CONNECT_RESPONSE: Self =
         Self(cef_errorcode_t::ERR_PROXY_DELEGATE_CANCELED_CONNECT_RESPONSE);
+    #[doc = "See [`cef_errorcode_t::ERR_CONTROL_MSG_TOO_BIG`] for more documentation."]
+    pub const CONTROL_MSG_TOO_BIG: Self = Self(cef_errorcode_t::ERR_CONTROL_MSG_TOO_BIG);
     #[doc = "See [`cef_errorcode_t::ERR_CERT_COMMON_NAME_INVALID`] for more documentation."]
     pub const CERT_COMMON_NAME_INVALID: Self = Self(cef_errorcode_t::ERR_CERT_COMMON_NAME_INVALID);
     #[doc = "See [`cef_errorcode_t::ERR_CERT_DATE_INVALID`] for more documentation."]
@@ -46153,8 +46562,6 @@ impl Errorcode {
     pub const PROXY_HTTP_1_1_REQUIRED: Self = Self(cef_errorcode_t::ERR_PROXY_HTTP_1_1_REQUIRED);
     #[doc = "See [`cef_errorcode_t::ERR_PAC_SCRIPT_TERMINATED`] for more documentation."]
     pub const PAC_SCRIPT_TERMINATED: Self = Self(cef_errorcode_t::ERR_PAC_SCRIPT_TERMINATED);
-    #[doc = "See [`cef_errorcode_t::ERR_PROXY_REQUIRED`] for more documentation."]
-    pub const PROXY_REQUIRED: Self = Self(cef_errorcode_t::ERR_PROXY_REQUIRED);
     #[doc = "See [`cef_errorcode_t::ERR_INVALID_HTTP_RESPONSE`] for more documentation."]
     pub const INVALID_HTTP_RESPONSE: Self = Self(cef_errorcode_t::ERR_INVALID_HTTP_RESPONSE);
     #[doc = "See [`cef_errorcode_t::ERR_CONTENT_DECODING_INIT_FAILED`] for more documentation."]
@@ -46226,6 +46633,9 @@ impl Errorcode {
     #[doc = "See [`cef_errorcode_t::ERR_CACHE_OPEN_OR_CREATE_FAILURE`] for more documentation."]
     pub const CACHE_OPEN_OR_CREATE_FAILURE: Self =
         Self(cef_errorcode_t::ERR_CACHE_OPEN_OR_CREATE_FAILURE);
+    #[doc = "See [`cef_errorcode_t::ERR_CACHE_COMPRESSION_FAILURE`] for more documentation."]
+    pub const CACHE_COMPRESSION_FAILURE: Self =
+        Self(cef_errorcode_t::ERR_CACHE_COMPRESSION_FAILURE);
     #[doc = "See [`cef_errorcode_t::ERR_INSECURE_RESPONSE`] for more documentation."]
     pub const INSECURE_RESPONSE: Self = Self(cef_errorcode_t::ERR_INSECURE_RESPONSE);
     #[doc = "See [`cef_errorcode_t::ERR_NO_PRIVATE_KEY_FOR_CERT`] for more documentation."]
@@ -46285,8 +46695,6 @@ impl Errorcode {
     pub const DNS_MALFORMED_RESPONSE: Self = Self(cef_errorcode_t::ERR_DNS_MALFORMED_RESPONSE);
     #[doc = "See [`cef_errorcode_t::ERR_DNS_SERVER_REQUIRES_TCP`] for more documentation."]
     pub const DNS_SERVER_REQUIRES_TCP: Self = Self(cef_errorcode_t::ERR_DNS_SERVER_REQUIRES_TCP);
-    #[doc = "See [`cef_errorcode_t::ERR_DNS_SERVER_FAILED`] for more documentation."]
-    pub const DNS_SERVER_FAILED: Self = Self(cef_errorcode_t::ERR_DNS_SERVER_FAILED);
     #[doc = "See [`cef_errorcode_t::ERR_DNS_TIMED_OUT`] for more documentation."]
     pub const DNS_TIMED_OUT: Self = Self(cef_errorcode_t::ERR_DNS_TIMED_OUT);
     #[doc = "See [`cef_errorcode_t::ERR_DNS_CACHE_MISS`] for more documentation."]
@@ -46311,6 +46719,18 @@ impl Errorcode {
     #[doc = "See [`cef_errorcode_t::ERR_DNS_CACHE_INVALIDATION_IN_PROGRESS`] for more documentation."]
     pub const DNS_CACHE_INVALIDATION_IN_PROGRESS: Self =
         Self(cef_errorcode_t::ERR_DNS_CACHE_INVALIDATION_IN_PROGRESS);
+    #[doc = "See [`cef_errorcode_t::ERR_DNS_FORMAT_ERROR`] for more documentation."]
+    pub const DNS_FORMAT_ERROR: Self = Self(cef_errorcode_t::ERR_DNS_FORMAT_ERROR);
+    #[doc = "See [`cef_errorcode_t::ERR_DNS_SERVER_FAILURE`] for more documentation."]
+    pub const DNS_SERVER_FAILURE: Self = Self(cef_errorcode_t::ERR_DNS_SERVER_FAILURE);
+    #[doc = "See [`cef_errorcode_t::ERR_DNS_NOT_IMPLEMENTED`] for more documentation."]
+    pub const DNS_NOT_IMPLEMENTED: Self = Self(cef_errorcode_t::ERR_DNS_NOT_IMPLEMENTED);
+    #[doc = "See [`cef_errorcode_t::ERR_DNS_REFUSED`] for more documentation."]
+    pub const DNS_REFUSED: Self = Self(cef_errorcode_t::ERR_DNS_REFUSED);
+    #[doc = "See [`cef_errorcode_t::ERR_DNS_OTHER_FAILURE`] for more documentation."]
+    pub const DNS_OTHER_FAILURE: Self = Self(cef_errorcode_t::ERR_DNS_OTHER_FAILURE);
+    #[doc = "See [`cef_errorcode_t::ERR_DNS_DIRECT_ONLY`] for more documentation."]
+    pub const DNS_DIRECT_ONLY: Self = Self(cef_errorcode_t::ERR_DNS_DIRECT_ONLY);
     #[doc = "See [`cef_errorcode_t::ERR_BLOB_INVALID_CONSTRUCTION_ARGUMENTS`] for more documentation."]
     pub const BLOB_INVALID_CONSTRUCTION_ARGUMENTS: Self =
         Self(cef_errorcode_t::ERR_BLOB_INVALID_CONSTRUCTION_ARGUMENTS);
@@ -46495,6 +46915,9 @@ impl Resultcode {
     #[doc = "See [`cef_resultcode_t::CEF_RESULT_CODE_TERMINATED_BY_OTHER_PROCESS_ON_COMMIT_FAILURE`] for more documentation."]
     pub const TERMINATED_BY_OTHER_PROCESS_ON_COMMIT_FAILURE: Self =
         Self(cef_resultcode_t::CEF_RESULT_CODE_TERMINATED_BY_OTHER_PROCESS_ON_COMMIT_FAILURE);
+    #[doc = "See [`cef_resultcode_t::CEF_RESULT_CODE_INVALID_ISOLATED_BROWSER_PROCESS`] for more documentation."]
+    pub const INVALID_ISOLATED_BROWSER_PROCESS: Self =
+        Self(cef_resultcode_t::CEF_RESULT_CODE_INVALID_ISOLATED_BROWSER_PROCESS);
     #[doc = "See [`cef_resultcode_t::CEF_RESULT_CODE_CHROME_LAST`] for more documentation."]
     pub const CHROME_LAST: Self = Self(cef_resultcode_t::CEF_RESULT_CODE_CHROME_LAST);
     #[doc = "See [`cef_resultcode_t::CEF_RESULT_CODE_SANDBOX_FATAL_FIRST`] for more documentation."]
@@ -46592,6 +47015,8 @@ impl WindowOpenDisposition {
     #[doc = "See [`cef_window_open_disposition_t::CEF_WOD_NEW_PICTURE_IN_PICTURE`] for more documentation."]
     pub const NEW_PICTURE_IN_PICTURE: Self =
         Self(cef_window_open_disposition_t::CEF_WOD_NEW_PICTURE_IN_PICTURE);
+    #[doc = "See [`cef_window_open_disposition_t::CEF_WOD_NEW_SPLIT_VIEW`] for more documentation."]
+    pub const NEW_SPLIT_VIEW: Self = Self(cef_window_open_disposition_t::CEF_WOD_NEW_SPLIT_VIEW);
     #[doc = "See [`cef_window_open_disposition_t::CEF_WOD_NUM_VALUES`] for more documentation."]
     pub const NUM_VALUES: Self = Self(cef_window_open_disposition_t::CEF_WOD_NUM_VALUES);
 }
@@ -49763,6 +50188,10 @@ impl ChannelLayout {
     pub const LAYOUT_1_1: Self = Self(cef_channel_layout_t::CEF_CHANNEL_LAYOUT_1_1);
     #[doc = "See [`cef_channel_layout_t::CEF_CHANNEL_LAYOUT_3_1_BACK`] for more documentation."]
     pub const LAYOUT_3_1_BACK: Self = Self(cef_channel_layout_t::CEF_CHANNEL_LAYOUT_3_1_BACK);
+    #[doc = "See [`cef_channel_layout_t::CEF_CHANNEL_LAYOUT_5_1_4`] for more documentation."]
+    pub const LAYOUT_5_1_4: Self = Self(cef_channel_layout_t::CEF_CHANNEL_LAYOUT_5_1_4);
+    #[doc = "See [`cef_channel_layout_t::CEF_CHANNEL_LAYOUT_7_1_4`] for more documentation."]
+    pub const LAYOUT_7_1_4: Self = Self(cef_channel_layout_t::CEF_CHANNEL_LAYOUT_7_1_4);
     #[doc = "See [`cef_channel_layout_t::CEF_CHANNEL_NUM_VALUES`] for more documentation."]
     pub const NUM_VALUES: Self = Self(cef_channel_layout_t::CEF_CHANNEL_NUM_VALUES);
 }
@@ -50191,6 +50620,27 @@ impl ChromePageActionIconType {
     #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_JS_OPTIMIZATIONS`] for more documentation."]
     pub const JS_OPTIMIZATIONS: Self =
         Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_JS_OPTIMIZATIONS);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_RECORD_REPLAY`] for more documentation."]
+    pub const RECORD_REPLAY: Self =
+        Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_RECORD_REPLAY);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_INDIGO`] for more documentation."]
+    pub const INDIGO: Self = Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_INDIGO);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_FEDERATION`] for more documentation."]
+    pub const FEDERATION: Self = Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_FEDERATION);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_GLIC`] for more documentation."]
+    pub const GLIC: Self = Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_GLIC);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_ANCHORED_CONTEXTUAL_CUE`] for more documentation."]
+    pub const ANCHORED_CONTEXTUAL_CUE: Self =
+        Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_ANCHORED_CONTEXTUAL_CUE);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_WEB_AUTHN_AMBIENT_SIGNIN`] for more documentation."]
+    pub const WEB_AUTHN_AMBIENT_SIGNIN: Self =
+        Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_WEB_AUTHN_AMBIENT_SIGNIN);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_AUTOFILL_PAYMENT`] for more documentation."]
+    pub const AUTOFILL_PAYMENT: Self =
+        Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_AUTOFILL_PAYMENT);
+    #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_MULTISTEP_FILTER`] for more documentation."]
+    pub const MULTISTEP_FILTER: Self =
+        Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_MULTISTEP_FILTER);
     #[doc = "See [`cef_chrome_page_action_icon_type_t::CEF_CPAIT_NUM_VALUES`] for more documentation."]
     pub const NUM_VALUES: Self = Self(cef_chrome_page_action_icon_type_t::CEF_CPAIT_NUM_VALUES);
 }
@@ -50244,8 +50694,9 @@ impl ChromeToolbarButtonType {
         Self(cef_chrome_toolbar_button_type_t::CEF_CTBT_SIDE_PANEL_DEPRECATED);
     #[doc = "See [`cef_chrome_toolbar_button_type_t::CEF_CTBT_MEDIA`] for more documentation."]
     pub const MEDIA: Self = Self(cef_chrome_toolbar_button_type_t::CEF_CTBT_MEDIA);
-    #[doc = "See [`cef_chrome_toolbar_button_type_t::CEF_CTBT_TAB_SEARCH`] for more documentation."]
-    pub const TAB_SEARCH: Self = Self(cef_chrome_toolbar_button_type_t::CEF_CTBT_TAB_SEARCH);
+    #[doc = "See [`cef_chrome_toolbar_button_type_t::CEF_CTBT_TAB_SEARCH_DEPRECATED`] for more documentation."]
+    pub const TAB_SEARCH_DEPRECATED: Self =
+        Self(cef_chrome_toolbar_button_type_t::CEF_CTBT_TAB_SEARCH_DEPRECATED);
     #[doc = "See [`cef_chrome_toolbar_button_type_t::CEF_CTBT_BATTERY_SAVER`] for more documentation."]
     pub const BATTERY_SAVER: Self = Self(cef_chrome_toolbar_button_type_t::CEF_CTBT_BATTERY_SAVER);
     #[doc = "See [`cef_chrome_toolbar_button_type_t::CEF_CTBT_AVATAR`] for more documentation."]
@@ -50543,9 +50994,17 @@ impl PermissionRequestTypes {
     #[doc = "See [`cef_permission_request_types_t::CEF_PERMISSION_TYPE_FILE_SYSTEM_ACCESS`] for more documentation."]
     pub const FILE_SYSTEM_ACCESS: Self =
         Self(cef_permission_request_types_t::CEF_PERMISSION_TYPE_FILE_SYSTEM_ACCESS);
-    #[doc = "See [`cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS`] for more documentation."]
-    pub const LOCAL_NETWORK_ACCESS: Self =
-        Self(cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS);
+    #[doc = "See [`cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS_DEPRECATED`] for more documentation."]
+    pub const LOCAL_NETWORK_ACCESS_DEPRECATED: Self =
+        Self(cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK_ACCESS_DEPRECATED);
+    #[doc = "See [`cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK`] for more documentation."]
+    pub const LOCAL_NETWORK: Self =
+        Self(cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOCAL_NETWORK);
+    #[doc = "See [`cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOOPBACK_NETWORK`] for more documentation."]
+    pub const LOOPBACK_NETWORK: Self =
+        Self(cef_permission_request_types_t::CEF_PERMISSION_TYPE_LOOPBACK_NETWORK);
+    #[doc = "See [`cef_permission_request_types_t::CEF_PERMISSION_TYPE_SENSORS`] for more documentation."]
+    pub const SENSORS: Self = Self(cef_permission_request_types_t::CEF_PERMISSION_TYPE_SENSORS);
 }
 impl PermissionRequestTypes {
     #[doc = "Get the raw integer representation."]
@@ -51024,6 +51483,4701 @@ impl TaskType {
 impl Default for TaskType {
     fn default() -> Self {
         Self(cef_task_type_t::CEF_TASK_TYPE_UNKNOWN)
+    }
+}
+
+/// See [`cef_component_update_error_t`] for more documentation.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct ComponentUpdateError(cef_component_update_error_t);
+impl AsRef<cef_component_update_error_t> for ComponentUpdateError {
+    fn as_ref(&self) -> &cef_component_update_error_t {
+        &self.0
+    }
+}
+impl AsMut<cef_component_update_error_t> for ComponentUpdateError {
+    fn as_mut(&mut self) -> &mut cef_component_update_error_t {
+        &mut self.0
+    }
+}
+impl From<cef_component_update_error_t> for ComponentUpdateError {
+    fn from(value: cef_component_update_error_t) -> Self {
+        Self(value)
+    }
+}
+impl From<ComponentUpdateError> for cef_component_update_error_t {
+    fn from(value: ComponentUpdateError) -> Self {
+        value.0
+    }
+}
+impl ComponentUpdateError {
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_NONE`] for more documentation."]
+    pub const NONE: Self = Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_NONE);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_UPDATE_IN_PROGRESS`] for more documentation."]
+    pub const UPDATE_IN_PROGRESS: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_UPDATE_IN_PROGRESS);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_UPDATE_CANCELED`] for more documentation."]
+    pub const UPDATE_CANCELED: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_UPDATE_CANCELED);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_RETRY_LATER`] for more documentation."]
+    pub const RETRY_LATER: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_RETRY_LATER);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_SERVICE_ERROR`] for more documentation."]
+    pub const SERVICE_ERROR: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_SERVICE_ERROR);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_UPDATE_CHECK_ERROR`] for more documentation."]
+    pub const UPDATE_CHECK_ERROR: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_UPDATE_CHECK_ERROR);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_CRX_NOT_FOUND`] for more documentation."]
+    pub const CRX_NOT_FOUND: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_CRX_NOT_FOUND);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_INVALID_ARGUMENT`] for more documentation."]
+    pub const INVALID_ARGUMENT: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_INVALID_ARGUMENT);
+    #[doc = "See [`cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_BAD_CRX_DATA_CALLBACK`] for more documentation."]
+    pub const BAD_CRX_DATA_CALLBACK: Self =
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_BAD_CRX_DATA_CALLBACK);
+}
+impl ComponentUpdateError {
+    #[doc = "Get the raw integer representation."]
+    pub fn get_raw(&self) -> i32 {
+        self.0 as i32
+    }
+}
+impl Default for ComponentUpdateError {
+    fn default() -> Self {
+        Self(cef_component_update_error_t::CEF_COMPONENT_UPDATE_ERROR_NONE)
+    }
+}
+
+/// See [`cef_component_update_priority_t`] for more documentation.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct ComponentUpdatePriority(cef_component_update_priority_t);
+impl AsRef<cef_component_update_priority_t> for ComponentUpdatePriority {
+    fn as_ref(&self) -> &cef_component_update_priority_t {
+        &self.0
+    }
+}
+impl AsMut<cef_component_update_priority_t> for ComponentUpdatePriority {
+    fn as_mut(&mut self) -> &mut cef_component_update_priority_t {
+        &mut self.0
+    }
+}
+impl From<cef_component_update_priority_t> for ComponentUpdatePriority {
+    fn from(value: cef_component_update_priority_t) -> Self {
+        Self(value)
+    }
+}
+impl From<ComponentUpdatePriority> for cef_component_update_priority_t {
+    fn from(value: ComponentUpdatePriority) -> Self {
+        value.0
+    }
+}
+impl ComponentUpdatePriority {
+    #[doc = "See [`cef_component_update_priority_t::CEF_COMPONENT_UPDATE_PRIORITY_BACKGROUND`] for more documentation."]
+    pub const BACKGROUND: Self =
+        Self(cef_component_update_priority_t::CEF_COMPONENT_UPDATE_PRIORITY_BACKGROUND);
+    #[doc = "See [`cef_component_update_priority_t::CEF_COMPONENT_UPDATE_PRIORITY_FOREGROUND`] for more documentation."]
+    pub const FOREGROUND: Self =
+        Self(cef_component_update_priority_t::CEF_COMPONENT_UPDATE_PRIORITY_FOREGROUND);
+}
+impl ComponentUpdatePriority {
+    #[doc = "Get the raw integer representation."]
+    pub fn get_raw(&self) -> i32 {
+        self.0 as i32
+    }
+}
+impl Default for ComponentUpdatePriority {
+    fn default() -> Self {
+        Self(cef_component_update_priority_t::CEF_COMPONENT_UPDATE_PRIORITY_BACKGROUND)
+    }
+}
+
+/// See [`cef_component_state_t`] for more documentation.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct ComponentState(cef_component_state_t);
+impl AsRef<cef_component_state_t> for ComponentState {
+    fn as_ref(&self) -> &cef_component_state_t {
+        &self.0
+    }
+}
+impl AsMut<cef_component_state_t> for ComponentState {
+    fn as_mut(&mut self) -> &mut cef_component_state_t {
+        &mut self.0
+    }
+}
+impl From<cef_component_state_t> for ComponentState {
+    fn from(value: cef_component_state_t) -> Self {
+        Self(value)
+    }
+}
+impl From<ComponentState> for cef_component_state_t {
+    fn from(value: ComponentState) -> Self {
+        value.0
+    }
+}
+impl ComponentState {
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_NEW`] for more documentation."]
+    pub const NEW: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_NEW);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_CHECKING`] for more documentation."]
+    pub const CHECKING: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_CHECKING);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_CAN_UPDATE`] for more documentation."]
+    pub const CAN_UPDATE: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_CAN_UPDATE);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_DOWNLOADING`] for more documentation."]
+    pub const DOWNLOADING: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_DOWNLOADING);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_DECOMPRESSING`] for more documentation."]
+    pub const DECOMPRESSING: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_DECOMPRESSING);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_PATCHING`] for more documentation."]
+    pub const PATCHING: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_PATCHING);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_UPDATING`] for more documentation."]
+    pub const UPDATING: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_UPDATING);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_UPDATED`] for more documentation."]
+    pub const UPDATED: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_UPDATED);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_UP_TO_DATE`] for more documentation."]
+    pub const UP_TO_DATE: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_UP_TO_DATE);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_UPDATE_ERROR`] for more documentation."]
+    pub const UPDATE_ERROR: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_UPDATE_ERROR);
+    #[doc = "See [`cef_component_state_t::CEF_COMPONENT_STATE_RUN`] for more documentation."]
+    pub const RUN: Self = Self(cef_component_state_t::CEF_COMPONENT_STATE_RUN);
+}
+impl ComponentState {
+    #[doc = "Get the raw integer representation."]
+    pub fn get_raw(&self) -> i32 {
+        self.0 as i32
+    }
+}
+impl Default for ComponentState {
+    fn default() -> Self {
+        Self(cef_component_state_t::CEF_COMPONENT_STATE_NEW)
+    }
+}
+
+/// See [`cef_color_id_t`] for more documentation.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct ColorId(cef_color_id_t);
+impl AsRef<cef_color_id_t> for ColorId {
+    fn as_ref(&self) -> &cef_color_id_t {
+        &self.0
+    }
+}
+impl AsMut<cef_color_id_t> for ColorId {
+    fn as_mut(&mut self) -> &mut cef_color_id_t {
+        &mut self.0
+    }
+}
+impl From<cef_color_id_t> for ColorId {
+    fn from(value: cef_color_id_t) -> Self {
+        Self(value)
+    }
+}
+impl From<ColorId> for cef_color_id_t {
+    fn from(value: ColorId) -> Self {
+        value.0
+    }
+}
+impl ColorId {
+    #[doc = "See [`cef_color_id_t::CEF_UiColorsStart`] for more documentation."]
+    pub const UI_COLORS_START: Self = Self(cef_color_id_t::CEF_UiColorsStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary10`] for more documentation."]
+    pub const COLOR_REF_PRIMARY10: Self = Self(cef_color_id_t::CEF_ColorRefPrimary10);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary20`] for more documentation."]
+    pub const COLOR_REF_PRIMARY20: Self = Self(cef_color_id_t::CEF_ColorRefPrimary20);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary25`] for more documentation."]
+    pub const COLOR_REF_PRIMARY25: Self = Self(cef_color_id_t::CEF_ColorRefPrimary25);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary30`] for more documentation."]
+    pub const COLOR_REF_PRIMARY30: Self = Self(cef_color_id_t::CEF_ColorRefPrimary30);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary40`] for more documentation."]
+    pub const COLOR_REF_PRIMARY40: Self = Self(cef_color_id_t::CEF_ColorRefPrimary40);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary50`] for more documentation."]
+    pub const COLOR_REF_PRIMARY50: Self = Self(cef_color_id_t::CEF_ColorRefPrimary50);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary60`] for more documentation."]
+    pub const COLOR_REF_PRIMARY60: Self = Self(cef_color_id_t::CEF_ColorRefPrimary60);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary70`] for more documentation."]
+    pub const COLOR_REF_PRIMARY70: Self = Self(cef_color_id_t::CEF_ColorRefPrimary70);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary80`] for more documentation."]
+    pub const COLOR_REF_PRIMARY80: Self = Self(cef_color_id_t::CEF_ColorRefPrimary80);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary90`] for more documentation."]
+    pub const COLOR_REF_PRIMARY90: Self = Self(cef_color_id_t::CEF_ColorRefPrimary90);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary95`] for more documentation."]
+    pub const COLOR_REF_PRIMARY95: Self = Self(cef_color_id_t::CEF_ColorRefPrimary95);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary99`] for more documentation."]
+    pub const COLOR_REF_PRIMARY99: Self = Self(cef_color_id_t::CEF_ColorRefPrimary99);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefPrimary100`] for more documentation."]
+    pub const COLOR_REF_PRIMARY100: Self = Self(cef_color_id_t::CEF_ColorRefPrimary100);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary0`] for more documentation."]
+    pub const COLOR_REF_SECONDARY0: Self = Self(cef_color_id_t::CEF_ColorRefSecondary0);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary10`] for more documentation."]
+    pub const COLOR_REF_SECONDARY10: Self = Self(cef_color_id_t::CEF_ColorRefSecondary10);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary12`] for more documentation."]
+    pub const COLOR_REF_SECONDARY12: Self = Self(cef_color_id_t::CEF_ColorRefSecondary12);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary15`] for more documentation."]
+    pub const COLOR_REF_SECONDARY15: Self = Self(cef_color_id_t::CEF_ColorRefSecondary15);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary20`] for more documentation."]
+    pub const COLOR_REF_SECONDARY20: Self = Self(cef_color_id_t::CEF_ColorRefSecondary20);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary25`] for more documentation."]
+    pub const COLOR_REF_SECONDARY25: Self = Self(cef_color_id_t::CEF_ColorRefSecondary25);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary30`] for more documentation."]
+    pub const COLOR_REF_SECONDARY30: Self = Self(cef_color_id_t::CEF_ColorRefSecondary30);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary35`] for more documentation."]
+    pub const COLOR_REF_SECONDARY35: Self = Self(cef_color_id_t::CEF_ColorRefSecondary35);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary40`] for more documentation."]
+    pub const COLOR_REF_SECONDARY40: Self = Self(cef_color_id_t::CEF_ColorRefSecondary40);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary50`] for more documentation."]
+    pub const COLOR_REF_SECONDARY50: Self = Self(cef_color_id_t::CEF_ColorRefSecondary50);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary60`] for more documentation."]
+    pub const COLOR_REF_SECONDARY60: Self = Self(cef_color_id_t::CEF_ColorRefSecondary60);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary70`] for more documentation."]
+    pub const COLOR_REF_SECONDARY70: Self = Self(cef_color_id_t::CEF_ColorRefSecondary70);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary80`] for more documentation."]
+    pub const COLOR_REF_SECONDARY80: Self = Self(cef_color_id_t::CEF_ColorRefSecondary80);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary90`] for more documentation."]
+    pub const COLOR_REF_SECONDARY90: Self = Self(cef_color_id_t::CEF_ColorRefSecondary90);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary95`] for more documentation."]
+    pub const COLOR_REF_SECONDARY95: Self = Self(cef_color_id_t::CEF_ColorRefSecondary95);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary99`] for more documentation."]
+    pub const COLOR_REF_SECONDARY99: Self = Self(cef_color_id_t::CEF_ColorRefSecondary99);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefSecondary100`] for more documentation."]
+    pub const COLOR_REF_SECONDARY100: Self = Self(cef_color_id_t::CEF_ColorRefSecondary100);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary0`] for more documentation."]
+    pub const COLOR_REF_TERTIARY0: Self = Self(cef_color_id_t::CEF_ColorRefTertiary0);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary10`] for more documentation."]
+    pub const COLOR_REF_TERTIARY10: Self = Self(cef_color_id_t::CEF_ColorRefTertiary10);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary20`] for more documentation."]
+    pub const COLOR_REF_TERTIARY20: Self = Self(cef_color_id_t::CEF_ColorRefTertiary20);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary30`] for more documentation."]
+    pub const COLOR_REF_TERTIARY30: Self = Self(cef_color_id_t::CEF_ColorRefTertiary30);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary40`] for more documentation."]
+    pub const COLOR_REF_TERTIARY40: Self = Self(cef_color_id_t::CEF_ColorRefTertiary40);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary50`] for more documentation."]
+    pub const COLOR_REF_TERTIARY50: Self = Self(cef_color_id_t::CEF_ColorRefTertiary50);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary60`] for more documentation."]
+    pub const COLOR_REF_TERTIARY60: Self = Self(cef_color_id_t::CEF_ColorRefTertiary60);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary70`] for more documentation."]
+    pub const COLOR_REF_TERTIARY70: Self = Self(cef_color_id_t::CEF_ColorRefTertiary70);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary80`] for more documentation."]
+    pub const COLOR_REF_TERTIARY80: Self = Self(cef_color_id_t::CEF_ColorRefTertiary80);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary90`] for more documentation."]
+    pub const COLOR_REF_TERTIARY90: Self = Self(cef_color_id_t::CEF_ColorRefTertiary90);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary95`] for more documentation."]
+    pub const COLOR_REF_TERTIARY95: Self = Self(cef_color_id_t::CEF_ColorRefTertiary95);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary99`] for more documentation."]
+    pub const COLOR_REF_TERTIARY99: Self = Self(cef_color_id_t::CEF_ColorRefTertiary99);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefTertiary100`] for more documentation."]
+    pub const COLOR_REF_TERTIARY100: Self = Self(cef_color_id_t::CEF_ColorRefTertiary100);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError0`] for more documentation."]
+    pub const COLOR_REF_ERROR0: Self = Self(cef_color_id_t::CEF_ColorRefError0);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError10`] for more documentation."]
+    pub const COLOR_REF_ERROR10: Self = Self(cef_color_id_t::CEF_ColorRefError10);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError20`] for more documentation."]
+    pub const COLOR_REF_ERROR20: Self = Self(cef_color_id_t::CEF_ColorRefError20);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError30`] for more documentation."]
+    pub const COLOR_REF_ERROR30: Self = Self(cef_color_id_t::CEF_ColorRefError30);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError40`] for more documentation."]
+    pub const COLOR_REF_ERROR40: Self = Self(cef_color_id_t::CEF_ColorRefError40);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError50`] for more documentation."]
+    pub const COLOR_REF_ERROR50: Self = Self(cef_color_id_t::CEF_ColorRefError50);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError60`] for more documentation."]
+    pub const COLOR_REF_ERROR60: Self = Self(cef_color_id_t::CEF_ColorRefError60);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError70`] for more documentation."]
+    pub const COLOR_REF_ERROR70: Self = Self(cef_color_id_t::CEF_ColorRefError70);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError80`] for more documentation."]
+    pub const COLOR_REF_ERROR80: Self = Self(cef_color_id_t::CEF_ColorRefError80);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError90`] for more documentation."]
+    pub const COLOR_REF_ERROR90: Self = Self(cef_color_id_t::CEF_ColorRefError90);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError95`] for more documentation."]
+    pub const COLOR_REF_ERROR95: Self = Self(cef_color_id_t::CEF_ColorRefError95);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError99`] for more documentation."]
+    pub const COLOR_REF_ERROR99: Self = Self(cef_color_id_t::CEF_ColorRefError99);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefError100`] for more documentation."]
+    pub const COLOR_REF_ERROR100: Self = Self(cef_color_id_t::CEF_ColorRefError100);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral0`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL0: Self = Self(cef_color_id_t::CEF_ColorRefNeutral0);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral4`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL4: Self = Self(cef_color_id_t::CEF_ColorRefNeutral4);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral6`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL6: Self = Self(cef_color_id_t::CEF_ColorRefNeutral6);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral8`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL8: Self = Self(cef_color_id_t::CEF_ColorRefNeutral8);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral10`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL10: Self = Self(cef_color_id_t::CEF_ColorRefNeutral10);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral12`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL12: Self = Self(cef_color_id_t::CEF_ColorRefNeutral12);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral15`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL15: Self = Self(cef_color_id_t::CEF_ColorRefNeutral15);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral17`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL17: Self = Self(cef_color_id_t::CEF_ColorRefNeutral17);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral20`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL20: Self = Self(cef_color_id_t::CEF_ColorRefNeutral20);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral22`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL22: Self = Self(cef_color_id_t::CEF_ColorRefNeutral22);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral24`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL24: Self = Self(cef_color_id_t::CEF_ColorRefNeutral24);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral25`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL25: Self = Self(cef_color_id_t::CEF_ColorRefNeutral25);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral30`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL30: Self = Self(cef_color_id_t::CEF_ColorRefNeutral30);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral40`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL40: Self = Self(cef_color_id_t::CEF_ColorRefNeutral40);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral50`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL50: Self = Self(cef_color_id_t::CEF_ColorRefNeutral50);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral60`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL60: Self = Self(cef_color_id_t::CEF_ColorRefNeutral60);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral70`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL70: Self = Self(cef_color_id_t::CEF_ColorRefNeutral70);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral80`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL80: Self = Self(cef_color_id_t::CEF_ColorRefNeutral80);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral87`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL87: Self = Self(cef_color_id_t::CEF_ColorRefNeutral87);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral90`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL90: Self = Self(cef_color_id_t::CEF_ColorRefNeutral90);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral92`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL92: Self = Self(cef_color_id_t::CEF_ColorRefNeutral92);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral94`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL94: Self = Self(cef_color_id_t::CEF_ColorRefNeutral94);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral95`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL95: Self = Self(cef_color_id_t::CEF_ColorRefNeutral95);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral96`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL96: Self = Self(cef_color_id_t::CEF_ColorRefNeutral96);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral98`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL98: Self = Self(cef_color_id_t::CEF_ColorRefNeutral98);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral99`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL99: Self = Self(cef_color_id_t::CEF_ColorRefNeutral99);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutral100`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL100: Self = Self(cef_color_id_t::CEF_ColorRefNeutral100);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant0`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT0: Self = Self(cef_color_id_t::CEF_ColorRefNeutralVariant0);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant10`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT10: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant10);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant15`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT15: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant15);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant20`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT20: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant20);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant30`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT30: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant30);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant40`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT40: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant40);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant50`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT50: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant50);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant60`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT60: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant60);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant70`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT70: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant70);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant80`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT80: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant80);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant90`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT90: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant90);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant95`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT95: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant95);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant99`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT99: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant99);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRefNeutralVariant100`] for more documentation."]
+    pub const COLOR_REF_NEUTRAL_VARIANT100: Self =
+        Self(cef_color_id_t::CEF_ColorRefNeutralVariant100);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysPrimary`] for more documentation."]
+    pub const COLOR_SYS_PRIMARY: Self = Self(cef_color_id_t::CEF_ColorSysPrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnPrimary`] for more documentation."]
+    pub const COLOR_SYS_ON_PRIMARY: Self = Self(cef_color_id_t::CEF_ColorSysOnPrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysPrimaryContainer`] for more documentation."]
+    pub const COLOR_SYS_PRIMARY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysPrimaryContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnPrimaryContainer`] for more documentation."]
+    pub const COLOR_SYS_ON_PRIMARY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnPrimaryContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSecondary`] for more documentation."]
+    pub const COLOR_SYS_SECONDARY: Self = Self(cef_color_id_t::CEF_ColorSysSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSecondary`] for more documentation."]
+    pub const COLOR_SYS_ON_SECONDARY: Self = Self(cef_color_id_t::CEF_ColorSysOnSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSecondaryContainer`] for more documentation."]
+    pub const COLOR_SYS_SECONDARY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysSecondaryContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSecondaryContainer`] for more documentation."]
+    pub const COLOR_SYS_ON_SECONDARY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnSecondaryContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysTertiary`] for more documentation."]
+    pub const COLOR_SYS_TERTIARY: Self = Self(cef_color_id_t::CEF_ColorSysTertiary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnTertiary`] for more documentation."]
+    pub const COLOR_SYS_ON_TERTIARY: Self = Self(cef_color_id_t::CEF_ColorSysOnTertiary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysTertiaryContainer`] for more documentation."]
+    pub const COLOR_SYS_TERTIARY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysTertiaryContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnTertiaryContainer`] for more documentation."]
+    pub const COLOR_SYS_ON_TERTIARY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnTertiaryContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysError`] for more documentation."]
+    pub const COLOR_SYS_ERROR: Self = Self(cef_color_id_t::CEF_ColorSysError);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnError`] for more documentation."]
+    pub const COLOR_SYS_ON_ERROR: Self = Self(cef_color_id_t::CEF_ColorSysOnError);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysErrorContainer`] for more documentation."]
+    pub const COLOR_SYS_ERROR_CONTAINER: Self = Self(cef_color_id_t::CEF_ColorSysErrorContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnErrorContainer`] for more documentation."]
+    pub const COLOR_SYS_ON_ERROR_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnErrorContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSurface`] for more documentation."]
+    pub const COLOR_SYS_ON_SURFACE: Self = Self(cef_color_id_t::CEF_ColorSysOnSurface);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSurfaceVariant`] for more documentation."]
+    pub const COLOR_SYS_ON_SURFACE_VARIANT: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnSurfaceVariant);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOutline`] for more documentation."]
+    pub const COLOR_SYS_OUTLINE: Self = Self(cef_color_id_t::CEF_ColorSysOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurfaceVariant`] for more documentation."]
+    pub const COLOR_SYS_SURFACE_VARIANT: Self = Self(cef_color_id_t::CEF_ColorSysSurfaceVariant);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysBlack`] for more documentation."]
+    pub const COLOR_SYS_BLACK: Self = Self(cef_color_id_t::CEF_ColorSysBlack);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysWhite`] for more documentation."]
+    pub const COLOR_SYS_WHITE: Self = Self(cef_color_id_t::CEF_ColorSysWhite);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysInversePrimary`] for more documentation."]
+    pub const COLOR_SYS_INVERSE_PRIMARY: Self = Self(cef_color_id_t::CEF_ColorSysInversePrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysInverseOnSurface`] for more documentation."]
+    pub const COLOR_SYS_INVERSE_ON_SURFACE: Self =
+        Self(cef_color_id_t::CEF_ColorSysInverseOnSurface);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysInverseSurface`] for more documentation."]
+    pub const COLOR_SYS_INVERSE_SURFACE: Self = Self(cef_color_id_t::CEF_ColorSysInverseSurface);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysInverseSurfacePrimary`] for more documentation."]
+    pub const COLOR_SYS_INVERSE_SURFACE_PRIMARY: Self =
+        Self(cef_color_id_t::CEF_ColorSysInverseSurfacePrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurface`] for more documentation."]
+    pub const COLOR_SYS_SURFACE: Self = Self(cef_color_id_t::CEF_ColorSysSurface);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurface1`] for more documentation."]
+    pub const COLOR_SYS_SURFACE1: Self = Self(cef_color_id_t::CEF_ColorSysSurface1);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurface2`] for more documentation."]
+    pub const COLOR_SYS_SURFACE2: Self = Self(cef_color_id_t::CEF_ColorSysSurface2);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurface3`] for more documentation."]
+    pub const COLOR_SYS_SURFACE3: Self = Self(cef_color_id_t::CEF_ColorSysSurface3);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurface4`] for more documentation."]
+    pub const COLOR_SYS_SURFACE4: Self = Self(cef_color_id_t::CEF_ColorSysSurface4);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurface5`] for more documentation."]
+    pub const COLOR_SYS_SURFACE5: Self = Self(cef_color_id_t::CEF_ColorSysSurface5);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurfaceNumberedForeground`] for more documentation."]
+    pub const COLOR_SYS_SURFACE_NUMBERED_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSysSurfaceNumberedForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSurfaceSecondary`] for more documentation."]
+    pub const COLOR_SYS_ON_SURFACE_SECONDARY: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnSurfaceSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSurfaceSubtle`] for more documentation."]
+    pub const COLOR_SYS_ON_SURFACE_SUBTLE: Self = Self(cef_color_id_t::CEF_ColorSysOnSurfaceSubtle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSurfacePrimary`] for more documentation."]
+    pub const COLOR_SYS_ON_SURFACE_PRIMARY: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnSurfacePrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnSurfacePrimaryInactive`] for more documentation."]
+    pub const COLOR_SYS_ON_SURFACE_PRIMARY_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnSurfacePrimaryInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysTonalContainer`] for more documentation."]
+    pub const COLOR_SYS_TONAL_CONTAINER: Self = Self(cef_color_id_t::CEF_ColorSysTonalContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnTonalContainer`] for more documentation."]
+    pub const COLOR_SYS_ON_TONAL_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnTonalContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysBaseTonalContainer`] for more documentation."]
+    pub const COLOR_SYS_BASE_TONAL_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysBaseTonalContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnBaseTonalContainer`] for more documentation."]
+    pub const COLOR_SYS_ON_BASE_TONAL_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnBaseTonalContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysTonalOutline`] for more documentation."]
+    pub const COLOR_SYS_TONAL_OUTLINE: Self = Self(cef_color_id_t::CEF_ColorSysTonalOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysNeutralOutline`] for more documentation."]
+    pub const COLOR_SYS_NEUTRAL_OUTLINE: Self = Self(cef_color_id_t::CEF_ColorSysNeutralOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysNeutralContainer`] for more documentation."]
+    pub const COLOR_SYS_NEUTRAL_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysNeutralContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysDivider`] for more documentation."]
+    pub const COLOR_SYS_DIVIDER: Self = Self(cef_color_id_t::CEF_ColorSysDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysBase`] for more documentation."]
+    pub const COLOR_SYS_BASE: Self = Self(cef_color_id_t::CEF_ColorSysBase);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysBaseContainer`] for more documentation."]
+    pub const COLOR_SYS_BASE_CONTAINER: Self = Self(cef_color_id_t::CEF_ColorSysBaseContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysBaseContainerElevated`] for more documentation."]
+    pub const COLOR_SYS_BASE_CONTAINER_ELEVATED: Self =
+        Self(cef_color_id_t::CEF_ColorSysBaseContainerElevated);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysHeader`] for more documentation."]
+    pub const COLOR_SYS_HEADER: Self = Self(cef_color_id_t::CEF_ColorSysHeader);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysHeaderInactive`] for more documentation."]
+    pub const COLOR_SYS_HEADER_INACTIVE: Self = Self(cef_color_id_t::CEF_ColorSysHeaderInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysHeaderContainer`] for more documentation."]
+    pub const COLOR_SYS_HEADER_CONTAINER: Self = Self(cef_color_id_t::CEF_ColorSysHeaderContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysHeaderContainerInactive`] for more documentation."]
+    pub const COLOR_SYS_HEADER_CONTAINER_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorSysHeaderContainerInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnHeaderDivider`] for more documentation."]
+    pub const COLOR_SYS_ON_HEADER_DIVIDER: Self = Self(cef_color_id_t::CEF_ColorSysOnHeaderDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnHeaderDividerInactive`] for more documentation."]
+    pub const COLOR_SYS_ON_HEADER_DIVIDER_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnHeaderDividerInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnHeaderPrimary`] for more documentation."]
+    pub const COLOR_SYS_ON_HEADER_PRIMARY: Self = Self(cef_color_id_t::CEF_ColorSysOnHeaderPrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOnHeaderPrimaryInactive`] for more documentation."]
+    pub const COLOR_SYS_ON_HEADER_PRIMARY_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorSysOnHeaderPrimaryInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHoverOnProminent`] for more documentation."]
+    pub const COLOR_SYS_STATE_HOVER_ON_PROMINENT: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHoverOnProminent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHoverOnSubtle`] for more documentation."]
+    pub const COLOR_SYS_STATE_HOVER_ON_SUBTLE: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHoverOnSubtle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateRippleNeutralOnProminent`] for more documentation."]
+    pub const COLOR_SYS_STATE_RIPPLE_NEUTRAL_ON_PROMINENT: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateRippleNeutralOnProminent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateRippleNeutralOnSubtle`] for more documentation."]
+    pub const COLOR_SYS_STATE_RIPPLE_NEUTRAL_ON_SUBTLE: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateRippleNeutralOnSubtle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateRipplePrimary`] for more documentation."]
+    pub const COLOR_SYS_STATE_RIPPLE_PRIMARY: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateRipplePrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateFocusRing`] for more documentation."]
+    pub const COLOR_SYS_STATE_FOCUS_RING: Self = Self(cef_color_id_t::CEF_ColorSysStateFocusRing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateFocusRingInverse`] for more documentation."]
+    pub const COLOR_SYS_STATE_FOCUS_RING_INVERSE: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateFocusRingInverse);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateTextHighlight`] for more documentation."]
+    pub const COLOR_SYS_STATE_TEXT_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateTextHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateOnTextHighlight`] for more documentation."]
+    pub const COLOR_SYS_STATE_ON_TEXT_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateOnTextHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateFocusHighlight`] for more documentation."]
+    pub const COLOR_SYS_STATE_FOCUS_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateFocusHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateDisabled`] for more documentation."]
+    pub const COLOR_SYS_STATE_DISABLED: Self = Self(cef_color_id_t::CEF_ColorSysStateDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateDisabledContainer`] for more documentation."]
+    pub const COLOR_SYS_STATE_DISABLED_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateDisabledContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHoverDimBlendProtection`] for more documentation."]
+    pub const COLOR_SYS_STATE_HOVER_DIM_BLEND_PROTECTION: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHoverDimBlendProtection);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHoverBrightBlendProtection`] for more documentation."]
+    pub const COLOR_SYS_STATE_HOVER_BRIGHT_BLEND_PROTECTION: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHoverBrightBlendProtection);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateInactiveRing`] for more documentation."]
+    pub const COLOR_SYS_STATE_INACTIVE_RING: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateInactiveRing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateScrim`] for more documentation."]
+    pub const COLOR_SYS_STATE_SCRIM: Self = Self(cef_color_id_t::CEF_ColorSysStateScrim);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateOnHeaderHover`] for more documentation."]
+    pub const COLOR_SYS_STATE_ON_HEADER_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateOnHeaderHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHeaderHover`] for more documentation."]
+    pub const COLOR_SYS_STATE_HEADER_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHeaderHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHeaderHoverInactive`] for more documentation."]
+    pub const COLOR_SYS_STATE_HEADER_HOVER_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHeaderHoverInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHeaderSelect`] for more documentation."]
+    pub const COLOR_SYS_STATE_HEADER_SELECT: Self =
+        Self(cef_color_id_t::CEF_ColorSysStateHeaderSelect);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysShadow`] for more documentation."]
+    pub const COLOR_SYS_SHADOW: Self = Self(cef_color_id_t::CEF_ColorSysShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysGradientPrimary`] for more documentation."]
+    pub const COLOR_SYS_GRADIENT_PRIMARY: Self = Self(cef_color_id_t::CEF_ColorSysGradientPrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysGradientTertiary`] for more documentation."]
+    pub const COLOR_SYS_GRADIENT_TERTIARY: Self =
+        Self(cef_color_id_t::CEF_ColorSysGradientTertiary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloPrimaryMin`] for more documentation."]
+    pub const COLOR_SYS_ILLO_PRIMARY_MIN: Self = Self(cef_color_id_t::CEF_ColorSysIlloPrimaryMin);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloPrimaryLow`] for more documentation."]
+    pub const COLOR_SYS_ILLO_PRIMARY_LOW: Self = Self(cef_color_id_t::CEF_ColorSysIlloPrimaryLow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloPrimaryMid`] for more documentation."]
+    pub const COLOR_SYS_ILLO_PRIMARY_MID: Self = Self(cef_color_id_t::CEF_ColorSysIlloPrimaryMid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloPrimaryHigh`] for more documentation."]
+    pub const COLOR_SYS_ILLO_PRIMARY_HIGH: Self = Self(cef_color_id_t::CEF_ColorSysIlloPrimaryHigh);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloPrimaryMax`] for more documentation."]
+    pub const COLOR_SYS_ILLO_PRIMARY_MAX: Self = Self(cef_color_id_t::CEF_ColorSysIlloPrimaryMax);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloSecondaryMin`] for more documentation."]
+    pub const COLOR_SYS_ILLO_SECONDARY_MIN: Self =
+        Self(cef_color_id_t::CEF_ColorSysIlloSecondaryMin);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloSecondaryLow`] for more documentation."]
+    pub const COLOR_SYS_ILLO_SECONDARY_LOW: Self =
+        Self(cef_color_id_t::CEF_ColorSysIlloSecondaryLow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloSecondaryMid`] for more documentation."]
+    pub const COLOR_SYS_ILLO_SECONDARY_MID: Self =
+        Self(cef_color_id_t::CEF_ColorSysIlloSecondaryMid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloSecondaryHigh`] for more documentation."]
+    pub const COLOR_SYS_ILLO_SECONDARY_HIGH: Self =
+        Self(cef_color_id_t::CEF_ColorSysIlloSecondaryHigh);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloSecondaryMax`] for more documentation."]
+    pub const COLOR_SYS_ILLO_SECONDARY_MAX: Self =
+        Self(cef_color_id_t::CEF_ColorSysIlloSecondaryMax);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloTertiaryMin`] for more documentation."]
+    pub const COLOR_SYS_ILLO_TERTIARY_MIN: Self = Self(cef_color_id_t::CEF_ColorSysIlloTertiaryMin);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloTertiaryLow`] for more documentation."]
+    pub const COLOR_SYS_ILLO_TERTIARY_LOW: Self = Self(cef_color_id_t::CEF_ColorSysIlloTertiaryLow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloTertiaryMid`] for more documentation."]
+    pub const COLOR_SYS_ILLO_TERTIARY_MID: Self = Self(cef_color_id_t::CEF_ColorSysIlloTertiaryMid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloTertiaryHigh`] for more documentation."]
+    pub const COLOR_SYS_ILLO_TERTIARY_HIGH: Self =
+        Self(cef_color_id_t::CEF_ColorSysIlloTertiaryHigh);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloTertiaryMax`] for more documentation."]
+    pub const COLOR_SYS_ILLO_TERTIARY_MAX: Self = Self(cef_color_id_t::CEF_ColorSysIlloTertiaryMax);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloNeutralMin`] for more documentation."]
+    pub const COLOR_SYS_ILLO_NEUTRAL_MIN: Self = Self(cef_color_id_t::CEF_ColorSysIlloNeutralMin);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloNeutralLow`] for more documentation."]
+    pub const COLOR_SYS_ILLO_NEUTRAL_LOW: Self = Self(cef_color_id_t::CEF_ColorSysIlloNeutralLow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloNeutralMid`] for more documentation."]
+    pub const COLOR_SYS_ILLO_NEUTRAL_MID: Self = Self(cef_color_id_t::CEF_ColorSysIlloNeutralMid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloNeutralHigh`] for more documentation."]
+    pub const COLOR_SYS_ILLO_NEUTRAL_HIGH: Self = Self(cef_color_id_t::CEF_ColorSysIlloNeutralHigh);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysIlloNeutralMax`] for more documentation."]
+    pub const COLOR_SYS_ILLO_NEUTRAL_MAX: Self = Self(cef_color_id_t::CEF_ColorSysIlloNeutralMax);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysActorUiBorder`] for more documentation."]
+    pub const COLOR_SYS_ACTOR_UI_BORDER: Self = Self(cef_color_id_t::CEF_ColorSysActorUiBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysActorUiGradientStart`] for more documentation."]
+    pub const COLOR_SYS_ACTOR_UI_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorSysActorUiGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysActorUiGradientMiddle`] for more documentation."]
+    pub const COLOR_SYS_ACTOR_UI_GRADIENT_MIDDLE: Self =
+        Self(cef_color_id_t::CEF_ColorSysActorUiGradientMiddle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysActorUiGradientEnd`] for more documentation."]
+    pub const COLOR_SYS_ACTOR_UI_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorSysActorUiGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicTabUnderline1`] for more documentation."]
+    pub const COLOR_GLIC_TAB_UNDERLINE1: Self = Self(cef_color_id_t::CEF_ColorGlicTabUnderline1);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicTabUnderline2`] for more documentation."]
+    pub const COLOR_GLIC_TAB_UNDERLINE2: Self = Self(cef_color_id_t::CEF_ColorGlicTabUnderline2);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicTabUnderline3`] for more documentation."]
+    pub const COLOR_GLIC_TAB_UNDERLINE3: Self = Self(cef_color_id_t::CEF_ColorGlicTabUnderline3);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurface1`] for more documentation."]
+    pub const COLOR_SYS_AI_ILLUSTRATION_SHAPE_SURFACE1: Self =
+        Self(cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurface1);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurface2`] for more documentation."]
+    pub const COLOR_SYS_AI_ILLUSTRATION_SHAPE_SURFACE2: Self =
+        Self(cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurface2);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurfaceGradientStart`] for more documentation."]
+    pub const COLOR_SYS_AI_ILLUSTRATION_SHAPE_SURFACE_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurfaceGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurfaceGradientEnd`] for more documentation."]
+    pub const COLOR_SYS_AI_ILLUSTRATION_SHAPE_SURFACE_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorSysAiIllustrationShapeSurfaceGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysOmniboxContainer`] for more documentation."]
+    pub const COLOR_SYS_OMNIBOX_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSysOmniboxContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysSurfaceSection`] for more documentation."]
+    pub const COLOR_SYS_SURFACE_SECTION: Self = Self(cef_color_id_t::CEF_ColorSysSurfaceSection);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysBaseContainerOnSurface`] for more documentation."]
+    pub const COLOR_SYS_BASE_CONTAINER_ON_SURFACE: Self =
+        Self(cef_color_id_t::CEF_ColorSysBaseContainerOnSurface);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateHover`] for more documentation."]
+    pub const COLOR_SYS_STATE_HOVER: Self = Self(cef_color_id_t::CEF_ColorSysStateHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStateFocus`] for more documentation."]
+    pub const COLOR_SYS_STATE_FOCUS: Self = Self(cef_color_id_t::CEF_ColorSysStateFocus);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSysStatePressed`] for more documentation."]
+    pub const COLOR_SYS_STATE_PRESSED: Self = Self(cef_color_id_t::CEF_ColorSysStatePressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAccent`] for more documentation."]
+    pub const COLOR_ACCENT: Self = Self(cef_color_id_t::CEF_ColorAccent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAccentWithGuaranteedContrastAtopPrimaryBackground`] for more documentation."]
+    pub const COLOR_ACCENT_WITH_GUARANTEED_CONTRAST_ATOP_PRIMARY_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAccentWithGuaranteedContrastAtopPrimaryBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAlertHighSeverity`] for more documentation."]
+    pub const COLOR_ALERT_HIGH_SEVERITY: Self = Self(cef_color_id_t::CEF_ColorAlertHighSeverity);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAlertLowSeverity`] for more documentation."]
+    pub const COLOR_ALERT_LOW_SEVERITY: Self = Self(cef_color_id_t::CEF_ColorAlertLowSeverity);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAlertMediumSeverityIcon`] for more documentation."]
+    pub const COLOR_ALERT_MEDIUM_SEVERITY_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorAlertMediumSeverityIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAlertMediumSeverityText`] for more documentation."]
+    pub const COLOR_ALERT_MEDIUM_SEVERITY_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorAlertMediumSeverityText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDisabledForeground`] for more documentation."]
+    pub const COLOR_DISABLED_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorDisabledForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorEndpointBackground`] for more documentation."]
+    pub const COLOR_ENDPOINT_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorEndpointBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorEndpointForeground`] for more documentation."]
+    pub const COLOR_ENDPOINT_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorEndpointForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorItemHighlight`] for more documentation."]
+    pub const COLOR_ITEM_HIGHLIGHT: Self = Self(cef_color_id_t::CEF_ColorItemHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorItemSelectionBackground`] for more documentation."]
+    pub const COLOR_ITEM_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorItemSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuSelectionBackground`] for more documentation."]
+    pub const COLOR_MENU_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorMenuSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMidground`] for more documentation."]
+    pub const COLOR_MIDGROUND: Self = Self(cef_color_id_t::CEF_ColorMidground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPrimaryBackground`] for more documentation."]
+    pub const COLOR_PRIMARY_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorPrimaryBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPrimaryForeground`] for more documentation."]
+    pub const COLOR_PRIMARY_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorPrimaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSecondaryForeground`] for more documentation."]
+    pub const COLOR_SECONDARY_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSubtleAccent`] for more documentation."]
+    pub const COLOR_SUBTLE_ACCENT: Self = Self(cef_color_id_t::CEF_ColorSubtleAccent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSubtleEmphasisBackground`] for more documentation."]
+    pub const COLOR_SUBTLE_EMPHASIS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSubtleEmphasisBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextSelectionBackground`] for more documentation."]
+    pub const COLOR_TEXT_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTextSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextSelectionForeground`] for more documentation."]
+    pub const COLOR_TEXT_SELECTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTextSelectionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuProfileRowBackground`] for more documentation."]
+    pub const COLOR_APP_MENU_PROFILE_ROW_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuProfileRowBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuProfileRowChipBackground`] for more documentation."]
+    pub const COLOR_APP_MENU_PROFILE_ROW_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuProfileRowChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuProfileRowChipHovered`] for more documentation."]
+    pub const COLOR_APP_MENU_PROFILE_ROW_CHIP_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuProfileRowChipHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuRowBackgroundHovered`] for more documentation."]
+    pub const COLOR_APP_MENU_ROW_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuRowBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuUpgradeRowBackground`] for more documentation."]
+    pub const COLOR_APP_MENU_UPGRADE_ROW_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuUpgradeRowBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuUpgradeRowSubstringForeground`] for more documentation."]
+    pub const COLOR_APP_MENU_UPGRADE_ROW_SUBSTRING_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuUpgradeRowSubstringForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarIconGuest`] for more documentation."]
+    pub const COLOR_AVATAR_ICON_GUEST: Self = Self(cef_color_id_t::CEF_ColorAvatarIconGuest);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarIconIncognito`] for more documentation."]
+    pub const COLOR_AVATAR_ICON_INCOGNITO: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarIconIncognito);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBadgeBackground`] for more documentation."]
+    pub const COLOR_BADGE_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorBadgeBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBadgeForeground`] for more documentation."]
+    pub const COLOR_BADGE_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorBadgeForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBadgeInCocoaMenuBackground`] for more documentation."]
+    pub const COLOR_BADGE_IN_COCOA_MENU_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBadgeInCocoaMenuBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBadgeInCocoaMenuForeground`] for more documentation."]
+    pub const COLOR_BADGE_IN_COCOA_MENU_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBadgeInCocoaMenuForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBubbleBackground`] for more documentation."]
+    pub const COLOR_BUBBLE_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorBubbleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBubbleBorder`] for more documentation."]
+    pub const COLOR_BUBBLE_BORDER: Self = Self(cef_color_id_t::CEF_ColorBubbleBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBubbleBorderShadowLarge`] for more documentation."]
+    pub const COLOR_BUBBLE_BORDER_SHADOW_LARGE: Self =
+        Self(cef_color_id_t::CEF_ColorBubbleBorderShadowLarge);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBubbleBorderShadowSmall`] for more documentation."]
+    pub const COLOR_BUBBLE_BORDER_SHADOW_SMALL: Self =
+        Self(cef_color_id_t::CEF_ColorBubbleBorderShadowSmall);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBubbleFooterBackground`] for more documentation."]
+    pub const COLOR_BUBBLE_FOOTER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBubbleFooterBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBubbleFooterBorder`] for more documentation."]
+    pub const COLOR_BUBBLE_FOOTER_BORDER: Self = Self(cef_color_id_t::CEF_ColorBubbleFooterBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonFeatureAttentionHighlight`] for more documentation."]
+    pub const COLOR_BUTTON_FEATURE_ATTENTION_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorButtonFeatureAttentionHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackground`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundPressed`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundProminent`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_PROMINENT: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundProminent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundProminentDisabled`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_PROMINENT_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundProminentDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundProminentFocused`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_PROMINENT_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundProminentFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundTonal`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_TONAL: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundTonal);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundTonalDisabled`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_TONAL_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundTonalDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundTonalFocused`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_TONAL_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundTonalFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBackgroundWithAttention`] for more documentation."]
+    pub const COLOR_BUTTON_BACKGROUND_WITH_ATTENTION: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBackgroundWithAttention);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBorder`] for more documentation."]
+    pub const COLOR_BUTTON_BORDER: Self = Self(cef_color_id_t::CEF_ColorButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonBorderDisabled`] for more documentation."]
+    pub const COLOR_BUTTON_BORDER_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonBorderDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonForeground`] for more documentation."]
+    pub const COLOR_BUTTON_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonForegroundDisabled`] for more documentation."]
+    pub const COLOR_BUTTON_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorButtonForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonForegroundProminent`] for more documentation."]
+    pub const COLOR_BUTTON_FOREGROUND_PROMINENT: Self =
+        Self(cef_color_id_t::CEF_ColorButtonForegroundProminent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonForegroundTonal`] for more documentation."]
+    pub const COLOR_BUTTON_FOREGROUND_TONAL: Self =
+        Self(cef_color_id_t::CEF_ColorButtonForegroundTonal);
+    #[doc = "See [`cef_color_id_t::CEF_ColorButtonHoverBackgroundText`] for more documentation."]
+    pub const COLOR_BUTTON_HOVER_BACKGROUND_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorButtonHoverBackgroundText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMultitaskMenuNudgePulse`] for more documentation."]
+    pub const COLOR_MULTITASK_MENU_NUDGE_PULSE: Self =
+        Self(cef_color_id_t::CEF_ColorMultitaskMenuNudgePulse);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxCheck`] for more documentation."]
+    pub const COLOR_CHECKBOX_CHECK: Self = Self(cef_color_id_t::CEF_ColorCheckboxCheck);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxCheckDisabled`] for more documentation."]
+    pub const COLOR_CHECKBOX_CHECK_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorCheckboxCheckDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxContainer`] for more documentation."]
+    pub const COLOR_CHECKBOX_CONTAINER: Self = Self(cef_color_id_t::CEF_ColorCheckboxContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxContainerDisabled`] for more documentation."]
+    pub const COLOR_CHECKBOX_CONTAINER_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorCheckboxContainerDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxOutline`] for more documentation."]
+    pub const COLOR_CHECKBOX_OUTLINE: Self = Self(cef_color_id_t::CEF_ColorCheckboxOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxOutlineDisabled`] for more documentation."]
+    pub const COLOR_CHECKBOX_OUTLINE_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorCheckboxOutlineDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxForegroundChecked`] for more documentation."]
+    pub const COLOR_CHECKBOX_FOREGROUND_CHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorCheckboxForegroundChecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCheckboxForegroundUnchecked`] for more documentation."]
+    pub const COLOR_CHECKBOX_FOREGROUND_UNCHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorCheckboxForegroundUnchecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipBackgroundHover`] for more documentation."]
+    pub const COLOR_CHIP_BACKGROUND_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorChipBackgroundHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipBackgroundSelected`] for more documentation."]
+    pub const COLOR_CHIP_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorChipBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipBorder`] for more documentation."]
+    pub const COLOR_CHIP_BORDER: Self = Self(cef_color_id_t::CEF_ColorChipBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipForeground`] for more documentation."]
+    pub const COLOR_CHIP_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorChipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipForegroundSelected`] for more documentation."]
+    pub const COLOR_CHIP_FOREGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorChipForegroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipIcon`] for more documentation."]
+    pub const COLOR_CHIP_ICON: Self = Self(cef_color_id_t::CEF_ColorChipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChipIconSelected`] for more documentation."]
+    pub const COLOR_CHIP_ICON_SELECTED: Self = Self(cef_color_id_t::CEF_ColorChipIconSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComboboxBackground`] for more documentation."]
+    pub const COLOR_COMBOBOX_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorComboboxBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComboboxBackgroundDisabled`] for more documentation."]
+    pub const COLOR_COMBOBOX_BACKGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorComboboxBackgroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComboboxContainerOutline`] for more documentation."]
+    pub const COLOR_COMBOBOX_CONTAINER_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorComboboxContainerOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComboboxInkDropHovered`] for more documentation."]
+    pub const COLOR_COMBOBOX_INK_DROP_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorComboboxInkDropHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComboboxInkDropRipple`] for more documentation."]
+    pub const COLOR_COMBOBOX_INK_DROP_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorComboboxInkDropRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemActiveText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_ACTIVE_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorCssSystemActiveText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemBtnFace`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_BTN_FACE: Self = Self(cef_color_id_t::CEF_ColorCssSystemBtnFace);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemBtnText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_BTN_TEXT: Self = Self(cef_color_id_t::CEF_ColorCssSystemBtnText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemField`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_FIELD: Self = Self(cef_color_id_t::CEF_ColorCssSystemField);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemFieldText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_FIELD_TEXT: Self = Self(cef_color_id_t::CEF_ColorCssSystemFieldText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemGrayText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_GRAY_TEXT: Self = Self(cef_color_id_t::CEF_ColorCssSystemGrayText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemHighlight`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_HIGHLIGHT: Self = Self(cef_color_id_t::CEF_ColorCssSystemHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemHighlightText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_HIGHLIGHT_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorCssSystemHighlightText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemHotlight`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_HOTLIGHT: Self = Self(cef_color_id_t::CEF_ColorCssSystemHotlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemLinkText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_LINK_TEXT: Self = Self(cef_color_id_t::CEF_ColorCssSystemLinkText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemMenuHilight`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_MENU_HILIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorCssSystemMenuHilight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemScrollbar`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_SCROLLBAR: Self = Self(cef_color_id_t::CEF_ColorCssSystemScrollbar);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemVisitedText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_VISITED_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorCssSystemVisitedText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemWindow`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_WINDOW: Self = Self(cef_color_id_t::CEF_ColorCssSystemWindow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCssSystemWindowText`] for more documentation."]
+    pub const COLOR_CSS_SYSTEM_WINDOW_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorCssSystemWindowText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCustomFrameCaptionForeground`] for more documentation."]
+    pub const COLOR_CUSTOM_FRAME_CAPTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorCustomFrameCaptionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDebugBoundsOutline`] for more documentation."]
+    pub const COLOR_DEBUG_BOUNDS_OUTLINE: Self = Self(cef_color_id_t::CEF_ColorDebugBoundsOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDebugContentOutline`] for more documentation."]
+    pub const COLOR_DEBUG_CONTENT_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorDebugContentOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDialogBackground`] for more documentation."]
+    pub const COLOR_DIALOG_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDialogForeground`] for more documentation."]
+    pub const COLOR_DIALOG_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorDialogForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDropdownBackground`] for more documentation."]
+    pub const COLOR_DROPDOWN_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorDropdownBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDropdownBackgroundSelected`] for more documentation."]
+    pub const COLOR_DROPDOWN_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorDropdownBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDropdownForeground`] for more documentation."]
+    pub const COLOR_DROPDOWN_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorDropdownForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDropdownForegroundSelected`] for more documentation."]
+    pub const COLOR_DROPDOWN_FOREGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorDropdownForegroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFocusableBorderFocused`] for more documentation."]
+    pub const COLOR_FOCUSABLE_BORDER_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorFocusableBorderFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFocusableBorderUnfocused`] for more documentation."]
+    pub const COLOR_FOCUSABLE_BORDER_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorFocusableBorderUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameActive`] for more documentation."]
+    pub const COLOR_FRAME_ACTIVE: Self = Self(cef_color_id_t::CEF_ColorFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameActiveUnthemed`] for more documentation."]
+    pub const COLOR_FRAME_ACTIVE_UNTHEMED: Self =
+        Self(cef_color_id_t::CEF_ColorFrameActiveUnthemed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameCaptionButtonUnfocused`] for more documentation."]
+    pub const COLOR_FRAME_CAPTION_BUTTON_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorFrameCaptionButtonUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameCaptionForegroundActive`] for more documentation."]
+    pub const COLOR_FRAME_CAPTION_FOREGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorFrameCaptionForegroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameCaptionForegroundInactive`] for more documentation."]
+    pub const COLOR_FRAME_CAPTION_FOREGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorFrameCaptionForegroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameInactive`] for more documentation."]
+    pub const COLOR_FRAME_INACTIVE: Self = Self(cef_color_id_t::CEF_ColorFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHelpIconActive`] for more documentation."]
+    pub const COLOR_HELP_ICON_ACTIVE: Self = Self(cef_color_id_t::CEF_ColorHelpIconActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHelpIconInactive`] for more documentation."]
+    pub const COLOR_HELP_ICON_INACTIVE: Self = Self(cef_color_id_t::CEF_ColorHelpIconInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryClustersSidePanelDivider`] for more documentation."]
+    pub const COLOR_HISTORY_CLUSTERS_SIDE_PANEL_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryClustersSidePanelDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogBackground`] for more documentation."]
+    pub const COLOR_HISTORY_CLUSTERS_SIDE_PANEL_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogDivider`] for more documentation."]
+    pub const COLOR_HISTORY_CLUSTERS_SIDE_PANEL_DIALOG_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogPrimaryForeground`] for more documentation."]
+    pub const COLOR_HISTORY_CLUSTERS_SIDE_PANEL_DIALOG_PRIMARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogPrimaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogSecondaryForeground`] for more documentation."]
+    pub const COLOR_HISTORY_CLUSTERS_SIDE_PANEL_DIALOG_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryClustersSidePanelDialogSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryClustersSidePanelCardSecondaryForeground`] for more documentation."]
+    pub const COLOR_HISTORY_CLUSTERS_SIDE_PANEL_CARD_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryClustersSidePanelCardSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorIcon`] for more documentation."]
+    pub const COLOR_ICON: Self = Self(cef_color_id_t::CEF_ColorIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorIconDisabled`] for more documentation."]
+    pub const COLOR_ICON_DISABLED: Self = Self(cef_color_id_t::CEF_ColorIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorIconHovered`] for more documentation."]
+    pub const COLOR_ICON_HOVERED: Self = Self(cef_color_id_t::CEF_ColorIconHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorIconSecondary`] for more documentation."]
+    pub const COLOR_ICON_SECONDARY: Self = Self(cef_color_id_t::CEF_ColorIconSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarIcon`] for more documentation."]
+    pub const COLOR_INFO_BAR_ICON: Self = Self(cef_color_id_t::CEF_ColorInfoBarIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLabelForeground`] for more documentation."]
+    pub const COLOR_LABEL_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorLabelForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLabelForegroundDisabled`] for more documentation."]
+    pub const COLOR_LABEL_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorLabelForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLabelForegroundSecondary`] for more documentation."]
+    pub const COLOR_LABEL_FOREGROUND_SECONDARY: Self =
+        Self(cef_color_id_t::CEF_ColorLabelForegroundSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLabelSelectionBackground`] for more documentation."]
+    pub const COLOR_LABEL_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLabelSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLabelSelectionForeground`] for more documentation."]
+    pub const COLOR_LABEL_SELECTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLabelSelectionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForeground`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorLinkForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForegroundDefault`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorLinkForegroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForegroundDisabled`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorLinkForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForegroundOnBubbleFooter`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND_ON_BUBBLE_FOOTER: Self =
+        Self(cef_color_id_t::CEF_ColorLinkForegroundOnBubbleFooter);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForegroundPressed`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorLinkForegroundPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForegroundPressedDefault`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND_PRESSED_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorLinkForegroundPressedDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLinkForegroundPressedOnBubbleFooter`] for more documentation."]
+    pub const COLOR_LINK_FOREGROUND_PRESSED_ON_BUBBLE_FOOTER: Self =
+        Self(cef_color_id_t::CEF_ColorLinkForegroundPressedOnBubbleFooter);
+    #[doc = "See [`cef_color_id_t::CEF_ColorListItemFolderIconBackground`] for more documentation."]
+    pub const COLOR_LIST_ITEM_FOLDER_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorListItemFolderIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorListItemFolderIconForeground`] for more documentation."]
+    pub const COLOR_LIST_ITEM_FOLDER_ICON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorListItemFolderIconForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorListItemUrlFaviconBackground`] for more documentation."]
+    pub const COLOR_LIST_ITEM_URL_FAVICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorListItemUrlFaviconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleBackgroundDefault`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_BACKGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleBackgroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleButtonBackground`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleButtonIcon`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleButtonIconDisabled`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleForegroundDefault`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_FOREGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleForegroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleForegroundSecondary`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_FOREGROUND_SECONDARY: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleForegroundSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleCheckbox`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_CHECKBOX: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleCheckbox);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionBubbleLink`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_BUBBLE_LINK: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionBubbleLink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionDialogBackground`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLiveCaptionDialogForeground`] for more documentation."]
+    pub const COLOR_LIVE_CAPTION_DIALOG_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLiveCaptionDialogForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLoadingGradientBorder`] for more documentation."]
+    pub const COLOR_LOADING_GRADIENT_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorLoadingGradientBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLoadingGradientEnd`] for more documentation."]
+    pub const COLOR_LOADING_GRADIENT_END: Self = Self(cef_color_id_t::CEF_ColorLoadingGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLoadingGradientMiddle`] for more documentation."]
+    pub const COLOR_LOADING_GRADIENT_MIDDLE: Self =
+        Self(cef_color_id_t::CEF_ColorLoadingGradientMiddle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLoadingGradientStart`] for more documentation."]
+    pub const COLOR_LOADING_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorLoadingGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuBackground`] for more documentation."]
+    pub const COLOR_MENU_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorMenuBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuBorder`] for more documentation."]
+    pub const COLOR_MENU_BORDER: Self = Self(cef_color_id_t::CEF_ColorMenuBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuButtonBackground`] for more documentation."]
+    pub const COLOR_MENU_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorMenuButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuButtonBackgroundSelected`] for more documentation."]
+    pub const COLOR_MENU_BUTTON_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorMenuButtonBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuDropmarker`] for more documentation."]
+    pub const COLOR_MENU_DROPMARKER: Self = Self(cef_color_id_t::CEF_ColorMenuDropmarker);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuIcon`] for more documentation."]
+    pub const COLOR_MENU_ICON: Self = Self(cef_color_id_t::CEF_ColorMenuIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuIconDisabled`] for more documentation."]
+    pub const COLOR_MENU_ICON_DISABLED: Self = Self(cef_color_id_t::CEF_ColorMenuIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuIconOnEmphasizedBackground`] for more documentation."]
+    pub const COLOR_MENU_ICON_ON_EMPHASIZED_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorMenuIconOnEmphasizedBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemBackgroundAlertedInitial`] for more documentation."]
+    pub const COLOR_MENU_ITEM_BACKGROUND_ALERTED_INITIAL: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemBackgroundAlertedInitial);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemBackgroundAlertedTarget`] for more documentation."]
+    pub const COLOR_MENU_ITEM_BACKGROUND_ALERTED_TARGET: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemBackgroundAlertedTarget);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemBackgroundHighlighted`] for more documentation."]
+    pub const COLOR_MENU_ITEM_BACKGROUND_HIGHLIGHTED: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemBackgroundHighlighted);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemBackgroundSelected`] for more documentation."]
+    pub const COLOR_MENU_ITEM_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemForeground`] for more documentation."]
+    pub const COLOR_MENU_ITEM_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorMenuItemForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemForegroundDisabled`] for more documentation."]
+    pub const COLOR_MENU_ITEM_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemForegroundHighlighted`] for more documentation."]
+    pub const COLOR_MENU_ITEM_FOREGROUND_HIGHLIGHTED: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemForegroundHighlighted);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemForegroundSecondary`] for more documentation."]
+    pub const COLOR_MENU_ITEM_FOREGROUND_SECONDARY: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemForegroundSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuItemForegroundSelected`] for more documentation."]
+    pub const COLOR_MENU_ITEM_FOREGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorMenuItemForegroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMenuSeparator`] for more documentation."]
+    pub const COLOR_MENU_SEPARATOR: Self = Self(cef_color_id_t::CEF_ColorMenuSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationActionsBackground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_ACTIONS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationActionsBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationBackgroundActive`] for more documentation."]
+    pub const COLOR_NOTIFICATION_BACKGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationBackgroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationBackgroundInactive`] for more documentation."]
+    pub const COLOR_NOTIFICATION_BACKGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationBackgroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationHeaderForeground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_HEADER_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationHeaderForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationIconBackground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationIconForeground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_ICON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationIconForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationImageBackground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_IMAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationImageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationInputBackground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_INPUT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationInputBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationInputForeground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_INPUT_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationInputForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNotificationInputPlaceholderForeground`] for more documentation."]
+    pub const COLOR_NOTIFICATION_INPUT_PLACEHOLDER_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNotificationInputPlaceholderForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOverlayScrollbarFill`] for more documentation."]
+    pub const COLOR_OVERLAY_SCROLLBAR_FILL: Self =
+        Self(cef_color_id_t::CEF_ColorOverlayScrollbarFill);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOverlayScrollbarFillHovered`] for more documentation."]
+    pub const COLOR_OVERLAY_SCROLLBAR_FILL_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorOverlayScrollbarFillHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOverlayScrollbarStroke`] for more documentation."]
+    pub const COLOR_OVERLAY_SCROLLBAR_STROKE: Self =
+        Self(cef_color_id_t::CEF_ColorOverlayScrollbarStroke);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOverlayScrollbarStrokeHovered`] for more documentation."]
+    pub const COLOR_OVERLAY_SCROLLBAR_STROKE_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorOverlayScrollbarStrokeHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProgressBar`] for more documentation."]
+    pub const COLOR_PROGRESS_BAR: Self = Self(cef_color_id_t::CEF_ColorProgressBar);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProgressBarBackground`] for more documentation."]
+    pub const COLOR_PROGRESS_BAR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProgressBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProgressBarPaused`] for more documentation."]
+    pub const COLOR_PROGRESS_BAR_PAUSED: Self = Self(cef_color_id_t::CEF_ColorProgressBarPaused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRadioButtonForegroundUnchecked`] for more documentation."]
+    pub const COLOR_RADIO_BUTTON_FOREGROUND_UNCHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorRadioButtonForegroundUnchecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRadioButtonForegroundDisabled`] for more documentation."]
+    pub const COLOR_RADIO_BUTTON_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorRadioButtonForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorRadioButtonForegroundChecked`] for more documentation."]
+    pub const COLOR_RADIO_BUTTON_FOREGROUND_CHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorRadioButtonForegroundChecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonBorder`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonFocus`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_FOCUS: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonFocus);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonForegroundChecked`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_FOREGROUND_CHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonForegroundChecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonForegroundUnchecked`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_FOREGROUND_UNCHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonForegroundUnchecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonHover`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonRipple`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSegmentedButtonChecked`] for more documentation."]
+    pub const COLOR_SEGMENTED_BUTTON_CHECKED: Self =
+        Self(cef_color_id_t::CEF_ColorSegmentedButtonChecked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSeparator`] for more documentation."]
+    pub const COLOR_SEPARATOR: Self = Self(cef_color_id_t::CEF_ColorSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowBase`] for more documentation."]
+    pub const COLOR_SHADOW_BASE: Self = Self(cef_color_id_t::CEF_ColorShadowBase);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationFour`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_AMBIENT_SHADOW_ELEVATION_FOUR: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationFour);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationSixteen`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_AMBIENT_SHADOW_ELEVATION_SIXTEEN: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationSixteen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationThree`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_AMBIENT_SHADOW_ELEVATION_THREE: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationThree);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationTwelve`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_AMBIENT_SHADOW_ELEVATION_TWELVE: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationTwelve);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationTwentyFour`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_AMBIENT_SHADOW_ELEVATION_TWENTY_FOUR: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueAmbientShadowElevationTwentyFour);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationFour`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_KEY_SHADOW_ELEVATION_FOUR: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationFour);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationSixteen`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_KEY_SHADOW_ELEVATION_SIXTEEN: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationSixteen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationThree`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_KEY_SHADOW_ELEVATION_THREE: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationThree);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationTwelve`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_KEY_SHADOW_ELEVATION_TWELVE: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationTwelve);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationTwentyFour`] for more documentation."]
+    pub const COLOR_SHADOW_VALUE_KEY_SHADOW_ELEVATION_TWENTY_FOUR: Self =
+        Self(cef_color_id_t::CEF_ColorShadowValueKeyShadowElevationTwentyFour);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelComboboxBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMBOBOX_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelComboboxBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelComboboxBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMBOBOX_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelComboboxBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderThumb`] for more documentation."]
+    pub const COLOR_SLIDER_THUMB: Self = Self(cef_color_id_t::CEF_ColorSliderThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderThumbMinimal`] for more documentation."]
+    pub const COLOR_SLIDER_THUMB_MINIMAL: Self = Self(cef_color_id_t::CEF_ColorSliderThumbMinimal);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderTrack`] for more documentation."]
+    pub const COLOR_SLIDER_TRACK: Self = Self(cef_color_id_t::CEF_ColorSliderTrack);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderTrackMinimal`] for more documentation."]
+    pub const COLOR_SLIDER_TRACK_MINIMAL: Self = Self(cef_color_id_t::CEF_ColorSliderTrackMinimal);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSyncInfoBackground`] for more documentation."]
+    pub const COLOR_SYNC_INFO_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorSyncInfoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSyncInfoBackgroundError`] for more documentation."]
+    pub const COLOR_SYNC_INFO_BACKGROUND_ERROR: Self =
+        Self(cef_color_id_t::CEF_ColorSyncInfoBackgroundError);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSyncInfoBackgroundPaused`] for more documentation."]
+    pub const COLOR_SYNC_INFO_BACKGROUND_PAUSED: Self =
+        Self(cef_color_id_t::CEF_ColorSyncInfoBackgroundPaused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundHighlighted`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_HIGHLIGHTED: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundHighlighted);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundHighlightedFocused`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_HIGHLIGHTED_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundHighlightedFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBorderSelected`] for more documentation."]
+    pub const COLOR_TAB_BORDER_SELECTED: Self = Self(cef_color_id_t::CEF_ColorTabBorderSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabContentSeparator`] for more documentation."]
+    pub const COLOR_TAB_CONTENT_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorTabContentSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForegroundDisabled`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorTabForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForeground`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorTabForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForegroundSelected`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorTabForegroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableBackground`] for more documentation."]
+    pub const COLOR_TABLE_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorTableBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableBackgroundAlternate`] for more documentation."]
+    pub const COLOR_TABLE_BACKGROUND_ALTERNATE: Self =
+        Self(cef_color_id_t::CEF_ColorTableBackgroundAlternate);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableBackgroundSelectedFocused`] for more documentation."]
+    pub const COLOR_TABLE_BACKGROUND_SELECTED_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTableBackgroundSelectedFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableBackgroundSelectedUnfocused`] for more documentation."]
+    pub const COLOR_TABLE_BACKGROUND_SELECTED_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTableBackgroundSelectedUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableForeground`] for more documentation."]
+    pub const COLOR_TABLE_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorTableForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableForegroundSelectedFocused`] for more documentation."]
+    pub const COLOR_TABLE_FOREGROUND_SELECTED_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTableForegroundSelectedFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableForegroundSelectedUnfocused`] for more documentation."]
+    pub const COLOR_TABLE_FOREGROUND_SELECTED_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTableForegroundSelectedUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableGroupingIndicator`] for more documentation."]
+    pub const COLOR_TABLE_GROUPING_INDICATOR: Self =
+        Self(cef_color_id_t::CEF_ColorTableGroupingIndicator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableHeaderBackground`] for more documentation."]
+    pub const COLOR_TABLE_HEADER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTableHeaderBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableHeaderForeground`] for more documentation."]
+    pub const COLOR_TABLE_HEADER_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTableHeaderForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableHeaderSeparator`] for more documentation."]
+    pub const COLOR_TABLE_HEADER_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorTableHeaderSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableIconBackground`] for more documentation."]
+    pub const COLOR_TABLE_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTableIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTableRowHighlight`] for more documentation."]
+    pub const COLOR_TABLE_ROW_HIGHLIGHT: Self = Self(cef_color_id_t::CEF_ColorTableRowHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSuggestionChipBorder`] for more documentation."]
+    pub const COLOR_SUGGESTION_CHIP_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSuggestionChipBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSuggestionChipIcon`] for more documentation."]
+    pub const COLOR_SUGGESTION_CHIP_ICON: Self = Self(cef_color_id_t::CEF_ColorSuggestionChipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldBackground`] for more documentation."]
+    pub const COLOR_TEXTFIELD_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorTextfieldBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldBackgroundDisabled`] for more documentation."]
+    pub const COLOR_TEXTFIELD_BACKGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldBackgroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldFilledBackground`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FILLED_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldFilledBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldFilledForegroundInvalid`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FILLED_FOREGROUND_INVALID: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldFilledForegroundInvalid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldFilledUnderline`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FILLED_UNDERLINE: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldFilledUnderline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldFilledUnderlineFocused`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FILLED_UNDERLINE_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldFilledUnderlineFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldForeground`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorTextfieldForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldForegroundDisabled`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldForegroundIcon`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FOREGROUND_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldForegroundIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldForegroundLabel`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FOREGROUND_LABEL: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldForegroundLabel);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldForegroundPlaceholderInvalid`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FOREGROUND_PLACEHOLDER_INVALID: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldForegroundPlaceholderInvalid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldForegroundPlaceholder`] for more documentation."]
+    pub const COLOR_TEXTFIELD_FOREGROUND_PLACEHOLDER: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldForegroundPlaceholder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldHover`] for more documentation."]
+    pub const COLOR_TEXTFIELD_HOVER: Self = Self(cef_color_id_t::CEF_ColorTextfieldHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldSelectionBackground`] for more documentation."]
+    pub const COLOR_TEXTFIELD_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldSelectionForeground`] for more documentation."]
+    pub const COLOR_TEXTFIELD_SELECTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldSelectionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldOutline`] for more documentation."]
+    pub const COLOR_TEXTFIELD_OUTLINE: Self = Self(cef_color_id_t::CEF_ColorTextfieldOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldOutlineDisabled`] for more documentation."]
+    pub const COLOR_TEXTFIELD_OUTLINE_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldOutlineDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTextfieldOutlineInvalid`] for more documentation."]
+    pub const COLOR_TEXTFIELD_OUTLINE_INVALID: Self =
+        Self(cef_color_id_t::CEF_ColorTextfieldOutlineInvalid);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerCheckmarkBackground`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_CHECKMARK_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerCheckmarkBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerCheckmarkForeground`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_CHECKMARK_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerCheckmarkForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerCustomColorIconBackground`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_CUSTOM_COLOR_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerCustomColorIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerHueSliderDialogBackground`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_HUE_SLIDER_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerHueSliderDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerHueSliderDialogForeground`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_HUE_SLIDER_DIALOG_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerHueSliderDialogForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerHueSliderDialogIcon`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_HUE_SLIDER_DIALOG_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerHueSliderDialogIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerHueSliderHandle`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_HUE_SLIDER_HANDLE: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerHueSliderHandle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThemeColorPickerOptionBackground`] for more documentation."]
+    pub const COLOR_THEME_COLOR_PICKER_OPTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThemeColorPickerOptionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThrobber`] for more documentation."]
+    pub const COLOR_THROBBER: Self = Self(cef_color_id_t::CEF_ColorThrobber);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThrobberPreconnect`] for more documentation."]
+    pub const COLOR_THROBBER_PRECONNECT: Self = Self(cef_color_id_t::CEF_ColorThrobberPreconnect);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToastBackground`] for more documentation."]
+    pub const COLOR_TOAST_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorToastBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToastBackgroundProminent`] for more documentation."]
+    pub const COLOR_TOAST_BACKGROUND_PROMINENT: Self =
+        Self(cef_color_id_t::CEF_ColorToastBackgroundProminent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToastButton`] for more documentation."]
+    pub const COLOR_TOAST_BUTTON: Self = Self(cef_color_id_t::CEF_ColorToastButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToastForeground`] for more documentation."]
+    pub const COLOR_TOAST_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorToastForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonHover`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_HOVER: Self = Self(cef_color_id_t::CEF_ColorToggleButtonHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonPressed`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonShadow`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_SHADOW: Self = Self(cef_color_id_t::CEF_ColorToggleButtonShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonThumbOff`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_THUMB_OFF: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonThumbOff);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonThumbOffDisabled`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_THUMB_OFF_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonThumbOffDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonThumbOn`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_THUMB_ON: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonThumbOn);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonThumbOnDisabled`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_THUMB_ON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonThumbOnDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonThumbOnHover`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_THUMB_ON_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonThumbOnHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonTrackOff`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_TRACK_OFF: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonTrackOff);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonTrackOffDisabled`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_TRACK_OFF_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonTrackOffDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonTrackOn`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_TRACK_ON: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonTrackOn);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToggleButtonTrackOnDisabled`] for more documentation."]
+    pub const COLOR_TOGGLE_BUTTON_TRACK_ON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToggleButtonTrackOnDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSearchFieldBackground`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEARCH_FIELD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSearchFieldBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSearchFieldBackgroundHover`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEARCH_FIELD_BACKGROUND_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSearchFieldBackgroundHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSearchFieldBackgroundPressed`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEARCH_FIELD_BACKGROUND_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSearchFieldBackgroundPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSearchFieldForeground`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEARCH_FIELD_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSearchFieldForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSearchFieldForegroundPlaceholder`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEARCH_FIELD_FOREGROUND_PLACEHOLDER: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSearchFieldForegroundPlaceholder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSearchFieldIcon`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEARCH_FIELD_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSearchFieldIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTooltipBackground`] for more documentation."]
+    pub const COLOR_TOOLTIP_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorTooltipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTooltipForeground`] for more documentation."]
+    pub const COLOR_TOOLTIP_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorTooltipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTreeBackground`] for more documentation."]
+    pub const COLOR_TREE_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorTreeBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTreeNodeBackgroundSelectedFocused`] for more documentation."]
+    pub const COLOR_TREE_NODE_BACKGROUND_SELECTED_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTreeNodeBackgroundSelectedFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTreeNodeBackgroundSelectedUnfocused`] for more documentation."]
+    pub const COLOR_TREE_NODE_BACKGROUND_SELECTED_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTreeNodeBackgroundSelectedUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTreeNodeForeground`] for more documentation."]
+    pub const COLOR_TREE_NODE_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorTreeNodeForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTreeNodeForegroundSelectedFocused`] for more documentation."]
+    pub const COLOR_TREE_NODE_FOREGROUND_SELECTED_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTreeNodeForegroundSelectedFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTreeNodeForegroundSelectedUnfocused`] for more documentation."]
+    pub const COLOR_TREE_NODE_FOREGROUND_SELECTED_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTreeNodeForegroundSelectedUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlAccent`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_ACCENT: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlAccent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlAccentDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_ACCENT_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlAccentDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlAccentHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_ACCENT_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlAccentHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlAccentPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_ACCENT_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlAccentPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlAutoCompleteBackground`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_AUTO_COMPLETE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlAutoCompleteBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlBorder`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlBorderDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BORDER_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlBorderDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlBorderHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BORDER_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlBorderHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlBorderPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BORDER_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlBorderPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonBorder`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonBorderDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_BORDER_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonBorderDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonBorderHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_BORDER_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonBorderHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonBorderPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_BORDER_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonBorderPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonFill`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_FILL: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonFill);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonFillDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_FILL_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonFillDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonFillHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_FILL_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonFillHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlButtonFillPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_BUTTON_FILL_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlButtonFillPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlCheckboxBackground`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_CHECKBOX_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlCheckboxBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlCheckboxBackgroundDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_CHECKBOX_BACKGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlCheckboxBackgroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlFill`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_FILL: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlFill);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlFillDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_FILL_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlFillDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlFillHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_FILL_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlFillHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlFillPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_FILL_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlFillPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlLightenLayer`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_LIGHTEN_LAYER: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlLightenLayer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlProgressValue`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_PROGRESS_VALUE: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlProgressValue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowBackgroundDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_BACKGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowBackgroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowBackgroundHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowBackgroundPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_BACKGROUND_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowBackgroundPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForeground`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForegroundDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForegroundHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_FOREGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForegroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForegroundPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_ARROW_FOREGROUND_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarArrowForegroundPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarCorner`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_CORNER: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarCorner);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumb`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumbHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_THUMB_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumbHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumbOverlayMinimalMode`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_THUMB_OVERLAY_MINIMAL_MODE: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumbOverlayMinimalMode);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumbPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_THUMB_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarThumbPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlScrollbarTrack`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SCROLLBAR_TRACK: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlScrollbarTrack);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSlider`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSlider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSliderBorder`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSliderBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSliderBorderHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER_BORDER_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSliderBorderHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSliderBorderPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER_BORDER_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSliderBorderPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSliderDisabled`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSliderDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSliderHovered`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSliderHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebNativeControlSliderPressed`] for more documentation."]
+    pub const COLOR_WEB_NATIVE_CONTROL_SLIDER_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorWebNativeControlSliderPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWindowBackground`] for more documentation."]
+    pub const COLOR_WINDOW_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorWindowBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeBtnFace`] for more documentation."]
+    pub const COLOR_NATIVE_BTN_FACE: Self = Self(cef_color_id_t::CEF_ColorNativeBtnFace);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeBtnHighlight`] for more documentation."]
+    pub const COLOR_NATIVE_BTN_HIGHLIGHT: Self = Self(cef_color_id_t::CEF_ColorNativeBtnHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeBtnShadow`] for more documentation."]
+    pub const COLOR_NATIVE_BTN_SHADOW: Self = Self(cef_color_id_t::CEF_ColorNativeBtnShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeBtnText`] for more documentation."]
+    pub const COLOR_NATIVE_BTN_TEXT: Self = Self(cef_color_id_t::CEF_ColorNativeBtnText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeGrayText`] for more documentation."]
+    pub const COLOR_NATIVE_GRAY_TEXT: Self = Self(cef_color_id_t::CEF_ColorNativeGrayText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeHighlight`] for more documentation."]
+    pub const COLOR_NATIVE_HIGHLIGHT: Self = Self(cef_color_id_t::CEF_ColorNativeHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeHighlightText`] for more documentation."]
+    pub const COLOR_NATIVE_HIGHLIGHT_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorNativeHighlightText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeHotlight`] for more documentation."]
+    pub const COLOR_NATIVE_HOTLIGHT: Self = Self(cef_color_id_t::CEF_ColorNativeHotlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeMenuHilight`] for more documentation."]
+    pub const COLOR_NATIVE_MENU_HILIGHT: Self = Self(cef_color_id_t::CEF_ColorNativeMenuHilight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeScrollbar`] for more documentation."]
+    pub const COLOR_NATIVE_SCROLLBAR: Self = Self(cef_color_id_t::CEF_ColorNativeScrollbar);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeWindow`] for more documentation."]
+    pub const COLOR_NATIVE_WINDOW: Self = Self(cef_color_id_t::CEF_ColorNativeWindow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNativeWindowText`] for more documentation."]
+    pub const COLOR_NATIVE_WINDOW_TEXT: Self = Self(cef_color_id_t::CEF_ColorNativeWindowText);
+    #[doc = "See [`cef_color_id_t::CEF_UiColorsEnd`] for more documentation."]
+    pub const UI_COLORS_END: Self = Self(cef_color_id_t::CEF_UiColorsEnd);
+    #[doc = "See [`cef_color_id_t::kFullscreenNotificationOpaqueBackgroundColor`] for more documentation."]
+    pub const FULLSCREEN_NOTIFICATION_OPAQUE_BACKGROUND_COLOR: Self =
+        Self(cef_color_id_t::kFullscreenNotificationOpaqueBackgroundColor);
+    #[doc = "See [`cef_color_id_t::kFullscreenNotificationTransparentBackgroundColor`] for more documentation."]
+    pub const FULLSCREEN_NOTIFICATION_TRANSPARENT_BACKGROUND_COLOR: Self =
+        Self(cef_color_id_t::kFullscreenNotificationTransparentBackgroundColor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorEyedropperBoundary`] for more documentation."]
+    pub const COLOR_EYEDROPPER_BOUNDARY: Self = Self(cef_color_id_t::CEF_ColorEyedropperBoundary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorEyedropperCentralPixelInnerRing`] for more documentation."]
+    pub const COLOR_EYEDROPPER_CENTRAL_PIXEL_INNER_RING: Self =
+        Self(cef_color_id_t::CEF_ColorEyedropperCentralPixelInnerRing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorEyedropperCentralPixelOuterRing`] for more documentation."]
+    pub const COLOR_EYEDROPPER_CENTRAL_PIXEL_OUTER_RING: Self =
+        Self(cef_color_id_t::CEF_ColorEyedropperCentralPixelOuterRing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorEyedropperGrid`] for more documentation."]
+    pub const COLOR_EYEDROPPER_GRID: Self = Self(cef_color_id_t::CEF_ColorEyedropperGrid);
+    #[doc = "See [`cef_color_id_t::CEF_ComponentsColorsEnd`] for more documentation."]
+    pub const COMPONENTS_COLORS_END: Self = Self(cef_color_id_t::CEF_ComponentsColorsEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuHighlightSeverityHigh`] for more documentation."]
+    pub const COLOR_APP_MENU_HIGHLIGHT_SEVERITY_HIGH: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuHighlightSeverityHigh);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuHighlightSeverityMedium`] for more documentation."]
+    pub const COLOR_APP_MENU_HIGHLIGHT_SEVERITY_MEDIUM: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuHighlightSeverityMedium);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuHighlightDefault`] for more documentation."]
+    pub const COLOR_APP_MENU_HIGHLIGHT_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuHighlightDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuHighlightPrimary`] for more documentation."]
+    pub const COLOR_APP_MENU_HIGHLIGHT_PRIMARY: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuHighlightPrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuExpandedForegroundDefault`] for more documentation."]
+    pub const COLOR_APP_MENU_EXPANDED_FOREGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuExpandedForegroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuExpandedForegroundPrimary`] for more documentation."]
+    pub const COLOR_APP_MENU_EXPANDED_FOREGROUND_PRIMARY: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuExpandedForegroundPrimary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuChipInkDropHover`] for more documentation."]
+    pub const COLOR_APP_MENU_CHIP_INK_DROP_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuChipInkDropHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAppMenuChipInkDropRipple`] for more documentation."]
+    pub const COLOR_APP_MENU_CHIP_INK_DROP_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorAppMenuChipInkDropRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiHandoffButtonBorder`] for more documentation."]
+    pub const COLOR_ACTOR_UI_HANDOFF_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorActorUiHandoffButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiOverlayBorder`] for more documentation."]
+    pub const COLOR_ACTOR_UI_OVERLAY_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorActorUiOverlayBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiOverlayBorderGlow`] for more documentation."]
+    pub const COLOR_ACTOR_UI_OVERLAY_BORDER_GLOW: Self =
+        Self(cef_color_id_t::CEF_ColorActorUiOverlayBorderGlow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiScrimStart`] for more documentation."]
+    pub const COLOR_ACTOR_UI_SCRIM_START: Self = Self(cef_color_id_t::CEF_ColorActorUiScrimStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiScrimMiddle`] for more documentation."]
+    pub const COLOR_ACTOR_UI_SCRIM_MIDDLE: Self = Self(cef_color_id_t::CEF_ColorActorUiScrimMiddle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiScrimEnd`] for more documentation."]
+    pub const COLOR_ACTOR_UI_SCRIM_END: Self = Self(cef_color_id_t::CEF_ColorActorUiScrimEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActorUiMagicCursor`] for more documentation."]
+    pub const COLOR_ACTOR_UI_MAGIC_CURSOR: Self = Self(cef_color_id_t::CEF_ColorActorUiMagicCursor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActivityIndicatorForeground`] for more documentation."]
+    pub const COLOR_ACTIVITY_INDICATOR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorActivityIndicatorForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorActivityIndicatorSubtitleForeground`] for more documentation."]
+    pub const COLOR_ACTIVITY_INDICATOR_SUBTITLE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorActivityIndicatorSubtitleForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightDefault`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightGuest`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_GUEST: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightGuest);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightSyncError`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_SYNC_ERROR: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightSyncError);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightSyncPaused`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_SYNC_PAUSED: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightSyncPaused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightPasskeysLocked`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_PASSKEYS_LOCKED: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightPasskeysLocked);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightSigninPaused`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_SIGNIN_PAUSED: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightSigninPaused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightExplicitText`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_EXPLICIT_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightExplicitText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightIncognito`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_INCOGNITO: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightIncognito);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightManagement`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_MANAGEMENT: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightManagement);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightGuestForeground`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_GUEST_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightGuestForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightDefaultForeground`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_DEFAULT_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightDefaultForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightSyncErrorForeground`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_SYNC_ERROR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightSyncErrorForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightIncognitoForeground`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_INCOGNITO_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightIncognitoForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonHighlightManagementForeground`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_HIGHLIGHT_MANAGEMENT_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonHighlightManagementForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonIncognitoHover`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_INCOGNITO_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonIncognitoHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarButtonNormalRipple`] for more documentation."]
+    pub const COLOR_AVATAR_BUTTON_NORMAL_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarButtonNormalRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarStroke`] for more documentation."]
+    pub const COLOR_AVATAR_STROKE: Self = Self(cef_color_id_t::CEF_ColorAvatarStroke);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAvatarFillForContrast`] for more documentation."]
+    pub const COLOR_AVATAR_FILL_FOR_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorAvatarFillForContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAiSubscriptionRingGradientStart`] for more documentation."]
+    pub const COLOR_AI_SUBSCRIPTION_RING_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorAiSubscriptionRingGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAiSubscriptionRingGradientEnd`] for more documentation."]
+    pub const COLOR_AI_SUBSCRIPTION_RING_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorAiSubscriptionRingGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkManagerItemBackgroundSelected`] for more documentation."]
+    pub const COLOR_BOOKMARK_MANAGER_ITEM_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkManagerItemBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkManagerItemOutline`] for more documentation."]
+    pub const COLOR_BOOKMARK_MANAGER_ITEM_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkManagerItemOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkManagerItemText`] for more documentation."]
+    pub const COLOR_BOOKMARK_MANAGER_ITEM_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkManagerItemText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkManagerItemTitle`] for more documentation."]
+    pub const COLOR_BOOKMARK_MANAGER_ITEM_TITLE: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkManagerItemTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkBarBackground`] for more documentation."]
+    pub const COLOR_BOOKMARK_BAR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkBarForeground`] for more documentation."]
+    pub const COLOR_BOOKMARK_BAR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkBarForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkBarForegroundDisabled`] for more documentation."]
+    pub const COLOR_BOOKMARK_BAR_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkBarForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkBarSeparator`] for more documentation."]
+    pub const COLOR_BOOKMARK_BAR_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkBarSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkBarSeparatorChromeRefresh`] for more documentation."]
+    pub const COLOR_BOOKMARK_BAR_SEPARATOR_CHROME_REFRESH: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkBarSeparatorChromeRefresh);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkButtonIcon`] for more documentation."]
+    pub const COLOR_BOOKMARK_BUTTON_ICON: Self = Self(cef_color_id_t::CEF_ColorBookmarkButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDialogTrackPriceIcon`] for more documentation."]
+    pub const COLOR_BOOKMARK_DIALOG_TRACK_PRICE_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDialogTrackPriceIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDialogProductImageBorder`] for more documentation."]
+    pub const COLOR_BOOKMARK_DIALOG_PRODUCT_IMAGE_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDialogProductImageBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDragImageBackground`] for more documentation."]
+    pub const COLOR_BOOKMARK_DRAG_IMAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDragImageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDragImageCountBackground`] for more documentation."]
+    pub const COLOR_BOOKMARK_DRAG_IMAGE_COUNT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDragImageCountBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDragImageCountForeground`] for more documentation."]
+    pub const COLOR_BOOKMARK_DRAG_IMAGE_COUNT_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDragImageCountForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDragImageForeground`] for more documentation."]
+    pub const COLOR_BOOKMARK_DRAG_IMAGE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDragImageForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkDragImageIconBackground`] for more documentation."]
+    pub const COLOR_BOOKMARK_DRAG_IMAGE_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBookmarkDragImageIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkFavicon`] for more documentation."]
+    pub const COLOR_BOOKMARK_FAVICON: Self = Self(cef_color_id_t::CEF_ColorBookmarkFavicon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBookmarkFolderIcon`] for more documentation."]
+    pub const COLOR_BOOKMARK_FOLDER_ICON: Self = Self(cef_color_id_t::CEF_ColorBookmarkFolderIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionButtonBackground`] for more documentation."]
+    pub const COLOR_CAPTION_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCapturedTabContentsBorder`] for more documentation."]
+    pub const COLOR_CAPTURED_TAB_CONTENTS_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorCapturedTabContentsBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCastDialogHelpIcon`] for more documentation."]
+    pub const COLOR_CAST_DIALOG_HELP_ICON: Self = Self(cef_color_id_t::CEF_ColorCastDialogHelpIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChromeSigninBubbleBackground`] for more documentation."]
+    pub const COLOR_CHROME_SIGNIN_BUBBLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorChromeSigninBubbleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorChromeSigninBubbleInfoBackground`] for more documentation."]
+    pub const COLOR_CHROME_SIGNIN_BUBBLE_INFO_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorChromeSigninBubbleInfoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBatchUploadBackground`] for more documentation."]
+    pub const COLOR_BATCH_UPLOAD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBatchUploadBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBatchUploadDataBackground`] for more documentation."]
+    pub const COLOR_BATCH_UPLOAD_DATA_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBatchUploadDataBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBatchUploadDataSeparator`] for more documentation."]
+    pub const COLOR_BATCH_UPLOAD_DATA_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorBatchUploadDataSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBnplIssuerLabelForeground`] for more documentation."]
+    pub const COLOR_BNPL_ISSUER_LABEL_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBnplIssuerLabelForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBnplIssuerLabelForegroundDisabled`] for more documentation."]
+    pub const COLOR_BNPL_ISSUER_LABEL_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorBnplIssuerLabelForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBnplIssuerLinkedIneligibleBackground`] for more documentation."]
+    pub const COLOR_BNPL_ISSUER_LINKED_INELIGIBLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBnplIssuerLinkedIneligibleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBnplIssuerLinkedPillBackground`] for more documentation."]
+    pub const COLOR_BNPL_ISSUER_LINKED_PILL_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBnplIssuerLinkedPillBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorBnplIssuerLinkedPillForeground`] for more documentation."]
+    pub const COLOR_BNPL_ISSUER_LINKED_PILL_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorBnplIssuerLinkedPillForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAutofillPopupDeactivatedBnplForeground`] for more documentation."]
+    pub const COLOR_AUTOFILL_POPUP_DEACTIVATED_BNPL_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorAutofillPopupDeactivatedBnplForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogBackground`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogDivider`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogError`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_ERROR: Self = Self(cef_color_id_t::CEF_ColorComposeDialogError);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogForegroundSubtle`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_FOREGROUND_SUBTLE: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogForegroundSubtle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogLink`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_LINK: Self = Self(cef_color_id_t::CEF_ColorComposeDialogLink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogLogo`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_LOGO: Self = Self(cef_color_id_t::CEF_ColorComposeDialogLogo);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogResultBackground`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_RESULT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogResultBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogResultForeground`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_RESULT_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogResultForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogResultForegroundWhileLoading`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_RESULT_FOREGROUND_WHILE_LOADING: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogResultForegroundWhileLoading);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogResultIcon`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_RESULT_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogResultIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogResultContainerScrollbarThumb`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_RESULT_CONTAINER_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogResultContainerScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogScrollbarThumb`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTitle`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TITLE: Self = Self(cef_color_id_t::CEF_ColorComposeDialogTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTextarea`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TEXTAREA: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogTextarea);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTextareaOutline`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TEXTAREA_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogTextareaOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTextareaPlaceholder`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TEXTAREA_PLACEHOLDER: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogTextareaPlaceholder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTextareaReadonlyBackground`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TEXTAREA_READONLY_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogTextareaReadonlyBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTextareaReadonlyForeground`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TEXTAREA_READONLY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogTextareaReadonlyForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogTextareaIcon`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_TEXTAREA_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogTextareaIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeDialogSelectOptionDisabled`] for more documentation."]
+    pub const COLOR_COMPOSE_DIALOG_SELECT_OPTION_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorComposeDialogSelectOptionDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorContextualTasksBannerPromoBackground`] for more documentation."]
+    pub const COLOR_CONTEXTUAL_TASKS_BANNER_PROMO_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorContextualTasksBannerPromoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorContextualTasksBannerPromoText`] for more documentation."]
+    pub const COLOR_CONTEXTUAL_TASKS_BANNER_PROMO_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorContextualTasksBannerPromoText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorContextualTasksBannerPromoIconBackground`] for more documentation."]
+    pub const COLOR_CONTEXTUAL_TASKS_BANNER_PROMO_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorContextualTasksBannerPromoIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDesktopMediaPickerDescriptionLabel`] for more documentation."]
+    pub const COLOR_DESKTOP_MEDIA_PICKER_DESCRIPTION_LABEL: Self =
+        Self(cef_color_id_t::CEF_ColorDesktopMediaPickerDescriptionLabel);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDesktopMediaTabListBorder`] for more documentation."]
+    pub const COLOR_DESKTOP_MEDIA_TAB_LIST_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorDesktopMediaTabListBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDesktopMediaTabListPreviewBackground`] for more documentation."]
+    pub const COLOR_DESKTOP_MEDIA_TAB_LIST_PREVIEW_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorDesktopMediaTabListPreviewBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDesktopToIOSPromoFooterSubtitleLabel`] for more documentation."]
+    pub const COLOR_DESKTOP_TO_IOS_PROMO_FOOTER_SUBTITLE_LABEL: Self =
+        Self(cef_color_id_t::CEF_ColorDesktopToIOSPromoFooterSubtitleLabel);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadItemIconDangerous`] for more documentation."]
+    pub const COLOR_DOWNLOAD_ITEM_ICON_DANGEROUS: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadItemIconDangerous);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadItemTextDangerous`] for more documentation."]
+    pub const COLOR_DOWNLOAD_ITEM_TEXT_DANGEROUS: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadItemTextDangerous);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadItemIconWarning`] for more documentation."]
+    pub const COLOR_DOWNLOAD_ITEM_ICON_WARNING: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadItemIconWarning);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadItemTextWarning`] for more documentation."]
+    pub const COLOR_DOWNLOAD_ITEM_TEXT_WARNING: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadItemTextWarning);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadBubbleInfoBackground`] for more documentation."]
+    pub const COLOR_DOWNLOAD_BUBBLE_INFO_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadBubbleInfoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadBubbleInfoIcon`] for more documentation."]
+    pub const COLOR_DOWNLOAD_BUBBLE_INFO_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadBubbleInfoIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadBubbleRowHover`] for more documentation."]
+    pub const COLOR_DOWNLOAD_BUBBLE_ROW_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadBubbleRowHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadBubbleShowAllDownloadsIcon`] for more documentation."]
+    pub const COLOR_DOWNLOAD_BUBBLE_SHOW_ALL_DOWNLOADS_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadBubbleShowAllDownloadsIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadBubblePrimaryIcon`] for more documentation."]
+    pub const COLOR_DOWNLOAD_BUBBLE_PRIMARY_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadBubblePrimaryIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadToolbarButtonActive`] for more documentation."]
+    pub const COLOR_DOWNLOAD_TOOLBAR_BUTTON_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadToolbarButtonActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadToolbarButtonAnimationBackground`] for more documentation."]
+    pub const COLOR_DOWNLOAD_TOOLBAR_BUTTON_ANIMATION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadToolbarButtonAnimationBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadToolbarButtonAnimationForeground`] for more documentation."]
+    pub const COLOR_DOWNLOAD_TOOLBAR_BUTTON_ANIMATION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadToolbarButtonAnimationForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadToolbarButtonInactive`] for more documentation."]
+    pub const COLOR_DOWNLOAD_TOOLBAR_BUTTON_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadToolbarButtonInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadToolbarButtonRingBackground`] for more documentation."]
+    pub const COLOR_DOWNLOAD_TOOLBAR_BUTTON_RING_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadToolbarButtonRingBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadManagerItemError`] for more documentation."]
+    pub const COLOR_DOWNLOAD_MANAGER_ITEM_ERROR: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadManagerItemError);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadManagerItemBackground`] for more documentation."]
+    pub const COLOR_DOWNLOAD_MANAGER_ITEM_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadManagerItemBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadManagerItemBackgroundInactive`] for more documentation."]
+    pub const COLOR_DOWNLOAD_MANAGER_ITEM_BACKGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadManagerItemBackgroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDownloadManagerProgress`] for more documentation."]
+    pub const COLOR_DOWNLOAD_MANAGER_PROGRESS: Self =
+        Self(cef_color_id_t::CEF_ColorDownloadManagerProgress);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionDialogBackground`] for more documentation."]
+    pub const COLOR_EXTENSION_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionIconBadgeBackgroundDefault`] for more documentation."]
+    pub const COLOR_EXTENSION_ICON_BADGE_BACKGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionIconBadgeBackgroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionIconDecorationAmbientShadow`] for more documentation."]
+    pub const COLOR_EXTENSION_ICON_DECORATION_AMBIENT_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionIconDecorationAmbientShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionIconDecorationBackground`] for more documentation."]
+    pub const COLOR_EXTENSION_ICON_DECORATION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionIconDecorationBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionIconDecorationKeyShadow`] for more documentation."]
+    pub const COLOR_EXTENSION_ICON_DECORATION_KEY_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionIconDecorationKeyShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionMenuIcon`] for more documentation."]
+    pub const COLOR_EXTENSION_MENU_ICON: Self = Self(cef_color_id_t::CEF_ColorExtensionMenuIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionMenuIconDisabled`] for more documentation."]
+    pub const COLOR_EXTENSION_MENU_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionMenuIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionMenuPinButtonIcon`] for more documentation."]
+    pub const COLOR_EXTENSION_MENU_PIN_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionMenuPinButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionMenuPinButtonIconDisabled`] for more documentation."]
+    pub const COLOR_EXTENSION_MENU_PIN_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionMenuPinButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionsMenuContainerBackground`] for more documentation."]
+    pub const COLOR_EXTENSIONS_MENU_CONTAINER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionsMenuContainerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionsMenuText`] for more documentation."]
+    pub const COLOR_EXTENSIONS_MENU_TEXT: Self = Self(cef_color_id_t::CEF_ColorExtensionsMenuText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionsMenuSecondaryText`] for more documentation."]
+    pub const COLOR_EXTENSIONS_MENU_SECONDARY_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionsMenuSecondaryText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorExtensionManagerHighlightText`] for more documentation."]
+    pub const COLOR_EXTENSION_MANAGER_HIGHLIGHT_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorExtensionManagerHighlightText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureFirstRunInfoContainerBackground`] for more documentation."]
+    pub const COLOR_FEATURE_FIRST_RUN_INFO_CONTAINER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureFirstRunInfoContainerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureFirstRunIconColor`] for more documentation."]
+    pub const COLOR_FEATURE_FIRST_RUN_ICON_COLOR: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureFirstRunIconColor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeaturePromoBubbleBackground`] for more documentation."]
+    pub const COLOR_FEATURE_PROMO_BUBBLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeaturePromoBubbleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeaturePromoBubbleButtonBorder`] for more documentation."]
+    pub const COLOR_FEATURE_PROMO_BUBBLE_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorFeaturePromoBubbleButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeaturePromoBubbleCloseButtonInkDrop`] for more documentation."]
+    pub const COLOR_FEATURE_PROMO_BUBBLE_CLOSE_BUTTON_INK_DROP: Self =
+        Self(cef_color_id_t::CEF_ColorFeaturePromoBubbleCloseButtonInkDrop);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeaturePromoBubbleDefaultButtonBackground`] for more documentation."]
+    pub const COLOR_FEATURE_PROMO_BUBBLE_DEFAULT_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeaturePromoBubbleDefaultButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeaturePromoBubbleDefaultButtonForeground`] for more documentation."]
+    pub const COLOR_FEATURE_PROMO_BUBBLE_DEFAULT_BUTTON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeaturePromoBubbleDefaultButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeaturePromoBubbleForeground`] for more documentation."]
+    pub const COLOR_FEATURE_PROMO_BUBBLE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeaturePromoBubbleForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureShowcaseStepperCheck`] for more documentation."]
+    pub const COLOR_FEATURE_SHOWCASE_STEPPER_CHECK: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureShowcaseStepperCheck);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureShowcaseStepperDot`] for more documentation."]
+    pub const COLOR_FEATURE_SHOWCASE_STEPPER_DOT: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureShowcaseStepperDot);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureShowcaseThemePickerWrapperBackground`] for more documentation."]
+    pub const COLOR_FEATURE_SHOWCASE_THEME_PICKER_WRAPPER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureShowcaseThemePickerWrapperBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureShowcaseThemePickerBackground`] for more documentation."]
+    pub const COLOR_FEATURE_SHOWCASE_THEME_PICKER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureShowcaseThemePickerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureShowcaseThemeColorBorder`] for more documentation."]
+    pub const COLOR_FEATURE_SHOWCASE_THEME_COLOR_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureShowcaseThemeColorBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureLensPromoBubbleBackground`] for more documentation."]
+    pub const COLOR_FEATURE_LENS_PROMO_BUBBLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureLensPromoBubbleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFeatureLensPromoBubbleForeground`] for more documentation."]
+    pub const COLOR_FEATURE_LENS_PROMO_BUBBLE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFeatureLensPromoBubbleForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFindBarBackground`] for more documentation."]
+    pub const COLOR_FIND_BAR_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorFindBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFindBarButtonIcon`] for more documentation."]
+    pub const COLOR_FIND_BAR_BUTTON_ICON: Self = Self(cef_color_id_t::CEF_ColorFindBarButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFindBarButtonIconHovered`] for more documentation."]
+    pub const COLOR_FIND_BAR_BUTTON_ICON_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorFindBarButtonIconHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFindBarButtonIconDisabled`] for more documentation."]
+    pub const COLOR_FIND_BAR_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorFindBarButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFindBarForeground`] for more documentation."]
+    pub const COLOR_FIND_BAR_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorFindBarForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFindBarMatchCount`] for more documentation."]
+    pub const COLOR_FIND_BAR_MATCH_COUNT: Self = Self(cef_color_id_t::CEF_ColorFindBarMatchCount);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFlyingIndicatorBackground`] for more documentation."]
+    pub const COLOR_FLYING_INDICATOR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFlyingIndicatorBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFlyingIndicatorForeground`] for more documentation."]
+    pub const COLOR_FLYING_INDICATOR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorFlyingIndicatorForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFocusHighlightDefault`] for more documentation."]
+    pub const COLOR_FOCUS_HIGHLIGHT_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorFocusHighlightDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameCaptionActive`] for more documentation."]
+    pub const COLOR_FRAME_CAPTION_ACTIVE: Self = Self(cef_color_id_t::CEF_ColorFrameCaptionActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorFrameCaptionInactive`] for more documentation."]
+    pub const COLOR_FRAME_CAPTION_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorFrameCaptionInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryPageBookmarkStar`] for more documentation."]
+    pub const COLOR_HISTORY_PAGE_BOOKMARK_STAR: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryPageBookmarkStar);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryPageSeparator`] for more documentation."]
+    pub const COLOR_HISTORY_PAGE_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryPageSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryPageText`] for more documentation."]
+    pub const COLOR_HISTORY_PAGE_TEXT: Self = Self(cef_color_id_t::CEF_ColorHistoryPageText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsBackground`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsDivider`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsForeground`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsForegroundSubtle`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_FOREGROUND_SUBTLE: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsForegroundSubtle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsImageBackground`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_IMAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsImageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsImageBackgroundGradientEnd`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_IMAGE_BACKGROUND_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsImageBackgroundGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHistoryEmbeddingsImageBackgroundGradientStart`] for more documentation."]
+    pub const COLOR_HISTORY_EMBEDDINGS_IMAGE_BACKGROUND_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorHistoryEmbeddingsImageBackgroundGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarBackground`] for more documentation."]
+    pub const COLOR_INFO_BAR_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorInfoBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarButtonIcon`] for more documentation."]
+    pub const COLOR_INFO_BAR_BUTTON_ICON: Self = Self(cef_color_id_t::CEF_ColorInfoBarButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarButtonIconDisabled`] for more documentation."]
+    pub const COLOR_INFO_BAR_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorInfoBarButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarButtonIconHovered`] for more documentation."]
+    pub const COLOR_INFO_BAR_BUTTON_ICON_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorInfoBarButtonIconHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarContentAreaSeparator`] for more documentation."]
+    pub const COLOR_INFO_BAR_CONTENT_AREA_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorInfoBarContentAreaSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorInfoBarForeground`] for more documentation."]
+    pub const COLOR_INFO_BAR_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorInfoBarForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorIntentPickerItemBackgroundHovered`] for more documentation."]
+    pub const COLOR_INTENT_PICKER_ITEM_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorIntentPickerItemBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorIntentPickerItemBackgroundSelected`] for more documentation."]
+    pub const COLOR_INTENT_PICKER_ITEM_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorIntentPickerItemBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicBackground`] for more documentation."]
+    pub const COLOR_GLIC_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorGlicBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicModalBackground`] for more documentation."]
+    pub const COLOR_GLIC_MODAL_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorGlicModalBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicModalForeground`] for more documentation."]
+    pub const COLOR_GLIC_MODAL_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorGlicModalForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicActiveTabUnderlineGradient1`] for more documentation."]
+    pub const COLOR_GLIC_ACTIVE_TAB_UNDERLINE_GRADIENT1: Self =
+        Self(cef_color_id_t::CEF_ColorGlicActiveTabUnderlineGradient1);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicActiveTabUnderlineGradient2`] for more documentation."]
+    pub const COLOR_GLIC_ACTIVE_TAB_UNDERLINE_GRADIENT2: Self =
+        Self(cef_color_id_t::CEF_ColorGlicActiveTabUnderlineGradient2);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicActiveTabUnderlineGradient3`] for more documentation."]
+    pub const COLOR_GLIC_ACTIVE_TAB_UNDERLINE_GRADIENT3: Self =
+        Self(cef_color_id_t::CEF_ColorGlicActiveTabUnderlineGradient3);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicInactiveTabUnderlineGradient1`] for more documentation."]
+    pub const COLOR_GLIC_INACTIVE_TAB_UNDERLINE_GRADIENT1: Self =
+        Self(cef_color_id_t::CEF_ColorGlicInactiveTabUnderlineGradient1);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicInactiveTabUnderlineGradient2`] for more documentation."]
+    pub const COLOR_GLIC_INACTIVE_TAB_UNDERLINE_GRADIENT2: Self =
+        Self(cef_color_id_t::CEF_ColorGlicInactiveTabUnderlineGradient2);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicInactiveTabUnderlineGradient3`] for more documentation."]
+    pub const COLOR_GLIC_INACTIVE_TAB_UNDERLINE_GRADIENT3: Self =
+        Self(cef_color_id_t::CEF_ColorGlicInactiveTabUnderlineGradient3);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicSelectionOverlayToast`] for more documentation."]
+    pub const COLOR_GLIC_SELECTION_OVERLAY_TOAST: Self =
+        Self(cef_color_id_t::CEF_ColorGlicSelectionOverlayToast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorGlicSelectionOverlayToastCancelButton`] for more documentation."]
+    pub const COLOR_GLIC_SELECTION_OVERLAY_TOAST_CANCEL_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorGlicSelectionOverlayToastCancelButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHoverButtonBackgroundHovered`] for more documentation."]
+    pub const COLOR_HOVER_BUTTON_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorHoverButtonBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLensOverlayToastBackground`] for more documentation."]
+    pub const COLOR_LENS_OVERLAY_TOAST_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLensOverlayToastBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLensOverlayToastButtonBorder`] for more documentation."]
+    pub const COLOR_LENS_OVERLAY_TOAST_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorLensOverlayToastButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLensOverlayToastForeground`] for more documentation."]
+    pub const COLOR_LENS_OVERLAY_TOAST_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLensOverlayToastForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarBackground`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorLocationBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarBackgroundHovered`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorLocationBarBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarBorder`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_BORDER: Self = Self(cef_color_id_t::CEF_ColorLocationBarBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarBorderOnMismatch`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_BORDER_ON_MISMATCH: Self =
+        Self(cef_color_id_t::CEF_ColorLocationBarBorderOnMismatch);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarBorderOpaque`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_BORDER_OPAQUE: Self =
+        Self(cef_color_id_t::CEF_ColorLocationBarBorderOpaque);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarClearAllButtonIcon`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_CLEAR_ALL_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorLocationBarClearAllButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorLocationBarClearAllButtonIconDisabled`] for more documentation."]
+    pub const COLOR_LOCATION_BAR_CLEAR_ALL_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorLocationBarClearAllButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMediaRouterIconActive`] for more documentation."]
+    pub const COLOR_MEDIA_ROUTER_ICON_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorMediaRouterIconActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMediaRouterIconWarning`] for more documentation."]
+    pub const COLOR_MEDIA_ROUTER_ICON_WARNING: Self =
+        Self(cef_color_id_t::CEF_ColorMediaRouterIconWarning);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMultiContentsViewActiveContentOutline`] for more documentation."]
+    pub const COLOR_MULTI_CONTENTS_VIEW_ACTIVE_CONTENT_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorMultiContentsViewActiveContentOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMultiContentsViewInactiveContentOutline`] for more documentation."]
+    pub const COLOR_MULTI_CONTENTS_VIEW_INACTIVE_CONTENT_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorMultiContentsViewInactiveContentOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMultiContentsViewHighlightContentOutline`] for more documentation."]
+    pub const COLOR_MULTI_CONTENTS_VIEW_HIGHLIGHT_CONTENT_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorMultiContentsViewHighlightContentOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorMultiContentsViewMiniToolbarForeground`] for more documentation."]
+    pub const COLOR_MULTI_CONTENTS_VIEW_MINI_TOOLBAR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorMultiContentsViewMiniToolbarForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNavMenuItem`] for more documentation."]
+    pub const COLOR_NAV_MENU_ITEM: Self = Self(cef_color_id_t::CEF_ColorNavMenuItem);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNavMenuItemSelected`] for more documentation."]
+    pub const COLOR_NAV_MENU_ITEM_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorNavMenuItemSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNavMenuItemBackgroundHover`] for more documentation."]
+    pub const COLOR_NAV_MENU_ITEM_BACKGROUND_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorNavMenuItemBackgroundHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNavMenuItemBackgroundSelected`] for more documentation."]
+    pub const COLOR_NAV_MENU_ITEM_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorNavMenuItemBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonForegroundFrameActive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_FOREGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonForegroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonForegroundFrameInactive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_FOREGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonForegroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonBackgroundFrameActive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_BACKGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonBackgroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonBackgroundFrameInactive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_BACKGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonBackgroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonFocusRing`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_FOCUS_RING: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonFocusRing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonInkDropFrameActive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_INK_DROP_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonInkDropFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonInkDropFrameInactive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_INK_DROP_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonInkDropFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabStripComboButtonSeparator`] for more documentation."]
+    pub const COLOR_TAB_STRIP_COMBO_BUTTON_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorTabStripComboButtonSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabStripControlButtonInkDrop`] for more documentation."]
+    pub const COLOR_TAB_STRIP_CONTROL_BUTTON_INK_DROP: Self =
+        Self(cef_color_id_t::CEF_ColorTabStripControlButtonInkDrop);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabStripControlButtonInkDropRipple`] for more documentation."]
+    pub const COLOR_TAB_STRIP_CONTROL_BUTTON_INK_DROP_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorTabStripControlButtonInkDropRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonCRForegroundFrameActive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_CR_FOREGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonCRForegroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonCRForegroundFrameInactive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_CR_FOREGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonCRForegroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonCRBackgroundFrameActive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_CR_BACKGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonCRBackgroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabButtonCRBackgroundFrameInactive`] for more documentation."]
+    pub const COLOR_NEW_TAB_BUTTON_CR_BACKGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabButtonCRBackgroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionButtonBorder`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionButtonBorderHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_BUTTON_BORDER_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionButtonBorderHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionButtonForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_BUTTON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActiveBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTIVE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActiveBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageAddShortcutBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ADD_SHORTCUT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageAddShortcutBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageAddShortcutForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ADD_SHORTCUT_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageAddShortcutForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageAttributionForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ATTRIBUTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageAttributionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageBackgroundOverride`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_BACKGROUND_OVERRIDE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageBackgroundOverride);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageBorder`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_BORDER: Self = Self(cef_color_id_t::CEF_ColorNewTabPageBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageButtonBackgroundHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_BUTTON_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageButtonBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageButtonForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_BUTTON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageCartModuleDiscountChipBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_CART_MODULE_DISCOUNT_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageCartModuleDiscountChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageCartModuleDiscountChipForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_CART_MODULE_DISCOUNT_CHIP_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageCartModuleDiscountChipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionChipTextBody`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_CHIP_TEXT_BODY: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionChipTextBody);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionChipTextTitle`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_CHIP_TEXT_TITLE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionChipTextTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionChipDeepSearchIcon`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_CHIP_DEEP_SEARCH_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionChipDeepSearchIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageThreadsRailBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_THREADS_RAIL_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageThreadsRailBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageThreadsRailIconButton`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_THREADS_RAIL_ICON_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageThreadsRailIconButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageChipBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageChipForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_CHIP_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageChipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageComposeboxSubmitButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_COMPOSEBOX_SUBMIT_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageComposeboxSubmitButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileChipSpinner`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CHIP_SPINNER: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileChipSpinner);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFont`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FONT: Self = Self(cef_color_id_t::CEF_ColorComposeboxFont);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFontLight`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FONT_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFontLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxCancelButton`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_CANCEL_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxCancelButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxCancelButtonLight`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_CANCEL_BUTTON_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxCancelButtonLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxErrorScrimBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_ERROR_SCRIM_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxErrorScrimBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxErrorScrimButtonBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_ERROR_SCRIM_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxErrorScrimButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxErrorScrimButtonBackgroundHover`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_ERROR_SCRIM_BUTTON_BACKGROUND_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxErrorScrimButtonBackgroundHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxErrorScrimButtonText`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_ERROR_SCRIM_BUTTON_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxErrorScrimButtonText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxErrorScrimForeground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_ERROR_SCRIM_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxErrorScrimForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxHover`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_HOVER: Self = Self(cef_color_id_t::CEF_ColorComposeboxHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxInputIcon`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_INPUT_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxInputIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxLensButton`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_LENS_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxLensButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxOutlineHcm`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_OUTLINE_HCM: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxOutlineHcm);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxRecentTabChipOutline`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_RECENT_TAB_CHIP_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxRecentTabChipOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxScrimBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_SCRIM_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxScrimBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxSubmitButtonBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_SUBMIT_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxSubmitButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxSuggestionActivity`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_SUGGESTION_ACTIVITY: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxSuggestionActivity);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxTabSelectorButtonSelected`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_TAB_SELECTOR_BUTTON_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxTabSelectorButtonSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxTypeAhead`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_TYPE_AHEAD: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxTypeAhead);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxTypeAheadChip`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_TYPE_AHEAD_CHIP: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxTypeAheadChip);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxUploadButton`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_UPLOAD_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxUploadButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxUploadButtonDisabled`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_UPLOAD_BUTTON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxUploadButtonDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileChipBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileChipFaviconBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CHIP_FAVICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileChipFaviconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileChipText`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CHIP_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileChipText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxPdfChipIcon`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_PDF_CHIP_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxPdfChipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileImageOverlay`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_IMAGE_OVERLAY: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileImageOverlay);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileCarouselDivider`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CAROUSEL_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileCarouselDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileCarouselRemoveButton`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CAROUSEL_REMOVE_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileCarouselRemoveButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileCarouselRemoveGradientStart`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CAROUSEL_REMOVE_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileCarouselRemoveGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileCarouselRemoveGradientEnd`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CAROUSEL_REMOVE_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileCarouselRemoveGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxFileCarouselUrl`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_FILE_CAROUSEL_URL: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxFileCarouselUrl);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxContextEntrypointTextDisabled`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_CONTEXT_ENTRYPOINT_TEXT_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxContextEntrypointTextDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxContextEntrypointHoverBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_CONTEXT_ENTRYPOINT_HOVER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxContextEntrypointHoverBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxContextEntrypointBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_CONTEXT_ENTRYPOINT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxContextEntrypointBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxLensButtonHoverBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_LENS_BUTTON_HOVER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxLensButtonHoverBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxLink`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_LINK: Self = Self(cef_color_id_t::CEF_ColorComposeboxLink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxToolChipBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_TOOL_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxToolChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorComposeboxVoiceButtonHoverBackground`] for more documentation."]
+    pub const COLOR_COMPOSEBOX_VOICE_BUTTON_HOVER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorComposeboxVoiceButtonHoverBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageCommonInputPlaceholder`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_COMMON_INPUT_PLACEHOLDER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageCommonInputPlaceholder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageControlBackgroundHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_CONTROL_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageControlBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageControlBackgroundSelected`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_CONTROL_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageControlBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageFirstRunBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_FIRST_RUN_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageFirstRunBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageFocusRing`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_FOCUS_RING: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageFocusRing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageHeader`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_HEADER: Self = Self(cef_color_id_t::CEF_ColorNewTabPageHeader);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageHistoryClustersModuleItemBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_HISTORY_CLUSTERS_MODULE_ITEM_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageHistoryClustersModuleItemBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPagePromoBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_PROMO_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPagePromoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPagePromoImageBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_PROMO_IMAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPagePromoImageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageIconButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ICON_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageIconButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageIconButtonBackgroundActive`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ICON_BUTTON_BACKGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageIconButtonBackgroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageLink`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_LINK: Self = Self(cef_color_id_t::CEF_ColorNewTabPageLink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageLogo`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_LOGO: Self = Self(cef_color_id_t::CEF_ColorNewTabPageLogo);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageLogoUnthemedDark`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_LOGO_UNTHEMED_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageLogoUnthemedDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageLogoUnthemedLight`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_LOGO_UNTHEMED_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageLogoUnthemedLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMenuInnerShadow`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MENU_INNER_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMenuInnerShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMenuOuterShadow`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MENU_OUTER_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMenuOuterShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMicBorderColor`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MIC_BORDER_COLOR: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMicBorderColor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMicIconColor`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MIC_ICON_COLOR: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMicIconColor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleControlBorder`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_CONTROL_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleControlBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleContextMenuDivider`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_CONTEXT_MENU_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleContextMenuDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleCalendarEventTimeStatusBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_CALENDAR_EVENT_TIME_STATUS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleCalendarEventTimeStatusBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleCalendarAttachmentScrollbarThumb`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_CALENDAR_ATTACHMENT_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleCalendarAttachmentScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleCalendarDividerColor`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_CALENDAR_DIVIDER_COLOR: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleCalendarDividerColor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleIconBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleElementDivider`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_ELEMENT_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleElementDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleIconContainerBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_ICON_CONTAINER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleIconContainerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleItemBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_ITEM_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleItemBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleItemBackgroundHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_ITEM_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleItemBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleScrollButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_SCROLL_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleScrollButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleScrollButtonBackgroundHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_SCROLL_BUTTON_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleScrollButtonBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsGrey`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsBlue`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsRed`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_RED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsYellow`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsGreen`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsPink`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsPink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsPurple`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsPurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsCyan`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsOrange`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotGrey`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotBlue`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotRed`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_RED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotYellow`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotGreen`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotPink`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotPink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotPurple`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotPurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotCyan`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotOrange`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MODULE_TAB_GROUPS_DOT_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageModuleTabGroupsDotOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMostVisitedForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MOST_VISITED_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMostVisitedForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMostVisitedTileBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MOST_VISITED_TILE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMostVisitedTileBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMostVisitedTileBackgroundThemed`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MOST_VISITED_TILE_BACKGROUND_THEMED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMostVisitedTileBackgroundThemed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageMostVisitedTileBackgroundUnthemed`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_MOST_VISITED_TILE_BACKGROUND_UNTHEMED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageMostVisitedTileBackgroundUnthemed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageOnThemeForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ON_THEME_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageOnThemeForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageOverlayBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_OVERLAY_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageOverlayBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageOverlayForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_OVERLAY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageOverlayForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageOverlaySecondaryForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_OVERLAY_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageOverlaySecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPagePrimaryForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_PRIMARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPagePrimaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageRealboxNextIconHover`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_REALBOX_NEXT_ICON_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageRealboxNextIconHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageSearchBoxBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_SEARCH_BOX_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageSearchBoxBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageSearchBoxBackgroundHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_SEARCH_BOX_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageSearchBoxBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageSearchBoxResultsTextDimmedSelected`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_SEARCH_BOX_RESULTS_TEXT_DIMMED_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageSearchBoxResultsTextDimmedSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageSecondaryForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageSectionBorder`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_SECTION_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageSectionBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageTagBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_TAG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageTagBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageText`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_TEXT: Self = Self(cef_color_id_t::CEF_ColorNewTabPageText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageTextUnthemed`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_TEXT_UNTHEMED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageTextUnthemed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageTextLight`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_TEXT_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageTextLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageWallpaperSearchButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_WALLPAPER_SEARCH_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageWallpaperSearchButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageWallpaperSearchButtonBackgroundHovered`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_WALLPAPER_SEARCH_BUTTON_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageWallpaperSearchButtonBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageWallpaperSearchButtonForeground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_WALLPAPER_SEARCH_BUTTON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageWallpaperSearchButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageDoodleShareButtonBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_DOODLE_SHARE_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageDoodleShareButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageDoodleShareButtonIcon`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_DOODLE_SHARE_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageDoodleShareButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabFooterBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_FOOTER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabFooterBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabFooterText`] for more documentation."]
+    pub const COLOR_NEW_TAB_FOOTER_TEXT: Self = Self(cef_color_id_t::CEF_ColorNewTabFooterText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabFooterLogoBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_FOOTER_LOGO_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabFooterLogoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxActionIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_ACTION_ICON: Self = Self(cef_color_id_t::CEF_ColorOmniboxActionIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxActionIconHover`] for more documentation."]
+    pub const COLOR_OMNIBOX_ACTION_ICON_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxActionIconHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxAnswerIconGM3Background`] for more documentation."]
+    pub const COLOR_OMNIBOX_ANSWER_ICON_GM3BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxAnswerIconGM3Background);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxAnswerIconGM3Foreground`] for more documentation."]
+    pub const COLOR_OMNIBOX_ANSWER_ICON_GM3FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxAnswerIconGM3Foreground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxBubbleOutline`] for more documentation."]
+    pub const COLOR_OMNIBOX_BUBBLE_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxBubbleOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipInUseActivityIndicatorBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_IN_USE_ACTIVITY_INDICATOR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipInUseActivityIndicatorBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipInUseActivityIndicatorForeground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_IN_USE_ACTIVITY_INDICATOR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipInUseActivityIndicatorForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipBlockedActivityIndicatorBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_BLOCKED_ACTIVITY_INDICATOR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipBlockedActivityIndicatorBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipBlockedActivityIndicatorForeground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_BLOCKED_ACTIVITY_INDICATOR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipBlockedActivityIndicatorForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipForegroundLowVisibility`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_FOREGROUND_LOW_VISIBILITY: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipForegroundLowVisibility);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipForegroundNormalVisibility`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_FOREGROUND_NORMAL_VISIBILITY: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipForegroundNormalVisibility);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipInkDropHover`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_INK_DROP_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipInkDropHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipInkDropRipple`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_INK_DROP_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipInkDropRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipOnSystemBlockedActivityIndicatorBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_ON_SYSTEM_BLOCKED_ACTIVITY_INDICATOR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipOnSystemBlockedActivityIndicatorBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxChipOnSystemBlockedActivityIndicatorForeground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CHIP_ON_SYSTEM_BLOCKED_ACTIVITY_INDICATOR_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxChipOnSystemBlockedActivityIndicatorForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxChipBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxContextEntrypointBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_CONTEXT_ENTRYPOINT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxContextEntrypointBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxDivider`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxFaviconBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_FAVICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxFaviconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxFileThumbnailOverlay`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_FILE_THUMBNAIL_OVERLAY: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxFileThumbnailOverlay);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxFileThumbnailOverlayIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_FILE_THUMBNAIL_OVERLAY_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxFileThumbnailOverlayIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxPrimaryAction`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_PRIMARY_ACTION: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxPrimaryAction);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxSubmitButtonBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_SUBMIT_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxSubmitButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxSubmitButtonEnergy`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_SUBMIT_BUTTON_ENERGY: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxSubmitButtonEnergy);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxComposeboxSubmitButtonIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_COMPOSEBOX_SUBMIT_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxComposeboxSubmitButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxContextEntrypointHoverBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_CONTEXT_ENTRYPOINT_HOVER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxContextEntrypointHoverBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxContextEntrypointText`] for more documentation."]
+    pub const COLOR_OMNIBOX_CONTEXT_ENTRYPOINT_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxContextEntrypointText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxForegroundDisabled`] for more documentation."]
+    pub const COLOR_OMNIBOX_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIconBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIconBackgroundTonal`] for more documentation."]
+    pub const COLOR_OMNIBOX_ICON_BACKGROUND_TONAL: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxIconBackgroundTonal);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIconForeground`] for more documentation."]
+    pub const COLOR_OMNIBOX_ICON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxIconForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIconForegroundTonal`] for more documentation."]
+    pub const COLOR_OMNIBOX_ICON_FOREGROUND_TONAL: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxIconForegroundTonal);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIconHover`] for more documentation."]
+    pub const COLOR_OMNIBOX_ICON_HOVER: Self = Self(cef_color_id_t::CEF_ColorOmniboxIconHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIconPressed`] for more documentation."]
+    pub const COLOR_OMNIBOX_ICON_PRESSED: Self = Self(cef_color_id_t::CEF_ColorOmniboxIconPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIntentChipBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_INTENT_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxIntentChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxIntentChipIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_INTENT_CHIP_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxIntentChipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxKeywordSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_KEYWORD_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxKeywordSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxKeywordSeparator`] for more documentation."]
+    pub const COLOR_OMNIBOX_KEYWORD_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxKeywordSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsBackgroundHovered`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsBackgroundHoverOverlay`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BACKGROUND_HOVER_OVERLAY: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsBackgroundHoverOverlay);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsBackgroundSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsBackgroundIph`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BACKGROUND_IPH: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsBackgroundIph);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonBorder`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonIconSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_ICON_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonIconSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDrop`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_INK_DROP: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDrop);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropRowHovered`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_INK_DROP_ROW_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropRowHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropRowSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_INK_DROP_ROW_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropRowSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_INK_DROP_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropSelectedRowHovered`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_INK_DROP_SELECTED_ROW_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropSelectedRowHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropSelectedRowSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_BUTTON_INK_DROP_SELECTED_ROW_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsButtonInkDropSelectedRowSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsChipBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsFocusIndicator`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_FOCUS_INDICATOR: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsFocusIndicator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_ICON: Self = Self(cef_color_id_t::CEF_ColorOmniboxResultsIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsIconGM3Background`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_ICON_GM3BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsIconGM3Background);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsIconSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_ICON_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsIconSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsIconHovered`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_ICON_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsIconHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsStarterPackIcon`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_STARTER_PACK_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsStarterPackIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextAnswer`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_ANSWER: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextAnswer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextDimmed`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_DIMMED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextDimmed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextDimmedSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_DIMMED_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextDimmedSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextNegative`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_NEGATIVE: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextNegative);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextNegativeSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_NEGATIVE_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextNegativeSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextPositive`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_POSITIVE: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextPositive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextPositiveSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_POSITIVE_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextPositiveSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextSecondary`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_SECONDARY: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextSecondary);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextSecondarySelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_SECONDARY_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextSecondarySelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsTextSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_TEXT_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsTextSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsUrl`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_URL: Self = Self(cef_color_id_t::CEF_ColorOmniboxResultsUrl);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxResultsUrlSelected`] for more documentation."]
+    pub const COLOR_OMNIBOX_RESULTS_URL_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxResultsUrlSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipDangerous`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_DANGEROUS: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipDangerous);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipDangerousBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_DANGEROUS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipDangerousBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipDefault`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipInkDropHover`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_INK_DROP_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipInkDropHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipInkDropRipple`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_INK_DROP_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipInkDropRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipSecure`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_SECURE: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipSecure);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSecurityChipText`] for more documentation."]
+    pub const COLOR_OMNIBOX_SECURITY_CHIP_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSecurityChipText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSelectionBackground`] for more documentation."]
+    pub const COLOR_OMNIBOX_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxSelectionForeground`] for more documentation."]
+    pub const COLOR_OMNIBOX_SELECTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorOmniboxSelectionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxText`] for more documentation."]
+    pub const COLOR_OMNIBOX_TEXT: Self = Self(cef_color_id_t::CEF_ColorOmniboxText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorOmniboxTextDimmed`] for more documentation."]
+    pub const COLOR_OMNIBOX_TEXT_DIMMED: Self = Self(cef_color_id_t::CEF_ColorOmniboxTextDimmed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPageInfoChosenObjectDeleteButtonIcon`] for more documentation."]
+    pub const COLOR_PAGE_INFO_CHOSEN_OBJECT_DELETE_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorPageInfoChosenObjectDeleteButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPageInfoChosenObjectDeleteButtonIconDisabled`] for more documentation."]
+    pub const COLOR_PAGE_INFO_CHOSEN_OBJECT_DELETE_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorPageInfoChosenObjectDeleteButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPageInfoForeground`] for more documentation."]
+    pub const COLOR_PAGE_INFO_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorPageInfoForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPageInfoSubtitleForeground`] for more documentation."]
+    pub const COLOR_PAGE_INFO_SUBTITLE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPageInfoSubtitleForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPageInfoPermissionBlockedOnSystemLevelDisabled`] for more documentation."]
+    pub const COLOR_PAGE_INFO_PERMISSION_BLOCKED_ON_SYSTEM_LEVEL_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorPageInfoPermissionBlockedOnSystemLevelDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPageInfoPermissionUsedIcon`] for more documentation."]
+    pub const COLOR_PAGE_INFO_PERMISSION_USED_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorPageInfoPermissionUsedIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorParentAccessViewLocalWebApprovalBackground`] for more documentation."]
+    pub const COLOR_PARENT_ACCESS_VIEW_LOCAL_WEB_APPROVAL_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorParentAccessViewLocalWebApprovalBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsFeedbackTipBackground`] for more documentation."]
+    pub const COLOR_PAYMENTS_FEEDBACK_TIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsFeedbackTipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsFeedbackTipBorder`] for more documentation."]
+    pub const COLOR_PAYMENTS_FEEDBACK_TIP_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsFeedbackTipBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsFeedbackTipForeground`] for more documentation."]
+    pub const COLOR_PAYMENTS_FEEDBACK_TIP_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsFeedbackTipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsFeedbackTipIcon`] for more documentation."]
+    pub const COLOR_PAYMENTS_FEEDBACK_TIP_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsFeedbackTipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsGooglePayLogo`] for more documentation."]
+    pub const COLOR_PAYMENTS_GOOGLE_PAY_LOGO: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsGooglePayLogo);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsPromoCodeBackground`] for more documentation."]
+    pub const COLOR_PAYMENTS_PROMO_CODE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsPromoCodeBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsPromoCodeForeground`] for more documentation."]
+    pub const COLOR_PAYMENTS_PROMO_CODE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsPromoCodeForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsPromoCodeForegroundHovered`] for more documentation."]
+    pub const COLOR_PAYMENTS_PROMO_CODE_FOREGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsPromoCodeForegroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsPromoCodeForegroundPressed`] for more documentation."]
+    pub const COLOR_PAYMENTS_PROMO_CODE_FOREGROUND_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsPromoCodeForegroundPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsPromoCodeInkDrop`] for more documentation."]
+    pub const COLOR_PAYMENTS_PROMO_CODE_INK_DROP: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsPromoCodeInkDrop);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsRequestBackArrowButtonIcon`] for more documentation."]
+    pub const COLOR_PAYMENTS_REQUEST_BACK_ARROW_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsRequestBackArrowButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsRequestBackArrowButtonIconDisabled`] for more documentation."]
+    pub const COLOR_PAYMENTS_REQUEST_BACK_ARROW_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsRequestBackArrowButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPaymentsRequestRowBackgroundHighlighted`] for more documentation."]
+    pub const COLOR_PAYMENTS_REQUEST_ROW_BACKGROUND_HIGHLIGHTED: Self =
+        Self(cef_color_id_t::CEF_ColorPaymentsRequestRowBackgroundHighlighted);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPermissionPromptRequestText`] for more documentation."]
+    pub const COLOR_PERMISSION_PROMPT_REQUEST_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorPermissionPromptRequestText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPerformanceInterventionButtonIconActive`] for more documentation."]
+    pub const COLOR_PERFORMANCE_INTERVENTION_BUTTON_ICON_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorPerformanceInterventionButtonIconActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPerformanceInterventionButtonIconInactive`] for more documentation."]
+    pub const COLOR_PERFORMANCE_INTERVENTION_BUTTON_ICON_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorPerformanceInterventionButtonIconInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowBackToTabButtonBackground`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_BACK_TO_TAB_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowBackToTabButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowBackground`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowTopBarBackground`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_TOP_BAR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowTopBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowForeground`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowForegroundInactive`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_FOREGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowForegroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowScrimFull`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SCRIM_FULL: Self = Self(cef_color_id_t::CEF_ColorPipWindowScrimFull);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowScrimTopGradientStart`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SCRIM_TOP_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowScrimTopGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowScrimTopGradientEnd`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SCRIM_TOP_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowScrimTopGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowScrimBottomGradientStart`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SCRIM_BOTTOM_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowScrimBottomGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowScrimBottomGradientEnd`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SCRIM_BOTTOM_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowScrimBottomGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowSkipAdButtonBackground`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SKIP_AD_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowSkipAdButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPipWindowSkipAdButtonBorder`] for more documentation."]
+    pub const COLOR_PIP_WINDOW_SKIP_AD_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorPipWindowSkipAdButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsButtonBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsCitationBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_CITATION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsCitationBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsCitationPopupBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_CITATION_POPUP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsCitationPopupBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsCitationPopupText`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_CITATION_POPUP_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsCitationPopupText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsCitationPopupTitle`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_CITATION_POPUP_TITLE: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsCitationPopupTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsComparisonTableListBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_COMPARISON_TABLE_LIST_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsComparisonTableListBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDetailChipBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DETAIL_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDetailChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDisclosureBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DISCLOSURE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDisclosureBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDisclosureForeground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DISCLOSURE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDisclosureForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDisclosureGradientEnd`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DISCLOSURE_GRADIENT_END: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDisclosureGradientEnd);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDisclosureGradientStart`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DISCLOSURE_GRADIENT_START: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDisclosureGradientStart);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDisclosureSummaryBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DISCLOSURE_SUMMARY_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDisclosureSummaryBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsDivider`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsGradientIcon`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_GRADIENT_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsGradientIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsHorizontalCarouselScrollbarThumb`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_HORIZONTAL_CAROUSEL_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsHorizontalCarouselScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsIcon`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsIconButtonBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_ICON_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsIconButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsIconButtonHoveredBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_ICON_BUTTON_HOVERED_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsIconButtonHoveredBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsLink`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_LINK: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsLink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsPageBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_PAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsPageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsSummaryBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_SUMMARY_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsSummaryBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsSummaryBackgroundDragging`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_SUMMARY_BACKGROUND_DRAGGING: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsSummaryBackgroundDragging);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsTonalButtonBackground`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_TONAL_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsTonalButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProductSpecificationsTonalButtonIcon`] for more documentation."]
+    pub const COLOR_PRODUCT_SPECIFICATIONS_TONAL_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorProductSpecificationsTonalButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProfileMenuBackground`] for more documentation."]
+    pub const COLOR_PROFILE_MENU_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProfileMenuBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProfileMenuIdentityInfoBackground`] for more documentation."]
+    pub const COLOR_PROFILE_MENU_IDENTITY_INFO_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProfileMenuIdentityInfoBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProfileMenuIdentityInfoTitle`] for more documentation."]
+    pub const COLOR_PROFILE_MENU_IDENTITY_INFO_TITLE: Self =
+        Self(cef_color_id_t::CEF_ColorProfileMenuIdentityInfoTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProfileMenuIdentityInfoSubtitle`] for more documentation."]
+    pub const COLOR_PROFILE_MENU_IDENTITY_INFO_SUBTITLE: Self =
+        Self(cef_color_id_t::CEF_ColorProfileMenuIdentityInfoSubtitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProfileMenuPromoButtonsBackground`] for more documentation."]
+    pub const COLOR_PROFILE_MENU_PROMO_BUTTONS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProfileMenuPromoButtonsBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProfilesReauthDialogBorder`] for more documentation."]
+    pub const COLOR_PROFILES_REAUTH_DIALOG_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorProfilesReauthDialogBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelBackground`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelButtonDisabledIcon`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_BUTTON_DISABLED_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelButtonDisabledIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelButtonHoverBackground`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_BUTTON_HOVER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelButtonHoverBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelButtonIcon`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelListsSeparator`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_LISTS_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelListsSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelNoTabGroupsText`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_NO_TAB_GROUPS_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelNoTabGroupsText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelTabGroupsDragPlaceholder`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_TAB_GROUPS_DRAG_PLACEHOLDER: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelTabGroupsDragPlaceholder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorProjectsPanelTabGroupsDropIndicator`] for more documentation."]
+    pub const COLOR_PROJECTS_PANEL_TAB_GROUPS_DROP_INDICATOR: Self =
+        Self(cef_color_id_t::CEF_ColorProjectsPanelTabGroupsDropIndicator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaBackground`] for more documentation."]
+    pub const COLOR_PWA_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorPwaBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaMenuButtonIcon`] for more documentation."]
+    pub const COLOR_PWA_MENU_BUTTON_ICON: Self = Self(cef_color_id_t::CEF_ColorPwaMenuButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaSecurityChipForeground`] for more documentation."]
+    pub const COLOR_PWA_SECURITY_CHIP_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPwaSecurityChipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaSecurityChipForegroundDangerous`] for more documentation."]
+    pub const COLOR_PWA_SECURITY_CHIP_FOREGROUND_DANGEROUS: Self =
+        Self(cef_color_id_t::CEF_ColorPwaSecurityChipForegroundDangerous);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaSecurityChipForegroundSecure`] for more documentation."]
+    pub const COLOR_PWA_SECURITY_CHIP_FOREGROUND_SECURE: Self =
+        Self(cef_color_id_t::CEF_ColorPwaSecurityChipForegroundSecure);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaTabBarBottomSeparator`] for more documentation."]
+    pub const COLOR_PWA_TAB_BAR_BOTTOM_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorPwaTabBarBottomSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaTabBarTopSeparator`] for more documentation."]
+    pub const COLOR_PWA_TAB_BAR_TOP_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorPwaTabBarTopSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaTheme`] for more documentation."]
+    pub const COLOR_PWA_THEME: Self = Self(cef_color_id_t::CEF_ColorPwaTheme);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaToolbarBackground`] for more documentation."]
+    pub const COLOR_PWA_TOOLBAR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorPwaToolbarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaToolbarButtonIcon`] for more documentation."]
+    pub const COLOR_PWA_TOOLBAR_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorPwaToolbarButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorPwaToolbarButtonIconDisabled`] for more documentation."]
+    pub const COLOR_PWA_TOOLBAR_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorPwaToolbarButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorQrCodeBackground`] for more documentation."]
+    pub const COLOR_QR_CODE_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorQrCodeBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorQrCodeBorder`] for more documentation."]
+    pub const COLOR_QR_CODE_BORDER: Self = Self(cef_color_id_t::CEF_ColorQrCodeBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorQuickAnswersReportQueryButtonBackground`] for more documentation."]
+    pub const COLOR_QUICK_ANSWERS_REPORT_QUERY_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorQuickAnswersReportQueryButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorQuickAnswersReportQueryButtonForeground`] for more documentation."]
+    pub const COLOR_QUICK_ANSWERS_REPORT_QUERY_BUTTON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorQuickAnswersReportQueryButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackground`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingBackgroundLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_BACKGROUND_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingBackgroundLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_CURRENT_READ_ALOUD_HIGHLIGHT_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingCurrentReadAloudHighlightLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackground`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOCUS_RING_BACKGROUND_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFocusRingBackgroundLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForeground`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingForegroundLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FOREGROUND_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingForegroundLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocus`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocus);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusScrim`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_SCRIM: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusScrim);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLineFocusLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINE_FOCUS_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLineFocusLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparator`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingSeparatorLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_SEPARATOR_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingSeparatorLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackground`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_BACKGROUND_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownBackgroundLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelected`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_DROPDOWN_SELECTED_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingDropdownSelectedLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelection`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelection);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingTextSelectionLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TEXT_SELECTION_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingTextSelectionLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefault`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkDefaultLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_DEFAULT_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkDefaultLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisited`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisited);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingLinkVisitedLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_LINK_VISITED_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingLinkVisitedLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_PREVIOUS_READ_ALOUD_HIGHLIGHT_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingPreviousReadAloudHighlightLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackground`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_BACKGROUND_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerBackgroundLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIcon`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_PLAYER_ICON_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioPlayerIconLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIcon`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconLowContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_LOW_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconLowContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackground`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_ICON_HOVER_BACKGROUND_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarIconHoverBackgroundLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutline`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_TOOLBAR_FOCUS_OUTLINE_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingToolbarFocusOutlineLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutline`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_ON_AUDIO_PLAYER_FOCUS_OUTLINE_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingOnAudioPlayerFocusOutlineLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIcon`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_AUDIO_CONTROLS_ICON_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingAudioControlsIconLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarBlue`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarYellow`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarHighContrast`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_HIGH_CONTRAST: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarHighContrast);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarLowContrastLight`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_LOW_CONTRAST_LIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarLowContrastLight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarLowContrastDark`] for more documentation."]
+    pub const COLOR_READ_ANYTHING_FULL_PAGE_SCROLLBAR_LOW_CONTRAST_DARK: Self =
+        Self(cef_color_id_t::CEF_ColorReadAnythingFullPageScrollbarLowContrastDark);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxAnswerIconBackground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_ANSWER_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxAnswerIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxAnswerIconForeground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_ANSWER_ICON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxAnswerIconForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxBackground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_BACKGROUND: Self = Self(cef_color_id_t::CEF_ColorSearchboxBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxBackgroundHovered`] for more documentation."]
+    pub const COLOR_SEARCHBOX_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxBorder`] for more documentation."]
+    pub const COLOR_SEARCHBOX_BORDER: Self = Self(cef_color_id_t::CEF_ColorSearchboxBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxForeground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_FOREGROUND: Self = Self(cef_color_id_t::CEF_ColorSearchboxForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxLensVoiceIconBackground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_LENS_VOICE_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxLensVoiceIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxPlaceholder`] for more documentation."]
+    pub const COLOR_SEARCHBOX_PLACEHOLDER: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxPlaceholder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsActionChip`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_ACTION_CHIP: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsActionChip);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsActionChipIcon`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_ACTION_CHIP_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsActionChipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsActionChipFocusOutline`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_ACTION_CHIP_FOCUS_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsActionChipFocusOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsBackground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsBackgroundHovered`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsButtonHover`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_BUTTON_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsButtonHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsDimSelected`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_DIM_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsDimSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsFocusIndicator`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_FOCUS_INDICATOR: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsFocusIndicator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsForeground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsForegroundDimmed`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_FOREGROUND_DIMMED: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsForegroundDimmed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsIcon`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsIconFocusedOutline`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_ICON_FOCUSED_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsIconFocusedOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsIconSelected`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_ICON_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsIconSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsUrl`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_URL: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsUrl);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxResultsUrlSelected`] for more documentation."]
+    pub const COLOR_SEARCHBOX_RESULTS_URL_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxResultsUrlSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxSearchIconBackground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_SEARCH_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxSearchIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxSelectionBackground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_SELECTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxSelectionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxSelectionForeground`] for more documentation."]
+    pub const COLOR_SEARCHBOX_SELECTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSearchboxSelectionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSearchboxShadow`] for more documentation."]
+    pub const COLOR_SEARCHBOX_SHADOW: Self = Self(cef_color_id_t::CEF_ColorSearchboxShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionChipBackground`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_CHIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionChipBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorNewTabPageActionChipBackgroundHover`] for more documentation."]
+    pub const COLOR_NEW_TAB_PAGE_ACTION_CHIP_BACKGROUND_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorNewTabPageActionChipBackgroundHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundGrey`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundBlue`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundRed`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_RED: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundYellow`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundGreen`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundPink`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundPink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundPurple`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundPurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundCyan`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupForegroundOrange`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_FOREGROUND_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupForegroundOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineGrey`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineBlue`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineRed`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_RED: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineYellow`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineGreen`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlinePink`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlinePink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlinePurple`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlinePurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineCyan`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSavedTabGroupOutlineOrange`] for more documentation."]
+    pub const COLOR_SAVED_TAB_GROUP_OUTLINE_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorSavedTabGroupOutlineOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorScreenshotCapturedImageBackground`] for more documentation."]
+    pub const COLOR_SCREENSHOT_CAPTURED_IMAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorScreenshotCapturedImageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorScreenshotCapturedImageBorder`] for more documentation."]
+    pub const COLOR_SCREENSHOT_CAPTURED_IMAGE_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorScreenshotCapturedImageBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSettingsColumnedSectionDescriptionHeader`] for more documentation."]
+    pub const COLOR_SETTINGS_COLUMNED_SECTION_DESCRIPTION_HEADER: Self =
+        Self(cef_color_id_t::CEF_ColorSettingsColumnedSectionDescriptionHeader);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSettingsInfoCardBackground`] for more documentation."]
+    pub const COLOR_SETTINGS_INFO_CARD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSettingsInfoCardBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShareThisTabAudioToggleBackground`] for more documentation."]
+    pub const COLOR_SHARE_THIS_TAB_AUDIO_TOGGLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorShareThisTabAudioToggleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorShareThisTabSourceViewBorder`] for more documentation."]
+    pub const COLOR_SHARE_THIS_TAB_SOURCE_VIEW_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorShareThisTabSourceViewBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSharingRecentActivityDialogFaviconContainer`] for more documentation."]
+    pub const COLOR_SHARING_RECENT_ACTIVITY_DIALOG_FAVICON_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSharingRecentActivityDialogFaviconContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSharingRecentActivityDialogActivityContainer`] for more documentation."]
+    pub const COLOR_SHARING_RECENT_ACTIVITY_DIALOG_ACTIVITY_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSharingRecentActivityDialogActivityContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelSearchFieldBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_SEARCH_FIELD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelSearchFieldBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBadgeBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BADGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBadgeBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBadgeBackgroundUpdated`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BADGE_BACKGROUND_UPDATED: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBadgeBackgroundUpdated);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBadgeForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BADGE_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBadgeForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBadgeForegroundUpdated`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BADGE_FOREGROUND_UPDATED: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBadgeForegroundUpdated);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBookmarksSelectedFolderBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BOOKMARKS_SELECTED_FOLDER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBookmarksSelectedFolderBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBookmarksSelectedFolderForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BOOKMARKS_SELECTED_FOLDER_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBookmarksSelectedFolderForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBookmarksSelectedFolderIcon`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BOOKMARKS_SELECTED_FOLDER_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBookmarksSelectedFolderIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBookmarksActiveFolderForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BOOKMARKS_ACTIVE_FOLDER_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBookmarksActiveFolderForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelBookmarksActiveFolderBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_BOOKMARKS_ACTIVE_FOLDER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelBookmarksActiveFolderBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCardBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CARD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCardBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCardPrimaryForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CARD_PRIMARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCardPrimaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCardSecondaryForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CARD_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCardSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCommerceGraphAxis`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMMERCE_GRAPH_AXIS: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCommerceGraphAxis);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCommerceGraphBubbleBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMMERCE_GRAPH_BUBBLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCommerceGraphBubbleBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCommerceGraphLine`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMMERCE_GRAPH_LINE: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCommerceGraphLine);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelContentAreaSeparator`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CONTENT_AREA_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelContentAreaSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelContentBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CONTENT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelContentBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeClassicChromeTileBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_CLASSIC_CHROME_TILE_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeClassicChromeTileBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeCornerNtpBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_CORNER_NTP_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeCornerNtpBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeCustomOptionBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_CUSTOM_OPTION_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeCustomOptionBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeCustomOptionForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_CUSTOM_OPTION_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeCustomOptionForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpActiveTab`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_ACTIVE_TAB: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpActiveTab);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpArrowsAndRefreshButton`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_ARROWS_AND_REFRESH_BUTTON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpArrowsAndRefreshButton);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpCaron`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_CARON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpCaron);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpCaronContainer`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_CARON_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpCaronContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpChromeLogo`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_CHROME_LOGO: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpChromeLogo);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpOmnibox`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_OMNIBOX: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpOmnibox);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpTabStripBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_MINI_NTP_TAB_STRIP_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeMiniNtpTabStripBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_THEME_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeCheckmarkBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_THEME_CHECKMARK_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeCheckmarkBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeCheckmarkForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_THEME_CHECKMARK_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeCheckmarkForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeSnapshotBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_THEME_SNAPSHOT_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeThemeSnapshotBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelCustomizeChromeWebStoreBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_CUSTOMIZE_CHROME_WEB_STORE_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelCustomizeChromeWebStoreBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelDialogBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelDialogDivider`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_DIALOG_DIVIDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelDialogDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelDialogPrimaryForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_DIALOG_PRIMARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelDialogPrimaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelDialogSecondaryForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_DIALOG_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelDialogSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelDivider`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_DIVIDER: Self = Self(cef_color_id_t::CEF_ColorSidePanelDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelEditFooterBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_EDIT_FOOTER_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelEditFooterBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelComboboxEntryIcon`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMBOBOX_ENTRY_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelComboboxEntryIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelComboboxEntryTitle`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_COMBOBOX_ENTRY_TITLE: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelComboboxEntryTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelEntryIcon`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_ENTRY_ICON: Self = Self(cef_color_id_t::CEF_ColorSidePanelEntryIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelEntryDropdownIcon`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_ENTRY_DROPDOWN_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelEntryDropdownIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelEntryTitle`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_ENTRY_TITLE: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelEntryTitle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipForeground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipForegroundSelected`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_FOREGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipForegroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipIcon`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipIconSelected`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_ICON_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipIconSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipBackgroundHover`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_BACKGROUND_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipBackgroundHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelFilterChipBackgroundSelected`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_FILTER_CHIP_BACKGROUND_SELECTED: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelFilterChipBackgroundSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelHeaderButtonIcon`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_HEADER_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelHeaderButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelHeaderButtonIconDisabled`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_HEADER_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelHeaderButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelHoverResizeAreaHandle`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_HOVER_RESIZE_AREA_HANDLE: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelHoverResizeAreaHandle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelResizeAreaHandle`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_RESIZE_AREA_HANDLE: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelResizeAreaHandle);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelScrollbarThumb`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelTextfieldBorder`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_TEXTFIELD_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelTextfieldBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelWallpaperSearchTileBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_WALLPAPER_SEARCH_TILE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelWallpaperSearchTileBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelWallpaperSearchErrorButtonBackground`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_WALLPAPER_SEARCH_ERROR_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelWallpaperSearchErrorButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelWallpaperSearchErrorButtonText`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_WALLPAPER_SEARCH_ERROR_BUTTON_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelWallpaperSearchErrorButtonText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSidePanelWallpaperSearchInspirationDescriptors`] for more documentation."]
+    pub const COLOR_SIDE_PANEL_WALLPAPER_SEARCH_INSPIRATION_DESCRIPTORS: Self =
+        Self(cef_color_id_t::CEF_ColorSidePanelWallpaperSearchInspirationDescriptors);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderActive`] for more documentation."]
+    pub const COLOR_SLIDER_ACTIVE: Self = Self(cef_color_id_t::CEF_ColorSliderActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderActiveContainer`] for more documentation."]
+    pub const COLOR_SLIDER_ACTIVE_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSliderActiveContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderActiveRipple`] for more documentation."]
+    pub const COLOR_SLIDER_ACTIVE_RIPPLE: Self = Self(cef_color_id_t::CEF_ColorSliderActiveRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderActiveText`] for more documentation."]
+    pub const COLOR_SLIDER_ACTIVE_TEXT: Self = Self(cef_color_id_t::CEF_ColorSliderActiveText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderDisabled`] for more documentation."]
+    pub const COLOR_SLIDER_DISABLED: Self = Self(cef_color_id_t::CEF_ColorSliderDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSliderDisabledContainer`] for more documentation."]
+    pub const COLOR_SLIDER_DISABLED_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorSliderDisabledContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorSplitViewBackground`] for more documentation."]
+    pub const COLOR_SPLIT_VIEW_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorSplitViewBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStarRatingFullIcon`] for more documentation."]
+    pub const COLOR_STAR_RATING_FULL_ICON: Self = Self(cef_color_id_t::CEF_ColorStarRatingFullIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStarRatingEmptyIcon`] for more documentation."]
+    pub const COLOR_STAR_RATING_EMPTY_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorStarRatingEmptyIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStatusBubbleBackgroundFrameActive`] for more documentation."]
+    pub const COLOR_STATUS_BUBBLE_BACKGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorStatusBubbleBackgroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStatusBubbleBackgroundFrameInactive`] for more documentation."]
+    pub const COLOR_STATUS_BUBBLE_BACKGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorStatusBubbleBackgroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStatusBubbleForegroundFrameActive`] for more documentation."]
+    pub const COLOR_STATUS_BUBBLE_FOREGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorStatusBubbleForegroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStatusBubbleForegroundFrameInactive`] for more documentation."]
+    pub const COLOR_STATUS_BUBBLE_FOREGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorStatusBubbleForegroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorStatusBubbleShadow`] for more documentation."]
+    pub const COLOR_STATUS_BUBBLE_SHADOW: Self = Self(cef_color_id_t::CEF_ColorStatusBubbleShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertAudioPlayingActiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_AUDIO_PLAYING_ACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertAudioPlayingActiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertAudioPlayingActiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_AUDIO_PLAYING_ACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertAudioPlayingActiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertAudioPlayingInactiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_AUDIO_PLAYING_INACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertAudioPlayingInactiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertAudioPlayingInactiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_AUDIO_PLAYING_INACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertAudioPlayingInactiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertMediaRecordingActiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_MEDIA_RECORDING_ACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertMediaRecordingActiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertMediaRecordingActiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_MEDIA_RECORDING_ACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertMediaRecordingActiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertMediaRecordingInactiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_MEDIA_RECORDING_INACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertMediaRecordingInactiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertMediaRecordingInactiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_MEDIA_RECORDING_INACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertMediaRecordingInactiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertPipPlayingActiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_PIP_PLAYING_ACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertPipPlayingActiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertPipPlayingActiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_PIP_PLAYING_ACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertPipPlayingActiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertPipPlayingInactiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_PIP_PLAYING_INACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertPipPlayingInactiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabAlertPipPlayingInactiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_ALERT_PIP_PLAYING_INACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabAlertPipPlayingInactiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHoverCardTabAlertMediaRecordingIcon`] for more documentation."]
+    pub const COLOR_HOVER_CARD_TAB_ALERT_MEDIA_RECORDING_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorHoverCardTabAlertMediaRecordingIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHoverCardTabAlertPipPlayingIcon`] for more documentation."]
+    pub const COLOR_HOVER_CARD_TAB_ALERT_PIP_PLAYING_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorHoverCardTabAlertPipPlayingIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorHoverCardTabAlertAudioPlayingIcon`] for more documentation."]
+    pub const COLOR_HOVER_CARD_TAB_ALERT_AUDIO_PLAYING_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorHoverCardTabAlertAudioPlayingIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundActiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_ACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundActiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorDetachedTabBackgroundActiveFrameActive`] for more documentation."]
+    pub const COLOR_DETACHED_TAB_BACKGROUND_ACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorDetachedTabBackgroundActiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundActiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_ACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundActiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundInactiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_INACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundInactiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundInactiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_INACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundInactiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundInactiveHoverFrameActive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_INACTIVE_HOVER_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundInactiveHoverFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundInactiveHoverFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_INACTIVE_HOVER_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundInactiveHoverFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundSelectedFrameActive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_SELECTED_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundSelectedFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundSelectedFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_SELECTED_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundSelectedFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundSelectedHoverFrameActive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_SELECTED_HOVER_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundSelectedHoverFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabBackgroundSelectedHoverFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_BACKGROUND_SELECTED_HOVER_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabBackgroundSelectedHoverFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabCloseButtonFocusRingActive`] for more documentation."]
+    pub const COLOR_TAB_CLOSE_BUTTON_FOCUS_RING_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabCloseButtonFocusRingActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabCloseButtonFocusRingInactive`] for more documentation."]
+    pub const COLOR_TAB_CLOSE_BUTTON_FOCUS_RING_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabCloseButtonFocusRingInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabDiscardRingFrameActive`] for more documentation."]
+    pub const COLOR_TAB_DISCARD_RING_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabDiscardRingFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabDiscardRingFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_DISCARD_RING_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabDiscardRingFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabFocusRingActive`] for more documentation."]
+    pub const COLOR_TAB_FOCUS_RING_ACTIVE: Self = Self(cef_color_id_t::CEF_ColorTabFocusRingActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabFocusRingInactive`] for more documentation."]
+    pub const COLOR_TAB_FOCUS_RING_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabFocusRingInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForegroundActiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND_ACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabForegroundActiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForegroundActiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND_ACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabForegroundActiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForegroundInactiveFrameActive`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND_INACTIVE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabForegroundInactiveFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabForegroundInactiveFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_FOREGROUND_INACTIVE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabForegroundInactiveFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabDividerFrameActive`] for more documentation."]
+    pub const COLOR_TAB_DIVIDER_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabDividerFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabDividerFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_DIVIDER_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabDividerFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabHoverCardBackground`] for more documentation."]
+    pub const COLOR_TAB_HOVER_CARD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabHoverCardBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabHoverCardForeground`] for more documentation."]
+    pub const COLOR_TAB_HOVER_CARD_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabHoverCardForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabHoverCardSecondaryText`] for more documentation."]
+    pub const COLOR_TAB_HOVER_CARD_SECONDARY_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorTabHoverCardSecondaryText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarGrey`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarBlue`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarRed`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_RED: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarYellow`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarGreen`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarPink`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarPink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarPurple`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarPurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarCyan`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupBookmarkBarOrange`] for more documentation."]
+    pub const COLOR_TAB_GROUP_BOOKMARK_BAR_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupBookmarkBarOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuBlue`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuCyan`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuGreen`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuGrey`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuOrange`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuPink`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuPink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuPurple`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuPurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuRed`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_RED: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupContextMenuYellow`] for more documentation."]
+    pub const COLOR_TAB_GROUP_CONTEXT_MENU_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupContextMenuYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogGrey`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_GREY: Self = Self(cef_color_id_t::CEF_ColorTabGroupDialogGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogBlue`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_BLUE: Self = Self(cef_color_id_t::CEF_ColorTabGroupDialogBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogRed`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_RED: Self = Self(cef_color_id_t::CEF_ColorTabGroupDialogRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogYellow`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupDialogYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogGreen`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupDialogGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogPink`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_PINK: Self = Self(cef_color_id_t::CEF_ColorTabGroupDialogPink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogPurple`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupDialogPurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogCyan`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_CYAN: Self = Self(cef_color_id_t::CEF_ColorTabGroupDialogCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogOrange`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupDialogOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupDialogIconEnabled`] for more documentation."]
+    pub const COLOR_TAB_GROUP_DIALOG_ICON_ENABLED: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupDialogIconEnabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveGrey`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveBlue`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveRed`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_RED: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveYellow`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveGreen`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActivePink`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActivePink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActivePurple`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActivePurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveCyan`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveOrange`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_ACTIVE_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameActiveOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveGrey`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveBlue`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveRed`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_RED: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveYellow`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveGreen`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactivePink`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactivePink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactivePurple`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactivePurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveCyan`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveOrange`] for more documentation."]
+    pub const COLOR_TAB_GROUP_TAB_STRIP_FRAME_INACTIVE_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorTabGroupTabStripFrameInactiveOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabStrokeFrameActive`] for more documentation."]
+    pub const COLOR_TAB_STROKE_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabStrokeFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabStrokeFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_STROKE_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabStrokeFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabstripScrollContainerShadow`] for more documentation."]
+    pub const COLOR_TABSTRIP_SCROLL_CONTAINER_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorTabstripScrollContainerShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabThrobber`] for more documentation."]
+    pub const COLOR_TAB_THROBBER: Self = Self(cef_color_id_t::CEF_ColorTabThrobber);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabThrobberPreconnect`] for more documentation."]
+    pub const COLOR_TAB_THROBBER_PRECONNECT: Self =
+        Self(cef_color_id_t::CEF_ColorTabThrobberPreconnect);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabNavItemSelected`] for more documentation."]
+    pub const COLOR_TAB_NAV_ITEM_SELECTED: Self = Self(cef_color_id_t::CEF_ColorTabNavItemSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchButtonBackground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_BUTTON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchButtonBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchButtonIcon`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchButtonIconBackground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_BUTTON_ICON_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchButtonIconBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchBackground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchButtonCRForegroundFrameActive`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_BUTTON_CR_FOREGROUND_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchButtonCRForegroundFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchButtonCRForegroundFrameInactive`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_BUTTON_CR_FOREGROUND_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchButtonCRForegroundFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchCardBackground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_CARD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchCardBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchDisabled`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_DISABLED: Self = Self(cef_color_id_t::CEF_ColorTabSearchDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchDisabledContainer`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_DISABLED_CONTAINER: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchDisabledContainer);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchDivider`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_DIVIDER: Self = Self(cef_color_id_t::CEF_ColorTabSearchDivider);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchFooterBackground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_FOOTER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchFooterBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchImageTabContentBottom`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_IMAGE_TAB_CONTENT_BOTTOM: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchImageTabContentBottom);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchImageTabContentTop`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_IMAGE_TAB_CONTENT_TOP: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchImageTabContentTop);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchImageTabText`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_IMAGE_TAB_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchImageTabText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchImageWindowFrame`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_IMAGE_WINDOW_FRAME: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchImageWindowFrame);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchMediaIcon`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_MEDIA_ICON: Self = Self(cef_color_id_t::CEF_ColorTabSearchMediaIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchMediaRecordingIcon`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_MEDIA_RECORDING_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchMediaRecordingIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchMediaGlicActiveIcon`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_MEDIA_GLIC_ACTIVE_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchMediaGlicActiveIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchPrimaryForeground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_PRIMARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchPrimaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchSecondaryForeground`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_SECONDARY_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchSecondaryForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchSelected`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_SELECTED: Self = Self(cef_color_id_t::CEF_ColorTabSearchSelected);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchScrollbarThumb`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_SCROLLBAR_THUMB: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchScrollbarThumb);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerBackground`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerTableBackground`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_TABLE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerTableBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerTableBackgroundAlternate`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_TABLE_BACKGROUND_ALTERNATE: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerTableBackgroundAlternate);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerTableBackgroundSelectedFocused`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_TABLE_BACKGROUND_SELECTED_FOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerTableBackgroundSelectedFocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerTableBackgroundSelectedUnfocused`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_TABLE_BACKGROUND_SELECTED_UNFOCUSED: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerTableBackgroundSelectedUnfocused);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerTableHeaderBackground`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_TABLE_HEADER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerTableHeaderBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerSearchBarBackground`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_SEARCH_BAR_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerSearchBarBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerSearchBarTransparent`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_SEARCH_BAR_TRANSPARENT: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerSearchBarTransparent);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTaskManagerSearchBarPlaceholderText`] for more documentation."]
+    pub const COLOR_TASK_MANAGER_SEARCH_BAR_PLACEHOLDER_TEXT: Self =
+        Self(cef_color_id_t::CEF_ColorTaskManagerSearchBarPlaceholderText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabBackground`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabForeground`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripBackgroundActive`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_BACKGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripBackgroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripBackgroundInactive`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_BACKGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripBackgroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveGrey`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveBlue`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveRed`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_RED: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveYellow`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveGreen`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActivePink`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActivePink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActivePurple`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActivePurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveCyan`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveOrange`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_ACTIVE_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameActiveOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveGrey`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_GREY: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveGrey);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveBlue`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_BLUE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveBlue);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveRed`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_RED: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveRed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveYellow`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_YELLOW: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveYellow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveGreen`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_GREEN: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveGreen);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactivePink`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_PINK: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactivePink);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactivePurple`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_PURPLE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactivePurple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveCyan`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_CYAN: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveCyan);
+    #[doc = "See [`cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveOrange`] for more documentation."]
+    pub const COLOR_THUMBNAIL_TAB_STRIP_TAB_GROUP_FRAME_INACTIVE_ORANGE: Self =
+        Self(cef_color_id_t::CEF_ColorThumbnailTabStripTabGroupFrameInactiveOrange);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbar`] for more documentation."]
+    pub const COLOR_TOOLBAR: Self = Self(cef_color_id_t::CEF_ColorToolbar);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarBackgroundSubtleEmphasis`] for more documentation."]
+    pub const COLOR_TOOLBAR_BACKGROUND_SUBTLE_EMPHASIS: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarBackgroundSubtleEmphasis);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarBackgroundSubtleEmphasisHovered`] for more documentation."]
+    pub const COLOR_TOOLBAR_BACKGROUND_SUBTLE_EMPHASIS_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarBackgroundSubtleEmphasisHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonBackgroundHighlightedDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_BACKGROUND_HIGHLIGHTED_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonBackgroundHighlightedDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonBorder`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonIcon`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_ICON: Self = Self(cef_color_id_t::CEF_ColorToolbarButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonIconDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_ICON_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonIconDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonIconDisabled`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonIconHovered`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_ICON_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonIconHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonIconInactive`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_ICON_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonIconInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonIconPressed`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_ICON_PRESSED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarButtonIconPressed);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarButtonText`] for more documentation."]
+    pub const COLOR_TOOLBAR_BUTTON_TEXT: Self = Self(cef_color_id_t::CEF_ColorToolbarButtonText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarCloseButtonBackgroundDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_CLOSE_BUTTON_BACKGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarCloseButtonBackgroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarContentAreaSeparator`] for more documentation."]
+    pub const COLOR_TOOLBAR_CONTENT_AREA_SEPARATOR: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarContentAreaSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarContextualTasksButtonShadow`] for more documentation."]
+    pub const COLOR_TOOLBAR_CONTEXTUAL_TASKS_BUTTON_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarContextualTasksButtonShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarExtensionSeparatorDisabled`] for more documentation."]
+    pub const COLOR_TOOLBAR_EXTENSION_SEPARATOR_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarExtensionSeparatorDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarExtensionSeparatorEnabled`] for more documentation."]
+    pub const COLOR_TOOLBAR_EXTENSION_SEPARATOR_ENABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarExtensionSeparatorEnabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarFeaturePromoHighlight`] for more documentation."]
+    pub const COLOR_TOOLBAR_FEATURE_PROMO_HIGHLIGHT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarFeaturePromoHighlight);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarGlicButtonBackgroundDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_GLIC_BUTTON_BACKGROUND_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarGlicButtonBackgroundDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarIconContainerBorder`] for more documentation."]
+    pub const COLOR_TOOLBAR_ICON_CONTAINER_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarIconContainerBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarInkDrop`] for more documentation."]
+    pub const COLOR_TOOLBAR_INK_DROP: Self = Self(cef_color_id_t::CEF_ColorToolbarInkDrop);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarInkDropHover`] for more documentation."]
+    pub const COLOR_TOOLBAR_INK_DROP_HOVER: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarInkDropHover);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarInkDropRipple`] for more documentation."]
+    pub const COLOR_TOOLBAR_INK_DROP_RIPPLE: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarInkDropRipple);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSeparator`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEPARATOR: Self = Self(cef_color_id_t::CEF_ColorToolbarSeparator);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarActionItemEngaged`] for more documentation."]
+    pub const COLOR_TOOLBAR_ACTION_ITEM_ENGAGED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarActionItemEngaged);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarSeparatorDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_SEPARATOR_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarSeparatorDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarText`] for more documentation."]
+    pub const COLOR_TOOLBAR_TEXT: Self = Self(cef_color_id_t::CEF_ColorToolbarText);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarTextDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_TEXT_DEFAULT: Self = Self(cef_color_id_t::CEF_ColorToolbarTextDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarTextDisabled`] for more documentation."]
+    pub const COLOR_TOOLBAR_TEXT_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarTextDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarTextDisabledDefault`] for more documentation."]
+    pub const COLOR_TOOLBAR_TEXT_DISABLED_DEFAULT: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarTextDisabledDefault);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarTopSeparatorFrameActive`] for more documentation."]
+    pub const COLOR_TOOLBAR_TOP_SEPARATOR_FRAME_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarTopSeparatorFrameActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorToolbarTopSeparatorFrameInactive`] for more documentation."]
+    pub const COLOR_TOOLBAR_TOP_SEPARATOR_FRAME_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorToolbarTopSeparatorFrameInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorVerticalTabStripShadow`] for more documentation."]
+    pub const COLOR_VERTICAL_TAB_STRIP_SHADOW: Self =
+        Self(cef_color_id_t::CEF_ColorVerticalTabStripShadow);
+    #[doc = "See [`cef_color_id_t::CEF_ColorVerticalTabPinnedOutline`] for more documentation."]
+    pub const COLOR_VERTICAL_TAB_PINNED_OUTLINE: Self =
+        Self(cef_color_id_t::CEF_ColorVerticalTabPinnedOutline);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnHoverButtonForeground`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_HOVER_BUTTON_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnHoverButtonForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnHoverButtonForegroundDisabled`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_HOVER_BUTTON_FOREGROUND_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnHoverButtonForegroundDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnBackArrowButtonIcon`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_BACK_ARROW_BUTTON_ICON: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnBackArrowButtonIcon);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnBackArrowButtonIconDisabled`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_BACK_ARROW_BUTTON_ICON_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnBackArrowButtonIconDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnIconColor`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_ICON_COLOR: Self = Self(cef_color_id_t::CEF_ColorWebAuthnIconColor);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnIconColorDisabled`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_ICON_COLOR_DISABLED: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnIconColorDisabled);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnPinTextfieldBottomBorder`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_PIN_TEXTFIELD_BOTTOM_BORDER: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnPinTextfieldBottomBorder);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnProgressRingBackground`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_PROGRESS_RING_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnProgressRingBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebAuthnProgressRingForeground`] for more documentation."]
+    pub const COLOR_WEB_AUTHN_PROGRESS_RING_FOREGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebAuthnProgressRingForeground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebuiCardBackground`] for more documentation."]
+    pub const COLOR_WEBUI_CARD_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebuiCardBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebuiDialogBackground`] for more documentation."]
+    pub const COLOR_WEBUI_DIALOG_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebuiDialogBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebuiDialogContainerBackground`] for more documentation."]
+    pub const COLOR_WEBUI_DIALOG_CONTAINER_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebuiDialogContainerBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebuiPageBackground`] for more documentation."]
+    pub const COLOR_WEBUI_PAGE_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebuiPageBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebContentsBackground`] for more documentation."]
+    pub const COLOR_WEB_CONTENTS_BACKGROUND: Self =
+        Self(cef_color_id_t::CEF_ColorWebContentsBackground);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWebContentsBackgroundLetterboxing`] for more documentation."]
+    pub const COLOR_WEB_CONTENTS_BACKGROUND_LETTERBOXING: Self =
+        Self(cef_color_id_t::CEF_ColorWebContentsBackgroundLetterboxing);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWindowControlButtonBackgroundActive`] for more documentation."]
+    pub const COLOR_WINDOW_CONTROL_BUTTON_BACKGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorWindowControlButtonBackgroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorWindowControlButtonBackgroundInactive`] for more documentation."]
+    pub const COLOR_WINDOW_CONTROL_BUTTON_BACKGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorWindowControlButtonBackgroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAccentBorderActive`] for more documentation."]
+    pub const COLOR_ACCENT_BORDER_ACTIVE: Self = Self(cef_color_id_t::CEF_ColorAccentBorderActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorAccentBorderInactive`] for more documentation."]
+    pub const COLOR_ACCENT_BORDER_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorAccentBorderInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionButtonForegroundActive`] for more documentation."]
+    pub const COLOR_CAPTION_BUTTON_FOREGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionButtonForegroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionButtonForegroundInactive`] for more documentation."]
+    pub const COLOR_CAPTION_BUTTON_FOREGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionButtonForegroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionButtonOnToolbar`] for more documentation."]
+    pub const COLOR_CAPTION_BUTTON_ON_TOOLBAR: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionButtonOnToolbar);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionCloseButtonBackgroundHovered`] for more documentation."]
+    pub const COLOR_CAPTION_CLOSE_BUTTON_BACKGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionCloseButtonBackgroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionCloseButtonForegroundHovered`] for more documentation."]
+    pub const COLOR_CAPTION_CLOSE_BUTTON_FOREGROUND_HOVERED: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionCloseButtonForegroundHovered);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionForegroundActive`] for more documentation."]
+    pub const COLOR_CAPTION_FOREGROUND_ACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionForegroundActive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorCaptionForegroundInactive`] for more documentation."]
+    pub const COLOR_CAPTION_FOREGROUND_INACTIVE: Self =
+        Self(cef_color_id_t::CEF_ColorCaptionForegroundInactive);
+    #[doc = "See [`cef_color_id_t::CEF_ColorTabSearchCaptionButtonFocusRing`] for more documentation."]
+    pub const COLOR_TAB_SEARCH_CAPTION_BUTTON_FOCUS_RING: Self =
+        Self(cef_color_id_t::CEF_ColorTabSearchCaptionButtonFocusRing);
+    #[doc = "See [`cef_color_id_t::CEF_ChromeColorsEnd`] for more documentation."]
+    pub const CHROME_COLORS_END: Self = Self(cef_color_id_t::CEF_ChromeColorsEnd);
+    #[doc = "See [`cef_color_id_t::CEF_UiColorsLast`] for more documentation."]
+    pub const UI_COLORS_LAST: Self = Self(cef_color_id_t::CEF_UiColorsLast);
+}
+impl ColorId {
+    #[doc = "Get the raw integer representation."]
+    pub fn get_raw(&self) -> i32 {
+        self.0 as i32
+    }
+}
+impl Default for ColorId {
+    fn default() -> Self {
+        Self(cef_color_id_t::CEF_UiColorsStart)
     }
 }
 
@@ -52724,6 +57878,19 @@ pub fn v8_context_in_context() -> ::std::os::raw::c_int {
     }
 }
 
+/// See [`cef_v8_backing_store_create`] for more documentation.
+pub fn v8_backing_store_create(byte_length: usize) -> Option<V8BackingStore> {
+    unsafe {
+        let arg_byte_length = byte_length;
+        let result = cef_v8_backing_store_create(arg_byte_length);
+        if result.is_null() {
+            None
+        } else {
+            Some(result.wrap_result())
+        }
+    }
+}
+
 /// See [`cef_v8_value_create_undefined`] for more documentation.
 pub fn v8_value_create_undefined() -> Option<V8Value> {
     unsafe {
@@ -52900,6 +58067,27 @@ pub fn v8_value_create_array_buffer_with_copy(buffer: *mut u8, length: usize) ->
         let (arg_buffer, arg_length) = (buffer, length);
         let arg_buffer = arg_buffer.cast();
         let result = cef_v8_value_create_array_buffer_with_copy(arg_buffer, arg_length);
+        if result.is_null() {
+            None
+        } else {
+            Some(result.wrap_result())
+        }
+    }
+}
+
+/// See [`cef_v8_value_create_array_buffer_from_backing_store`] for more documentation.
+pub fn v8_value_create_array_buffer_from_backing_store(
+    backing_store: Option<&mut V8BackingStore>,
+) -> Option<V8Value> {
+    unsafe {
+        let arg_backing_store = backing_store;
+        let arg_backing_store = arg_backing_store
+            .map(|arg| {
+                arg.add_ref();
+                ImplV8BackingStore::get_raw(arg)
+            })
+            .unwrap_or(std::ptr::null_mut());
+        let result = cef_v8_value_create_array_buffer_from_backing_store(arg_backing_store);
         if result.is_null() {
             None
         } else {
@@ -53122,6 +58310,18 @@ pub fn set_nestable_tasks_allowed(allowed: ::std::os::raw::c_int) {
     unsafe {
         let arg_allowed = allowed;
         cef_set_nestable_tasks_allowed(arg_allowed);
+    }
+}
+
+/// See [`cef_component_updater_get`] for more documentation.
+pub fn component_updater_get() -> Option<ComponentUpdater> {
+    unsafe {
+        let result = cef_component_updater_get();
+        if result.is_null() {
+            None
+        } else {
+            Some(result.wrap_result())
+        }
     }
 }
 

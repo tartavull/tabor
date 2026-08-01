@@ -1,18 +1,18 @@
 //! macOS IOSurface texture import implementation
 
-#![allow(unexpected_cfgs)] // Suppress objc crate internal cfg warnings
-
 use super::common::texture;
 use super::{TextureImportError, TextureImportResult, TextureImporter};
 use crate::osr_texture_import::common::format;
 use crate::{sys::cef_color_type_t, AcceleratedPaintInfo};
+use objc2::rc::Retained;
 use objc2_io_surface::IOSurfaceRef;
+use objc2_metal::{
+    MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
+};
 use wgpu::TextureDescriptor;
 
 use std::os::raw::c_void;
-
-#[cfg(target_os = "macos")]
-use objc::{sel, sel_impl};
 
 pub struct IOSurfaceImporter {
     pub handle: *mut c_void,
@@ -91,43 +91,41 @@ impl IOSurfaceImporter {
     fn get_metal_desc(
         &self,
         texture_desc: &TextureDescriptor,
-    ) -> Result<metal::TextureDescriptor, TextureImportError> {
-        use metal::{MTLPixelFormat, MTLStorageMode, MTLTextureType, MTLTextureUsage};
-
+    ) -> Result<Retained<MTLTextureDescriptor>, TextureImportError> {
         if self.width == 0 || self.height == 0 {
             return Err(TextureImportError::InvalidHandle(
                 "Invalid IOSurface texture dimensions".to_string(),
             ));
         }
 
-        let metal_desc = metal::TextureDescriptor::new();
-        metal_desc.set_width(texture_desc.size.width as _);
-        metal_desc.set_height(texture_desc.size.height as _);
-        metal_desc.set_array_length(texture_desc.array_layer_count() as _);
-        metal_desc.set_mipmap_level_count(texture_desc.mip_level_count as _);
-        metal_desc.set_sample_count(texture_desc.sample_count as _);
-        metal_desc.set_texture_type(MTLTextureType::D2);
-        metal_desc.set_pixel_format(match texture_desc.format {
-            wgpu::TextureFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
-            wgpu::TextureFormat::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
-            _ => unimplemented!(),
-        });
-        metal_desc.set_usage(MTLTextureUsage::ShaderRead);
-        metal_desc.set_storage_mode(MTLStorageMode::Managed);
+        let metal_desc = MTLTextureDescriptor::new();
+        unsafe {
+            metal_desc.setWidth(texture_desc.size.width as _);
+            metal_desc.setHeight(texture_desc.size.height as _);
+            metal_desc.setArrayLength(texture_desc.array_layer_count() as _);
+            metal_desc.setMipmapLevelCount(texture_desc.mip_level_count as _);
+            metal_desc.setSampleCount(texture_desc.sample_count as _);
+            metal_desc.setTextureType(MTLTextureType::Type2D);
+            metal_desc.setPixelFormat(match texture_desc.format {
+                wgpu::TextureFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
+                wgpu::TextureFormat::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
+                _ => unimplemented!(),
+            });
+            metal_desc.setUsage(MTLTextureUsage::ShaderRead);
+            metal_desc.setStorageMode(MTLStorageMode::Managed);
+        }
 
         Ok(metal_desc)
     }
 
     fn import_via_metal(&self, device: &wgpu::Device) -> TextureImportResult {
-        use metal::MTLTextureType;
-
         // Convert handle to IOSurface
         let io_surface = std::ptr::NonNull::new(self.handle.cast::<IOSurfaceRef>()).ok_or(
             TextureImportError::InvalidHandle("Invalid IOSurface handle".to_string()),
         )?;
 
         let texture_desc = self.get_texture_desc();
-        let hal_tex = objc::rc::autoreleasepool(|| {
+        let hal_tex = {
             let metal_desc = self.get_metal_desc(&texture_desc)?;
 
             // Get Metal device from wgpu and create texture
@@ -139,17 +137,21 @@ impl IOSurfaceImporter {
                     ));
                 };
 
-                let texture = objc::msg_send![
-                    hal_device.raw_device().as_ref(),
-                    newTextureWithDescriptor:metal_desc.as_ref()
-                    iosurface:io_surface
-                    plane:0
-                ];
+                let texture = hal_device
+                    .raw_device()
+                    .newTextureWithDescriptor_iosurface_plane(
+                        metal_desc.as_ref(),
+                        io_surface.as_ref(),
+                        0,
+                    )
+                    .ok_or(TextureImportError::InvalidHandle(
+                        "Invalid IOSurface handle".to_string(),
+                    ))?;
 
                 let hal_tex = <wgpu::wgc::api::Metal as wgpu::hal::Api>::Device::texture_from_raw(
                     texture,
                     texture_desc.format,
-                    MTLTextureType::D2,
+                    MTLTextureType::Type2D,
                     texture_desc.array_layer_count(),
                     texture_desc.mip_level_count,
                     wgpu::hal::CopyExtent {
@@ -157,15 +159,20 @@ impl IOSurfaceImporter {
                         height: texture_desc.size.height,
                         depth: texture_desc.array_layer_count(),
                     },
+                    None,
                 );
 
                 Ok::<_, TextureImportError>(hal_tex)
             }?;
-            Ok(texture)
-        })?;
+            texture
+        };
 
         Ok(unsafe {
-            device.create_texture_from_hal::<wgpu::wgc::api::Metal>(hal_tex, &texture_desc)
+            device.create_texture_from_hal::<wgpu::wgc::api::Metal>(
+                hal_tex,
+                &texture_desc,
+                wgpu::TextureUses::RESOURCE,
+            )
         })
     }
 

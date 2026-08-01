@@ -22,9 +22,9 @@ sandbox = ["cef-dll-sys/sandbox"]
 accelerated_osr = [
     "ash",
     "libc",
-    "objc",
+    "objc2-foundation",
     "objc2-io-surface",
-    "metal",
+    "objc2-metal",
     "thiserror",
     "tracing",
     "wgpu",
@@ -72,9 +72,9 @@ windows = { workspace = true, optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 libloading.workspace = true
 objc2.workspace = true
+objc2-foundation = { workspace = true, optional = true }
 objc2-io-surface = { workspace = true, optional = true }
-objc = { workspace = true, optional = true }
-metal = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
 plist = { workspace = true, optional = true }
 semver = { workspace = true, optional = true }
 

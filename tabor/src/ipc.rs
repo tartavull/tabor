@@ -216,12 +216,15 @@ pub enum IpcBrowserAccelerationState {
 #[serde(rename_all = "snake_case")]
 pub enum IpcWebFrameDeliveryMode {
     CefInternal,
+    CefHostIpc,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IpcBrowserAccelerationInfo {
     pub state: IpcBrowserAccelerationState,
     pub frame_delivery_mode: IpcWebFrameDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main_surface_width: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +427,31 @@ pub struct IpcRuntimeMetrics {
     pub web_close: Option<IpcWebCloseMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cef_pump: Option<IpcCefPumpMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cef_host: Option<IpcCefHostMetrics>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct IpcCefHostMetrics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub generation: u64,
+    pub starts: u64,
+    pub crashes: u64,
+    pub restarts: u64,
+    pub active_views: u64,
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub memory_pressure_tests_started: u64,
+    pub memory_pressure_tests_passed: u64,
+    pub memory_pressure_tests_failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_memory_pressure_request_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_memory_pressure_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
@@ -1017,6 +1045,11 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_text: Option<String>,
     },
+    WindowDebugCefMemoryPressure {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tab_id: Option<IpcTabId>,
+    },
+    WindowDebugCefHostCrash,
     RuntimeMetrics,
     SetConfig(IpcConfig),
     GetConfig(IpcGetConfig),
@@ -1129,6 +1162,14 @@ pub fn ipc_request_help() -> &'static [IpcRequestHelp] {
             summary: "Press a JavaScript dialog button in an isolated test bundle.",
         },
         IpcRequestHelp {
+            name: "window_debug_cef_memory_pressure",
+            summary: "Simulate critical CEF memory pressure in an isolated test bundle.",
+        },
+        IpcRequestHelp {
+            name: "window_debug_cef_host_crash",
+            summary: "Crash the isolated CEF host in a test bundle.",
+        },
+        IpcRequestHelp {
             name: "runtime_metrics",
             summary: "Read runtime instrumentation metrics.",
         },
@@ -1162,7 +1203,8 @@ impl IpcRequest {
             | IpcRequest::TerminalObserve { tab_id }
             | IpcRequest::TerminalRead { tab_id, .. }
             | IpcRequest::TerminalScreenshot { tab_id }
-            | IpcRequest::TerminalKey { tab_id, .. } => *tab_id,
+            | IpcRequest::TerminalKey { tab_id, .. }
+            | IpcRequest::WindowDebugCefMemoryPressure { tab_id } => *tab_id,
             IpcRequest::OpenUrl { target: UrlTarget::TabId { tab_id }, .. } => Some(*tab_id),
             IpcRequest::OpenUrl {
                 target: UrlTarget::NewTabInSourceGroup { source_tab_id },
@@ -1417,6 +1459,8 @@ pub trait IpcContext {
         button: IpcWindowDebugJsDialogButton,
         prompt_text: Option<String>,
     ) -> Result<(), IpcError>;
+    fn window_debug_cef_memory_pressure(&mut self, tab_id: Option<TabId>) -> Result<(), IpcError>;
+    fn window_debug_cef_host_crash(&mut self) -> Result<(), IpcError>;
     fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError>;
 }
 
@@ -1899,6 +1943,20 @@ pub fn handle_request<C: IpcContext>(ctx: &mut C, request: IpcRequest) -> IpcRes
                 },
             }
         },
+        IpcRequest::WindowDebugCefMemoryPressure { tab_id } => {
+            match ctx.window_debug_cef_memory_pressure(tab_id.map(Into::into)) {
+                Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+                Err(err) => {
+                    IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+                },
+            }
+        },
+        IpcRequest::WindowDebugCefHostCrash => match ctx.window_debug_cef_host_crash() {
+            Ok(()) => IpcResponse { reply: SocketReply::Ok, close_window: false },
+            Err(err) => {
+                IpcResponse { reply: SocketReply::Error { error: err }, close_window: false }
+            },
+        },
         IpcRequest::RuntimeMetrics => match ctx.runtime_metrics() {
             Ok(metrics) => {
                 IpcResponse { reply: SocketReply::RuntimeMetrics { metrics }, close_window: false }
@@ -2380,6 +2438,7 @@ mod tests {
                         last_run_ms_ago: Some(12),
                         hidden_throttle_active: true,
                     }),
+                    cef_host: None,
                 },
             };
             let _ = context.add_tab(IpcTabKind::Terminal, None, None);
@@ -2417,6 +2476,7 @@ mod tests {
                         acceleration: IpcBrowserAccelerationInfo {
                             state: IpcBrowserAccelerationState::Ready,
                             frame_delivery_mode: IpcWebFrameDeliveryMode::CefInternal,
+                            failure_reason: None,
                             main_surface_width: Some(900),
                             main_surface_height: Some(1200),
                             popup_surface_width: None,
@@ -3095,6 +3155,17 @@ mod tests {
             Ok(())
         }
 
+        fn window_debug_cef_memory_pressure(
+            &mut self,
+            _tab_id: Option<TabId>,
+        ) -> Result<(), IpcError> {
+            Ok(())
+        }
+
+        fn window_debug_cef_host_crash(&mut self) -> Result<(), IpcError> {
+            Ok(())
+        }
+
         fn runtime_metrics(&mut self) -> Result<IpcRuntimeMetrics, IpcError> {
             Ok(self.runtime_metrics.clone())
         }
@@ -3493,6 +3564,14 @@ mod tests {
             ctx.last_js_dialog_button,
             Some((IpcWindowDebugJsDialogButton::Accept, Some(String::from("typed"))))
         );
+
+        let request = IpcRequest::WindowDebugCefMemoryPressure { tab_id: Some(tab_id.into()) };
+        assert_eq!(request.target_tab_id(), Some(tab_id.into()));
+        let response = handle_request(&mut ctx, request);
+        assert!(matches!(response.reply, SocketReply::Ok));
+
+        let response = handle_request(&mut ctx, IpcRequest::WindowDebugCefHostCrash);
+        assert!(matches!(response.reply, SocketReply::Ok));
     }
 
     #[test]

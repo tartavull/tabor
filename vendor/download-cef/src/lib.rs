@@ -14,6 +14,9 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+const DOWNLOAD_DISABLED: &str =
+    "automatic CEF download is disabled; provide the repo-pinned CEF runtime through CEF_PATH";
+
 pub fn default_version(version: &str) -> String {
     version
         .split('+')
@@ -26,15 +29,23 @@ pub fn check_archive_json(_version: &str, _location: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn default_download_url() -> String {
+    String::from("https://cef-builds.spotifycdn.com")
+}
+
 pub struct CefIndex;
 
 impl CefIndex {
     pub fn download() -> Result<Self> {
-        Err(Error(String::from("CEF download disabled")))
+        Err(Error(String::from(DOWNLOAD_DISABLED)))
+    }
+
+    pub fn download_from(_url: &str) -> Result<Self> {
+        Err(Error(String::from(DOWNLOAD_DISABLED)))
     }
 
     pub fn platform(&self, _target: &str) -> Result<&CefPlatform> {
-        Err(Error(String::from("CEF download disabled")))
+        Err(Error(String::from(DOWNLOAD_DISABLED)))
     }
 }
 
@@ -42,7 +53,7 @@ pub struct CefPlatform;
 
 impl CefPlatform {
     pub fn version(&self, _cef_version: &str) -> Result<&CefVersion> {
-        Err(Error(String::from("CEF download disabled")))
+        Err(Error(String::from(DOWNLOAD_DISABLED)))
     }
 }
 
@@ -50,7 +61,19 @@ pub struct CefVersion;
 
 impl CefVersion {
     pub fn download_archive(&self, _out_dir: &Path, _minimal: bool) -> Result<PathBuf> {
-        Err(Error(String::from("CEF download disabled")))
+        Err(Error(String::from(DOWNLOAD_DISABLED)))
+    }
+
+    pub fn download_archive_from<P>(
+        &self,
+        _url: &str,
+        _location: P,
+        _show_progress: bool,
+    ) -> Result<PathBuf>
+    where
+        P: AsRef<Path>,
+    {
+        Err(Error(String::from(DOWNLOAD_DISABLED)))
     }
 
     pub fn write_archive_json(&self, _location: PathBuf) -> Result<()> {
@@ -64,7 +87,7 @@ pub fn extract_target_archive(
     _out_dir: &Path,
     _minimal: bool,
 ) -> Result<PathBuf> {
-    Err(Error(String::from("CEF download disabled")))
+    Err(Error(String::from(DOWNLOAD_DISABLED)))
 }
 
 pub struct OsAndArch {

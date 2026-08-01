@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::ffi::c_void;
@@ -8,7 +8,6 @@ use std::ptr::NonNull;
 use std::rc::Rc as StdRc;
 use std::time::{Duration, Instant};
 
-use block2::RcBlock;
 use cef::{
     CefString, Client, DevToolsMessageObserver, DisplayHandler, DownloadHandler, FocusHandler,
     ImplBeforeDownloadCallback, ImplBrowser, ImplBrowserHost, ImplClient,
@@ -25,32 +24,32 @@ use log::debug;
 use objc2::encode::{Encode, Encoding};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, MainThreadOnly, msg_send};
-use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSModalResponse, NSModalResponseAbort,
-    NSTextField, NSWindow,
-};
-use objc2_foundation::NSString;
+use objc2::{MainThreadMarker, msg_send};
+use objc2_app_kit::NSWindow;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, KeyEvent, MouseButton};
-use winit::event_loop::EventLoopProxy;
 use winit::keyboard::{Key, KeyLocation, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::raw_window_handle::RawWindowHandle;
-use winit::window::WindowId;
 
-use super::keycodes::macos_scancode_from_physical_key;
-use super::webview::{
-    WebAccelerationInfo, WebAccelerationState, WebFrameDeliveryMode, WebPopupSurfaceRef,
-    WebSurfaceRef,
+use super::cef_host::HostEventSender;
+use super::cef_host_protocol::{
+    HostEvent, HostFrameEditCommand, HostGeometry, HostJsDialogKind, HostKeyEvent,
+    HostKeyEventKind, HostMouseButton, HostMouseEvent, HostRect, HostSurfaceElement,
+    HostSurfaceFormat, SurfaceLeaseId, ViewId,
 };
-use crate::display::SizeInfo;
+use super::cef_surface_transport::{SurfaceSendRequest, SurfaceSender};
+use super::keycodes::macos_scancode_from_physical_key;
+use super::webview::WebAccelerationState;
 use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::window::Window;
-use crate::event::{Event, EventType, WebCommand};
+#[cfg(test)]
+use crate::event::{Event, EventType};
 use crate::ipc::AgentDownload;
+#[cfg(test)]
 use crate::tabs::TabId;
+#[cfg(test)]
+use winit::window::WindowId;
 #[cfg(target_pointer_width = "32")]
 type CGFloat = f32;
 #[cfg(target_pointer_width = "64")]
@@ -98,6 +97,7 @@ const MAX_PENDING_DEVTOOLS_CALLS: usize = 256;
 const DEVTOOLS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_EVENT_CAPTURE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Clone)]
 struct DevToolsEvent {
     id: u64,
     payload: String,
@@ -164,13 +164,81 @@ impl AcceleratedSurface {
         Ok(Self { io_surface, width, height, format: info.format })
     }
 
-    fn as_public_ref(&self) -> WebSurfaceRef {
-        WebSurfaceRef {
-            io_surface: self.io_surface.as_ptr(),
+    fn retained_clone(&self) -> Self {
+        unsafe {
+            CFRetain(self.io_surface.as_ptr().cast());
+        }
+        super::register_accelerated_surface();
+        Self {
+            io_surface: self.io_surface,
             width: self.width,
             height: self.height,
             format: self.format,
         }
+    }
+}
+
+#[derive(Clone)]
+struct HostPaintBridge {
+    view_id: ViewId,
+    sender: HostEventSender,
+    surface_sender: SurfaceSender,
+    next_lease_id: StdRc<Cell<u64>>,
+    leases: StdRc<RefCell<HashMap<SurfaceLeaseId, AcceleratedSurface>>>,
+}
+
+impl HostPaintBridge {
+    fn new(view_id: ViewId, sender: HostEventSender, surface_sender: SurfaceSender) -> Self {
+        Self {
+            view_id,
+            sender,
+            surface_sender,
+            next_lease_id: StdRc::new(Cell::new(1)),
+            leases: StdRc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    fn publish(
+        &self,
+        element: HostSurfaceElement,
+        surface: &AcceleratedSurface,
+        popup_rect: Option<cef::Rect>,
+    ) {
+        let lease_id = self.next_lease_id.get();
+        self.next_lease_id.set(lease_id.saturating_add(1));
+        let format = match surface.format {
+            cef::ColorType::BGRA_8888 => HostSurfaceFormat::Bgra8888,
+            cef::ColorType::RGBA_8888 => HostSurfaceFormat::Rgba8888,
+            _ => return,
+        };
+        self.leases.borrow_mut().insert(lease_id, surface.retained_clone());
+        let popup_rect = popup_rect.map(|rect| HostRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        });
+        if let Err(error) = self.surface_sender.send(SurfaceSendRequest {
+            view_id: self.view_id,
+            lease_id,
+            element,
+            io_surface: surface.io_surface.as_ptr(),
+            width: surface.width,
+            height: surface.height,
+            format,
+            popup_rect,
+        }) {
+            self.leases.borrow_mut().remove(&lease_id);
+            debug!("Failed to send accelerated CEF frame: {error}");
+        }
+    }
+
+    fn release(&self, lease_id: SurfaceLeaseId) {
+        self.leases.borrow_mut().remove(&lease_id);
+    }
+
+    fn popup_closed(&self) {
+        self.sender.send(HostEvent::PopupClosed { view_id: self.view_id });
     }
 }
 
@@ -247,83 +315,135 @@ impl PaintState {
         self.main = None;
         self.popup.surface = None;
     }
+}
 
-    fn acceleration_info(&self) -> WebAccelerationInfo {
-        WebAccelerationInfo {
-            state: self.acceleration_state,
-            frame_delivery_mode: WebFrameDeliveryMode::CefInternal,
-            main_surface_width: self.main.as_ref().map(|surface| surface.width),
-            main_surface_height: self.main.as_ref().map(|surface| surface.height),
-            popup_surface_width: self.popup.surface.as_ref().map(|surface| surface.width),
-            popup_surface_height: self.popup.surface.as_ref().map(|surface| surface.height),
+#[derive(Clone)]
+enum WebViewEventTarget {
+    Host {
+        view_id: ViewId,
+        sender: HostEventSender,
+    },
+    #[cfg(test)]
+    Recorder {
+        window_id: WindowId,
+        tab_id: TabId,
+        events: StdRc<RefCell<Vec<Event>>>,
+    },
+}
+
+impl WebViewEventTarget {
+    fn host(view_id: ViewId, sender: HostEventSender) -> Self {
+        Self::Host { view_id, sender }
+    }
+
+    fn dirty(&self) {
+        match self {
+            #[cfg(test)]
+            Self::Recorder { window_id, tab_id, events } => {
+                let event = Event::for_tab(EventType::WebViewDirty, *window_id, *tab_id);
+                events.borrow_mut().push(event);
+            },
+            Self::Host { .. } => (),
+        }
+    }
+
+    fn editable_focus(&self, editable: bool) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::EditableFocus { view_id: *view_id, editable });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
+        }
+    }
+
+    fn open_url(&self, url: String, new_tab: bool) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::OpenUrl { view_id: *view_id, url, new_tab });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
+        }
+    }
+
+    fn title(&self, title: String) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::Title { view_id: *view_id, title });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
+        }
+    }
+
+    fn url(&self, url: String) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::Url { view_id: *view_id, url });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
+        }
+    }
+
+    fn downloads(&self, downloads: Vec<AgentDownload>) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::Downloads { view_id: *view_id, downloads });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
+        }
+    }
+
+    fn devtools_event(&self, id: u64, payload: String) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::DevToolsEvent { view_id: *view_id, id, payload });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
+        }
+    }
+
+    fn acceleration_failed(&self, reason: String) {
+        match self {
+            Self::Host { view_id, sender } => {
+                sender.send(HostEvent::AccelerationFailed { view_id: *view_id, reason });
+            },
+            #[cfg(test)]
+            Self::Recorder { .. } => (),
         }
     }
 }
 
 #[derive(Clone)]
-struct WebViewDirtyNotifier {
-    window_id: WindowId,
-    tab_id: TabId,
-    sender: WebViewDirtySender,
-}
-
-#[derive(Clone)]
-enum WebViewDirtySender {
-    Proxy(EventLoopProxy<Event>),
-    #[cfg(test)]
-    Recorder(StdRc<RefCell<Vec<Event>>>),
-}
+struct WebViewDirtyNotifier(WebViewEventTarget);
 
 impl WebViewDirtyNotifier {
-    fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: TabId) -> Self {
-        Self { window_id, tab_id, sender: WebViewDirtySender::Proxy(proxy) }
-    }
-
-    fn event(&self) -> Event {
-        Event::for_tab(crate::event::EventType::WebViewDirty, self.window_id, self.tab_id)
+    fn new(target: WebViewEventTarget) -> Self {
+        Self(target)
     }
 
     fn send(&self) {
-        let event = self.event();
-        match &self.sender {
-            WebViewDirtySender::Proxy(proxy) => {
-                let _ = proxy.send_event(event);
-            },
-            #[cfg(test)]
-            WebViewDirtySender::Recorder(events) => {
-                events.borrow_mut().push(event);
-            },
-        }
+        self.0.dirty();
     }
 
     #[cfg(test)]
     fn recorder(window_id: WindowId, tab_id: TabId) -> (Self, StdRc<RefCell<Vec<Event>>>) {
         let events = StdRc::new(RefCell::new(Vec::new()));
-        let notifier =
-            Self { window_id, tab_id, sender: WebViewDirtySender::Recorder(events.clone()) };
-        (notifier, events)
+        let target = WebViewEventTarget::Recorder { window_id, tab_id, events: events.clone() };
+        (Self(target), events)
     }
 }
 
 #[derive(Clone)]
-struct WebEditableFocusNotifier {
-    window_id: WindowId,
-    tab_id: TabId,
-    proxy: EventLoopProxy<Event>,
-}
+struct WebEditableFocusNotifier(WebViewEventTarget);
 
 impl WebEditableFocusNotifier {
-    fn new(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: TabId) -> Self {
-        Self { window_id, tab_id, proxy }
-    }
-
     fn send(&self, editable: bool) {
-        let event = Event::for_tab(
-            crate::event::EventType::WebEditableFocus { editable },
-            self.window_id,
-            self.tab_id,
-        );
-        let _ = self.proxy.send_event(event);
+        self.0.editable_focus(editable);
     }
 }
 
@@ -436,10 +556,6 @@ impl WebFocusPolicy {
         self.state.borrow().host_focused
     }
 
-    fn editable_focused(&self) -> bool {
-        self.state.borrow().editable_focused
-    }
-
     fn arm_native_focus(&self) {
         self.state.borrow_mut().native_focus_armed = true;
     }
@@ -498,7 +614,7 @@ fn browser_screen_point(
     ))
 }
 
-fn scaled_browser_wheel_delta_y(layout: &BrowserViewportLayout, delta_y: f64) -> f64 {
+pub(super) fn scaled_browser_wheel_delta_y(layout: &BrowserViewportLayout, delta_y: f64) -> f64 {
     delta_y * layout.column_count().max(1) as f64
 }
 
@@ -511,6 +627,7 @@ fn invalidate_browser_surfaces(browser: &cef::Browser) {
     host.invalidate(cef::PaintElementType::POPUP);
 }
 
+#[cfg(test)]
 fn should_invalidate_after_key_input(state: ElementState) -> bool {
     matches!(state, ElementState::Pressed)
 }
@@ -569,7 +686,7 @@ impl DevToolsState {
         id
     }
 
-    fn record_event(&mut self, method: &str, params: Option<&JsonValue>) {
+    fn record_event(&mut self, method: &str, params: Option<&JsonValue>) -> DevToolsEvent {
         let mut object = JsonMap::new();
         object.insert("method".to_string(), JsonValue::String(method.to_string()));
         if let Some(params) = params {
@@ -586,10 +703,10 @@ impl DevToolsState {
             })
             .to_string();
         }
-        self.push_event(payload);
+        self.push_event(payload)
     }
 
-    fn record_truncated_event(&mut self, method: &str, original_bytes: usize) {
+    fn record_truncated_event(&mut self, method: &str, original_bytes: usize) -> DevToolsEvent {
         let payload = serde_json::json!({
             "method": method,
             "params": {
@@ -598,10 +715,10 @@ impl DevToolsState {
             },
         })
         .to_string();
-        self.push_event(payload);
+        self.push_event(payload)
     }
 
-    fn push_event(&mut self, payload: String) {
+    fn push_event(&mut self, payload: String) -> DevToolsEvent {
         let id = self.next_event_id;
         self.next_event_id = self.next_event_id.saturating_add(1);
         self.retained_event_bytes = self.retained_event_bytes.saturating_add(payload.len());
@@ -613,12 +730,15 @@ impl DevToolsState {
             self.retained_event_bytes =
                 self.retained_event_bytes.saturating_sub(event.payload.len());
         }
+        self.events.back().expect("pushed DevTools event is retained").clone()
     }
 
+    #[cfg(test)]
     fn latest_event_id(&self) -> u64 {
         self.next_event_id.saturating_sub(1)
     }
 
+    #[cfg(test)]
     fn events_since(&self, last_id: u64, max: usize) -> (Vec<String>, u64) {
         if max == 0 {
             return (Vec::new(), last_id);
@@ -766,6 +886,7 @@ fn set_agent_event_domains(
 cef::wrap_dev_tools_message_observer! {
     struct TaborDevToolsObserver {
         state: StdRc<RefCell<DevToolsState>>,
+        target: WebViewEventTarget,
     }
 
     impl DevToolsMessageObserver {
@@ -838,13 +959,15 @@ cef::wrap_dev_tools_message_observer! {
             }
             if let Some(params) = params {
                 if params.len() > MAX_DEVTOOLS_EVENT_BYTES {
-                    self.state.borrow_mut().record_truncated_event(&method, params.len());
+                    let event =
+                        self.state.borrow_mut().record_truncated_event(&method, params.len());
+                    self.target.devtools_event(event.id, event.payload);
                     return;
                 }
             }
             let params = params.and_then(|bytes| serde_json::from_slice::<JsonValue>(bytes).ok());
-            let mut state = self.state.borrow_mut();
-            state.record_event(&method, params.as_ref());
+            let event = self.state.borrow_mut().record_event(&method, params.as_ref());
+            self.target.devtools_event(event.id, event.payload);
         }
     }
 }
@@ -852,12 +975,28 @@ cef::wrap_dev_tools_message_observer! {
 cef::wrap_display_handler! {
     struct TaborDisplayHandler {
         title: StdRc<RefCell<Option<String>>>,
+        target: WebViewEventTarget,
     }
 
     impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            frame: Option<&mut cef::Frame>,
+            url: Option<&cef::CefString>,
+        ) {
+            if frame.is_some_and(|frame| frame.is_main() != 0) {
+                if let Some(url) = url {
+                    self.target.url(url.to_string());
+                }
+            }
+        }
+
         fn on_title_change(&self, _browser: Option<&mut cef::Browser>, title: Option<&cef::CefString>) {
             if let Some(title) = title {
-                *self.title.borrow_mut() = Some(title.to_string());
+                let title = title.to_string();
+                *self.title.borrow_mut() = Some(title.clone());
+                self.target.title(title);
             }
         }
     }
@@ -865,9 +1004,7 @@ cef::wrap_display_handler! {
 
 cef::wrap_life_span_handler! {
     struct TaborLifeSpanHandler {
-        proxy: EventLoopProxy<Event>,
-        window_id: WindowId,
-        tab_id: TabId,
+        target: WebViewEventTarget,
     }
 
     impl LifeSpanHandler {
@@ -895,9 +1032,7 @@ cef::wrap_life_span_handler! {
                 return 0;
             }
 
-            let command = WebCommand::OpenUrl { url, new_tab: true };
-            let event = Event::for_tab(EventType::WebCommand(command), self.window_id, self.tab_id);
-            let _ = self.proxy.send_event(event);
+            self.target.open_url(url, true);
             1
         }
     }
@@ -907,6 +1042,7 @@ cef::wrap_render_handler! {
     struct TaborRenderHandler {
         paint_state: StdRc<RefCell<PaintState>>,
         dirty_notifier: WebViewDirtyNotifier,
+        host_bridge: Option<HostPaintBridge>,
     }
 
     impl RenderHandler {
@@ -987,6 +1123,9 @@ cef::wrap_render_handler! {
         fn on_popup_show(&self, _browser: Option<&mut cef::Browser>, show: ::std::os::raw::c_int) {
             if show == 0 {
                 self.paint_state.borrow_mut().clear_popup_surface();
+                if let Some(host_bridge) = &self.host_bridge {
+                    host_bridge.popup_closed();
+                }
                 self.dirty_notifier.send();
             }
         }
@@ -1015,9 +1154,10 @@ cef::wrap_render_handler! {
 
             let mut paint_state = self.paint_state.borrow_mut();
             if paint_state.acceleration_state == WebAccelerationState::Pending {
-                paint_state.fail(
-                    "Received CPU paint callback before accelerated rendering became ready",
-                );
+                let reason =
+                    String::from("Received CPU paint callback before accelerated rendering became ready");
+                paint_state.fail(reason.clone());
+                self.dirty_notifier.0.acceleration_failed(reason);
             }
         }
 
@@ -1032,7 +1172,10 @@ cef::wrap_render_handler! {
                 if type_ == cef::PaintElementType::VIEW {
                     let mut paint_state = self.paint_state.borrow_mut();
                     if paint_state.acceleration_state == WebAccelerationState::Pending {
-                        paint_state.fail("Accelerated paint callback was missing IOSurface info");
+                        let reason =
+                            String::from("Accelerated paint callback was missing IOSurface info");
+                        paint_state.fail(reason.clone());
+                        self.dirty_notifier.0.acceleration_failed(reason);
                     }
                 }
                 return;
@@ -1043,13 +1186,27 @@ cef::wrap_render_handler! {
                 Err(err) => {
                     let mut paint_state = self.paint_state.borrow_mut();
                     if type_ == cef::PaintElementType::VIEW {
-                        paint_state.fail(err);
+                        paint_state.fail(err.clone());
+                        self.dirty_notifier.0.acceleration_failed(err);
                     } else if type_ == cef::PaintElementType::POPUP {
                         paint_state.clear_popup_surface();
                     }
                     return;
                 },
             };
+
+            let popup_rect = (type_ == cef::PaintElementType::POPUP)
+                .then(|| self.paint_state.borrow().popup.rect.clone());
+            if let Some(host_bridge) = &self.host_bridge {
+                let element = if type_ == cef::PaintElementType::VIEW {
+                    HostSurfaceElement::View
+                } else if type_ == cef::PaintElementType::POPUP {
+                    HostSurfaceElement::Popup
+                } else {
+                    return;
+                };
+                host_bridge.publish(element, &surface, popup_rect);
+            }
 
             let mut paint_state = self.paint_state.borrow_mut();
             match type_ {
@@ -1095,6 +1252,7 @@ cef::wrap_render_handler! {
 cef::wrap_download_handler! {
     struct TaborDownloadHandler {
         automation_state: StdRc<RefCell<AutomationState>>,
+        target: WebViewEventTarget,
     }
 
     impl DownloadHandler {
@@ -1187,6 +1345,7 @@ cef::wrap_download_handler! {
                 total_bytes: (item.total_bytes() > 0).then_some(item.total_bytes()),
                 received_bytes: (item.received_bytes() > 0).then_some(item.received_bytes()),
             });
+            self.target.downloads(self.automation_state.borrow().downloads());
         }
     }
 }
@@ -1227,7 +1386,7 @@ fn all_known_permission_mask() -> u32 {
         | Permission::WEB_APP_INSTALLATION.get_raw()
         | Permission::WINDOW_MANAGEMENT.get_raw()
         | Permission::FILE_SYSTEM_ACCESS.get_raw()
-        | Permission::LOCAL_NETWORK_ACCESS.get_raw()
+        | Permission::LOCAL_NETWORK.get_raw()
 }
 
 #[cfg(not(feature = "passkey-webauthn"))]
@@ -1238,8 +1397,7 @@ fn blocked_permission_mask() -> u32 {
         | Permission::VR_SESSION.get_raw()
         | Permission::HAND_TRACKING.get_raw();
     if super::distribution_channel().is_mac_app_store() {
-        blocked |=
-            Permission::FILE_SYSTEM_ACCESS.get_raw() | Permission::LOCAL_NETWORK_ACCESS.get_raw();
+        blocked |= Permission::FILE_SYSTEM_ACCESS.get_raw() | Permission::LOCAL_NETWORK.get_raw();
     }
     blocked
 }
@@ -1409,159 +1567,85 @@ enum JsDialogKind {
     BeforeUnload { is_reload: bool },
 }
 
-struct ActiveJsDialog {
-    generation: u64,
-    alert: Retained<NSAlert>,
-    prompt_field: Option<Retained<NSTextField>>,
-    callback: Option<cef::JsdialogCallback>,
-    _completion: RcBlock<dyn Fn(NSModalResponse)>,
+struct HostJsDialogState {
+    view_id: ViewId,
+    sender: HostEventSender,
+    next_dialog_id: u64,
+    pending: HashMap<u64, cef::JsdialogCallback>,
 }
 
-struct JsDialogState {
-    parent_window: Retained<NSWindow>,
-    next_generation: u64,
-    active: Option<ActiveJsDialog>,
-}
+#[derive(Clone)]
+struct JsDialogBackend(StdRc<RefCell<HostJsDialogState>>);
 
-impl JsDialogState {
-    fn new(parent_window: Retained<NSWindow>) -> Self {
-        Self { parent_window, next_generation: 1, active: None }
+impl JsDialogBackend {
+    fn has_active(&self) -> bool {
+        !self.0.borrow().pending.is_empty()
     }
 
-    fn take_generation(&mut self) -> u64 {
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.wrapping_add(1);
-        generation
-    }
-}
-
-fn js_dialog_label(kind: JsDialogKind, origin_url: Option<&cef::CefString>) -> String {
-    let mut label = match kind {
-        JsDialogKind::Alert => String::from("JavaScript Alert"),
-        JsDialogKind::Confirm => String::from("JavaScript Confirm"),
-        JsDialogKind::Prompt => String::from("JavaScript Prompt"),
-        JsDialogKind::BeforeUnload { is_reload: true } => String::from("Reload this page?"),
-        JsDialogKind::BeforeUnload { is_reload: false } => String::from("Leave this page?"),
-    };
-
-    if let Some(origin_url) = origin_url {
-        let display_url = cef::format_url_for_security_display(Some(origin_url));
-        let display_url = CefString::from(&display_url).to_string();
-        if !display_url.is_empty() {
-            label.push_str(" - ");
-            label.push_str(&display_url);
+    fn present(
+        &self,
+        kind: JsDialogKind,
+        origin_url: Option<&cef::CefString>,
+        message_text: &cef::CefString,
+        default_prompt_text: Option<&cef::CefString>,
+        callback: cef::JsdialogCallback,
+    ) -> bool {
+        let mut state = self.0.borrow_mut();
+        if !state.pending.is_empty() {
+            return false;
+        }
+        let dialog_id = state.next_dialog_id;
+        state.next_dialog_id = state.next_dialog_id.saturating_add(1);
+        state.pending.insert(dialog_id, callback);
+        let kind = match kind {
+            JsDialogKind::Alert => HostJsDialogKind::Alert,
+            JsDialogKind::Confirm => HostJsDialogKind::Confirm,
+            JsDialogKind::Prompt => HostJsDialogKind::Prompt,
+            JsDialogKind::BeforeUnload { is_reload: true } => HostJsDialogKind::BeforeUnloadReload,
+            JsDialogKind::BeforeUnload { is_reload: false } => {
+                HostJsDialogKind::BeforeUnloadNavigate
+            },
+        };
+        let event = HostEvent::JsDialog {
+            view_id: state.view_id,
+            dialog_id,
+            kind,
+            origin_url: origin_url.map(ToString::to_string),
+            message_text: message_text.to_string(),
+            default_prompt_text: default_prompt_text.map(ToString::to_string),
+        };
+        if state.sender.send(event) {
+            true
+        } else {
+            state.pending.remove(&dialog_id);
+            false
         }
     }
-    label
-}
 
-fn complete_js_dialog(
-    state: &StdRc<RefCell<JsDialogState>>,
-    generation: u64,
-    response: NSModalResponse,
-) {
-    let mut active = {
-        let mut state = state.borrow_mut();
-        if state.active.as_ref().map(|active| active.generation) != Some(generation) {
-            return;
+    fn cancel(&self) {
+        let mut state = self.0.borrow_mut();
+        let dialog_ids = state.pending.keys().copied().collect::<Vec<_>>();
+        state.pending.clear();
+        for dialog_id in dialog_ids {
+            state.sender.send(HostEvent::JsDialogClosed { view_id: state.view_id, dialog_id });
         }
-        state.active.take().expect("generation matched an active JavaScript dialog")
-    };
-
-    let accepted = response == NSAlertFirstButtonReturn;
-    let prompt_text = active.prompt_field.as_ref().map(|field| field.stringValue().to_string());
-    let callback = active.callback.take().expect("active JavaScript dialog callback");
-    if let Some(prompt_text) = prompt_text {
-        let prompt_text = CefString::from(prompt_text.as_str());
-        callback.cont(i32::from(accepted), Some(&prompt_text));
-    } else {
-        callback.cont(i32::from(accepted), None);
     }
-}
 
-fn cancel_js_dialog(state: &StdRc<RefCell<JsDialogState>>) {
-    let (parent_window, mut active) = {
-        let mut state = state.borrow_mut();
-        let Some(active) = state.active.take() else {
+    fn complete(&self, dialog_id: u64, accepted: bool, prompt_text: Option<&str>) {
+        let Some(callback) = self.0.borrow_mut().pending.remove(&dialog_id) else {
             return;
         };
-        (state.parent_window.clone(), active)
-    };
-
-    active.callback.take();
-    let sheet = active.alert.window();
-    parent_window.endSheet_returnCode(&sheet, NSModalResponseAbort);
-}
-
-fn present_js_dialog(
-    state: &StdRc<RefCell<JsDialogState>>,
-    kind: JsDialogKind,
-    origin_url: Option<&cef::CefString>,
-    message_text: &cef::CefString,
-    default_prompt_text: Option<&cef::CefString>,
-    callback: cef::JsdialogCallback,
-) -> bool {
-    let mtm = MainThreadMarker::new().expect("CEF JavaScript dialogs must run on the main thread");
-    if state.borrow().active.is_some() {
-        return false;
-    }
-
-    let alert = NSAlert::new(mtm);
-    alert.setAlertStyle(NSAlertStyle::Informational);
-    alert.setMessageText(&NSString::from_str(&js_dialog_label(kind, origin_url)));
-    alert.setInformativeText(&NSString::from_str(&message_text.to_string()));
-    alert.addButtonWithTitle(&NSString::from_str("OK"));
-    if !matches!(kind, JsDialogKind::Alert) {
-        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-    }
-
-    let prompt_field = if matches!(kind, JsDialogKind::Prompt) {
-        let default_prompt_text = default_prompt_text
-            .expect("CEF prompt dialogs must provide default prompt text")
-            .to_string();
-        let field = NSTextField::initWithFrame(
-            NSTextField::alloc(mtm),
-            objc2_foundation::NSRect::new(
-                objc2_foundation::NSPoint::new(0.0, 0.0),
-                objc2_foundation::NSSize::new(300.0, 22.0),
-            ),
-        );
-        field.setStringValue(&NSString::from_str(&default_prompt_text));
-        alert.setAccessoryView(Some(&field));
-        alert.window().setInitialFirstResponder(Some(&field));
-        Some(field)
-    } else {
-        None
-    };
-
-    let (generation, parent_window) = {
-        let mut state = state.borrow_mut();
-        (state.take_generation(), state.parent_window.clone())
-    };
-    let weak_state = StdRc::downgrade(state);
-    let completion: RcBlock<dyn Fn(NSModalResponse)> = RcBlock::new(move |response| {
-        if let Some(state) = weak_state.upgrade() {
-            complete_js_dialog(&state, generation, response);
+        if let Some(prompt_text) = prompt_text {
+            callback.cont(i32::from(accepted), Some(&CefString::from(prompt_text)));
+        } else {
+            callback.cont(i32::from(accepted), None);
         }
-    });
-
-    state.borrow_mut().active = Some(ActiveJsDialog {
-        generation,
-        alert: alert.clone(),
-        prompt_field: prompt_field.clone(),
-        callback: Some(callback),
-        _completion: completion.clone(),
-    });
-    alert.beginSheetModalForWindow_completionHandler(&parent_window, Some(&completion));
-    if let Some(prompt_field) = prompt_field {
-        alert.window().makeFirstResponder(Some(&prompt_field));
     }
-    true
 }
 
 cef::wrap_jsdialog_handler! {
     struct TaborJsDialogHandler {
-        state: StdRc<RefCell<JsDialogState>>,
+        backend: JsDialogBackend,
     }
 
     impl JsdialogHandler {
@@ -1581,15 +1665,14 @@ cef::wrap_jsdialog_handler! {
                 cef::JsdialogType::PROMPT => JsDialogKind::Prompt,
                 _ => return 0,
             };
-            if self.state.borrow().active.is_some() {
+            if self.backend.has_active() {
                 if let Some(suppress_message) = suppress_message {
                     *suppress_message = 1;
                 }
                 return 0;
             }
 
-            let shown = present_js_dialog(
-                &self.state,
+            let shown = self.backend.present(
                 kind,
                 origin_url,
                 message_text.expect("CEF JavaScript dialogs must provide message text"),
@@ -1606,8 +1689,7 @@ cef::wrap_jsdialog_handler! {
             is_reload: ::std::os::raw::c_int,
             callback: Option<&mut cef::JsdialogCallback>,
         ) -> ::std::os::raw::c_int {
-            let shown = present_js_dialog(
-                &self.state,
+            let shown = self.backend.present(
                 JsDialogKind::BeforeUnload { is_reload: is_reload != 0 },
                 None,
                 message_text.expect("CEF before-unload dialogs must provide message text"),
@@ -1618,11 +1700,11 @@ cef::wrap_jsdialog_handler! {
         }
 
         fn on_reset_dialog_state(&self, _browser: Option<&mut cef::Browser>) {
-            cancel_js_dialog(&self.state);
+            self.backend.cancel();
         }
 
         fn on_dialog_closed(&self, _browser: Option<&mut cef::Browser>) {
-            cancel_js_dialog(&self.state);
+            self.backend.cancel();
         }
     }
 }
@@ -1745,28 +1827,6 @@ cef::wrap_client! {
     }
 }
 
-cef::wrap_task! {
-    struct SendKeyTask {
-        browser: cef::Browser,
-        events: Vec<cef::KeyEvent>,
-        invalidate_after: bool,
-    }
-
-    impl Task {
-        fn execute(&self) {
-            let Some(host) = self.browser.host() else {
-                return;
-            };
-            for event in &self.events {
-                host.send_key_event(Some(event));
-            }
-            if self.invalidate_after {
-                invalidate_browser_surfaces(&self.browser);
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum FrameEditCommand {
     Copy,
@@ -1814,16 +1874,11 @@ cef::wrap_task! {
 
 pub struct WebView {
     browser: cef::Browser,
-    last_title: Option<String>,
-    last_url: Option<String>,
     focus_policy: WebFocusPolicy,
-    title_state: StdRc<RefCell<Option<String>>>,
     paint_state: StdRc<RefCell<PaintState>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
-    automation_state: StdRc<RefCell<AutomationState>>,
-    js_dialog_state: StdRc<RefCell<JsDialogState>>,
-    last_mouse_event: Option<cef::MouseEvent>,
-    mouse_button_flags: u32,
+    js_dialog_backend: JsDialogBackend,
+    host_bridge: Option<HostPaintBridge>,
     _devtools_observer: cef::DevToolsMessageObserver,
     _devtools_registration: Option<cef::Registration>,
     _client: cef::Client,
@@ -1839,51 +1894,63 @@ fn browser_settings() -> cef::BrowserSettings {
 }
 
 impl WebView {
-    pub fn new(
-        window: &Window,
-        _size_info: &SizeInfo,
-        layout: BrowserViewportLayout,
-        tab_id: TabId,
+    pub(super) fn new_host(
+        parent_view: *mut c_void,
+        geometry: HostGeometry,
+        view_id: ViewId,
         url: &str,
-        proxy: &EventLoopProxy<Event>,
+        sender: HostEventSender,
+        surface_sender: SurfaceSender,
     ) -> Result<Self, Box<dyn Error>> {
-        let _mtm = MainThreadMarker::new()
-            .ok_or_else(|| std::io::Error::other("WebView must be created on main thread"))?;
-
-        crate::macos::cef::ensure_initialized()?;
+        let _mtm = MainThreadMarker::new().ok_or_else(|| {
+            std::io::Error::other("Hosted WebView must be created on main thread")
+        })?;
+        crate::macos::cef::ensure_initialized_for_host()?;
         super::register_webview();
         let mut web_view_constructed = false;
 
         let result = (|| {
-            let parent = ns_view(window)?;
-            let parent_window = ns_window(parent)?;
-            let screen_rect = cef_screen_rect(window, &layout);
-            let paint_state =
-                StdRc::new(RefCell::new(PaintState::new(layout, screen_rect, window.scale_factor)));
+            let target = WebViewEventTarget::host(view_id, sender.clone());
+            let screen_rect = cef::Rect {
+                x: geometry.screen_rect.x,
+                y: geometry.screen_rect.y,
+                width: geometry.screen_rect.width,
+                height: geometry.screen_rect.height,
+            };
+            let paint_state = StdRc::new(RefCell::new(PaintState::new(
+                geometry.layout,
+                screen_rect,
+                geometry.scale_factor,
+            )));
+            let host_bridge = HostPaintBridge::new(view_id, sender.clone(), surface_sender.clone());
             let render_handler = TaborRenderHandler::new(
                 paint_state.clone(),
-                WebViewDirtyNotifier::new(proxy.clone(), window.id(), tab_id),
+                WebViewDirtyNotifier::new(target.clone()),
+                Some(host_bridge.clone()),
             );
-            let mut window_info = cef::WindowInfo::default().set_as_windowless(parent.cast());
+            let mut window_info = cef::WindowInfo::default().set_as_windowless(parent_view);
             window_info.shared_texture_enabled = 1;
 
-            let title_state = StdRc::new(RefCell::new(None));
-            let automation_state = StdRc::new(RefCell::new(AutomationState::new()));
-            let display_handler = TaborDisplayHandler::new(title_state.clone());
-            let download_handler = TaborDownloadHandler::new(automation_state.clone());
+            let display_handler =
+                TaborDisplayHandler::new(StdRc::new(RefCell::new(None)), target.clone());
+            let download_handler = TaborDownloadHandler::new(
+                StdRc::new(RefCell::new(AutomationState::new())),
+                target.clone(),
+            );
             let focus_policy = WebFocusPolicy::new();
             let focus_handler = TaborFocusHandler::new(focus_policy.clone());
-            let life_span_handler = TaborLifeSpanHandler::new(proxy.clone(), window.id(), tab_id);
-            let js_dialog_state = StdRc::new(RefCell::new(JsDialogState::new(parent_window)));
-            let jsdialog_handler = TaborJsDialogHandler::new(js_dialog_state.clone());
-            let test_use_default_js_dialog = super::bundle_identifier()
-                .starts_with("com.pinkbot.tabor.test.")
-                && std::env::var_os("TABOR_TEST_USE_DEFAULT_JS_DIALOG").is_some();
-            let editable_focus_notifier =
-                WebEditableFocusNotifier::new(proxy.clone(), window.id(), tab_id);
+            let life_span_handler = TaborLifeSpanHandler::new(target.clone());
+            let js_dialog_backend = JsDialogBackend(StdRc::new(RefCell::new(HostJsDialogState {
+                view_id,
+                sender,
+                next_dialog_id: 1,
+                pending: HashMap::new(),
+            })));
+            let jsdialog_handler = TaborJsDialogHandler::new(js_dialog_backend.clone());
+            let editable_focus_notifier = WebEditableFocusNotifier(target.clone());
             let web_state = TaborClientWebState {
                 jsdialog_handler,
-                test_use_default_js_dialog,
+                test_use_default_js_dialog: false,
                 editable_focus_notifier,
             };
             #[cfg(not(feature = "passkey-webauthn"))]
@@ -1919,7 +1986,7 @@ impl WebView {
                 None,
                 None,
             )
-            .ok_or_else(|| std::io::Error::other("Failed to create CEF browser"))?;
+            .ok_or_else(|| std::io::Error::other("Failed to create hosted CEF browser"))?;
 
             if let Some(host) = browser.host() {
                 host.set_windowless_frame_rate(60);
@@ -1930,37 +1997,29 @@ impl WebView {
             }
 
             let devtools_state = StdRc::new(RefCell::new(DevToolsState::new()));
-            let mut observer = TaborDevToolsObserver::new(devtools_state.clone());
+            let mut observer = TaborDevToolsObserver::new(devtools_state.clone(), target);
             let registration = browser
                 .host()
                 .and_then(|host| host.add_dev_tools_message_observer(Some(&mut observer)));
 
             let web_view = Self {
                 browser,
-                last_title: None,
-                last_url: None,
                 focus_policy,
-                title_state,
                 paint_state,
                 devtools_state,
-                automation_state,
-                js_dialog_state,
-                last_mouse_event: None,
-                mouse_button_flags: 0,
+                js_dialog_backend,
+                host_bridge: Some(host_bridge),
                 _devtools_observer: observer,
                 _devtools_registration: registration,
                 _client: client,
             };
             web_view_constructed = true;
-
             Ok(web_view)
         })();
 
-        // Startup failures before `Self` is constructed still need to roll back the counter.
         if result.is_err() && !web_view_constructed {
             super::unregister_webview();
         }
-
         result
     }
 
@@ -1985,39 +2044,19 @@ impl WebView {
         invalidate_browser_surfaces(&self.browser);
     }
 
-    pub fn restore_native_focus(&mut self, window: &Window) -> bool {
-        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-        let Some(view) = browser_view(&self.browser) else {
-            return false;
-        };
-
-        if !self.focus_policy.host_focused() || !self.focus_policy.editable_focused() {
-            return false;
-        }
-
-        self.focus_policy.arm_native_focus();
-        let restored = window.focus_native_view(view);
-        if restored {
-            if let Some(host) = self.browser.host() {
-                host.set_focus(1);
-            }
-            invalidate_browser_surfaces(&self.browser);
-        } else {
-            self.focus_policy.disarm_native_focus();
-        }
-        restored
-    }
-
-    pub fn update_frame(
-        &mut self,
-        window: &Window,
-        _size_info: &SizeInfo,
-        layout: BrowserViewportLayout,
-    ) {
+    pub(super) fn update_host_geometry(&mut self, geometry: HostGeometry) {
         {
-            let screen_rect = cef_screen_rect(window, &layout);
             let mut paint_state = self.paint_state.borrow_mut();
-            paint_state.update_geometry(layout, screen_rect, window.scale_factor);
+            paint_state.update_geometry(
+                geometry.layout,
+                cef::Rect {
+                    x: geometry.screen_rect.x,
+                    y: geometry.screen_rect.y,
+                    width: geometry.screen_rect.width,
+                    height: geometry.screen_rect.height,
+                },
+                geometry.scale_factor,
+            );
         }
         if let Some(host) = self.browser.host() {
             host.notify_screen_info_changed();
@@ -2026,13 +2065,7 @@ impl WebView {
         invalidate_browser_surfaces(&self.browser);
     }
 
-    pub fn acceleration_info(&self) -> WebAccelerationInfo {
-        self.paint_state.borrow().acceleration_info()
-    }
-
     pub fn load_url(&mut self, url: &str) -> bool {
-        self.last_title = None;
-        self.last_url = None;
         let url = if url.is_empty() { "about:blank" } else { url };
         if let Some(frame) = self.browser.main_frame() {
             frame.load_url(Some(&CefString::from(url)));
@@ -2053,53 +2086,26 @@ impl WebView {
         self.browser.go_forward();
     }
 
-    pub fn handle_mouse_input(
+    pub(super) fn host_mouse_click(
         &mut self,
-        window: &Window,
-        position: PhysicalPosition<f64>,
-        state: ElementState,
-        button: MouseButton,
-        modifiers: objc2_app_kit::NSEventModifierFlags,
-    ) -> bool {
-        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-        if matches!((state, button), (ElementState::Pressed, MouseButton::Left)) {
+        event: HostMouseEvent,
+        button: HostMouseButton,
+        mouse_up: bool,
+        click_count: i32,
+    ) {
+        if !mouse_up && matches!(button, HostMouseButton::Left) {
             self.prepare_browser_focus_for_mouse_input();
         }
-        let button_flag = cef_mouse_button_flag(button);
-        let event_button_flags = match state {
-            ElementState::Pressed => self.mouse_button_flags | button_flag,
-            ElementState::Released => self.mouse_button_flags & !button_flag,
+        let event = cef::MouseEvent { x: event.x, y: event.y, modifiers: event.modifiers };
+        let button = match button {
+            HostMouseButton::Left => cef::MouseButtonType::LEFT,
+            HostMouseButton::Right => cef::MouseButtonType::RIGHT,
+            HostMouseButton::Middle => cef::MouseButtonType::MIDDLE,
         };
-        let Some(event) = self.mouse_event(window, position, modifiers, event_button_flags) else {
-            return false;
-        };
-
-        let button_type = match button {
-            MouseButton::Left => cef::MouseButtonType::LEFT,
-            MouseButton::Right => cef::MouseButtonType::RIGHT,
-            MouseButton::Middle => cef::MouseButtonType::MIDDLE,
-            MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => {
-                cef::MouseButtonType::MIDDLE
-            },
-        };
-
-        let Some(host) = self.browser.host() else {
-            return false;
-        };
-        self.last_mouse_event = Some(event.clone());
-        self.mouse_button_flags = event_button_flags;
-
-        match state {
-            ElementState::Pressed => {
-                host.send_mouse_click_event(Some(&event), button_type, 0, 1);
-            },
-            ElementState::Released => {
-                host.send_mouse_click_event(Some(&event), button_type, 1, 1);
-            },
+        if let Some(host) = self.browser.host() {
+            host.send_mouse_click_event(Some(&event), button, i32::from(mouse_up), click_count);
         }
-
         invalidate_browser_surfaces(&self.browser);
-        true
     }
 
     fn prepare_browser_focus_for_mouse_input(&mut self) {
@@ -2116,70 +2122,19 @@ impl WebView {
         }
     }
 
-    pub fn handle_mouse_move(
-        &mut self,
-        window: &Window,
-        position: PhysicalPosition<f64>,
-        modifiers: objc2_app_kit::NSEventModifierFlags,
-    ) -> bool {
-        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-        let Some(event) = self.mouse_event(window, position, modifiers, self.mouse_button_flags)
-        else {
-            self.handle_mouse_leave();
-            return false;
-        };
-        let Some(host) = self.browser.host() else {
-            return false;
-        };
-
-        self.last_mouse_event = Some(event.clone());
-        host.send_mouse_move_event(Some(&event), 0);
-        if self.mouse_button_flags != 0 {
-            invalidate_browser_surfaces(&self.browser);
+    pub(super) fn host_mouse_move(&mut self, event: HostMouseEvent, mouse_leave: bool) {
+        let event = cef::MouseEvent { x: event.x, y: event.y, modifiers: event.modifiers };
+        if let Some(host) = self.browser.host() {
+            host.send_mouse_move_event(Some(&event), i32::from(mouse_leave));
         }
-        true
     }
 
-    pub fn handle_mouse_leave(&mut self) {
-        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-        let Some(host) = self.browser.host() else {
-            return;
-        };
-
-        let event = self.last_mouse_event.clone().unwrap_or_default();
-        host.send_mouse_move_event(Some(&event), 1);
-    }
-
-    pub fn handle_mouse_wheel(
-        &mut self,
-        window: &Window,
-        position: PhysicalPosition<f64>,
-        delta_x: f64,
-        delta_y: f64,
-        modifiers: objc2_app_kit::NSEventModifierFlags,
-    ) -> bool {
-        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-        let Some(event) = self.mouse_event(window, position, modifiers, self.mouse_button_flags)
-        else {
-            return false;
-        };
-        let Some(host) = self.browser.host() else {
-            return false;
-        };
-
-        let scaled_delta_y = {
-            let paint_state = self.paint_state.borrow();
-            scaled_browser_wheel_delta_y(&paint_state.layout, delta_y)
-        };
-
-        self.last_mouse_event = Some(event.clone());
-        host.send_mouse_wheel_event(
-            Some(&event),
-            delta_x.round() as i32,
-            scaled_delta_y.round() as i32,
-        );
+    pub(super) fn host_mouse_wheel(&mut self, event: HostMouseEvent, delta_x: i32, delta_y: i32) {
+        let event = cef::MouseEvent { x: event.x, y: event.y, modifiers: event.modifiers };
+        if let Some(host) = self.browser.host() {
+            host.send_mouse_wheel_event(Some(&event), delta_x, delta_y);
+        }
         invalidate_browser_surfaces(&self.browser);
-        true
     }
 
     pub fn handle_ime_commit(&mut self, text: &str) {
@@ -2236,149 +2191,33 @@ impl WebView {
         }
     }
 
-    pub fn handle_key_input(
-        &mut self,
-        _window: &Window,
-        key: &KeyEvent,
-        text: &str,
-        modifiers: ModifiersState,
-    ) -> bool {
-        let key_without_modifiers = key.key_without_modifiers();
-        self.handle_key_input_inner(
-            &key_without_modifiers,
-            text,
-            key.state,
-            modifiers,
-            key.repeat,
-            key.location,
-            key.physical_key,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn handle_key_input_inner(
-        &mut self,
-        key: &Key,
-        text: &str,
-        state: ElementState,
-        modifiers: ModifiersState,
-        repeat: bool,
-        location: KeyLocation,
-        physical_key: winit::keyboard::PhysicalKey,
-    ) -> bool {
-        let _mtm = MainThreadMarker::new().expect("WebView input requires main thread");
-
-        let base_flags = cef_event_flags(modifiers, repeat, location);
-        let windows_key_code = cef_windows_key_code_from_key(key);
-        let scancode = macos_scancode_from_physical_key(physical_key).unwrap_or(0);
-        let native_key_code = cef_native_key_code(scancode, modifiers);
-        let (character, unmodified_character) =
-            cef_characters_from_key_text(key, if text.is_empty() { "" } else { text });
-        let should_send_char = character != 0 && !modifiers.super_key() && !modifiers.control_key();
-
-        let focus_on_editable_field = 1;
-        let mut events = Vec::new();
-
-        match state {
-            ElementState::Pressed => {
-                if windows_key_code != 0 {
-                    let down = cef::KeyEvent {
-                        type_: cef::KeyEventType::KEYDOWN,
-                        modifiers: base_flags,
-                        windows_key_code,
-                        native_key_code,
-                        is_system_key: 0,
-                        character,
-                        unmodified_character,
-                        focus_on_editable_field,
-                        ..cef::KeyEvent::default()
-                    };
-                    events.push(down);
-                }
-
-                if should_send_char {
-                    let ch = cef::KeyEvent {
-                        type_: cef::KeyEventType::CHAR,
-                        modifiers: base_flags,
-                        windows_key_code: character as i32,
-                        native_key_code,
-                        is_system_key: 0,
-                        character,
-                        unmodified_character,
-                        focus_on_editable_field,
-                        ..cef::KeyEvent::default()
-                    };
-                    events.push(ch);
-                }
-            },
-            ElementState::Released => {
-                if windows_key_code != 0 {
-                    let up = cef::KeyEvent {
-                        type_: cef::KeyEventType::KEYUP,
-                        modifiers: base_flags,
-                        windows_key_code,
-                        native_key_code,
-                        is_system_key: 0,
-                        character: 0,
-                        unmodified_character: 0,
-                        focus_on_editable_field,
-                        ..cef::KeyEvent::default()
-                    };
-                    events.push(up);
-                }
-            },
-        }
-
-        if events.is_empty() {
-            return false;
-        }
-
-        let invalidate_after = should_invalidate_after_key_input(state);
-        if cef::currently_on(cef::ThreadId::UI) == 1 {
-            if let Some(host) = self.browser.host() {
-                for event in &events {
-                    host.send_key_event(Some(event));
-                }
+    pub(super) fn host_key_events(&mut self, events: Vec<HostKeyEvent>, invalidate_after: bool) {
+        let events = events
+            .into_iter()
+            .map(|event| cef::KeyEvent {
+                type_: match event.kind {
+                    HostKeyEventKind::KeyDown => cef::KeyEventType::KEYDOWN,
+                    HostKeyEventKind::KeyUp => cef::KeyEventType::KEYUP,
+                    HostKeyEventKind::Char => cef::KeyEventType::CHAR,
+                },
+                modifiers: event.modifiers,
+                windows_key_code: event.windows_key_code,
+                native_key_code: event.native_key_code,
+                is_system_key: 0,
+                character: event.character,
+                unmodified_character: event.unmodified_character,
+                focus_on_editable_field: i32::from(event.focus_on_editable_field),
+                ..cef::KeyEvent::default()
+            })
+            .collect::<Vec<_>>();
+        if let Some(host) = self.browser.host() {
+            for event in &events {
+                host.send_key_event(Some(event));
             }
-            if invalidate_after {
-                invalidate_browser_surfaces(&self.browser);
-            }
-        } else {
-            let mut task = SendKeyTask::new(self.browser.clone(), events, invalidate_after);
-            let _ = cef::post_task(cef::ThreadId::UI, Some(&mut task));
         }
-
-        windows_key_code != 0 || should_send_char
-    }
-
-    pub fn exec_js(&mut self, script: &str) {
-        self.eval_js_string(script, |_| {});
-    }
-
-    pub fn copy_selection(&mut self) {
-        self.run_frame_edit_command(FrameEditCommand::Copy);
-    }
-
-    pub fn cut_selection(&mut self) {
-        self.run_frame_edit_command(FrameEditCommand::Cut);
-    }
-
-    pub fn paste(&mut self) {
-        self.run_frame_edit_command(FrameEditCommand::Paste);
-    }
-
-    pub fn eval_js_string<F>(&mut self, script: &str, callback: F)
-    where
-        F: FnOnce(Option<String>) + 'static,
-    {
-        self.eval_js_string_impl(script, false, callback);
-    }
-
-    pub fn eval_js_string_with_user_gesture<F>(&mut self, script: &str, callback: F)
-    where
-        F: FnOnce(Option<String>) + 'static,
-    {
-        self.eval_js_string_impl(script, true, callback);
+        if invalidate_after {
+            invalidate_browser_surfaces(&self.browser);
+        }
     }
 
     fn eval_js_string_impl<F>(&mut self, script: &str, user_gesture: bool, callback: F)
@@ -2411,6 +2250,17 @@ impl WebView {
         });
     }
 
+    pub(super) fn eval_js_string_impl_for_host<F>(
+        &mut self,
+        script: &str,
+        user_gesture: bool,
+        callback: F,
+    ) where
+        F: FnOnce(Option<String>) + 'static,
+    {
+        self.eval_js_string_impl(script, user_gesture, callback);
+    }
+
     fn run_frame_edit_command(&self, command: FrameEditCommand) {
         if should_run_frame_edit_inline(
             cef::currently_on(cef::ThreadId::UI) == 1,
@@ -2435,6 +2285,14 @@ impl WebView {
         }
     }
 
+    pub(super) fn host_frame_edit(&self, command: HostFrameEditCommand) {
+        self.run_frame_edit_command(match command {
+            HostFrameEditCommand::Copy => FrameEditCommand::Copy,
+            HostFrameEditCommand::Cut => FrameEditCommand::Cut,
+            HostFrameEditCommand::Paste => FrameEditCommand::Paste,
+        });
+    }
+
     pub fn devtools_command_json<F>(
         &self,
         method: &str,
@@ -2451,16 +2309,6 @@ impl WebView {
         };
 
         self.devtools_execute_checked(method, params, callback)
-    }
-
-    pub fn devtools_events_since(&self, last_id: u64, max: usize) -> (Vec<String>, u64) {
-        let state = self.devtools_state.borrow();
-        state.events_since(last_id, max)
-    }
-
-    pub fn latest_devtools_event_id(&self) -> u64 {
-        let state = self.devtools_state.borrow();
-        state.latest_event_id()
     }
 
     pub fn renew_agent_event_capture(&self) {
@@ -2629,40 +2477,6 @@ impl WebView {
         )
     }
 
-    pub fn downloads(&self) -> Vec<AgentDownload> {
-        self.automation_state.borrow().downloads()
-    }
-
-    pub fn poll_title(&mut self) -> Option<String> {
-        self.maintain_devtools_state();
-        let title = self.title_state.borrow().clone();
-        let title = title?;
-
-        if self.last_title.as_deref() == Some(&title) {
-            return None;
-        }
-
-        self.last_title = Some(title.clone());
-        Some(title)
-    }
-
-    pub fn poll_url(&mut self) -> Option<String> {
-        let url = self.current_url()?;
-        if self.last_url.as_deref() == Some(&url) {
-            return None;
-        }
-        self.last_url = Some(url.clone());
-        Some(url)
-    }
-
-    pub fn current_url(&self) -> Option<String> {
-        let frame = self.browser.main_frame()?;
-        let url = frame.url();
-        let url = CefString::from(&url);
-        let url = url.to_string();
-        if url.is_empty() { None } else { Some(url) }
-    }
-
     pub fn show_inspector(&mut self) -> bool {
         let Some(host) = self.browser.host() else {
             return false;
@@ -2671,30 +2485,19 @@ impl WebView {
         true
     }
 
-    pub fn with_surfaces<R>(
-        &self,
-        func: impl FnOnce(Option<WebSurfaceRef>, Option<WebPopupSurfaceRef>) -> R,
-    ) -> R {
-        let paint_state = self.paint_state.borrow();
-        let main = paint_state.main.as_ref().map(AcceleratedSurface::as_public_ref);
-        let popup = paint_state.popup.surface.as_ref().map(|surface| WebPopupSurfaceRef {
-            x: paint_state.popup.rect.x.max(0) as usize,
-            y: paint_state.popup.rect.y.max(0) as usize,
-            width: paint_state.popup.rect.width.max(0) as usize,
-            height: paint_state.popup.rect.height.max(0) as usize,
-            surface: surface.as_public_ref(),
-        });
-
-        func(main, popup)
+    pub(super) fn release_host_surface_lease(&mut self, lease_id: SurfaceLeaseId) {
+        if let Some(host_bridge) = &self.host_bridge {
+            host_bridge.release(lease_id);
+        }
     }
 
-    fn maintain_devtools_state(&self) {
-        let now = Instant::now();
-        fail_expired_devtools_callbacks(&self.devtools_state, now);
-        let should_disable = self.devtools_state.borrow_mut().expire_agent_event_capture(now);
-        if should_disable && set_agent_event_domains(&self.browser, &self.devtools_state, false) {
-            self.devtools_state.borrow_mut().mark_agent_event_domains_disabled();
-        }
+    pub(super) fn complete_host_js_dialog(
+        &mut self,
+        dialog_id: u64,
+        accepted: bool,
+        prompt_text: Option<&str>,
+    ) {
+        self.js_dialog_backend.complete(dialog_id, accepted, prompt_text);
     }
 
     fn devtools_execute<F>(&self, method: &str, params: Option<cef::DictionaryValue>, callback: F)
@@ -2763,28 +2566,6 @@ impl WebView {
 
         Ok(())
     }
-
-    fn mouse_event(
-        &self,
-        window: &Window,
-        position: PhysicalPosition<f64>,
-        modifiers: objc2_app_kit::NSEventModifierFlags,
-        button_flags: u32,
-    ) -> Option<cef::MouseEvent> {
-        let scale_factor = window.scale_factor.max(f64::MIN_POSITIVE);
-        let x = (position.x / scale_factor).floor().max(0.0) as usize;
-        let y = (position.y / scale_factor).floor().max(0.0) as usize;
-        let (logical_x, logical_y) = {
-            let paint_state = self.paint_state.borrow();
-            paint_state.layout.logical_point_for_visual(x, y)?
-        };
-
-        Some(cef::MouseEvent {
-            x: logical_x as i32,
-            y: logical_y as i32,
-            modifiers: cef_mouse_event_flags(modifiers, button_flags),
-        })
-    }
 }
 
 fn should_run_frame_edit_inline(on_ui_thread: bool, handling_send_event: bool) -> bool {
@@ -2794,7 +2575,7 @@ fn should_run_frame_edit_inline(on_ui_thread: bool, handling_send_event: bool) -
 impl Drop for WebView {
     fn drop(&mut self) {
         if MainThreadMarker::new().is_some() {
-            cancel_js_dialog(&self.js_dialog_state);
+            self.js_dialog_backend.cancel();
         }
         if cef::currently_on(cef::ThreadId::UI) == 1 {
             close_browser_resources(&self.browser);
@@ -2889,7 +2670,7 @@ fn finish_string_result_callback(callback: &StringResultCallback, result: Result
     }
 }
 
-fn cef_mouse_button_flag(button: MouseButton) -> u32 {
+pub(super) fn cef_mouse_button_flag(button: MouseButton) -> u32 {
     use cef::sys::cef_event_flags_t;
 
     match button {
@@ -2900,7 +2681,10 @@ fn cef_mouse_button_flag(button: MouseButton) -> u32 {
     }
 }
 
-fn cef_mouse_event_flags(modifiers: objc2_app_kit::NSEventModifierFlags, button_flags: u32) -> u32 {
+pub(super) fn cef_mouse_event_flags(
+    modifiers: objc2_app_kit::NSEventModifierFlags,
+    button_flags: u32,
+) -> u32 {
     use cef::sys::cef_event_flags_t;
 
     let mut flags = cef_event_flags_t::EVENTFLAG_NONE;
@@ -2944,6 +2728,60 @@ fn cef_event_flags(modifiers: ModifiersState, repeat: bool, location: KeyLocatio
     }
 
     flags.0
+}
+
+pub(super) fn encode_host_key_input(
+    key: &KeyEvent,
+    text: &str,
+    modifiers: ModifiersState,
+) -> (Vec<HostKeyEvent>, bool) {
+    let key_without_modifiers = key.key_without_modifiers();
+    let base_flags = cef_event_flags(modifiers, key.repeat, key.location);
+    let windows_key_code = cef_windows_key_code_from_key(&key_without_modifiers);
+    let scancode = macos_scancode_from_physical_key(key.physical_key).unwrap_or(0);
+    let native_key_code = cef_native_key_code(scancode, modifiers);
+    let (character, unmodified_character) =
+        cef_characters_from_key_text(&key_without_modifiers, text);
+    let should_send_char = character != 0 && !modifiers.super_key() && !modifiers.control_key();
+    let mut events = Vec::new();
+    match key.state {
+        ElementState::Pressed => {
+            if windows_key_code != 0 {
+                events.push(HostKeyEvent {
+                    kind: HostKeyEventKind::KeyDown,
+                    modifiers: base_flags,
+                    windows_key_code,
+                    native_key_code,
+                    character,
+                    unmodified_character,
+                    focus_on_editable_field: true,
+                });
+            }
+            if should_send_char {
+                events.push(HostKeyEvent {
+                    kind: HostKeyEventKind::Char,
+                    modifiers: base_flags,
+                    windows_key_code: i32::from(character),
+                    native_key_code,
+                    character,
+                    unmodified_character,
+                    focus_on_editable_field: true,
+                });
+            }
+        },
+        ElementState::Released if windows_key_code != 0 => events.push(HostKeyEvent {
+            kind: HostKeyEventKind::KeyUp,
+            modifiers: base_flags,
+            windows_key_code,
+            native_key_code,
+            character: 0,
+            unmodified_character: 0,
+            focus_on_editable_field: true,
+        }),
+        ElementState::Released => (),
+    }
+    let forwarded = windows_key_code != 0 || should_send_char;
+    (events, forwarded)
 }
 
 fn cef_native_key_code(scancode: u16, modifiers: ModifiersState) -> i32 {
@@ -3203,19 +3041,19 @@ fn set_list_value(
     Ok(())
 }
 
-fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
+pub(super) fn ns_view(window: &Window) -> Result<*mut AnyObject, Box<dyn Error>> {
     match window.raw_window_handle() {
         RawWindowHandle::AppKit(handle) => Ok(handle.ns_view.as_ptr() as *mut AnyObject),
         _ => Err(std::io::Error::other("WebView requires an AppKit window").into()),
     }
 }
 
-fn ns_window(view: *mut AnyObject) -> Result<Retained<NSWindow>, Box<dyn Error>> {
+pub(super) fn ns_window(view: *mut AnyObject) -> Result<Retained<NSWindow>, Box<dyn Error>> {
     let window: Option<Retained<NSWindow>> = unsafe { msg_send![view, window] };
     window.ok_or_else(|| std::io::Error::other("WebView parent NSView has no NSWindow").into())
 }
 
-fn cef_screen_rect(window: &Window, layout: &BrowserViewportLayout) -> cef::Rect {
+pub(super) fn cef_screen_rect(window: &Window, layout: &BrowserViewportLayout) -> cef::Rect {
     let layout_viewport = layout.viewport();
     let fallback = cef::Rect {
         x: layout_viewport.x as i32,
@@ -3244,12 +3082,6 @@ fn cef_screen_rect(window: &Window, layout: &BrowserViewportLayout) -> cef::Rect
             height: layout_viewport.height as i32,
         }
     }
-}
-
-fn browser_view(browser: &cef::Browser) -> Option<*mut AnyObject> {
-    let host = browser.host()?;
-    let view = host.window_handle() as *mut AnyObject;
-    if view.is_null() { None } else { Some(view) }
 }
 
 fn close_browser_resources(browser: &cef::Browser) {
@@ -3719,7 +3551,7 @@ mod tests {
     fn permission_policy_allows_local_network_permission() {
         let _env_guard = env_lock().lock().expect("environment lock poisoned");
         let _distribution = EnvVarGuard::unset("TABOR_DISTRIBUTION_CHANNEL");
-        let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
+        let permissions = Permission::LOCAL_NETWORK.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert_eq!(permission_decision(permissions), PermissionDecision::Allow);
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::ACCEPT);
@@ -3730,7 +3562,7 @@ mod tests {
     fn mac_app_store_permission_policy_denies_local_network_permission() {
         let _env_guard = env_lock().lock().expect("environment lock poisoned");
         let _distribution = EnvVarGuard::set("TABOR_DISTRIBUTION_CHANNEL", "mac_app_store");
-        let permissions = Permission::LOCAL_NETWORK_ACCESS.get_raw();
+        let permissions = Permission::LOCAL_NETWORK.get_raw();
         assert_eq!(permission_decision(permissions), PermissionDecision::Deny);
         assert_eq!(permission_request_result(permissions), PermissionRequestResult::DENY);
     }

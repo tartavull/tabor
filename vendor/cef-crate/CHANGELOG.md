@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [150.2.1+150.0.14](https://github.com/tauri-apps/cef-rs/compare/cef-v150.2.0+150.0.14...cef-v150.2.1+150.0.14) - 2026-07-21
+
+### Other
+
+- *(deps)* update wgpu to v30
+
+## [150.0.0+150.0.10](https://github.com/tauri-apps/cef-rs/compare/cef-v149.3.0+149.0.6...cef-v150.0.0+150.0.10) - 2026-07-10
+
+### Other
+
+- *(release)* update CEF version to 150.0.10 ([#438](https://github.com/tauri-apps/cef-rs/pull/438))
+- Fix #364: remove spurious eprintln! for null pointer in UTF-16 string conversion ([#425](https://github.com/tauri-apps/cef-rs/pull/425))
+
+## [148.2.0+148.0.8](https://github.com/tauri-apps/cef-rs/compare/cef-v148.1.0+147.0.14...cef-v148.2.0+148.0.8) - 2026-05-25
+
+### Other
+
+- *(release)* update CEF version to 148.0.8
+
+## [148.0.0+147.0.10](https://github.com/tauri-apps/cef-rs/compare/cef-v147.1.0+147.0.10...cef-v148.0.0+147.0.10) - 2026-05-07
+
+### Other
+
+- *(deps)* switch to objc2-metal crate
+
+## [147.0.0+147.0.9](https://github.com/tauri-apps/cef-rs/compare/cef-v146.7.0+146.0.12...cef-v147.0.0+147.0.9) - 2026-04-25
+
+### Other
+
+- update bindings
+
+## [145.6.1+145.0.28](https://github.com/tauri-apps/cef-rs/compare/cef-v145.6.0+145.0.28...cef-v145.6.1+145.0.28) - 2026-03-08
+
+### Other
+
+- update bindings
+
+## [145.1.1+145.0.23](https://github.com/tauri-apps/cef-rs/compare/cef-v145.1.0+145.0.23...cef-v145.1.1+145.0.23) - 2026-02-16
+
+### Other
+
+- Merge branch 'dev' into fix/cefquery-persistent-field
+- Merge pull request #348 from tasuren/message-router-patch
+
+### Fixed
+
+- Filter undefined values for optional cefQuery persistent field
+- port missing early returns in BrowserSideRouter and BrowserInfoMap to prevent panics during startup
+- return string responses as V8 strings instead of ArrayBuffer from RendererSideRouter
+
 ## [144.0.1+144.0.6](https://github.com/tauri-apps/cef-rs/compare/cef-v144.0.0+144.0.6...cef-v144.0.1+144.0.6) - 2026-01-22
 
 ### Other

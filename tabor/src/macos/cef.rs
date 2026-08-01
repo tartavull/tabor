@@ -37,6 +37,11 @@ type MessagePumpNotifier = Arc<dyn Fn(Duration) + Send + Sync + 'static>;
 const METRICS_NONE: u64 = u64::MAX;
 const MAX_MESSAGE_PUMP_DELAY_MS: u64 = 10_000;
 const CEF_CACHE_LOCK_FILE_NAME: &str = ".tabor-cef-instance.lock";
+pub(crate) const CEF_RUNTIME_VERSION: &str = "151.3.12+gd9cea67+chromium-151.0.7922.47";
+#[cfg(test)]
+const CEF_CRATE_VERSION: &str = "151.1.0";
+const PAGE_DISCARDER_FIX_MIN_CHROMIUM_MAJOR: u32 = 146;
+const CEF_WEB_HOST_NAME: &str = "Tabor Web Host";
 
 static MESSAGE_PUMP_NOTIFIER: OnceLock<MessagePumpNotifier> = OnceLock::new();
 static CEF_PUMP_SCHEDULED: AtomicU64 = AtomicU64::new(0);
@@ -336,11 +341,12 @@ pub fn maybe_execute_subprocess() -> Result<Option<i32>, Box<dyn Error>> {
     Ok(None)
 }
 
-pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
+pub(crate) fn ensure_initialized_for_host() -> Result<(), Box<dyn Error>> {
     if is_initialized() {
         return Ok(());
     }
 
+    ensure_page_discarder_fix_floor()?;
     let framework_dir = framework_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "CEF framework not found")
     })?;
@@ -354,7 +360,7 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     let mut app = TaborCefApp::new();
     let mut settings = Settings {
         no_sandbox: cef_no_sandbox_setting(),
-        external_message_pump: 1,
+        external_message_pump: 0,
         windowless_rendering_enabled: 1,
         remote_debugging_port: remote_debugging_port(),
         ..Settings::default()
@@ -419,6 +425,21 @@ pub fn ensure_initialized() -> Result<(), Box<dyn Error>> {
     });
     CEF_INITIALIZED.store(true, Ordering::Relaxed);
 
+    Ok(())
+}
+
+fn ensure_page_discarder_fix_floor() -> io::Result<()> {
+    let chromium_major = CEF_RUNTIME_VERSION
+        .split("chromium-")
+        .nth(1)
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::other("CEF runtime pin is missing a Chromium major version"))?;
+    if chromium_major < PAGE_DISCARDER_FIX_MIN_CHROMIUM_MAJOR {
+        return Err(io::Error::other(format!(
+            "Chromium {chromium_major} predates the PageDiscarder kNoLifecycleUnit fix"
+        )));
+    }
     Ok(())
 }
 
@@ -824,6 +845,19 @@ fn helper_subprocess_path(main_bundle: &Path) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+pub(crate) fn web_host_subprocess_path() -> Option<PathBuf> {
+    let bundle = bundle_paths()?.main_bundle;
+    let name = CEF_WEB_HOST_NAME;
+    let path = bundle
+        .join("Contents")
+        .join("Frameworks")
+        .join(format!("{name}.app"))
+        .join("Contents")
+        .join("MacOS")
+        .join(name);
+    path.exists().then_some(path)
+}
+
 fn remote_debugging_port() -> i32 {
     let port = env::var("TABOR_CDP_PORT")
         .or_else(|_| env::var("TABOR_CEF_REMOTE_DEBUGGING_PORT"))
@@ -838,6 +872,36 @@ fn remote_debugging_port() -> i32 {
 mod tests {
     use super::*;
     use crate::macos::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn cef_pins_include_page_discarder_lifecycle_unit_fix() {
+        let chromium_version = CEF_RUNTIME_VERSION
+            .split("chromium-")
+            .nth(1)
+            .expect("CEF runtime pin includes Chromium version");
+        let chromium_major = chromium_version
+            .split('.')
+            .next()
+            .expect("Chromium version includes major")
+            .parse::<u32>()
+            .expect("Chromium major is numeric");
+        assert!(
+            chromium_major >= PAGE_DISCARDER_FIX_MIN_CHROMIUM_MAJOR,
+            "Chromium {chromium_major} predates the PageDiscarder kNoLifecycleUnit fix"
+        );
+
+        let archive_name = format!("cef_binary_{CEF_RUNTIME_VERSION}_macosarm64.tar.bz2");
+        assert!(include_str!("../../../flake.nix").contains(&archive_name));
+        assert!(include_str!("../../../.github/workflows/release.yml").contains(&archive_name));
+        assert!(
+            include_str!("../../Cargo.toml")
+                .contains(&format!("cef = {{ version = \"{CEF_CRATE_VERSION}\""))
+        );
+        assert!(
+            include_str!("../../../Cargo.lock")
+                .contains(&format!("name = \"cef\"\nversion = \"{CEF_CRATE_VERSION}+151.3.12\""))
+        );
+    }
 
     #[cfg(not(feature = "passkey-webauthn"))]
     #[test]

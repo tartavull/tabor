@@ -38,6 +38,9 @@ use plist::Value;
 unsafe extern "C" {}
 
 pub mod cef;
+pub(crate) mod cef_host;
+pub(crate) mod cef_host_protocol;
+pub(crate) mod cef_surface_transport;
 pub mod favicon;
 pub mod image_view;
 pub(crate) mod keycodes;
@@ -387,7 +390,7 @@ pub(crate) fn webview_metrics() -> WebViewMetrics {
         created: WEBVIEW_CREATED_TOTAL.load(Ordering::SeqCst),
         dropped: WEBVIEW_DROPPED_TOTAL.load(Ordering::SeqCst),
         accelerated_frames: WEBVIEW_ACCELERATED_FRAMES_TOTAL.load(Ordering::SeqCst),
-        frame_delivery_mode: WebFrameDeliveryMode::CefInternal,
+        frame_delivery_mode: WebFrameDeliveryMode::CefHostIpc,
         external_begin_frames: WEBVIEW_EXTERNAL_BEGIN_FRAMES_TOTAL.load(Ordering::SeqCst),
         accelerated_startup_failures: WEBVIEW_ACCELERATED_STARTUP_FAILURES_TOTAL
             .load(Ordering::SeqCst),

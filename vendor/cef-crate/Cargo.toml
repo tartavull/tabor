@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "cef"
-version = "144.2.0+144.0.11"
+version = "151.1.0+151.3.12"
 authors = [
     "Wu Yu Wei <yuweiwu@pm.me>",
     "Bill Avery <wravery@gmail.com>",
@@ -36,9 +36,9 @@ features = ["dox"]
 accelerated_osr = [
     "ash",
     "libc",
-    "objc",
+    "objc2-foundation",
     "objc2-io-surface",
-    "metal",
+    "objc2-metal",
     "thiserror",
     "tracing",
     "wgpu",
@@ -83,7 +83,7 @@ version = "0.23.1"
 optional = true
 
 [dependencies.cef-dll-sys]
-version = "144.2.0"
+version = "151.1.0"
 
 [dependencies.clap]
 version = "4"
@@ -108,7 +108,7 @@ version = "0.1"
 optional = true
 
 [dependencies.wgpu]
-version = "28"
+version = "30"
 optional = true
 
 [target.'cfg(target_os = "linux")'.dependencies.libc]
@@ -118,19 +118,20 @@ optional = true
 [target.'cfg(target_os = "macos")'.dependencies.libloading]
 version = "0.9"
 
-[target.'cfg(target_os = "macos")'.dependencies.metal]
-version = "0.33"
-optional = true
-
-[target.'cfg(target_os = "macos")'.dependencies.objc]
-version = "0.2"
-optional = true
-
 [target.'cfg(target_os = "macos")'.dependencies.objc2]
 version = "0.6.3"
 
+[target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
+version = "0.3.2"
+optional = true
+
 [target.'cfg(target_os = "macos")'.dependencies.objc2-io-surface]
 version = "0.3.2"
+optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-metal]
+version = "0.3"
+features = ["objc2-io-surface"]
 optional = true
 
 [target.'cfg(target_os = "macos")'.dependencies.plist]

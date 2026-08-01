@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "cef"
-version = "144.2.0+144.0.11"
+version = "151.1.0+151.3.12"
 dependencies = [
  "cef-dll-sys",
  "libloading 0.9.0",
@@ -323,9 +323,9 @@ dependencies = [
 
 [[package]]
 name = "cef-dll-sys"
-version = "144.2.0+144.0.11"
+version = "151.1.0+151.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf6882e1e10fe7ff0c9b1815e8a2943c0975be5bb48f15ca3b4cbb9dc4329d0e"
+checksum = "7591a3d390902376f771c6635daad2246255d0e9b266dbfc0a860a759fa47083"
 dependencies = [
  "anyhow",
  "cmake",
@@ -706,7 +706,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "download-cef"
-version = "2.3.0"
+version = "2.3.2"
 
 [[package]]
 name = "dpi"

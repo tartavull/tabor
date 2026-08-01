@@ -39,13 +39,13 @@ impl BrowserViewportRect {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BrowserViewportColumn {
     rect: BrowserViewportRect,
     logical_y: usize,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserViewportLayout {
     mode: BrowserViewMode,
     viewport: BrowserViewportRect,

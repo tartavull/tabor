@@ -112,6 +112,7 @@ distribution_channel="$(read_optional_plist_string 'TABORDistributionChannel')"
 
 helper_prefix="${TABOR_CEF_HELPER_PREFIX:-Tabor}"
 helpers=(
+  "$helper_prefix Web Host"
   "$helper_prefix Helper"
   "$helper_prefix Helper (Renderer)"
   "$helper_prefix Helper (GPU)"
@@ -142,7 +143,14 @@ for helper_name in "${helpers[@]}"; do
   cp -f "$main_binary" "$helper_binary"
   chmod +x "$helper_binary"
   rm -rf "$helper_contents/Frameworks"
-  ln -sfn ../.. "$helper_contents/Frameworks"
+  if [[ "$helper_name" == "$helper_prefix Web Host" ]]; then
+    mkdir -p "$helper_contents/Frameworks"
+    while IFS= read -r bundled_library; do
+      cp -fp "$bundled_library" "$helper_contents/Frameworks/"
+    done < <(find "$frameworks_dir" -maxdepth 1 -type f \( -name '*.dylib' -o -name '*.so' \) | sort)
+  else
+    ln -sfn ../.. "$helper_contents/Frameworks"
+  fi
   for lib in libGLESv2.dylib libEGL.dylib; do
     ln -sfn "../Frameworks/$lib" "$helper_macos/$lib"
   done

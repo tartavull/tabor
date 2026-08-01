@@ -598,6 +598,17 @@ impl ipc::IpcContext for IpcWindowContext<'_> {
         self.window.ipc_window_debug_press_js_dialog_button(button, prompt_text)
     }
 
+    fn window_debug_cef_memory_pressure(
+        &mut self,
+        tab_id: Option<TabId>,
+    ) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_cef_memory_pressure(tab_id)
+    }
+
+    fn window_debug_cef_host_crash(&mut self) -> Result<(), ipc::IpcError> {
+        self.window.ipc_window_debug_cef_host_crash()
+    }
+
     fn runtime_metrics(&mut self) -> Result<ipc::IpcRuntimeMetrics, ipc::IpcError> {
         self.window.ipc_runtime_metrics()
     }

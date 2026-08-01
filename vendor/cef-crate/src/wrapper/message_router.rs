@@ -666,6 +666,10 @@ impl BrowserSideRouter {
             return;
         };
 
+        if browser_query_info_map.is_empty() {
+            return;
+        }
+
         struct Visitor {
             router: Arc<BrowserSideRouter>,
             handler_id: Option<HandlerId>,
@@ -1322,28 +1326,35 @@ impl RendererSideRouter {
         let Some(mut context) = self.get_context_by_id(context_id) else {
             return;
         };
-        if context.enter() == 0 {
-            return;
-        }
 
-        let data = match &response {
-            mru::MessagePayload::Empty => &[],
-            mru::MessagePayload::String(s) => s.as_slice().unwrap_or(&[]),
-            mru::MessagePayload::Binary(b) => b.data(),
+        let value = match &response {
+            mru::MessagePayload::String(s) => v8_value_create_string(Some(&s.into())),
+            mru::MessagePayload::Empty | mru::MessagePayload::Binary(_) => {
+                let data = match &response {
+                    mru::MessagePayload::Binary(b) => b.data(),
+                    _ => &[],
+                };
+
+                if context.enter() == 0 {
+                    return;
+                }
+
+                #[cfg(feature = "sandbox")]
+                let value =
+                    v8_value_create_array_buffer_with_copy(data.as_ptr() as *mut u8, data.len());
+                #[cfg(not(feature = "sandbox"))]
+                let value = v8_value_create_array_buffer(
+                    data.as_ptr() as *mut u8,
+                    data.len(),
+                    Some(&mut mru::BinaryValueArrayBufferReleaseCallback::new(
+                        response,
+                    )),
+                );
+
+                context.exit();
+                value
+            }
         };
-
-        #[cfg(feature = "sandbox")]
-        let value = v8_value_create_array_buffer_with_copy(data.as_ptr() as *mut u8, data.len());
-        #[cfg(not(feature = "sandbox"))]
-        let value = v8_value_create_array_buffer(
-            data.as_ptr() as *mut u8,
-            data.len(),
-            Some(&mut mru::BinaryValueArrayBufferReleaseCallback::new(
-                response,
-            )),
-        );
-
-        context.exit();
 
         success_callback.execute_function_with_context(Some(&mut context), None, Some(&[value]));
     }
@@ -1691,7 +1702,7 @@ wrap_v8_handler! {
                 };
 
                 let key = CefString::from(ObjectMember::PERSISTENT);
-                let persistent = if let Some(persistent) = arg.value_bykey(Some(&key)) {
+                let persistent = if let Some(persistent) = arg.value_bykey(Some(&key)).filter(|v| v.is_undefined() == 0) {
                     if persistent.is_bool() == 0 {
                         return_exception!(format!(
                             "Invalid arguments; object member '{}' must have type boolean",

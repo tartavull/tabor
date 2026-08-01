@@ -103,6 +103,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
+    #[cfg(target_os = "macos")]
+    if macos::cef_host::maybe_run_from_argv(std::env::args_os().skip(1))? {
+        return Ok(());
+    }
+
     #[cfg(unix)]
     if agent::maybe_run_internal_from_argv()? {
         return Ok(());

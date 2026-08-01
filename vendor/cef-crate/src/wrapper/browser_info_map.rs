@@ -107,10 +107,13 @@ impl<K: Copy + Ord, V: Clone> BrowserInfoMap<K, V> {
     /// Find all objects associated with the specified browser. If any objects are
     /// removed using the Visitor the caller is responsible for destroying them.
     pub fn find_browser_all(&mut self, browser_id: i32, visitor: &dyn BrowserInfoMapVisitor<K, V>) {
-        let info_map = self
-            .map
-            .get_mut(&browser_id)
-            .expect("missing browser info map");
+        if self.map.is_empty() {
+            return;
+        }
+
+        let Some(info_map) = self.map.get_mut(&browser_id) else {
+            return;
+        };
 
         let mut removed = vec![];
         let keys: Vec<_> = info_map.keys().copied().collect();

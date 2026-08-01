@@ -87,16 +87,17 @@ use crate::ipc;
 use crate::ipc::{
     AgentActResult, AgentAction, AgentElementDetail, AgentEvent, AgentObservation, AgentPdf,
     AgentScreenshot, IpcBrowserAccelerationInfo, IpcBrowserAccelerationState,
-    IpcBrowserLayoutState, IpcCefPumpMetrics, IpcError, IpcErrorCode, IpcImageDebugSnapshot,
-    IpcImageLoadState, IpcImageScaleMode, IpcImageViewState, IpcInspectorMessage,
-    IpcInspectorSession, IpcInspectorTarget, IpcPdfViewState, IpcRuntimeMetrics, IpcTabActivity,
-    IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState, IpcTabState, IpcTerminalCell,
-    IpcTerminalCursor, IpcTerminalCursorShape, IpcTerminalLayoutState, IpcTerminalLayoutStrip,
-    IpcTerminalObservation, IpcTerminalPoint, IpcTerminalRead, IpcTerminalReadScope,
-    IpcTerminalSelection, IpcTerminalSessionState, IpcTerminalViewportLine, IpcTerminalVisualPoint,
-    IpcTouchPhase, IpcWebCloseMetrics, IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics,
-    IpcWindowDebugButton, IpcWindowDebugJsDialogButton, IpcWindowDebugRect, IpcWindowDebugSnapshot,
-    IpcWindowDebugState, SocketReply, TabSelection, TerminalKeyInput,
+    IpcBrowserLayoutState, IpcCefHostMetrics, IpcCefPumpMetrics, IpcError, IpcErrorCode,
+    IpcImageDebugSnapshot, IpcImageLoadState, IpcImageScaleMode, IpcImageViewState,
+    IpcInspectorMessage, IpcInspectorSession, IpcInspectorTarget, IpcPdfViewState,
+    IpcRuntimeMetrics, IpcTabActivity, IpcTabGroup, IpcTabId, IpcTabKind, IpcTabPanelState,
+    IpcTabState, IpcTerminalCell, IpcTerminalCursor, IpcTerminalCursorShape,
+    IpcTerminalLayoutState, IpcTerminalLayoutStrip, IpcTerminalObservation, IpcTerminalPoint,
+    IpcTerminalRead, IpcTerminalReadScope, IpcTerminalSelection, IpcTerminalSessionState,
+    IpcTerminalViewportLine, IpcTerminalVisualPoint, IpcTouchPhase, IpcWebCloseMetrics,
+    IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
+    IpcWindowDebugJsDialogButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
+    SocketReply, TabSelection, TerminalKeyInput,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
@@ -483,8 +484,21 @@ struct WebCloseMetrics {
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct AgentRuntimeState {
+    host_generation: Option<u64>,
     preload_registered: bool,
     injected_once: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl AgentRuntimeState {
+    fn sync_host_generation(&mut self, generation: u64) {
+        if self.host_generation == Some(generation) {
+            return;
+        }
+        self.host_generation = Some(generation);
+        self.preload_registered = false;
+        self.injected_once = false;
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1282,6 +1296,7 @@ fn select_favicon_base(page_url: &str, base_uri: &str, referrer: &str) -> String
 
 #[cfg(target_os = "macos")]
 fn ensure_agent_runtime(web_view: &mut WebView, state: &mut AgentRuntimeState) {
+    state.sync_host_generation(web_view.host_generation());
     web_view.renew_agent_event_capture();
     if state.preload_registered {
         return;
@@ -3993,6 +4008,7 @@ impl WindowContext {
         {
             let webview = crate::macos::webview_metrics();
             let cef_pump = crate::macos::cef::cef_pump_metrics();
+            let cef_host = crate::macos::cef_host::metrics();
             Ok(IpcRuntimeMetrics {
                 webview: Some(IpcWebViewMetrics {
                     live: webview.live as u64,
@@ -4002,6 +4018,9 @@ impl WindowContext {
                     frame_delivery_mode: match webview.frame_delivery_mode {
                         crate::macos::webview::WebFrameDeliveryMode::CefInternal => {
                             IpcWebFrameDeliveryMode::CefInternal
+                        },
+                        crate::macos::webview::WebFrameDeliveryMode::CefHostIpc => {
+                            IpcWebFrameDeliveryMode::CefHostIpc
                         },
                     },
                     external_begin_frames: webview.external_begin_frames,
@@ -4018,6 +4037,22 @@ impl WindowContext {
                     last_effective_delay_ms: cef_pump.last_effective_delay_ms,
                     last_run_ms_ago: cef_pump.last_run_ms_ago,
                     hidden_throttle_active: cef_pump.hidden_throttle_active,
+                }),
+                cef_host: Some(IpcCefHostMetrics {
+                    pid: cef_host.pid,
+                    generation: cef_host.generation,
+                    starts: cef_host.starts,
+                    crashes: cef_host.crashes,
+                    restarts: cef_host.restarts,
+                    active_views: cef_host.active_views,
+                    connected: cef_host.connected,
+                    last_exit: cef_host.last_exit,
+                    last_error: cef_host.last_error,
+                    memory_pressure_tests_started: cef_host.memory_pressure_tests_started,
+                    memory_pressure_tests_passed: cef_host.memory_pressure_tests_passed,
+                    memory_pressure_tests_failed: cef_host.memory_pressure_tests_failed,
+                    last_memory_pressure_request_id: cef_host.last_memory_pressure_request_id,
+                    last_memory_pressure_error: cef_host.last_memory_pressure_error,
                 }),
             })
         }
@@ -4437,6 +4472,60 @@ impl WindowContext {
             Err(IpcError::new(
                 IpcErrorCode::Unsupported,
                 "JavaScript dialog debug actions are only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_cef_memory_pressure(
+        &mut self,
+        tab_id: Option<TabId>,
+    ) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            let tab_id = tab_id
+                .or_else(|| self.tabs.active_id())
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "No active tab"))?;
+            let tab = self
+                .tabs
+                .get_mut(tab_id)
+                .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "Tab not found"))?;
+            if !tab.kind.is_web() {
+                return Err(IpcError::new(IpcErrorCode::InvalidRequest, "Tab is not a web tab"));
+            }
+            let view_id = tab
+                .web_view
+                .as_mut()
+                .ok_or_else(|| IpcError::new(IpcErrorCode::Unsupported, "Web view is unavailable"))?
+                .host_view_id();
+            crate::macos::cef_host::simulate_memory_pressure_for_test(view_id)
+                .map(|_| ())
+                .map_err(|error| IpcError::new(IpcErrorCode::Unsupported, error))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = tab_id;
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "CEF memory-pressure injection is only available on macOS",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn ipc_window_debug_cef_host_crash(&self) -> Result<(), IpcError> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::cef_host::crash_for_test()
+                .map_err(|error| IpcError::new(IpcErrorCode::Unsupported, error))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(IpcError::new(
+                IpcErrorCode::Unsupported,
+                "CEF host crash injection is only available on macOS",
             ))
         }
     }
@@ -6164,7 +6253,11 @@ impl WindowContext {
                     crate::macos::webview::WebFrameDeliveryMode::CefInternal => {
                         IpcWebFrameDeliveryMode::CefInternal
                     },
+                    crate::macos::webview::WebFrameDeliveryMode::CefHostIpc => {
+                        IpcWebFrameDeliveryMode::CefHostIpc
+                    },
                 },
+                failure_reason: acceleration.failure_reason,
                 main_surface_width: acceleration.main_surface_width,
                 main_surface_height: acceleration.main_surface_height,
                 popup_surface_width: acceleration.popup_surface_width,
@@ -7500,6 +7593,24 @@ mod tests {
         assert_eq!(normalize_favicon_char_counter(0xE000), FIRST_DYNAMIC_FAVICON_CHAR);
         assert_eq!(normalize_favicon_char_counter(0xE00F), FIRST_DYNAMIC_FAVICON_CHAR);
         assert_eq!(normalize_favicon_char_counter(0xF900), 0xF0000);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn agent_runtime_resets_when_the_cef_host_generation_changes() {
+        let mut state = AgentRuntimeState::default();
+        state.sync_host_generation(1);
+        state.preload_registered = true;
+        state.injected_once = true;
+
+        state.sync_host_generation(1);
+        assert!(state.preload_registered);
+        assert!(state.injected_once);
+
+        state.sync_host_generation(2);
+        assert_eq!(state.host_generation, Some(2));
+        assert!(!state.preload_registered);
+        assert!(!state.injected_once);
     }
 
     #[cfg(unix)]

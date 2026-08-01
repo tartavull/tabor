@@ -24,8 +24,8 @@
         };
 
         cefTarball = pkgs.fetchzip {
-          url = "https://cef-builds.spotifycdn.com/cef_binary_144.0.11+ge135be2+chromium-144.0.7559.97_macosarm64.tar.bz2";
-          sha256 = "sha256-Opk2RsuA7q8QErQX6k7MgLRNo1Yhy/hc1UCKGcxmakc=";
+          url = "https://cef-builds.spotifycdn.com/cef_binary_151.3.12+gd9cea67+chromium-151.0.7922.47_macosarm64.tar.bz2";
+          sha256 = "sha256-8PfYZ69HrR+1zBHD8MAkzo9oR/CjFXwiay08s+r9VXw=";
           stripRoot = true;
         };
 

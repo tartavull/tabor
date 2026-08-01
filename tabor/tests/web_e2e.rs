@@ -33,7 +33,8 @@ struct TempAppBundle {
     executable: PathBuf,
 }
 
-const CEF_HELPER_NAMES: [&str; 5] = [
+const CEF_HELPER_NAMES: [&str; 6] = [
+    "Tabor Web Host",
     "Tabor Helper",
     "Tabor Helper (Renderer)",
     "Tabor Helper (GPU)",
