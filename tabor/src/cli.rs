@@ -4,7 +4,9 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use clap::{ArgAction, ArgGroup, Args, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueHint};
+#[cfg(unix)]
+use clap::{ArgGroup, ValueEnum};
 use log::{LevelFilter, error};
 use serde::{Deserialize, Serialize};
 use tabor_config::SerdeReplace;

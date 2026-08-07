@@ -569,6 +569,7 @@ fn build_app_bundle_at(
 
     let built_binary = tabor_binary_path(root, options.profile_release());
     fs::copy(&built_binary, &app_binary)?;
+    #[cfg(unix)]
     set_executable(&app_binary)?;
 
     let explicit_codesign_entitlements =
@@ -1173,14 +1174,11 @@ fn make_tree_user_writable(path: &Path) -> Result<(), Box<dyn Error>> {
     run_checked(&mut command, "chmod app bundle writable")
 }
 
+#[cfg(unix)]
 fn set_executable(path: &Path) -> Result<(), Box<dyn Error>> {
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
-
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
     Ok(())
 }
 

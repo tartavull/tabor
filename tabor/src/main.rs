@@ -13,6 +13,7 @@
 compile_error!(r#"at least one of the "x11"/"wayland" features must be enabled"#);
 
 use std::error::Error;
+#[cfg(target_os = "macos")]
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -52,8 +53,10 @@ mod renderer;
 mod scheduler;
 mod string;
 mod tab_panel;
+#[cfg(target_os = "macos")]
 mod tab_panel_icons;
 mod tabs;
+#[cfg(target_os = "macos")]
 mod text_edit;
 mod web_url;
 mod window_context;
@@ -164,6 +167,7 @@ fn dispatch_options(options: Options) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn args_indicate_cef_subprocess<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -694,7 +698,7 @@ fn log_config_path(config: &UiConfig) {
     info!("{msg}");
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::args_indicate_cef_subprocess;
 

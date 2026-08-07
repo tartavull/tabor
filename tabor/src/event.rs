@@ -30,12 +30,16 @@ use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
+#[cfg(unix)]
 use winit::dpi::PhysicalPosition;
+#[cfg(target_os = "macos")]
+use winit::event::KeyEvent;
 use winit::event::{
-    ElementState, Event as WinitEvent, Ime, KeyEvent, Modifiers, MouseButton, StartCause,
+    ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
     Touch as TouchEvent, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
+#[cfg(target_os = "macos")]
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::ActiveEventLoopExtMacOS;
@@ -59,6 +63,7 @@ use tabor_terminal::vte::ansi::NamedColor;
 use crate::cli::ParsedOptions;
 use crate::cli::{Options as CliOptions, WindowOptions};
 use crate::clipboard::Clipboard;
+#[cfg(unix)]
 use crate::config::Action;
 use crate::config::ui_config::{HintAction, HintInternalAction};
 use crate::config::{self, UiConfig};
@@ -118,6 +123,7 @@ use url::Url;
 pub const TYPING_SEARCH_DELAY: Duration = Duration::from_millis(500);
 
 /// Minimum delay between foreground process name refreshes.
+#[cfg(unix)]
 const FOREGROUND_PROCESS_REFRESH: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "macos")]
@@ -1175,6 +1181,7 @@ impl Processor {
         Err(ipc::reply_error(ipc::IpcErrorCode::NotFound, "No focused window"))
     }
 
+    #[cfg(unix)]
     fn close_window(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
         let window_context = match self.windows.entry(window_id) {
             Entry::Occupied(window_context) => window_context.remove(),
@@ -1366,8 +1373,9 @@ impl ApplicationHandler<Event> for Processor {
                     ipc::send_reply(&mut stream, reply);
                 }
             },
-            (EventType::CreateTab(mut options), Some(window_id)) => {
-                let close_tab_on_success = options.close_tab_on_success.take();
+            (EventType::CreateTab(options), Some(window_id)) => {
+                #[cfg(target_os = "macos")]
+                let close_tab_on_success = options.close_tab_on_success;
 
                 if let Some(window_context) = self.windows.get_mut(&window_id) {
                     match window_context.create_tab(options, &self.proxy) {
@@ -1529,6 +1537,7 @@ impl ApplicationHandler<Event> for Processor {
                         }
                     }
 
+                    #[cfg(unix)]
                     if !is_web && is_active {
                         let timer_id = TimerId::new(Topic::ForegroundProcess, window_id);
                         if !self.scheduler.scheduled(timer_id) {
@@ -1552,12 +1561,9 @@ impl ApplicationHandler<Event> for Processor {
                     self.ensure_tab_activity_tick(window_id);
                 }
             },
-            (
-                EventType::Terminal(
-                    terminal_event @ (TerminalEvent::Exit | TerminalEvent::ChildExit(_)),
-                ),
-                Some(window_id),
-            ) => {
+            (EventType::Terminal(terminal_event), Some(window_id))
+                if matches!(terminal_event, TerminalEvent::Exit | TerminalEvent::ChildExit(_)) =>
+            {
                 let Some(tab_id) = tab_id else {
                     return;
                 };
@@ -1853,6 +1859,7 @@ pub enum EventType {
     BlinkCursorTimeout,
     TabActivityTick,
     SearchNext,
+    #[cfg(unix)]
     UpdateTabProgramName,
     Frame,
 }
@@ -2690,12 +2697,18 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
     }
 
+    #[cfg(not(windows))]
     fn create_new_tab(&mut self) {
         let mut options = WindowOptions::default();
-        #[cfg(not(windows))]
-        {
-            options.terminal_options.working_directory = self.current_working_directory();
-        }
+        options.terminal_options.working_directory = self.current_working_directory();
+
+        let event = Event::new(EventType::CreateTab(options), self.display.window.id());
+        let _ = self.event_proxy.send_event(event);
+    }
+
+    #[cfg(windows)]
+    fn create_new_tab(&mut self) {
+        let options = WindowOptions::default();
 
         let event = Event::new(EventType::CreateTab(options), self.display.window.id());
         let _ = self.event_proxy.send_event(event);
@@ -4649,25 +4662,16 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         let _ = self.event_proxy.send_event(event);
     }
 
+    #[cfg(target_os = "macos")]
     fn open_web_url_new_tab_replace_current(&mut self, url: String) {
         let mut options = WindowOptions::default();
-        #[cfg(target_os = "macos")]
-        {
-            options.window_kind = match classify_open_url(&url) {
-                OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
-                OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
-                OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
-            };
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            options.window_kind = WindowKind::Web { url: url.clone() };
-        }
+        options.window_kind = match classify_open_url(&url) {
+            OpenUrlKind::Web => WindowKind::Web { url: url.clone() },
+            OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
+            OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
+        };
         options.close_tab_on_success = Some(self.tab_id);
-        #[cfg(not(windows))]
-        {
-            options.terminal_options.working_directory = self.current_working_directory();
-        }
+        options.terminal_options.working_directory = self.current_working_directory();
 
         let event = Event::new(EventType::CreateTab(options), self.display.window.id());
         self.command_history.record_url(url);
@@ -6098,9 +6102,10 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::CreateTab(_)
                 | EventType::TabCommand(_)
                 | EventType::SetMultiColumnCount(_)
-                | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
                 | EventType::Frame => (),
+                #[cfg(all(unix, not(target_os = "macos")))]
+                EventType::UpdateTabProgramName => (),
                 #[cfg(unix)]
                 EventType::WorkspaceAutosave => (),
             },

@@ -25,6 +25,7 @@ use crate::gl;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+#[cfg(target_os = "macos")]
 pub mod images;
 pub mod platform;
 pub mod rects;
@@ -36,8 +37,7 @@ use crate::macos::image_view::ImageRenderQuad;
 #[cfg(target_os = "macos")]
 pub use images::BitmapCacheKey;
 #[cfg(target_os = "macos")]
-use images::SurfaceSlot;
-use images::{ImageRenderer, ImageSlice};
+use images::{ImageRenderer, ImageSlice, SurfaceSlot};
 pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
@@ -99,6 +99,7 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    #[cfg(target_os = "macos")]
     image_renderer: ImageRenderer,
     robustness: bool,
 }
@@ -161,18 +162,21 @@ impl Renderer {
             None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
-        let (text_renderer, rect_renderer, image_renderer) = if use_glsl3 {
-            let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
-            let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
-            let image_renderer = ImageRenderer::new(context, ShaderVersion::Glsl3)?;
-            (text_renderer, rect_renderer, image_renderer)
-        } else {
-            let text_renderer =
-                TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?);
-            let rect_renderer = RectRenderer::new(ShaderVersion::Gles2)?;
-            let image_renderer = ImageRenderer::new(context, ShaderVersion::Gles2)?;
-            (text_renderer, rect_renderer, image_renderer)
+        let renderer_shader_version =
+            if use_glsl3 { ShaderVersion::Glsl3 } else { ShaderVersion::Gles2 };
+        let (text_renderer, rect_renderer) = match renderer_shader_version {
+            ShaderVersion::Glsl3 => (
+                TextRendererProvider::Glsl3(Glsl3Renderer::new()?),
+                RectRenderer::new(ShaderVersion::Glsl3)?,
+            ),
+            ShaderVersion::Gles2 => (
+                TextRendererProvider::Gles2(Gles2Renderer::new(allow_dsb, is_gles_context)?),
+                RectRenderer::new(ShaderVersion::Gles2)?,
+            ),
         };
+
+        #[cfg(target_os = "macos")]
+        let image_renderer = ImageRenderer::new(context, renderer_shader_version)?;
 
         // Enable debug logging for OpenGL as well.
         if log::max_level() >= LevelFilter::Debug && GlExtensions::contains("GL_KHR_debug") {
@@ -184,7 +188,13 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, image_renderer, robustness })
+        Ok(Self {
+            text_renderer,
+            rect_renderer,
+            #[cfg(target_os = "macos")]
+            image_renderer,
+            robustness,
+        })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -409,6 +419,7 @@ impl Renderer {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn read_front_buffer_rgba(&self, width: u32, height: u32) -> Vec<u8> {
         if width == 0 || height == 0 {
             return Vec::new();

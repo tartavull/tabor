@@ -667,24 +667,3 @@ mod macos {
 
 #[cfg(target_os = "macos")]
 pub use macos::{BitmapCacheKey, ImageRenderer, SurfaceSlot};
-
-#[cfg(not(target_os = "macos"))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum SurfaceSlot {
-    Main,
-    Popup,
-}
-
-#[cfg(not(target_os = "macos"))]
-#[derive(Debug, Default)]
-pub struct ImageRenderer;
-
-#[cfg(not(target_os = "macos"))]
-impl ImageRenderer {
-    pub fn new(
-        _context: &PossiblyCurrentContext,
-        _shader_version: ShaderVersion,
-    ) -> Result<Self, renderer::Error> {
-        Ok(Self)
-    }
-}

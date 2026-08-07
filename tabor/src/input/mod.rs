@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 
 use log::debug;
 use winit::dpi::PhysicalPosition;
+#[cfg(target_os = "macos")]
+use winit::event::KeyEvent;
 use winit::event::{
-    ElementState, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, Touch as TouchEvent,
-    TouchPhase,
+    ElementState, Modifiers, MouseButton, MouseScrollDelta, Touch as TouchEvent, TouchPhase,
 };
 #[cfg(target_os = "macos")]
 use winit::event_loop::ActiveEventLoop;
@@ -585,6 +586,7 @@ impl<T: EventListener> Execute<T> for Action {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn execute_action<T: EventListener, A: ActionContext<T>>(ctx: &mut A, action: &Action) {
     action.execute(ctx);
 }

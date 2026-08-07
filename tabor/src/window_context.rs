@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "macos")]
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
@@ -13,6 +14,7 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -34,8 +36,11 @@ use log::info;
 #[cfg(target_os = "macos")]
 use serde::Deserialize;
 use serde_json as json;
+#[cfg(unix)]
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, WindowEvent};
+#[cfg(target_os = "macos")]
+use winit::event::{ElementState, Ime, MouseButton};
+use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 #[cfg(target_os = "macos")]
@@ -45,15 +50,20 @@ use winit::window::WindowId;
 use tabor_terminal::event::{Event as TerminalEvent, Notify, OnResize};
 use tabor_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use tabor_terminal::grid::{Dimensions, Scroll};
-use tabor_terminal::index::{Column, Direction, Line, Point};
+use tabor_terminal::index::Direction;
+#[cfg(unix)]
+use tabor_terminal::index::{Column, Line, Point};
 use tabor_terminal::sync::FairMutex;
 #[cfg(target_os = "macos")]
 use tabor_terminal::term::MIN_COLUMNS;
+#[cfg(unix)]
 use tabor_terminal::term::cell::Flags;
 use tabor_terminal::term::test::TermSize;
 use tabor_terminal::term::{ResizeAnchor, Term, TermMode};
 use tabor_terminal::tty;
-use tabor_terminal::vte::ansi::{CursorShape, NamedColor};
+#[cfg(unix)]
+use tabor_terminal::vte::ansi::CursorShape;
+use tabor_terminal::vte::ansi::NamedColor;
 
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
@@ -62,9 +72,13 @@ use crate::config::Action;
 use crate::config::UiConfig;
 #[cfg(not(windows))]
 use crate::daemon::{foreground_process_name, foreground_process_path};
-use crate::display::browser_layout::{BrowserViewMode, BrowserViewportLayout};
+use crate::display::browser_layout::BrowserViewMode;
+#[cfg(unix)]
+use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::color::Rgb;
+#[cfg(unix)]
 use crate::display::content::RenderableContentContext;
+#[cfg(unix)]
 use crate::display::hint::HintState;
 use crate::display::terminal_layout::{TerminalViewMode, TerminalViewportLayout};
 use crate::display::window::Window;
@@ -105,7 +119,9 @@ use crate::ipc::{
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
-use crate::scheduler::{Scheduler, TimerId, Topic};
+use crate::scheduler::Scheduler;
+#[cfg(target_os = "macos")]
+use crate::scheduler::{TimerId, Topic};
 use crate::tab_panel::TabActivity;
 use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
@@ -141,6 +157,7 @@ struct TabState {
     id: TabId,
     title: String,
     custom_title: Option<String>,
+    #[cfg(unix)]
     program_name: String,
     kind: WindowKind,
     activity: TabActivity,
@@ -170,6 +187,7 @@ struct TabState {
     #[cfg(target_os = "macos")]
     favicon_pending: bool,
     notifier: TabNotifier,
+    #[cfg(unix)]
     terminal_runtime: TerminalRuntimeState,
 }
 
@@ -233,24 +251,25 @@ impl TabNotifier {
     }
 
     fn detach(&mut self) {
-        if let Self::Local { notifier, .. } = self {
-            let _ = notifier.0.send(Msg::Shutdown);
+        match self {
+            Self::Local { notifier, .. } => {
+                let _ = notifier.0.send(Msg::Shutdown);
+            },
+            #[cfg(unix)]
+            Self::Disconnected => {},
         }
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 enum TerminalRuntimeState {
     Local {
-        #[cfg(not(windows))]
         master_fd: RawFd,
-        #[cfg(not(windows))]
         shell_pid: u32,
-        #[cfg(unix)]
         terminal_id: Option<u64>,
         launch_options: tty::Options,
     },
-    #[cfg(unix)]
     Disconnected {
         terminal_id: u64,
         launch_options: tty::Options,
@@ -260,12 +279,11 @@ enum TerminalRuntimeState {
     },
 }
 
+#[cfg(unix)]
 impl TerminalRuntimeState {
-    #[cfg(not(windows))]
     fn master_fd_shell_pid(&self) -> Option<(RawFd, u32)> {
         match self {
             Self::Local { master_fd, shell_pid, .. } => Some((*master_fd, *shell_pid)),
-            #[cfg(unix)]
             Self::Disconnected { .. } => None,
         }
     }
@@ -273,7 +291,6 @@ impl TerminalRuntimeState {
     fn working_directory_hint(&self) -> Option<PathBuf> {
         match self {
             Self::Local { launch_options, .. } => launch_options.working_directory.clone(),
-            #[cfg(unix)]
             Self::Disconnected { working_directory, launch_options, .. } => {
                 working_directory.clone().or_else(|| launch_options.working_directory.clone())
             },
@@ -283,12 +300,10 @@ impl TerminalRuntimeState {
     fn launch_options(&self) -> &tty::Options {
         match self {
             Self::Local { launch_options, .. } => launch_options,
-            #[cfg(unix)]
             Self::Disconnected { launch_options, .. } => launch_options,
         }
     }
 
-    #[cfg(unix)]
     fn terminal_id(&self) -> Option<u64> {
         match self {
             Self::Local { terminal_id, .. } => *terminal_id,
@@ -311,14 +326,13 @@ struct MultiColumnDefaults {
 }
 
 #[derive(Clone)]
+#[cfg(unix)]
 enum TerminalSpawnMode {
-    NewLocal {
-        terminal_id: Option<u64>,
-    },
-    #[cfg(unix)]
+    NewLocal { terminal_id: Option<u64> },
     RestoredLocalShell(Box<RestoredTerminalSpawn>),
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum TabActivation {
     Activate,
@@ -339,10 +353,12 @@ struct LocalTerminalSpawnRequest<'a> {
     terminal: &'a Arc<FairMutex<Term<EventProxy>>>,
     event_proxy: &'a EventProxy,
     pty_config: &'a tty::Options,
+    #[cfg(unix)]
     title: &'a str,
     window_id: WindowId,
     size_info: SizeInfo,
     ref_test: bool,
+    #[cfg(unix)]
     terminal_id: Option<u64>,
 }
 
@@ -375,6 +391,7 @@ fn non_empty_workspace_group_layouts(
     layout.groups.iter().enumerate().filter(|(_, group)| !group.tabs.is_empty())
 }
 
+#[cfg(unix)]
 fn sync_terminal_tab_geometry(
     display: &Display,
     config: &UiConfig,
@@ -397,7 +414,7 @@ fn sync_terminal_tab_geometry(
     }
 }
 
-#[cfg_attr(not(unix), allow(unused_variables))]
+#[cfg(unix)]
 fn spawn_local_terminal_runtime(
     request: LocalTerminalSpawnRequest<'_>,
 ) -> Result<(String, TabNotifier, TerminalRuntimeState), Box<dyn Error>> {
@@ -414,12 +431,9 @@ fn spawn_local_terminal_runtime(
 
     let pty = tty::new(pty_config, size_info.into(), window_id.into())?;
 
-    #[cfg(not(windows))]
     let master_fd = pty.file().as_raw_fd();
-    #[cfg(not(windows))]
     let shell_pid = pty.child().id();
 
-    #[cfg(unix)]
     let output_observer = if let Some(terminal_id) = terminal_id {
         Some(Box::new({
             let observer =
@@ -428,14 +442,9 @@ fn spawn_local_terminal_runtime(
                     terminal: Arc::clone(terminal),
                     launch_options: pty_config.clone(),
                     title: Some(title.to_string()),
-                    #[cfg(not(windows))]
                     program_name: foreground_process_name(master_fd, shell_pid).unwrap_or_default(),
-                    #[cfg(windows)]
-                    program_name: String::new(),
                     working_directory: pty_config.working_directory.clone(),
-                    #[cfg(not(windows))]
                     master_fd,
-                    #[cfg(not(windows))]
                     shell_pid,
                 })?;
             move |bytes: &[u8]| observer.observe(bytes)
@@ -443,8 +452,6 @@ fn spawn_local_terminal_runtime(
     } else {
         None
     };
-    #[cfg(not(unix))]
-    let output_observer = None;
 
     let event_loop = PtyEventLoop::new(
         Arc::clone(terminal),
@@ -458,28 +465,47 @@ fn spawn_local_terminal_runtime(
     let loop_tx = event_loop.channel();
     let _io_thread = event_loop.spawn();
 
-    #[cfg(not(windows))]
     let program_name = foreground_process_name(master_fd, shell_pid).unwrap_or_default();
-    #[cfg(windows)]
-    let program_name = String::new();
 
     Ok((
         program_name,
-        TabNotifier::Local {
-            notifier: Notifier(loop_tx),
-            #[cfg(unix)]
-            terminal_id,
-        },
+        TabNotifier::Local { notifier: Notifier(loop_tx), terminal_id },
         TerminalRuntimeState::Local {
-            #[cfg(not(windows))]
             master_fd,
-            #[cfg(not(windows))]
             shell_pid,
-            #[cfg(unix)]
             terminal_id,
             launch_options: pty_config.clone(),
         },
     ))
+}
+
+#[cfg(windows)]
+fn spawn_local_terminal_runtime(
+    request: LocalTerminalSpawnRequest<'_>,
+) -> Result<TabNotifier, Box<dyn Error>> {
+    let LocalTerminalSpawnRequest {
+        terminal,
+        event_proxy,
+        pty_config,
+        window_id,
+        size_info,
+        ref_test,
+    } = request;
+
+    let pty = tty::new(pty_config, size_info.into(), window_id.into())?;
+    let event_loop = PtyEventLoop::new(
+        Arc::clone(terminal),
+        event_proxy.clone(),
+        pty,
+        None,
+        pty_config.drain_on_exit,
+        ref_test,
+    )?;
+
+    let loop_tx = event_loop.channel();
+    let _io_thread = event_loop.spawn();
+
+    Ok(TabNotifier::Local { notifier: Notifier(loop_tx) })
 }
 
 #[cfg(target_os = "macos")]
@@ -669,6 +695,7 @@ fn select_favicon_base(page_url: &str, base_uri: &str, referrer: &str) -> String
 }
 
 impl TabState {
+    #[cfg(unix)]
     fn panel_title(&self) -> String {
         if let Some(custom_title) = &self.custom_title {
             return custom_title.clone();
@@ -877,6 +904,7 @@ impl TabManager {
         Some(tab)
     }
 
+    #[cfg(unix)]
     fn move_tab(
         &mut self,
         tab_id: TabId,
@@ -950,6 +978,7 @@ impl TabManager {
         true
     }
 
+    #[cfg(unix)]
     fn move_group(&mut self, group_id: usize, target_index: usize) -> bool {
         let Some(from_index) = self.groups.iter().position(|group| group.id == group_id) else {
             return false;
@@ -989,6 +1018,7 @@ impl TabManager {
         true
     }
 
+    #[cfg(unix)]
     fn set_custom_title(&mut self, tab_id: TabId, title: Option<String>) -> bool {
         let Some(tab) = self.get_mut(tab_id) else {
             return false;
@@ -1006,10 +1036,12 @@ impl TabManager {
         self.get(tab_id).and_then(|tab| tab.custom_title.as_deref())
     }
 
+    #[cfg(unix)]
     fn tab_label(&self, tab_id: TabId) -> Option<String> {
         self.get(tab_id).map(|tab| tab.panel_title())
     }
 
+    #[cfg(unix)]
     fn set_group_name(&mut self, group_id: usize, name: Option<String>) -> bool {
         let Some(group) = self.groups.iter_mut().find(|group| group.id == group_id) else {
             return false;
@@ -1023,6 +1055,7 @@ impl TabManager {
         true
     }
 
+    #[cfg(unix)]
     fn group_name(&self, group_id: usize) -> Option<&str> {
         self.groups
             .iter()
@@ -1030,6 +1063,7 @@ impl TabManager {
             .and_then(|group| group.name.as_deref())
     }
 
+    #[cfg(unix)]
     fn group_for_tab(&self, tab_id: TabId) -> Option<(usize, usize)> {
         for group in &self.groups {
             if let Some(index) = group.tabs.iter().position(|id| *id == tab_id) {
@@ -1039,6 +1073,7 @@ impl TabManager {
         None
     }
 
+    #[cfg(unix)]
     fn set_program_name(&mut self, tab_id: TabId, program_name: String) -> bool {
         let Some(tab) = self.get_mut(tab_id) else {
             return false;
@@ -1052,6 +1087,7 @@ impl TabManager {
         true
     }
 
+    #[cfg(target_os = "macos")]
     fn panel_groups(&self) -> Vec<crate::tab_panel::TabPanelGroup> {
         let active = self.active;
         self.groups
@@ -1116,6 +1152,7 @@ impl TabManager {
         TabGroup { id, name: None, tabs: Vec::new() }
     }
 
+    #[cfg(unix)]
     fn create_group(&mut self, name: Option<String>) -> usize {
         let mut group = self.new_group();
         group.name = name.filter(|name| !name.is_empty());
@@ -1124,6 +1161,7 @@ impl TabManager {
         group_id
     }
 
+    #[cfg(unix)]
     fn preview_group_id(&self) -> usize {
         self.next_group_id
     }
@@ -1284,6 +1322,7 @@ impl WindowContext {
             options.window_kind,
             None,
             None,
+            #[cfg(unix)]
             None,
         )?;
 
@@ -1335,12 +1374,13 @@ impl WindowContext {
         display: &Display,
         config: &UiConfig,
         multi_column_defaults: MultiColumnDefaults,
-        mut pty_config: tty::Options,
+        #[cfg(unix)] mut pty_config: tty::Options,
+        #[cfg(windows)] pty_config: tty::Options,
         proxy: &EventLoopProxy<Event>,
         window_kind: WindowKind,
         group_id: Option<usize>,
         group_name: Option<String>,
-        terminal_spawn_mode: Option<TerminalSpawnMode>,
+        #[cfg(unix)] terminal_spawn_mode: Option<TerminalSpawnMode>,
     ) -> Result<TabId, Box<dyn Error>> {
         let tab_id = tabs.allocate_id();
         #[cfg(unix)]
@@ -1436,76 +1476,56 @@ impl WindowContext {
             },
         };
 
+        #[cfg(unix)]
         let (title, program_name, notifier, terminal_runtime) = if window_kind.is_terminal() {
-            #[cfg(unix)]
-            {
-                match terminal_spawn_mode
-                    .unwrap_or(TerminalSpawnMode::NewLocal { terminal_id: None })
-                {
-                    TerminalSpawnMode::NewLocal { terminal_id } => {
-                        let terminal_id = Some(match terminal_id {
-                            Some(terminal_id) => terminal_id,
-                            None => workspace::allocate_terminal_id()?,
-                        });
-                        let (program_name, notifier, terminal_runtime) =
-                            spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
-                                terminal: &terminal,
-                                event_proxy: &event_proxy,
-                                pty_config: &pty_config,
-                                title: &default_title,
-                                window_id: display.window.id(),
-                                size_info,
-                                ref_test: config.debug.ref_test,
-                                terminal_id,
-                            })?;
-                        (default_title.clone(), program_name, notifier, terminal_runtime)
-                    },
-                    TerminalSpawnMode::RestoredLocalShell(restored) => {
-                        let RestoredTerminalSpawn {
+            match terminal_spawn_mode.unwrap_or(TerminalSpawnMode::NewLocal { terminal_id: None }) {
+                TerminalSpawnMode::NewLocal { terminal_id } => {
+                    let terminal_id = Some(match terminal_id {
+                        Some(terminal_id) => terminal_id,
+                        None => workspace::allocate_terminal_id()?,
+                    });
+                    let (program_name, notifier, terminal_runtime) =
+                        spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                            terminal: &terminal,
+                            event_proxy: &event_proxy,
+                            pty_config: &pty_config,
+                            title: &default_title,
+                            window_id: display.window.id(),
+                            size_info,
+                            ref_test: config.debug.ref_test,
                             terminal_id,
-                            mut launch_options,
-                            preview_lines,
-                            title,
-                            working_directory,
-                        } = *restored;
-                        if let Some(working_directory) = working_directory {
-                            launch_options.working_directory = Some(working_directory);
-                        }
-                        set_tabor_tab_id_env(&mut launch_options, tab_id);
-                        let restored_title = title.unwrap_or_else(|| default_title.clone());
-                        if let Some(preview_lines) = preview_lines {
-                            terminal.lock().apply_preview_lines(&preview_lines);
-                        }
-                        let (program_name, notifier, terminal_runtime) =
-                            spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
-                                terminal: &terminal,
-                                event_proxy: &event_proxy,
-                                pty_config: &launch_options,
-                                title: &restored_title,
-                                window_id: display.window.id(),
-                                size_info,
-                                ref_test: config.debug.ref_test,
-                                terminal_id: Some(terminal_id),
-                            })?;
-                        (restored_title, program_name, notifier, terminal_runtime)
-                    },
-                }
-            }
-
-            #[cfg(not(unix))]
-            {
-                let (program_name, notifier, terminal_runtime) =
-                    spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
-                        terminal: &terminal,
-                        event_proxy: &event_proxy,
-                        pty_config: &pty_config,
-                        title: &default_title,
-                        window_id: display.window.id(),
-                        size_info,
-                        ref_test: config.debug.ref_test,
-                        terminal_id: None,
-                    })?;
-                (default_title.clone(), program_name, notifier, terminal_runtime)
+                        })?;
+                    (default_title.clone(), program_name, notifier, terminal_runtime)
+                },
+                TerminalSpawnMode::RestoredLocalShell(restored) => {
+                    let RestoredTerminalSpawn {
+                        terminal_id,
+                        mut launch_options,
+                        preview_lines,
+                        title,
+                        working_directory,
+                    } = *restored;
+                    if let Some(working_directory) = working_directory {
+                        launch_options.working_directory = Some(working_directory);
+                    }
+                    set_tabor_tab_id_env(&mut launch_options, tab_id);
+                    let restored_title = title.unwrap_or_else(|| default_title.clone());
+                    if let Some(preview_lines) = preview_lines {
+                        terminal.lock().apply_preview_lines(&preview_lines);
+                    }
+                    let (program_name, notifier, terminal_runtime) =
+                        spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                            terminal: &terminal,
+                            event_proxy: &event_proxy,
+                            pty_config: &launch_options,
+                            title: &restored_title,
+                            window_id: display.window.id(),
+                            size_info,
+                            ref_test: config.debug.ref_test,
+                            terminal_id: Some(terminal_id),
+                        })?;
+                    (restored_title, program_name, notifier, terminal_runtime)
+                },
             }
         } else {
             let (program_name, notifier, terminal_runtime) =
@@ -1522,6 +1542,19 @@ impl WindowContext {
             (default_title.clone(), program_name, notifier, terminal_runtime)
         };
 
+        #[cfg(windows)]
+        let (title, notifier) = {
+            let notifier = spawn_local_terminal_runtime(LocalTerminalSpawnRequest {
+                terminal: &terminal,
+                event_proxy: &event_proxy,
+                pty_config: &pty_config,
+                window_id: display.window.id(),
+                size_info,
+                ref_test: config.debug.ref_test,
+            })?;
+            (default_title.clone(), notifier)
+        };
+
         if config.cursor.style().blinking {
             event_proxy.send_event(TerminalEvent::CursorBlinkingChange.into());
         }
@@ -1530,6 +1563,7 @@ impl WindowContext {
             id: tab_id,
             title,
             custom_title: None,
+            #[cfg(unix)]
             program_name,
             kind: window_kind,
             activity: TabActivity::default(),
@@ -1558,11 +1592,11 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             web_command_state: Default::default(),
             #[cfg(target_os = "macos")]
-            #[cfg(target_os = "macos")]
             favicon: None,
             #[cfg(target_os = "macos")]
             favicon_pending: false,
             notifier,
+            #[cfg(unix)]
             terminal_runtime,
         };
 
@@ -1808,67 +1842,65 @@ impl WindowContext {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn update_active_web_title(&mut self, event_proxy: &EventLoopProxy<Event>) {
-        #[cfg(target_os = "macos")]
-        {
-            let mut pending_scroll = None;
-            let mut url_update = None;
-            let mut favicon_request = None;
-            let mut favicon_cleared = false;
-            let title = {
-                let Some(active_tab) = self.tabs.active_mut() else {
-                    return;
-                };
-
-                let Some(web_view) = active_tab.web_view.as_mut() else {
-                    return;
-                };
-
-                let title = web_view.poll_title().map(|title| (active_tab.id, title));
-                if let Some(url) = web_view.poll_url() {
-                    if let WindowKind::Web { url: current_url } = &mut active_tab.kind {
-                        *current_url = url.clone();
-                    }
-                    active_tab.web_command_state.set_cursor_bootstrapped(false);
-                    active_tab.web_command_state.clear_last_cursor_request();
-                    active_tab.favicon = None;
-                    active_tab.favicon_pending = false;
-                    favicon_cleared = true;
-                    favicon_request = Some((active_tab.id, url.clone()));
-                    pending_scroll = active_tab.web_command_state.take_pending_scroll(&url);
-                    url_update = Some(url);
-                }
-
-                title
+        let mut pending_scroll = None;
+        let mut url_update = None;
+        let mut favicon_request = None;
+        let mut favicon_cleared = false;
+        let title = {
+            let Some(active_tab) = self.tabs.active_mut() else {
+                return;
             };
 
-            if let Some((tab_id, title)) = title {
-                self.update_tab_title(tab_id, title);
+            let Some(web_view) = active_tab.web_view.as_mut() else {
+                return;
+            };
+
+            let title = web_view.poll_title().map(|title| (active_tab.id, title));
+            if let Some(url) = web_view.poll_url() {
+                if let WindowKind::Web { url: current_url } = &mut active_tab.kind {
+                    *current_url = url.clone();
+                }
+                active_tab.web_command_state.set_cursor_bootstrapped(false);
+                active_tab.web_command_state.clear_last_cursor_request();
+                active_tab.favicon = None;
+                active_tab.favicon_pending = false;
+                favicon_cleared = true;
+                favicon_request = Some((active_tab.id, url.clone()));
+                pending_scroll = active_tab.web_command_state.take_pending_scroll(&url);
+                url_update = Some(url);
             }
 
-            if let Some(url) = url_update.clone() {
-                self.command_history.record_url(url);
-            }
+            title
+        };
 
-            if url_update.is_some() {
-                self.dirty = true;
-            }
+        if let Some((tab_id, title)) = title {
+            self.update_tab_title(tab_id, title);
+        }
 
-            if let Some((scroll_x, scroll_y)) = pending_scroll {
-                if let Some(active_tab) = self.tabs.active_mut() {
-                    if let Some(web_view) = active_tab.web_view.as_mut() {
-                        web_view.exec_js(&format!("window.scrollTo({scroll_x}, {scroll_y});"));
-                    }
+        if let Some(url) = url_update.clone() {
+            self.command_history.record_url(url);
+        }
+
+        if url_update.is_some() {
+            self.dirty = true;
+        }
+
+        if let Some((scroll_x, scroll_y)) = pending_scroll {
+            if let Some(active_tab) = self.tabs.active_mut() {
+                if let Some(web_view) = active_tab.web_view.as_mut() {
+                    web_view.exec_js(&format!("window.scrollTo({scroll_x}, {scroll_y});"));
                 }
             }
+        }
 
-            if favicon_cleared {
-                self.refresh_tab_panel();
-            }
+        if favicon_cleared {
+            self.refresh_tab_panel();
+        }
 
-            if let Some((tab_id, url)) = favicon_request {
-                self.request_web_favicon(tab_id, url, event_proxy);
-            }
+        if let Some((tab_id, url)) = favicon_request {
+            self.request_web_favicon(tab_id, url, event_proxy);
         }
     }
 
@@ -2253,6 +2285,7 @@ impl WindowContext {
 
         let changed = self.tabs.set_active(tab_id);
 
+        #[cfg(unix)]
         if changed {
             self.update_tab_program_name(tab_id);
             if self.tabs.get(tab_id).is_some_and(|tab| !tab.kind.is_web()) {
@@ -2328,9 +2361,19 @@ impl WindowContext {
         options: WindowOptions,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_internal(options, proxy, None, None, None, TabActivation::Activate)
+        self.create_tab_internal(
+            options,
+            proxy,
+            None,
+            None,
+            #[cfg(unix)]
+            None,
+            #[cfg(target_os = "macos")]
+            TabActivation::Activate,
+        )
     }
 
+    #[cfg(unix)]
     pub(crate) fn create_tab_in_group(
         &mut self,
         options: WindowOptions,
@@ -2344,6 +2387,7 @@ impl WindowContext {
             group_id,
             group_name,
             None,
+            #[cfg(target_os = "macos")]
             TabActivation::Activate,
         )
     }
@@ -2354,8 +2398,8 @@ impl WindowContext {
         proxy: &EventLoopProxy<Event>,
         group_id: Option<usize>,
         group_name: Option<String>,
-        terminal_spawn_mode: Option<TerminalSpawnMode>,
-        activation: TabActivation,
+        #[cfg(unix)] terminal_spawn_mode: Option<TerminalSpawnMode>,
+        #[cfg(target_os = "macos")] activation: TabActivation,
     ) -> Result<TabId, Box<dyn Error>> {
         let terminal_command_input = if matches!(&options.window_kind, WindowKind::Terminal) {
             options.terminal_options.command_input()
@@ -2376,17 +2420,23 @@ impl WindowContext {
             options.window_kind,
             group_id,
             group_name,
+            #[cfg(unix)]
             terminal_spawn_mode,
         )?;
-        if activation == TabActivation::Activate {
-            self.set_active_tab(tab_id);
-        } else {
-            self.update_webview_visibility();
-            self.refresh_tab_panel();
-            self.display.pending_update.dirty = true;
-            self.display.damage_tracker.frame().mark_fully_damaged();
-            self.dirty = true;
+        #[cfg(target_os = "macos")]
+        {
+            if activation == TabActivation::Activate {
+                self.set_active_tab(tab_id);
+            } else {
+                self.update_webview_visibility();
+                self.refresh_tab_panel();
+                self.display.pending_update.dirty = true;
+                self.display.damage_tracker.frame().mark_fully_damaged();
+                self.dirty = true;
+            }
         }
+        #[cfg(not(target_os = "macos"))]
+        self.set_active_tab(tab_id);
         self.send_startup_input(tab_id, terminal_command_input);
         if let Some(input) = command_input.as_deref() {
             if let Some(tab) = self.tabs.get_mut(tab_id) {
@@ -5115,6 +5165,7 @@ impl WindowContext {
         )
     }
 
+    #[cfg(unix)]
     fn browser_viewport_for_kind(
         display: &Display,
         config: &UiConfig,
@@ -5133,6 +5184,7 @@ impl WindowContext {
         )
     }
 
+    #[cfg(unix)]
     fn browser_viewport_for_tab(
         display: &Display,
         config: &UiConfig,
@@ -5787,6 +5839,7 @@ impl WindowContext {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn rename_tab(&mut self, tab_id: TabId, name: Option<String>) {
         if !self.tabs.set_custom_title(tab_id, name.clone()) {
             return;
@@ -5806,6 +5859,7 @@ impl WindowContext {
         self.refresh_tab_panel();
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn rename_group(&mut self, group_id: usize, name: Option<String>) {
         let name = name.and_then(|name| {
             let trimmed = name.trim();
@@ -5821,7 +5875,7 @@ impl WindowContext {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     fn update_tab_program_name(&mut self, tab_id: TabId) -> bool {
         let Some(tab) = self.tabs.get(tab_id) else {
             return false;
@@ -5835,14 +5889,9 @@ impl WindowContext {
         }
 
         let program_name = match &tab.terminal_runtime {
-            TerminalRuntimeState::Local {
-                #[cfg(not(windows))]
-                master_fd,
-                #[cfg(not(windows))]
-                shell_pid,
-                ..
-            } => foreground_process_name(*master_fd, *shell_pid).ok(),
-            #[cfg(unix)]
+            TerminalRuntimeState::Local { master_fd, shell_pid, .. } => {
+                foreground_process_name(*master_fd, *shell_pid).ok()
+            },
             TerminalRuntimeState::Disconnected { .. } => Some(tab.program_name.clone()),
         };
 
@@ -5851,11 +5900,6 @@ impl WindowContext {
         };
 
         self.tabs.set_program_name(tab_id, program_name)
-    }
-
-    #[cfg(windows)]
-    fn update_tab_program_name(&mut self, _tab_id: TabId) -> bool {
-        false
     }
 
     /// Update the terminal window to the latest config.
@@ -6042,6 +6086,7 @@ impl WindowContext {
         }
 
         // Redraw the window.
+        #[cfg(target_os = "macos")]
         let multi_column_defaults = self.multi_column_defaults();
         let Some(tab) = self.tabs.active_mut() else {
             return;
@@ -6055,6 +6100,7 @@ impl WindowContext {
                     WindowKind::Pdf { source } => source.as_str(),
                     WindowKind::Terminal => "",
                 };
+                #[cfg(target_os = "macos")]
                 let browser_layout = Self::browser_viewport_for_tab(
                     &self.display,
                     &self.config,
@@ -6284,6 +6330,7 @@ impl WindowContext {
                             continue;
                         }
                     },
+                    #[cfg(unix)]
                     EventType::UpdateTabProgramName => {
                         let Some(tab_id) = event.tab_id() else {
                             continue;
@@ -6381,6 +6428,7 @@ impl WindowContext {
             active_tab.mouse.hint_highlight_dirty = false;
         }
 
+        #[cfg(target_os = "macos")]
         self.update_active_web_title(event_proxy);
 
         // Don't call `request_redraw` when event is `RedrawRequested` since the `dirty` flag
