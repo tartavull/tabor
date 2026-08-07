@@ -95,22 +95,8 @@ jobs:
         run: rustup update
       - name: Download CEF runtime
         run: |
-          CEF_VERSION="$(tr -d '\n' < cef-version.txt)"
-          CEF_URL="https://cef-builds.spotifycdn.com/cef_binary_${CEF_VERSION}_macosarm64.tar.bz2"
-          CEF_ARCHIVE="$RUNNER_TEMP/cef_binary_macosarm64.tar.bz2"
-          CEF_EXTRACT_DIR="$RUNNER_TEMP/cef"
-
-          curl --fail --location "$CEF_URL" --output "$CEF_ARCHIVE"
-          mkdir -p "$CEF_EXTRACT_DIR"
-          tar -xjf "$CEF_ARCHIVE" -C "$CEF_EXTRACT_DIR"
-
-          CEF_ROOT="$CEF_EXTRACT_DIR/cef_binary_${CEF_VERSION}_macosarm64"
-          if [ ! -d "$CEF_ROOT" ]; then
-            echo "CEF archive did not contain the expected directory: $CEF_ROOT"
-            exit 1
-          fi
-
-          echo "CEF_PATH=$CEF_ROOT" >> "$GITHUB_ENV"
+          CEF_PATH="$(scripts/download-cef-runtime.sh native-macos "$RUNNER_TEMP/cef")"
+          echo "CEF_PATH=$CEF_PATH" >> "$GITHUB_ENV"
       - name: Make DMG
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

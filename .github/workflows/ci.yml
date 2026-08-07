@@ -23,6 +23,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Download CEF runtime
+        if: runner.os == 'macOS'
+        run: |
+          CEF_PATH="$(scripts/download-cef-runtime.sh native-macos "$RUNNER_TEMP/cef")"
+          echo "CEF_PATH=$CEF_PATH" >> "$GITHUB_ENV"
       - name: Stable
         run: cargo test
       - name: Stable (no default features)
@@ -41,5 +46,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install target
         run: rustup update && rustup target add x86_64-apple-darwin
+      - name: Download CEF runtime
+        run: |
+          CEF_PATH="$(scripts/download-cef-runtime.sh macosx64 "$RUNNER_TEMP/cef")"
+          echo "CEF_PATH=$CEF_PATH" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --target=x86_64-apple-darwin
