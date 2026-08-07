@@ -4,6 +4,7 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::rc::Rc as StdRc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -23,11 +24,14 @@ use super::cef_host::{CefHostSupervisor, RemoteViewEvent, RemoteViewInbox};
 use super::cef_host_protocol::{
     HostCommand, HostEvent, HostFrameEditCommand, HostGeometry, HostJsDialogKind, HostMouseButton,
     HostMouseEvent, HostRect, HostSurfaceElement, HostSurfaceFormat, RequestId, ViewId,
+    unix_deadline_after,
 };
 use super::cef_surface_transport::{ReceivedIoSurface, SurfaceFrame};
 use super::webview_cef;
 use crate::display::browser_layout::BrowserViewportLayout;
-use crate::ipc::AgentDownload;
+use crate::ipc::{
+    AGENT_APP_OPERATION_TIMEOUT, AGENT_APP_UPLOAD_TIMEOUT, AgentDownload, IpcError, IpcErrorCode,
+};
 
 const MAX_PENDING_REQUESTS: usize = 256;
 const MAX_DEVTOOLS_EVENTS: usize = 2048;
@@ -138,10 +142,27 @@ struct RemoteDevToolsEvent {
     payload: String,
 }
 
-enum PendingRequest {
-    Evaluate(Box<dyn FnOnce(Option<String>)>),
+enum PendingCompletion {
+    Evaluate(Box<dyn FnOnce(Result<Option<String>, IpcError>)>),
     DevTools(Box<dyn FnOnce(Result<JsonValue, String>)>),
-    FileInput(Box<dyn FnOnce(Result<String, String>)>),
+    FileInput(Box<dyn FnOnce(Result<String, IpcError>)>),
+}
+
+#[derive(Clone, Copy)]
+enum EvaluationRuntime {
+    Raw,
+    Agent,
+}
+
+#[derive(Clone, Copy)]
+struct PendingRequestToken {
+    request_id: RequestId,
+    expires_at_unix_millis: u64,
+}
+
+struct PendingRequest {
+    deadline: Instant,
+    completion: PendingCompletion,
 }
 
 struct RemoteWebViewState {
@@ -216,9 +237,9 @@ impl RemoteWebViewState {
 }
 
 enum RequestCompletion {
-    Evaluate(Box<dyn FnOnce(Option<String>)>, Option<String>),
+    Evaluate(Box<dyn FnOnce(Result<Option<String>, IpcError>)>, Result<Option<String>, IpcError>),
     DevTools(Box<dyn FnOnce(Result<JsonValue, String>)>, Result<JsonValue, String>),
-    FileInput(Box<dyn FnOnce(Result<String, String>)>, Result<String, String>),
+    FileInput(Box<dyn FnOnce(Result<String, IpcError>)>, Result<String, IpcError>),
 }
 
 fn command_request_id(command: &HostCommand) -> Option<RequestId> {
@@ -226,10 +247,14 @@ fn command_request_id(command: &HostCommand) -> Option<RequestId> {
 }
 
 fn fail_pending_request(request: PendingRequest, error: &str) {
-    match request {
-        PendingRequest::Evaluate(callback) => callback(None),
-        PendingRequest::DevTools(callback) => callback(Err(error.to_string())),
-        PendingRequest::FileInput(callback) => callback(Err(error.to_string())),
+    match request.completion {
+        PendingCompletion::Evaluate(callback) => {
+            callback(Err(IpcError::new(IpcErrorCode::Internal, error)))
+        },
+        PendingCompletion::DevTools(callback) => callback(Err(error.to_string())),
+        PendingCompletion::FileInput(callback) => {
+            callback(Err(IpcError::new(IpcErrorCode::Internal, error)))
+        },
     }
 }
 
@@ -241,16 +266,63 @@ fn take_failed_request_completions(
     state
         .pending
         .drain()
-        .map(|(_, pending)| match pending {
-            PendingRequest::Evaluate(callback) => RequestCompletion::Evaluate(callback, None),
-            PendingRequest::DevTools(callback) => {
+        .map(|(_, pending)| match pending.completion {
+            PendingCompletion::Evaluate(callback) => RequestCompletion::Evaluate(
+                callback,
+                Err(IpcError::new(IpcErrorCode::Internal, error)),
+            ),
+            PendingCompletion::DevTools(callback) => {
                 RequestCompletion::DevTools(callback, Err(error.to_string()))
             },
-            PendingRequest::FileInput(callback) => {
-                RequestCompletion::FileInput(callback, Err(error.to_string()))
-            },
+            PendingCompletion::FileInput(callback) => RequestCompletion::FileInput(
+                callback,
+                Err(IpcError::new(IpcErrorCode::Internal, error)),
+            ),
         })
         .collect()
+}
+
+fn take_expired_request_completions(
+    state: &mut RemoteWebViewState,
+    now: Instant,
+) -> Vec<RequestCompletion> {
+    let expired = state
+        .pending
+        .iter()
+        .filter_map(|(request_id, pending)| (pending.deadline <= now).then_some(*request_id))
+        .collect::<Vec<_>>();
+    state.deferred.retain(|command| match command_request_id(command) {
+        Some(request_id) => !expired.contains(&request_id),
+        None => true,
+    });
+    expired
+        .into_iter()
+        .filter_map(|request_id| state.pending.remove(&request_id))
+        .map(|pending| match pending.completion {
+            PendingCompletion::Evaluate(callback) => RequestCompletion::Evaluate(
+                callback,
+                Err(IpcError::new(IpcErrorCode::Timeout, "CEF host request timed out")),
+            ),
+            PendingCompletion::DevTools(callback) => RequestCompletion::DevTools(
+                callback,
+                Err(String::from("CEF host request timed out")),
+            ),
+            PendingCompletion::FileInput(callback) => RequestCompletion::FileInput(
+                callback,
+                Err(IpcError::new(IpcErrorCode::Timeout, "CEF host request timed out")),
+            ),
+        })
+        .collect()
+}
+
+fn finish_request_completions(completions: Vec<RequestCompletion>) {
+    for completion in completions {
+        match completion {
+            RequestCompletion::Evaluate(callback, result) => callback(result),
+            RequestCompletion::DevTools(callback, result) => callback(result),
+            RequestCompletion::FileInput(callback, result) => callback(result),
+        }
+    }
 }
 
 struct PendingRemoteDialog {
@@ -350,6 +422,10 @@ impl WebView {
             popup_surface_width: state.popup_surface.as_ref().map(|popup| popup.surface.width),
             popup_surface_height: state.popup_surface.as_ref().map(|popup| popup.surface.height),
         }
+    }
+
+    pub(crate) fn process_inbox_events(&self) {
+        self.drain_events();
     }
 
     pub fn load_url(&mut self, url: &str) -> bool {
@@ -522,14 +598,27 @@ impl WebView {
     where
         F: FnOnce(Option<String>) + 'static,
     {
-        self.evaluate(script, false, callback);
+        self.evaluate(script, false, move |result| callback(result.ok().flatten()));
     }
 
-    pub fn eval_js_string_with_user_gesture<F>(&mut self, script: &str, callback: F)
+    pub fn agent_eval_js_string_result<F>(&mut self, script: &str, callback: F)
     where
-        F: FnOnce(Option<String>) + 'static,
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
     {
-        self.evaluate(script, true, callback);
+        self.renew_agent_event_capture();
+        self.agent_evaluate_with_timeout(script, false, AGENT_APP_OPERATION_TIMEOUT, callback);
+    }
+
+    pub fn agent_eval_js_string_with_user_gesture_and_timeout<F>(
+        &mut self,
+        script: &str,
+        timeout: Duration,
+        callback: F,
+    ) where
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
+    {
+        self.renew_agent_event_capture();
+        self.agent_evaluate_with_timeout(script, true, timeout, callback);
     }
 
     pub fn devtools_command_json<F>(
@@ -542,14 +631,18 @@ impl WebView {
         F: FnOnce(Result<JsonValue, String>) + 'static,
     {
         self.drain_events();
-        let request_id = self
-            .insert_pending(PendingRequest::DevTools(Box::new(callback)))
+        let request = self
+            .insert_pending(
+                PendingCompletion::DevTools(Box::new(callback)),
+                AGENT_APP_OPERATION_TIMEOUT,
+            )
             .map_err(|_| String::from("Too many pending CEF host requests"))?;
         self.send_or_defer(HostCommand::DevTools {
             view_id: self.view_id,
-            request_id,
+            request_id: request.request_id,
             method: method.to_string(),
             params,
+            expires_at_unix_millis: request.expires_at_unix_millis,
         });
         Ok(())
     }
@@ -610,26 +703,31 @@ impl WebView {
         self.send_or_defer_shared(HostCommand::ReleaseInspectorSession { view_id: self.view_id });
     }
 
-    pub fn set_file_input_files<F>(
-        &self,
-        element_id: &str,
-        paths: Vec<String>,
-        callback: F,
-    ) -> Result<(), String>
+    pub fn set_file_input_files<F>(&self, element_id: &str, paths: Vec<String>, callback: F)
     where
-        F: FnOnce(Result<String, String>) + 'static,
+        F: FnOnce(Result<String, IpcError>) + 'static,
     {
         self.drain_events();
-        let request_id = self
-            .insert_pending(PendingRequest::FileInput(Box::new(callback)))
-            .map_err(|_| String::from("Too many pending CEF host requests"))?;
+        self.renew_agent_event_capture();
+        let pending = PendingCompletion::FileInput(Box::new(callback));
+        let request = match self.insert_pending(pending, AGENT_APP_UPLOAD_TIMEOUT) {
+            Ok(request) => request,
+            Err(PendingCompletion::FileInput(callback)) => {
+                callback(Err(IpcError::new(
+                    IpcErrorCode::Internal,
+                    "Unable to queue CEF host file input request",
+                )));
+                return;
+            },
+            Err(_) => unreachable!("file input inserted a non-file-input request"),
+        };
         self.send_or_defer_shared(HostCommand::SetFileInputFiles {
             view_id: self.view_id,
-            request_id,
+            request_id: request.request_id,
             element_id: element_id.to_string(),
             paths,
+            expires_at_unix_millis: request.expires_at_unix_millis,
         });
-        Ok(())
     }
 
     pub fn downloads(&self) -> Vec<AgentDownload> {
@@ -664,11 +762,6 @@ impl WebView {
         self.state.borrow().url.clone()
     }
 
-    pub fn host_generation(&self) -> u64 {
-        self.drain_events();
-        self.state.borrow().generation
-    }
-
     pub fn show_inspector(&mut self) -> bool {
         self.send_or_defer(HostCommand::ShowInspector { view_id: self.view_id });
         true
@@ -697,34 +790,103 @@ impl WebView {
 
     fn evaluate<F>(&self, script: &str, user_gesture: bool, callback: F)
     where
-        F: FnOnce(Option<String>) + 'static,
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
+    {
+        self.evaluate_with_timeout(script, user_gesture, AGENT_APP_OPERATION_TIMEOUT, callback);
+    }
+
+    fn evaluate_with_timeout<F>(
+        &self,
+        script: &str,
+        user_gesture: bool,
+        timeout: Duration,
+        callback: F,
+    ) where
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
+    {
+        self.evaluate_with_runtime(EvaluationRuntime::Raw, script, user_gesture, timeout, callback);
+    }
+
+    fn agent_evaluate_with_timeout<F>(
+        &self,
+        script: &str,
+        user_gesture: bool,
+        timeout: Duration,
+        callback: F,
+    ) where
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
+    {
+        self.evaluate_with_runtime(
+            EvaluationRuntime::Agent,
+            script,
+            user_gesture,
+            timeout,
+            callback,
+        );
+    }
+
+    fn evaluate_with_runtime<F>(
+        &self,
+        runtime: EvaluationRuntime,
+        script: &str,
+        user_gesture: bool,
+        timeout: Duration,
+        callback: F,
+    ) where
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
     {
         self.drain_events();
-        let pending = PendingRequest::Evaluate(Box::new(callback));
-        let request_id = match self.insert_pending(pending) {
-            Ok(request_id) => request_id,
-            Err(PendingRequest::Evaluate(callback)) => {
-                callback(None);
+        let pending = PendingCompletion::Evaluate(Box::new(callback));
+        let request = match self.insert_pending(pending, timeout) {
+            Ok(request) => request,
+            Err(PendingCompletion::Evaluate(callback)) => {
+                callback(Err(IpcError::new(
+                    IpcErrorCode::Internal,
+                    "Unable to queue CEF host evaluation",
+                )));
                 return;
             },
             Err(_) => unreachable!("evaluate inserted a non-evaluate request"),
         };
-        self.send_or_defer_shared(HostCommand::Evaluate {
-            view_id: self.view_id,
-            request_id,
-            script: script.to_string(),
-            user_gesture,
-        });
+        let command = match runtime {
+            EvaluationRuntime::Raw => HostCommand::Evaluate {
+                view_id: self.view_id,
+                request_id: request.request_id,
+                script: script.to_string(),
+                user_gesture,
+                expires_at_unix_millis: request.expires_at_unix_millis,
+            },
+            EvaluationRuntime::Agent => HostCommand::AgentEvaluate {
+                view_id: self.view_id,
+                request_id: request.request_id,
+                script: script.to_string(),
+                user_gesture,
+                expires_at_unix_millis: request.expires_at_unix_millis,
+            },
+        };
+        self.send_or_defer_shared(command);
     }
 
-    fn insert_pending(&self, request: PendingRequest) -> Result<RequestId, PendingRequest> {
+    fn insert_pending(
+        &self,
+        completion: PendingCompletion,
+        timeout: Duration,
+    ) -> Result<PendingRequestToken, PendingCompletion> {
+        let Ok(expires_at_unix_millis) = unix_deadline_after(timeout) else {
+            return Err(completion);
+        };
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return Err(completion);
+        };
         let mut state = self.state.borrow_mut();
         if state.pending.len() >= MAX_PENDING_REQUESTS {
-            return Err(request);
+            return Err(completion);
         }
         let request_id = self.supervisor.allocate_request_id();
-        state.pending.insert(request_id, request);
-        Ok(request_id)
+        state.pending.insert(request_id, PendingRequest { deadline, completion });
+        drop(state);
+        self.inbox.notify_request_deadline_changed();
+        Ok(PendingRequestToken { request_id, expires_at_unix_millis })
     }
 
     fn send_state(&self, command: HostCommand) -> bool {
@@ -739,11 +901,16 @@ impl WebView {
         self.drain_events();
         let ready = self.state.borrow().ready;
         if ready {
-            let _ = self.supervisor.send(command);
+            self.send_live_command(command);
             return;
         }
         let completion = {
             let mut state = self.state.borrow_mut();
+            if command_request_id(&command)
+                .is_some_and(|request_id| !state.pending.contains_key(&request_id))
+            {
+                return;
+            }
             let completion = if state.deferred.len() >= MAX_DEFERRED_COMMANDS {
                 state
                     .deferred
@@ -758,6 +925,23 @@ impl WebView {
         };
         if let Some(completion) = completion {
             fail_pending_request(completion, "CEF host command queue is full");
+        }
+    }
+
+    fn send_live_command(&self, command: HostCommand) {
+        let request_id = command_request_id(&command);
+        if request_id
+            .is_some_and(|request_id| !self.state.borrow().pending.contains_key(&request_id))
+        {
+            return;
+        }
+        if self.supervisor.send(command) {
+            return;
+        }
+        let completion =
+            request_id.and_then(|request_id| self.state.borrow_mut().pending.remove(&request_id));
+        if let Some(completion) = completion {
+            fail_pending_request(completion, "CEF host supervisor stopped");
         }
     }
 
@@ -875,15 +1059,19 @@ impl WebView {
                         HostEvent::Url { url, .. } => state.url = Some(url),
                         HostEvent::Downloads { downloads, .. } => state.downloads = downloads,
                         HostEvent::EvaluateResult { request_id, result, .. } => {
-                            if let Some(PendingRequest::Evaluate(callback)) =
-                                state.pending.remove(&request_id)
+                            if let Some(PendingRequest {
+                                completion: PendingCompletion::Evaluate(callback),
+                                ..
+                            }) = state.pending.remove(&request_id)
                             {
                                 completions.push(RequestCompletion::Evaluate(callback, result));
                             }
                         },
                         HostEvent::DevToolsResult { request_id, result, .. } => {
-                            if let Some(PendingRequest::DevTools(callback)) =
-                                state.pending.remove(&request_id)
+                            if let Some(PendingRequest {
+                                completion: PendingCompletion::DevTools(callback),
+                                ..
+                            }) = state.pending.remove(&request_id)
                             {
                                 completions.push(RequestCompletion::DevTools(callback, result));
                             }
@@ -892,8 +1080,10 @@ impl WebView {
                             state.push_devtools_event(payload);
                         },
                         HostEvent::FileInputResult { request_id, result, .. } => {
-                            if let Some(PendingRequest::FileInput(callback)) =
-                                state.pending.remove(&request_id)
+                            if let Some(PendingRequest {
+                                completion: PendingCompletion::FileInput(callback),
+                                ..
+                            }) = state.pending.remove(&request_id)
                             {
                                 completions.push(RequestCompletion::FileInput(callback, result));
                             }
@@ -917,7 +1107,7 @@ impl WebView {
                 .send(HostCommand::SurfaceAcquired { view_id: self.view_id, lease_id });
         }
         for command in commands_after_ready {
-            let _ = self.supervisor.send(command);
+            self.send_live_command(command);
         }
         for dialog in dialogs {
             present_remote_js_dialog(&self.dialog_state, dialog);
@@ -925,19 +1115,30 @@ impl WebView {
         for dialog_id in closed_dialogs {
             close_remote_js_dialog(&self.dialog_state, dialog_id, false);
         }
-        for completion in completions {
-            match completion {
-                RequestCompletion::Evaluate(callback, result) => callback(result),
-                RequestCompletion::DevTools(callback, result) => callback(result),
-                RequestCompletion::FileInput(callback, result) => callback(result),
-            }
-        }
+        finish_request_completions(completions);
+    }
+
+    pub fn expire_pending_requests(&self, now: Instant) -> Option<Instant> {
+        self.drain_events();
+        let (completions, next_deadline) = {
+            let mut state = self.state.borrow_mut();
+            let completions = take_expired_request_completions(&mut state, now);
+            let next_deadline = state.pending.values().map(|pending| pending.deadline).min();
+            (completions, next_deadline)
+        };
+        finish_request_completions(completions);
+        next_deadline
     }
 }
 
 impl Drop for WebView {
     fn drop(&mut self) {
         self.drain_events();
+        let completions = {
+            let mut state = self.state.borrow_mut();
+            take_failed_request_completions(&mut state, "web view closed")
+        };
+        finish_request_completions(completions);
         close_remote_js_dialog(&self.dialog_state, None, true);
         self.supervisor.unregister(self.view_id);
         super::unregister_webview();

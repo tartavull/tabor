@@ -24,7 +24,8 @@ test_pid=""
 open_pid=""
 protected_pid="${TABOR_PROTECTED_PID:-}"
 protected_command=""
-expected_cef_version="151.3.12.0"
+pinned_cef_version="$(tr -d '\n' < "$repo_root/cef-version.txt")"
+expected_cef_version="${pinned_cef_version%%+*}.0"
 
 if [[ -z "$protected_pid" ]]; then
   protected_pid="$(ps -axo pid=,command= | awk '$2 ~ /^\/Applications\/Tabor\.app\/Contents\/MacOS\// && !found { print $1; found = 1 }')"
@@ -89,9 +90,9 @@ if [[ -n "$protected_pid" ]]; then
 fi
 assert_protected_unchanged
 
-cef_root="${TABOR_CEF_PATH:-${CEF_PATH:-}}"
+cef_root="${CEF_PATH:-}"
 if [[ -z "$cef_root" ]]; then
-  echo "Set TABOR_CEF_PATH or CEF_PATH to the repo-pinned CEF 151 runtime." >&2
+  echo "Set CEF_PATH to the repo-pinned CEF 151 runtime." >&2
   exit 1
 fi
 
@@ -118,7 +119,7 @@ fi
 mkdir -p "$artifact_dir" "$state_root" "$app_path/Contents/MacOS" \
   "$app_path/Contents/Resources"
 cd "$repo_root"
-TABOR_CEF_PATH="$cef_root" CEF_PATH="$cef_root" CARGO_TARGET_DIR="$build_target_dir" \
+CEF_PATH="$cef_root" CARGO_TARGET_DIR="$build_target_dir" \
   cargo build -p tabor --bin tabor
 cp extra/osx/Tabor.Info.plist "$app_path/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" \
@@ -131,7 +132,7 @@ cp extra/osx/Tabor.Info.plist "$app_path/Contents/Info.plist"
   "$app_path/Contents/Info.plist"
 cp "$build_target_dir/debug/tabor" "$main_binary"
 chmod 755 "$main_binary"
-TABOR_CEF_PATH="$cef_root" CEF_PATH="$cef_root" scripts/bundle-macos-deps.sh "$app_path"
+CEF_PATH="$cef_root" scripts/bundle-macos-deps.sh "$app_path"
 scripts/create-macos-cef-helpers.sh "$app_path"
 scripts/sign-macos-app.sh "$app_path"
 

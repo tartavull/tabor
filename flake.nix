@@ -18,13 +18,14 @@
           overlays = [ rust-overlay.overlays.default ];
         };
         lib = pkgs.lib;
+        cefVersion = lib.removeSuffix "\n" (builtins.readFile ./cef-version.txt);
 
         rustToolchain = pkgs.rust-bin.stable."1.85.0".default.override {
           extensions = [ "rust-src" "rustfmt" "clippy" ];
         };
 
         cefTarball = pkgs.fetchzip {
-          url = "https://cef-builds.spotifycdn.com/cef_binary_151.3.12+gd9cea67+chromium-151.0.7922.47_macosarm64.tar.bz2";
+          url = "https://cef-builds.spotifycdn.com/cef_binary_${cefVersion}_macosarm64.tar.bz2";
           sha256 = "sha256-8PfYZ69HrR+1zBHD8MAkzo9oR/CjFXwiay08s+r9VXw=";
           stripRoot = true;
         };
@@ -65,7 +66,6 @@
           shellHook = ''
             echo "Tabor dev shell activated."
             ${lib.optionalString (pkgs.stdenv.isDarwin && pkgs.stdenv.isAarch64) ''
-              export TABOR_CEF_PATH=${cefTarball}
               export CEF_PATH=${cefTarball}
             ''}
           '';

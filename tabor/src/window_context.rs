@@ -97,12 +97,12 @@ use crate::ipc::{
     IpcTerminalViewportLine, IpcTerminalVisualPoint, IpcTouchPhase, IpcWebCloseMetrics,
     IpcWebFrameDeliveryMode, IpcWebMode, IpcWebViewMetrics, IpcWindowDebugButton,
     IpcWindowDebugJsDialogButton, IpcWindowDebugRect, IpcWindowDebugSnapshot, IpcWindowDebugState,
-    SocketReply, TabSelection, TerminalKeyInput,
+    SocketReply, TabSelection, TerminalKeyInput, agent_app_act_timeout,
 };
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::tab_panel::TabActivity;
 use crate::tabs::TabId;
 use crate::window_kind::WindowKind;
@@ -162,8 +162,6 @@ struct TabState {
     pdf_view: Option<PdfViewState>,
     #[cfg(target_os = "macos")]
     web_command_state: WebCommandState,
-    #[cfg(target_os = "macos")]
-    agent_runtime: AgentRuntimeState,
     #[cfg(target_os = "macos")]
     favicon: Option<TabFavicon>,
     #[cfg(target_os = "macos")]
@@ -316,6 +314,12 @@ enum TerminalSpawnMode {
     },
     #[cfg(unix)]
     RestoredLocalShell(Box<RestoredTerminalSpawn>),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TabActivation {
+    Activate,
+    PreserveActive,
 }
 
 #[cfg(unix)]
@@ -482,26 +486,6 @@ struct WebCloseMetrics {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Default)]
-struct AgentRuntimeState {
-    host_generation: Option<u64>,
-    preload_registered: bool,
-    injected_once: bool,
-}
-
-#[cfg(target_os = "macos")]
-impl AgentRuntimeState {
-    fn sync_host_generation(&mut self, generation: u64) {
-        if self.host_generation == Some(generation) {
-            return;
-        }
-        self.host_generation = Some(generation);
-        self.preload_registered = false;
-        self.injected_once = false;
-    }
-}
-
-#[cfg(target_os = "macos")]
 #[derive(Debug, Deserialize)]
 struct AgentScreenshotMeta {
     width: u32,
@@ -532,8 +516,8 @@ pub(crate) struct WindowDebugMouseDrag {
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct PendingAgentScreenshot {
-    meta: Option<Result<AgentScreenshotMeta, String>>,
-    data_base64: Option<Result<String, String>>,
+    meta: Option<Result<AgentScreenshotMeta, IpcError>>,
+    data_base64: Option<Result<String, IpcError>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -635,622 +619,6 @@ const WEB_FAVICON_JS: &str = r#"
 "#;
 
 #[cfg(target_os = "macos")]
-const AGENT_BOOTSTRAP_JS: &str = r#"
-(() => {
-  const VERSION = 2;
-  if (window.__taborAgent && window.__taborAgent.version === VERSION) {
-    return;
-  }
-
-  const state = window.__taborAgentState || (window.__taborAgentState = {
-    nextId: 1,
-    revision: 1,
-    inflight: 0,
-    observersInstalled: false,
-    networkInstalled: false,
-    dialogsInstalled: false,
-    nextDialogDecision: null
-  });
-
-  const bump = () => { state.revision += 1; };
-  const doc = () => document;
-  const round = (value) => Math.round(Number(value) || 0);
-
-  if (!state.observersInstalled) {
-    const observer = new MutationObserver(() => { bump(); });
-    observer.observe(document, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      characterData: true
-    });
-    window.addEventListener("hashchange", bump);
-    window.addEventListener("popstate", bump);
-    state.observersInstalled = true;
-  }
-
-  if (!state.networkInstalled) {
-    const finish = () => {
-      state.inflight = Math.max(0, state.inflight - 1);
-      bump();
-    };
-    if (typeof window.fetch === "function") {
-      const originalFetch = window.fetch.bind(window);
-      window.fetch = (...args) => {
-        state.inflight += 1;
-        bump();
-        try {
-          return Promise.resolve(originalFetch(...args)).finally(finish);
-        } catch (error) {
-          finish();
-          throw error;
-        }
-      };
-    }
-    const originalSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function(...args) {
-      state.inflight += 1;
-      bump();
-      this.addEventListener("loadend", finish, { once: true });
-      return originalSend.apply(this, args);
-    };
-    state.networkInstalled = true;
-  }
-
-  if (!state.dialogsInstalled) {
-    const consumeDialogDecision = () => {
-      const decision = state.nextDialogDecision || { accept: false, text: null };
-      state.nextDialogDecision = null;
-      bump();
-      return decision;
-    };
-
-    window.alert = (message) => {
-      state.lastDialog = {
-        kind: "alert",
-        message: String(message ?? ""),
-        default_prompt_text: null
-      };
-      consumeDialogDecision();
-    };
-
-    window.confirm = (message) => {
-      state.lastDialog = {
-        kind: "confirm",
-        message: String(message ?? ""),
-        default_prompt_text: null
-      };
-      return !!consumeDialogDecision().accept;
-    };
-
-    window.prompt = (message, defaultText = "") => {
-      state.lastDialog = {
-        kind: "prompt",
-        message: String(message ?? ""),
-        default_prompt_text: defaultText == null ? null : String(defaultText)
-      };
-      const decision = consumeDialogDecision();
-      if (!decision.accept) return null;
-      if (decision.text != null) return String(decision.text);
-      return defaultText == null ? "" : String(defaultText);
-    };
-
-    state.dialogsInstalled = true;
-  }
-
-  const visible = (el) => {
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden") return false;
-    return rect.bottom >= 0 && rect.right >= 0 &&
-      rect.top <= window.innerHeight && rect.left <= window.innerWidth;
-  };
-
-  const editable = (el) => {
-    if (!el) return false;
-    return !!el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
-  };
-
-  const interactive = (el) => {
-    if (!visible(el)) return false;
-    if (editable(el)) return true;
-    if (el.tagName === "A" && el.href) return true;
-    if (["BUTTON", "SUMMARY"].includes(el.tagName)) return true;
-    if (el.onclick) return true;
-    if (el.getAttribute("role")) return true;
-    if (el.tabIndex >= 0) return true;
-    return false;
-  };
-
-  const role = (el) => {
-    return (
-      el.getAttribute("role") ||
-      (el.tagName || "").toLowerCase()
-    );
-  };
-
-  const compactText = (value) => {
-    if (value == null) return null;
-    const text = String(value).replace(/\s+/g, " ").trim();
-    if (!text) return null;
-    return text.length > 96 ? text.slice(0, 96) : text;
-  };
-
-  const name = (el) => {
-    return compactText(
-      el.getAttribute("aria-label") ||
-      el.getAttribute("placeholder") ||
-      el.getAttribute("title") ||
-      el.innerText ||
-      el.textContent ||
-      el.id ||
-      el.value ||
-      ""
-    ) || "";
-  };
-
-  const value = (el) => {
-    if (!editable(el)) return null;
-    if ("value" in el) return compactText(el.value || "");
-    return compactText(el.textContent || "");
-  };
-
-  const checked = (el) => {
-    if ("checked" in el) return !!el.checked;
-    return null;
-  };
-
-  const placeholder = (el) => compactText(el.getAttribute("placeholder") || "");
-
-  const inputType = (el) => {
-    if (!el || !el.tagName) return null;
-    if (el.tagName === "INPUT") return String(el.getAttribute("type") || "text").toLowerCase();
-    if (el.tagName === "TEXTAREA") return "textarea";
-    if (el.tagName === "SELECT") return "select";
-    if (el.isContentEditable) return "contenteditable";
-    return null;
-  };
-
-  const bbox = (el) => {
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
-    if (!rect) return null;
-    return {
-      x: round(rect.left),
-      y: round(rect.top),
-      width: round(rect.width),
-      height: round(rect.height)
-    };
-  };
-
-  const center = (el) => {
-    const rect = bbox(el);
-    if (!rect) return null;
-    return {
-      x: rect.x + Math.floor(rect.width / 2),
-      y: rect.y + Math.floor(rect.height / 2)
-    };
-  };
-
-  const optionNames = (el) => {
-    if (!el || el.tagName !== "SELECT" || !el.options) return null;
-    const values = Array.from(el.options)
-      .map((option) => compactText(option.label || option.textContent || option.value || ""))
-      .filter(Boolean);
-    return values.length ? values : null;
-  };
-
-  const idFor = (el) => {
-    let id = el.getAttribute("data-tabor-agent-id");
-    if (!id) {
-      id = state.nextId.toString(36);
-      state.nextId += 1;
-      el.setAttribute("data-tabor-agent-id", id);
-    }
-    return id;
-  };
-
-  const resolve = (id) => {
-    return Array.from(doc().querySelectorAll("[data-tabor-agent-id]"))
-      .find((el) => el.getAttribute("data-tabor-agent-id") === id) || null;
-  };
-
-  const elements = () => {
-    const out = [];
-    const seen = new Set();
-    const selector = [
-      "a[href]",
-      "button",
-      "input",
-      "textarea",
-      "select",
-      "summary",
-      "[role]",
-      "[contenteditable=\"true\"]",
-      "[tabindex]"
-    ].join(",");
-    for (const el of Array.from(doc().querySelectorAll(selector))) {
-      if (!interactive(el)) continue;
-      const id = idFor(el);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      out.push({
-        id,
-        role: role(el),
-        name: name(el),
-        value: value(el),
-        editable: editable(el),
-        disabled: !!el.disabled,
-        checked: checked(el)
-      });
-    }
-    return out;
-  };
-
-  const observe = () => ({
-    revision: state.revision,
-    url: window.location.href,
-    title: doc().title || "",
-    ready_state: doc().readyState || "",
-    pending_requests: state.inflight,
-    elements: elements()
-  });
-
-  const inspect = (id) => {
-    const el = resolve(id);
-    if (!el) return { error: "element not found" };
-    return {
-      id,
-      role: role(el),
-      name: name(el),
-      value: value(el),
-      text: compactText(el.innerText || el.textContent || ""),
-      href: el.getAttribute("href") || el.href || null,
-      placeholder: placeholder(el),
-      input_type: inputType(el),
-      bbox: bbox(el),
-      center: center(el),
-      editable: editable(el),
-      disabled: !!el.disabled,
-      checked: checked(el),
-      options: optionNames(el)
-    };
-  };
-
-  const dispatchKeyboard = (type, key, modifiers) => {
-    const target = doc().activeElement || doc().body;
-    const init = {
-      key,
-      ctrlKey: !!modifiers.control,
-      altKey: !!modifiers.alt,
-      shiftKey: !!modifiers.shift,
-      metaKey: !!modifiers.super_key,
-      bubbles: true,
-      cancelable: true
-    };
-    target.dispatchEvent(new KeyboardEvent(type, init));
-  };
-
-  const dispatchKey = (key, modifiers) => {
-    dispatchKeyboard("keydown", key, modifiers);
-    dispatchKeyboard("keyup", key, modifiers);
-  };
-
-  const fill = (el, text) => {
-    el.focus();
-    if ("value" in el) {
-      el.value = text;
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return;
-    }
-    if (el.isContentEditable) {
-      el.textContent = text;
-      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
-      return;
-    }
-    throw new Error("element is not editable");
-  };
-
-  const typeText = (text) => {
-    const target = doc().activeElement || doc().body;
-    if (!target) return;
-    if ("value" in target) {
-      const current = String(target.value || "");
-      const next = `${current}${text}`;
-      target.value = next;
-      target.dispatchEvent(new Event("input", { bubbles: true }));
-      return;
-    }
-    if (target.isContentEditable) {
-      target.textContent = `${target.textContent || ""}${text}`;
-      target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
-      return;
-    }
-    target.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
-  };
-
-  const buttonCode = (button) => {
-    const name = String(button || "left").toLowerCase();
-    if (name === "right") return 2;
-    if (name === "middle") return 1;
-    return 0;
-  };
-
-  const targetAt = (x, y) => doc().elementFromPoint(x, y) || doc().body;
-
-  const mouseInit = (x, y, button, clickCount = 1) => ({
-    clientX: x,
-    clientY: y,
-    button: buttonCode(button),
-    buttons: 1,
-    detail: clickCount,
-    bubbles: true,
-    cancelable: true
-  });
-
-  const hoverAt = (x, y) => {
-    const target = targetAt(x, y);
-    target.dispatchEvent(new MouseEvent("mouseover", mouseInit(x, y, "left")));
-    target.dispatchEvent(new MouseEvent("mousemove", mouseInit(x, y, "left")));
-  };
-
-  const hoverElement = (el) => {
-    const point = center(el);
-    if (!point) throw new Error("element has no bounding box");
-    el.dispatchEvent(new MouseEvent("mouseover", mouseInit(point.x, point.y, "left")));
-    el.dispatchEvent(new MouseEvent("mousemove", mouseInit(point.x, point.y, "left")));
-    return point;
-  };
-
-  const mouseDownAt = (x, y, button) => {
-    const target = targetAt(x, y);
-    target.dispatchEvent(new MouseEvent("mousedown", mouseInit(x, y, button)));
-  };
-
-  const mouseUpAt = (x, y, button) => {
-    const target = targetAt(x, y);
-    target.dispatchEvent(new MouseEvent("mouseup", mouseInit(x, y, button)));
-  };
-
-  const clickAt = (x, y, button, clickCount = 1) => {
-    const target = targetAt(x, y);
-    hoverAt(x, y);
-    target.dispatchEvent(new MouseEvent("mousedown", mouseInit(x, y, button, clickCount)));
-    target.dispatchEvent(new MouseEvent("mouseup", mouseInit(x, y, button, clickCount)));
-    target.dispatchEvent(new MouseEvent("click", mouseInit(x, y, button, clickCount)));
-    if (clickCount >= 2) {
-      target.dispatchEvent(new MouseEvent("dblclick", mouseInit(x, y, button, clickCount)));
-    }
-    if (buttonCode(button) === 0 && typeof target.click === "function") {
-      target.click();
-    }
-  };
-
-  const clickElement = (el, button, clickCount = 1) => {
-    const point = hoverElement(el);
-    el.dispatchEvent(new MouseEvent("mousedown", mouseInit(point.x, point.y, button, clickCount)));
-    el.dispatchEvent(new MouseEvent("mouseup", mouseInit(point.x, point.y, button, clickCount)));
-    if (buttonCode(button) === 0 && clickCount === 1 && typeof el.click === "function") {
-      el.click();
-      return;
-    }
-    el.dispatchEvent(new MouseEvent("click", mouseInit(point.x, point.y, button, clickCount)));
-    if (clickCount >= 2) {
-      el.dispatchEvent(new MouseEvent("dblclick", mouseInit(point.x, point.y, button, clickCount)));
-    }
-    if (buttonCode(button) === 0 && typeof el.click === "function") {
-      el.click();
-    }
-  };
-
-  const drag = (fromX, fromY, toX, toY) => {
-    const source = targetAt(fromX, fromY);
-    const destination = targetAt(toX, toY);
-    const transfer = typeof DataTransfer === "function" ? new DataTransfer() : null;
-    const eventInit = (x, y) => ({
-      clientX: x,
-      clientY: y,
-      bubbles: true,
-      cancelable: true,
-      dataTransfer: transfer
-    });
-    source.dispatchEvent(new DragEvent("dragstart", eventInit(fromX, fromY)));
-    destination.dispatchEvent(new DragEvent("dragenter", eventInit(toX, toY)));
-    destination.dispatchEvent(new DragEvent("dragover", eventInit(toX, toY)));
-    destination.dispatchEvent(new DragEvent("drop", eventInit(toX, toY)));
-    source.dispatchEvent(new DragEvent("dragend", eventInit(toX, toY)));
-  };
-
-  const wheelAt = (dx, dy, x, y) => {
-    const target = targetAt(x ?? Math.floor(window.innerWidth / 2), y ?? Math.floor(window.innerHeight / 2));
-    target.dispatchEvent(new WheelEvent("wheel", {
-      deltaX: dx,
-      deltaY: dy,
-      clientX: x ?? Math.floor(window.innerWidth / 2),
-      clientY: y ?? Math.floor(window.innerHeight / 2),
-      bubbles: true,
-      cancelable: true
-    }));
-    window.scrollBy(dx, dy);
-  };
-
-  const upload = async (id) => {
-    const el = resolve(id);
-    if (!el) throw new Error("element not found");
-    if (String(el.tagName || "").toLowerCase() !== "input" || inputType(el) !== "file") {
-      throw new Error("element is not a file input");
-    }
-    if (typeof el.showPicker === "function") {
-      try {
-        el.showPicker();
-      } catch (_error) {
-        el.click();
-      }
-    } else {
-      el.click();
-    }
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      if (el.files && el.files.length > 0) return inspect(id);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error("upload timed out");
-  };
-
-  const screenshotMeta = () => ({
-    width: round(window.innerWidth),
-    height: round(window.innerHeight),
-    dpr: Number(window.devicePixelRatio || 1),
-    scroll_x: round(window.scrollX || 0),
-    scroll_y: round(window.scrollY || 0)
-  });
-
-  const waitFor = async (spec) => {
-    const timeoutMs = spec.timeout_ms || 10000;
-    if (spec.ms != null) {
-      await new Promise((resolve) => setTimeout(resolve, spec.ms));
-      return;
-    }
-    const deadline = Date.now() + timeoutMs;
-    let stableAt = 0;
-    while (Date.now() < deadline) {
-      let ok = true;
-      if (spec.id) ok = !!resolve(spec.id);
-      if (ok && spec.text) {
-        const body = doc().body ? (doc().body.innerText || doc().body.textContent || "") : "";
-        ok = body.includes(spec.text);
-      }
-      if (ok && spec.url_contains) ok = window.location.href.includes(spec.url_contains);
-      if (ok && spec.load) {
-        const mode = String(spec.load).toLowerCase();
-        if (mode === "domcontentloaded" || mode === "domcontent") {
-          ok = doc().readyState === "interactive" || doc().readyState === "complete";
-        } else if (mode === "networkidle" || mode === "network_idle") {
-          const idle = state.inflight === 0 && doc().readyState === "complete";
-          if (!idle) {
-            stableAt = 0;
-            ok = false;
-          } else if (!stableAt) {
-            stableAt = Date.now();
-            ok = false;
-          } else {
-            ok = Date.now() - stableAt >= 500;
-          }
-        } else {
-          ok = doc().readyState === "complete";
-        }
-      }
-      if (ok) return;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error("wait timed out");
-  };
-
-  const act = async (actions, includeObservation) => {
-    const results = [];
-    const nextDialogDecision = (startIndex) => {
-      for (let index = startIndex + 1; index < actions.length; index += 1) {
-        const action = actions[index];
-        if (action.__dialogConsumed) continue;
-        if (action.type === "dialog_accept") {
-          action.__dialogConsumed = true;
-          return { accept: true, text: action.text ?? null };
-        }
-        if (action.type === "dialog_dismiss") {
-          action.__dialogConsumed = true;
-          return { accept: false, text: null };
-        }
-      }
-      return { accept: false, text: null };
-    };
-
-    for (let index = 0; index < actions.length; index += 1) {
-      const action = actions[index];
-      try {
-        if (action.__dialogConsumed) {
-          results.push({ index, ok: true });
-          continue;
-        }
-        state.nextDialogDecision = nextDialogDecision(index);
-        if (action.type === "goto") {
-          window.location.href = action.url;
-        } else if (action.type === "click") {
-          const el = resolve(action.id);
-          if (!el) throw new Error("element not found");
-          el.scrollIntoView({ block: "center", inline: "center" });
-          clickElement(el, "left", 1);
-        } else if (action.type === "hover") {
-          const el = resolve(action.id);
-          if (!el) throw new Error("element not found");
-          hoverElement(el);
-        } else if (action.type === "hover_at") {
-          hoverAt(action.x, action.y);
-        } else if (action.type === "click_at") {
-          clickAt(action.x, action.y, action.button || "left", action.click_count || 1);
-        } else if (action.type === "mouse_down") {
-          mouseDownAt(action.x, action.y, action.button || "left");
-        } else if (action.type === "mouse_up") {
-          mouseUpAt(action.x, action.y, action.button || "left");
-        } else if (action.type === "drag") {
-          drag(action.from_x, action.from_y, action.to_x, action.to_y);
-        } else if (action.type === "fill") {
-          const el = resolve(action.id);
-          if (!el) throw new Error("element not found");
-          fill(el, action.text);
-        } else if (action.type === "press") {
-          dispatchKey(action.key, action.modifiers || {});
-        } else if (action.type === "key_down") {
-          dispatchKeyboard("keydown", action.key, action.modifiers || {});
-        } else if (action.type === "key_up") {
-          dispatchKeyboard("keyup", action.key, action.modifiers || {});
-        } else if (action.type === "type") {
-          typeText(action.text);
-        } else if (action.type === "paste") {
-          typeText(action.text);
-        } else if (action.type === "scroll") {
-          window.scrollBy(action.dx || 0, action.dy || 0);
-        } else if (action.type === "wheel") {
-          wheelAt(action.dx, action.dy, action.x, action.y);
-        } else if (action.type === "dialog_accept" || action.type === "dialog_dismiss") {
-          // Consumed by alert/confirm/prompt interception when needed.
-        } else if (action.type === "wait") {
-          await waitFor(action);
-        } else {
-          throw new Error("unsupported action");
-        }
-        results.push({ index, ok: true });
-      } catch (error) {
-        results.push({
-          index,
-          ok: false,
-          error: error && error.message ? String(error.message) : String(error)
-        });
-        break;
-      } finally {
-        state.nextDialogDecision = null;
-      }
-    }
-    return {
-      results,
-      observation: includeObservation ? observe() : null
-    };
-  };
-
-  window.__taborAgent = {
-    version: VERSION,
-    observe,
-    inspect,
-    act,
-    upload,
-    screenshotMeta
-  };
-})()
-"#;
-
-#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 struct WebFaviconHint {
     #[serde(default)]
@@ -1292,49 +660,6 @@ fn select_favicon_base(page_url: &str, base_uri: &str, referrer: &str) -> String
         return referrer.to_string();
     }
     page_url.to_string()
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_agent_runtime(web_view: &mut WebView, state: &mut AgentRuntimeState) {
-    state.sync_host_generation(web_view.host_generation());
-    web_view.renew_agent_event_capture();
-    if state.preload_registered {
-        return;
-    }
-
-    let _ = web_view.devtools_command_json(
-        "Page.addScriptToEvaluateOnNewDocument",
-        Some(json::json!({ "source": AGENT_BOOTSTRAP_JS })),
-        |_| {},
-    );
-    state.preload_registered = true;
-}
-
-#[cfg(target_os = "macos")]
-fn agent_script(state: &mut AgentRuntimeState, expression: &str) -> String {
-    let mut script = agent_script_prefix(state);
-    script.push_str("JSON.stringify(");
-    script.push_str(expression);
-    script.push(')');
-    script
-}
-
-#[cfg(target_os = "macos")]
-fn agent_object_script(state: &mut AgentRuntimeState, expression: &str) -> String {
-    let mut script = agent_script_prefix(state);
-    script.push_str(expression);
-    script
-}
-
-#[cfg(target_os = "macos")]
-fn agent_script_prefix(state: &mut AgentRuntimeState) -> String {
-    let mut script = String::new();
-    if !state.injected_once {
-        script.push_str(AGENT_BOOTSTRAP_JS);
-        script.push('\n');
-        state.injected_once = true;
-    }
-    script
 }
 
 impl TabState {
@@ -2224,7 +1549,6 @@ impl WindowContext {
             #[cfg(target_os = "macos")]
             web_command_state: Default::default(),
             #[cfg(target_os = "macos")]
-            agent_runtime: Default::default(),
             #[cfg(target_os = "macos")]
             favicon: None,
             #[cfg(target_os = "macos")]
@@ -2284,6 +1608,28 @@ impl WindowContext {
     #[cfg(target_os = "macos")]
     pub(crate) fn has_web_tab(&self) -> bool {
         self.tabs.iter().any(|tab| tab.kind.is_web())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn refresh_web_request_deadline(&mut self, scheduler: &mut Scheduler) {
+        let now = Instant::now();
+        let next_deadline = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.web_view.as_ref())
+            .filter_map(|web_view| web_view.expire_pending_requests(now))
+            .min();
+        let window_id = self.display.window.id();
+        let timer_id = TimerId::new(Topic::WebRequestDeadline, window_id);
+        scheduler.unschedule(timer_id);
+        if let Some(deadline) = next_deadline {
+            scheduler.schedule(
+                Event::new(EventType::WebRequestDeadline, window_id),
+                deadline.saturating_duration_since(now),
+                false,
+                timer_id,
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -2970,7 +2316,7 @@ impl WindowContext {
         options: WindowOptions,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_internal(options, proxy, None, None, None)
+        self.create_tab_internal(options, proxy, None, None, None, TabActivation::Activate)
     }
 
     pub(crate) fn create_tab_in_group(
@@ -2980,7 +2326,14 @@ impl WindowContext {
         group_name: Option<String>,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.create_tab_internal(options, proxy, group_id, group_name, None)
+        self.create_tab_internal(
+            options,
+            proxy,
+            group_id,
+            group_name,
+            None,
+            TabActivation::Activate,
+        )
     }
 
     fn create_tab_internal(
@@ -2990,6 +2343,7 @@ impl WindowContext {
         group_id: Option<usize>,
         group_name: Option<String>,
         terminal_spawn_mode: Option<TerminalSpawnMode>,
+        activation: TabActivation,
     ) -> Result<TabId, Box<dyn Error>> {
         let terminal_command_input = if matches!(&options.window_kind, WindowKind::Terminal) {
             options.terminal_options.command_input()
@@ -3012,14 +2366,22 @@ impl WindowContext {
             group_name,
             terminal_spawn_mode,
         )?;
-        self.set_active_tab(tab_id);
+        if activation == TabActivation::Activate {
+            self.set_active_tab(tab_id);
+        } else {
+            self.update_webview_visibility();
+            self.refresh_tab_panel();
+            self.display.pending_update.dirty = true;
+            self.display.damage_tracker.frame().mark_fully_damaged();
+            self.dirty = true;
+        }
         self.send_startup_input(tab_id, terminal_command_input);
         if let Some(input) = command_input.as_deref() {
-            if let Some(active_tab) = self.tabs.active_mut() {
-                active_tab.command_state.start_with_input(':', input);
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                tab.command_state.start_with_input(':', input);
                 #[cfg(target_os = "macos")]
-                if active_tab.kind.is_web() {
-                    if let Some(web_view) = active_tab.web_view.as_mut() {
+                if activation == TabActivation::Activate && tab.kind.is_web() {
+                    if let Some(web_view) = tab.web_view.as_mut() {
                         web_view.set_focus(false);
                     }
                     self.display.window.focus_content_view();
@@ -3591,6 +2953,7 @@ impl WindowContext {
         &mut self,
         url: String,
         group_id: Option<usize>,
+        activation: TabActivation,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
         let mut options = WindowOptions::default();
@@ -3599,7 +2962,7 @@ impl WindowContext {
             OpenUrlKind::Image => WindowKind::Image { source: url.clone() },
             OpenUrlKind::Pdf => WindowKind::Pdf { source: url.clone() },
         };
-        let tab_id = self.create_tab_in_group(options, group_id, None, proxy)?;
+        let tab_id = self.create_tab_internal(options, proxy, group_id, None, None, activation)?;
         self.command_history.record_url(url);
         Ok(tab_id)
     }
@@ -3610,7 +2973,7 @@ impl WindowContext {
         url: String,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.open_url_new_tab_with_group(url, None, proxy)
+        self.open_url_new_tab_with_group(url, None, TabActivation::Activate, proxy)
     }
 
     #[cfg(target_os = "macos")]
@@ -3620,16 +2983,17 @@ impl WindowContext {
         group_id: usize,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<TabId, Box<dyn Error>> {
-        self.open_url_new_tab_with_group(url, Some(group_id), proxy)
+        self.open_url_new_tab_with_group(url, Some(group_id), TabActivation::Activate, proxy)
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn open_web_url_new_tab(
+    fn open_web_url_new_tab(
         &mut self,
         url: String,
+        activation: TabActivation,
         proxy: &EventLoopProxy<Event>,
     ) -> Result<(), Box<dyn Error>> {
-        let _ = self.open_url_new_tab(url, proxy)?;
+        let _ = self.open_url_new_tab_with_group(url, None, activation, proxy)?;
         Ok(())
     }
 
@@ -5031,22 +4395,21 @@ impl WindowContext {
                 return;
             };
 
-            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
-            let script = agent_script(&mut tab.agent_runtime, "window.__taborAgent.observe()");
             let stream = Arc::clone(&stream);
-            web_view.eval_js_string(&script, move |result| {
+            web_view.agent_eval_js_string_result("window.__taborAgent.observe()", move |result| {
                 let reply = match result {
-                    Some(raw) => match json::from_str::<AgentObservation>(&raw) {
+                    Ok(Some(raw)) => match json::from_str::<AgentObservation>(&raw) {
                         Ok(observation) => SocketReply::AgentObservation { observation },
                         Err(err) => ipc::reply_error(
                             IpcErrorCode::Internal,
                             format!("Invalid agent observation: {err}"),
                         ),
                     },
-                    None => ipc::reply_error(
+                    Ok(None) => ipc::reply_error(
                         IpcErrorCode::Internal,
                         "Agent observe returned no payload",
                     ),
+                    Err(error) => SocketReply::Error { error },
                 };
                 if let Ok(mut stream) = stream.try_clone() {
                     ipc::send_reply(&mut stream, reply);
@@ -5093,24 +4456,23 @@ impl WindowContext {
                 return;
             };
 
-            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
             let expression =
                 format!("window.__taborAgent.inspect({})", json::to_string(&element_id).unwrap());
-            let script = agent_script(&mut tab.agent_runtime, &expression);
             let stream = Arc::clone(&stream);
-            web_view.eval_js_string(&script, move |result| {
+            web_view.agent_eval_js_string_result(&expression, move |result| {
                 let reply = match result {
-                    Some(raw) => match json::from_str::<AgentElementDetail>(&raw) {
+                    Ok(Some(raw)) => match json::from_str::<AgentElementDetail>(&raw) {
                         Ok(element) => SocketReply::AgentElement { element },
                         Err(err) => ipc::reply_error(
                             IpcErrorCode::Internal,
                             format!("Invalid agent element detail: {err}"),
                         ),
                     },
-                    None => ipc::reply_error(
+                    Ok(None) => ipc::reply_error(
                         IpcErrorCode::Internal,
                         "Agent inspect returned no payload",
                     ),
+                    Err(error) => SocketReply::Error { error },
                 };
                 if let Ok(mut stream) = stream.try_clone() {
                     ipc::send_reply(&mut stream, reply);
@@ -5157,25 +4519,34 @@ impl WindowContext {
                 return;
             };
 
-            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
-
             let pending = Arc::new(Mutex::new(PendingAgentScreenshot::default()));
-            let script =
-                agent_script(&mut tab.agent_runtime, "window.__taborAgent.screenshotMeta()");
             let stream_for_meta = Arc::clone(&stream);
             let pending_for_meta = Arc::clone(&pending);
-            web_view.eval_js_string(&script, move |result| {
-                let meta = match result {
-                    Some(raw) => json::from_str::<AgentScreenshotMeta>(&raw)
-                        .map_err(|err| format!("Invalid screenshot metadata: {err}")),
-                    None => Err(String::from("Agent screenshot metadata returned no payload")),
-                };
-                {
-                    let mut pending = pending_for_meta.lock().unwrap();
-                    pending.meta = Some(meta);
-                }
-                finish_pending_agent_screenshot(&pending_for_meta, &stream_for_meta);
-            });
+            web_view.agent_eval_js_string_result(
+                "window.__taborAgent.screenshotMeta()",
+                move |result| {
+                    let meta = match result {
+                        Ok(Some(raw)) => {
+                            json::from_str::<AgentScreenshotMeta>(&raw).map_err(|err| {
+                                IpcError::new(
+                                    IpcErrorCode::Internal,
+                                    format!("Invalid screenshot metadata: {err}"),
+                                )
+                            })
+                        },
+                        Ok(None) => Err(IpcError::new(
+                            IpcErrorCode::Internal,
+                            "Agent screenshot metadata returned no payload",
+                        )),
+                        Err(error) => Err(error),
+                    };
+                    {
+                        let mut pending = pending_for_meta.lock().unwrap();
+                        pending.meta = Some(meta);
+                    }
+                    finish_pending_agent_screenshot(&pending_for_meta, &stream_for_meta);
+                },
+            );
 
             let stream_for_capture = Arc::clone(&stream);
             let pending_for_capture = Arc::clone(&pending);
@@ -5188,15 +4559,20 @@ impl WindowContext {
                 "Page.captureScreenshot",
                 Some(params),
                 move |result| {
-                    let data_base64 = result.and_then(|payload| {
-                        payload
-                            .get("data")
-                            .and_then(JsonValue::as_str)
-                            .map(ToOwned::to_owned)
-                            .ok_or_else(|| {
-                                String::from("Page.captureScreenshot returned no image data")
-                            })
-                    });
+                    let data_base64 = result
+                        .map_err(|error| IpcError::new(IpcErrorCode::Internal, error))
+                        .and_then(|payload| {
+                            payload
+                                .get("data")
+                                .and_then(JsonValue::as_str)
+                                .map(ToOwned::to_owned)
+                                .ok_or_else(|| {
+                                    IpcError::new(
+                                        IpcErrorCode::Internal,
+                                        "Page.captureScreenshot returned no image data",
+                                    )
+                                })
+                        });
                     {
                         let mut pending = pending_for_capture.lock().unwrap();
                         pending.data_base64 = Some(data_base64);
@@ -5398,9 +4774,8 @@ impl WindowContext {
                 return;
             };
 
-            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
             let stream_for_reply = Arc::clone(&stream);
-            let command = web_view.set_file_input_files(&element_id, paths, move |result| {
+            web_view.set_file_input_files(&element_id, paths, move |result| {
                 let reply = match result {
                     Ok(raw) => match json::from_str::<JsonValue>(&raw) {
                         Ok(value) => {
@@ -5423,19 +4798,12 @@ impl WindowContext {
                             format!("Invalid agent upload result: {err}; payload={raw}"),
                         ),
                     },
-                    Err(err) => ipc::reply_error(IpcErrorCode::Internal, err),
+                    Err(error) => SocketReply::Error { error },
                 };
                 if let Ok(mut stream) = stream_for_reply.try_clone() {
                     ipc::send_reply(&mut stream, reply);
                 }
             });
-            if let Err(err) = command {
-                send_stream_error(
-                    &stream,
-                    IpcErrorCode::Internal,
-                    &format!("Agent upload failed: {err}"),
-                );
-            }
         }
     }
 
@@ -5520,7 +4888,15 @@ impl WindowContext {
                 return;
             };
 
-            ensure_agent_runtime(web_view, &mut tab.agent_runtime);
+            let Some(timeout) = agent_app_act_timeout(&actions) else {
+                send_stream_error(
+                    &stream,
+                    IpcErrorCode::InvalidRequest,
+                    "Agent action timeout is too large",
+                );
+                return;
+            };
+
             let actions_json = match json::to_string(&actions) {
                 Ok(actions_json) => actions_json,
                 Err(err) => {
@@ -5533,25 +4909,30 @@ impl WindowContext {
                 },
             };
             let expression = format!("window.__taborAgent.act({actions_json}, {observe})");
-            let script = agent_object_script(&mut tab.agent_runtime, &expression);
             let stream = Arc::clone(&stream);
-            web_view.eval_js_string_with_user_gesture(&script, move |result| {
-                let reply = match result {
-                    Some(raw) => match json::from_str::<AgentActResult>(&raw) {
-                        Ok(result) => SocketReply::AgentAct { result },
-                        Err(err) => ipc::reply_error(
+            web_view.agent_eval_js_string_with_user_gesture_and_timeout(
+                &expression,
+                timeout,
+                move |result| {
+                    let reply = match result {
+                        Ok(Some(raw)) => match json::from_str::<AgentActResult>(&raw) {
+                            Ok(result) => SocketReply::AgentAct { result },
+                            Err(err) => ipc::reply_error(
+                                IpcErrorCode::Internal,
+                                format!("Invalid agent action result: {err}"),
+                            ),
+                        },
+                        Ok(None) => ipc::reply_error(
                             IpcErrorCode::Internal,
-                            format!("Invalid agent action result: {err}"),
+                            "Agent act returned no payload",
                         ),
-                    },
-                    None => {
-                        ipc::reply_error(IpcErrorCode::Internal, "Agent act returned no payload")
-                    },
-                };
-                if let Ok(mut stream) = stream.try_clone() {
-                    ipc::send_reply(&mut stream, reply);
-                }
-            });
+                        Err(error) => SocketReply::Error { error },
+                    };
+                    if let Ok(mut stream) = stream.try_clone() {
+                        ipc::send_reply(&mut stream, reply);
+                    }
+                },
+            );
         }
     }
 
@@ -6820,10 +6201,20 @@ impl WindowContext {
                         continue;
                     },
                     #[cfg(target_os = "macos")]
+                    EventType::WebRequestDeadline => {
+                        self.refresh_web_request_deadline(scheduler);
+                        continue;
+                    },
+                    #[cfg(target_os = "macos")]
                     EventType::WebViewDirty => {
                         let Some(tab_id) = event.tab_id() else {
                             continue;
                         };
+                        if let Some(web_view) =
+                            self.tabs.get(tab_id).and_then(|tab| tab.web_view.as_ref())
+                        {
+                            web_view.process_inbox_events();
+                        }
                         if Some(tab_id) == active_id {
                             self.dirty = true;
                             if self.display.window.has_frame {
@@ -7168,7 +6559,15 @@ impl WindowContext {
             },
             WebCommand::OpenUrl { url, new_tab } => {
                 if *new_tab {
-                    if let Err(err) = self.open_web_url_new_tab(url.clone(), event_proxy) {
+                    let activation = match event.tab_id() {
+                        Some(tab_id) if Some(tab_id) != self.tabs.active_id() => {
+                            TabActivation::PreserveActive
+                        },
+                        _ => TabActivation::Activate,
+                    };
+                    if let Err(err) =
+                        self.open_web_url_new_tab(url.clone(), activation, event_proxy)
+                    {
                         self.message_buffer.push(crate::message_bar::Message::new(
                             format!("Failed to open URL: {err}"),
                             crate::message_bar::MessageType::Error,
@@ -7497,7 +6896,7 @@ fn finish_pending_agent_screenshot(
                 scroll_y: meta.scroll_y,
             },
         },
-        (Err(err), _) | (_, Err(err)) => ipc::reply_error(IpcErrorCode::Internal, err),
+        (Err(error), _) | (_, Err(error)) => SocketReply::Error { error },
     };
 
     if let Ok(mut stream) = stream.try_clone() {
@@ -7593,24 +6992,6 @@ mod tests {
         assert_eq!(normalize_favicon_char_counter(0xE000), FIRST_DYNAMIC_FAVICON_CHAR);
         assert_eq!(normalize_favicon_char_counter(0xE00F), FIRST_DYNAMIC_FAVICON_CHAR);
         assert_eq!(normalize_favicon_char_counter(0xF900), 0xF0000);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn agent_runtime_resets_when_the_cef_host_generation_changes() {
-        let mut state = AgentRuntimeState::default();
-        state.sync_host_generation(1);
-        state.preload_registered = true;
-        state.injected_once = true;
-
-        state.sync_host_generation(1);
-        assert!(state.preload_registered);
-        assert!(state.injected_once);
-
-        state.sync_host_generation(2);
-        assert_eq!(state.host_generation, Some(2));
-        assert!(!state.preload_registered);
-        assert!(!state.injected_once);
     }
 
     #[cfg(unix)]

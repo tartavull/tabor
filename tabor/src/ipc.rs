@@ -8,7 +8,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{env, fs, process};
 
 use log::{error, warn};
@@ -871,6 +871,25 @@ pub enum AgentAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
     },
+}
+
+pub(crate) const AGENT_APP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const AGENT_APP_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_AGENT_WAIT_TIMEOUT_MILLIS: u64 = 10_000;
+
+pub(crate) fn agent_app_act_timeout(actions: &[AgentAction]) -> Option<Duration> {
+    let base_millis = u64::try_from(AGENT_APP_OPERATION_TIMEOUT.as_millis()).ok()?;
+    let timeout_millis = actions.iter().try_fold(base_millis, |timeout, action| {
+        let wait_millis = match action {
+            AgentAction::Wait { ms: Some(ms), .. } => *ms,
+            AgentAction::Wait { timeout_ms, .. } => timeout_ms
+                .filter(|timeout_ms| *timeout_ms > 0)
+                .unwrap_or(DEFAULT_AGENT_WAIT_TIMEOUT_MILLIS),
+            _ => 0,
+        };
+        timeout.checked_add(wait_millis)
+    })?;
+    Some(Duration::from_millis(timeout_millis))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -2095,6 +2114,11 @@ impl IpcConnection {
         self.send_raw(&json)
     }
 
+    pub fn set_timeout(&self, timeout: Option<Duration>) -> IoResult<()> {
+        self.reader.get_ref().set_read_timeout(timeout)?;
+        self.writer.set_write_timeout(timeout)
+    }
+
     pub fn send_raw(&mut self, message_json: &str) -> IoResult<Option<SocketReply>> {
         self.writer.write_all(message_json.as_bytes())?;
         self.writer.write_all(b"\n")?;
@@ -2115,7 +2139,7 @@ pub fn send_raw_message(
 /// Read IPC responses.
 fn read_reply_line<R: BufRead>(reader: &mut R) -> IoResult<Option<SocketReply>> {
     let mut buffer = String::new();
-    if let Ok(0) | Err(_) = reader.read_line(&mut buffer) {
+    if reader.read_line(&mut buffer)? == 0 {
         return Ok(None);
     }
 

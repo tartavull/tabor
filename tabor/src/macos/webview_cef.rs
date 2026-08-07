@@ -45,7 +45,7 @@ use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::window::Window;
 #[cfg(test)]
 use crate::event::{Event, EventType};
-use crate::ipc::AgentDownload;
+use crate::ipc::{AgentDownload, IpcError, IpcErrorCode};
 #[cfg(test)]
 use crate::tabs::TabId;
 #[cfg(test)]
@@ -88,14 +88,28 @@ unsafe impl Encode for CGRect {
     const ENCODING: Encoding = Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
 }
 
-type DevToolsCallback = Box<dyn FnOnce(Result<JsonValue, String>)>;
+type DevToolsCallback = Box<dyn FnOnce(Result<JsonValue, IpcError>)>;
+type AgentReadyCallback = Box<dyn FnOnce(Result<(), IpcError>)>;
+
+const AGENT_BOOTSTRAP_TEMPLATE: &str = include_str!("agent_bootstrap.js");
+const AGENT_RUNTIME_VERSION_PLACEHOLDER: &str = "__TABOR_AGENT_RUNTIME_VERSION__";
+const AGENT_RUNTIME_VERSION: u32 = 2;
 
 const MAX_DEVTOOLS_EVENTS: usize = 2048;
 const MAX_DEVTOOLS_EVENT_BYTES: usize = 256 * 1024;
 const MAX_DEVTOOLS_EVENTS_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PENDING_DEVTOOLS_CALLS: usize = 256;
+#[cfg(test)]
 const DEVTOOLS_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_EVENT_CAPTURE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn devtools_error(message: impl Into<String>) -> IpcError {
+    IpcError::new(IpcErrorCode::Internal, message)
+}
+
+fn devtools_timeout() -> IpcError {
+    IpcError::new(IpcErrorCode::Timeout, "DevTools method timed out")
+}
 
 #[derive(Clone)]
 struct DevToolsEvent {
@@ -105,7 +119,75 @@ struct DevToolsEvent {
 
 struct PendingDevToolsCall {
     callback: DevToolsCallback,
-    started_at: Instant,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AgentRuntimePhase {
+    #[default]
+    Unregistered,
+    Registering,
+    Registered,
+    Establishing,
+    Ready,
+}
+
+struct AgentReadyWaiter {
+    deadline: Instant,
+    callback: AgentReadyCallback,
+}
+
+enum AgentRuntimeQueueAction {
+    Run(AgentReadyWaiter),
+    Wait,
+    Register,
+    Establish,
+}
+
+#[derive(Default)]
+struct AgentRuntime {
+    phase: AgentRuntimePhase,
+    waiters: VecDeque<AgentReadyWaiter>,
+}
+
+impl AgentRuntime {
+    fn enqueue(&mut self, waiter: AgentReadyWaiter) -> AgentRuntimeQueueAction {
+        match self.phase {
+            AgentRuntimePhase::Ready => AgentRuntimeQueueAction::Run(waiter),
+            AgentRuntimePhase::Registering | AgentRuntimePhase::Establishing => {
+                self.waiters.push_back(waiter);
+                AgentRuntimeQueueAction::Wait
+            },
+            AgentRuntimePhase::Registered => {
+                self.phase = AgentRuntimePhase::Establishing;
+                self.waiters.push_back(waiter);
+                AgentRuntimeQueueAction::Establish
+            },
+            AgentRuntimePhase::Unregistered => {
+                self.phase = AgentRuntimePhase::Registering;
+                self.waiters.push_back(waiter);
+                AgentRuntimeQueueAction::Register
+            },
+        }
+    }
+
+    fn registration_succeeded(&mut self) {
+        debug_assert_eq!(self.phase, AgentRuntimePhase::Registering);
+        self.phase = AgentRuntimePhase::Establishing;
+    }
+
+    fn registration_failed(&mut self) -> VecDeque<AgentReadyWaiter> {
+        debug_assert_eq!(self.phase, AgentRuntimePhase::Registering);
+        self.phase = AgentRuntimePhase::Unregistered;
+        std::mem::take(&mut self.waiters)
+    }
+
+    fn finish_establishment(&mut self, succeeded: bool) -> VecDeque<AgentReadyWaiter> {
+        debug_assert_eq!(self.phase, AgentRuntimePhase::Establishing);
+        self.phase =
+            if succeeded { AgentRuntimePhase::Ready } else { AgentRuntimePhase::Registered };
+        std::mem::take(&mut self.waiters)
+    }
 }
 
 struct DevToolsState {
@@ -775,17 +857,31 @@ impl DevToolsState {
         (out, newest)
     }
 
+    #[cfg(test)]
     fn insert_pending(
         &mut self,
         callback: DevToolsCallback,
         now: Instant,
+        timeout: Duration,
+    ) -> Result<i32, DevToolsCallback> {
+        let Some(deadline) = now.checked_add(timeout) else {
+            return Err(callback);
+        };
+
+        self.insert_pending_at(callback, deadline)
+    }
+
+    fn insert_pending_at(
+        &mut self,
+        callback: DevToolsCallback,
+        deadline: Instant,
     ) -> Result<i32, DevToolsCallback> {
         if self.pending.len() >= MAX_PENDING_DEVTOOLS_CALLS {
             return Err(callback);
         }
 
         let id = self.next_id();
-        self.pending.insert(id, PendingDevToolsCall { callback, started_at: now });
+        self.pending.insert(id, PendingDevToolsCall { callback, deadline });
         Ok(id)
     }
 
@@ -793,10 +889,7 @@ impl DevToolsState {
         let expired_ids = self
             .pending
             .iter()
-            .filter_map(|(id, pending)| {
-                (now.saturating_duration_since(pending.started_at) >= DEVTOOLS_CALL_TIMEOUT)
-                    .then_some(*id)
-            })
+            .filter_map(|(id, pending)| (pending.deadline <= now).then_some(*id))
             .collect::<Vec<_>>();
 
         expired_ids
@@ -858,8 +951,65 @@ impl DevToolsState {
 fn fail_expired_devtools_callbacks(state: &StdRc<RefCell<DevToolsState>>, now: Instant) {
     let callbacks = state.borrow_mut().take_expired_callbacks(now);
     for callback in callbacks {
-        callback(Err(String::from("DevTools method timed out")));
+        callback(Err(devtools_timeout()));
     }
+}
+
+cef::wrap_task! {
+    struct ExpireDevToolsCallTask {
+        state: StdRc<RefCell<DevToolsState>>,
+        id: i32,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let callback = self
+                .state
+                .borrow_mut()
+                .pending
+                .remove(&self.id)
+                .map(|pending| pending.callback);
+            if let Some(callback) = callback {
+                callback(Err(devtools_timeout()));
+            }
+        }
+    }
+}
+
+fn insert_scheduled_devtools_call(
+    state: &StdRc<RefCell<DevToolsState>>,
+    callback: DevToolsCallback,
+    deadline: Instant,
+) -> Result<i32, (DevToolsCallback, IpcError)> {
+    let Some(remaining) =
+        deadline.checked_duration_since(Instant::now()).filter(|remaining| !remaining.is_zero())
+    else {
+        return Err((callback, devtools_timeout()));
+    };
+    let id = state
+        .borrow_mut()
+        .insert_pending_at(callback, deadline)
+        .map_err(|callback| (callback, devtools_error("Too many pending DevTools methods")))?;
+    let delay_ms = match i64::try_from(remaining.as_millis()) {
+        Ok(delay_ms) => delay_ms,
+        Err(_) => {
+            let callback = state
+                .borrow_mut()
+                .pending
+                .remove(&id)
+                .expect("inserted DevTools callback")
+                .callback;
+            return Err((callback, devtools_error("DevTools timeout is too large")));
+        },
+    };
+    let mut task = ExpireDevToolsCallTask::new(StdRc::clone(state), id);
+    if cef::post_delayed_task(cef::ThreadId::UI, Some(&mut task), delay_ms) != 0 {
+        return Ok(id);
+    }
+
+    let callback =
+        state.borrow_mut().pending.remove(&id).expect("inserted DevTools callback").callback;
+    Err((callback, devtools_error("Could not schedule DevTools timeout")))
 }
 
 const AGENT_EVENT_DOMAINS: [&str; 4] = ["Network", "Page", "Runtime", "Log"];
@@ -905,7 +1055,7 @@ cef::wrap_dev_tools_message_observer! {
                 (callback, expired_callbacks)
             };
             for callback in expired_callbacks {
-                callback(Err(String::from("DevTools method timed out")));
+                callback(Err(devtools_timeout()));
             }
 
             let Some(callback) = callback else {
@@ -913,7 +1063,7 @@ cef::wrap_dev_tools_message_observer! {
             };
 
             if success == 0 {
-                callback(Err(String::from("DevTools method failed")));
+                callback(Err(devtools_error("DevTools method failed")));
                 return;
             }
 
@@ -937,7 +1087,7 @@ cef::wrap_dev_tools_message_observer! {
                 (should_record, disable_domains, expired_callbacks)
             };
             for callback in expired_callbacks {
-                callback(Err(String::from("DevTools method timed out")));
+                callback(Err(devtools_timeout()));
             }
             if disable_domains
                 && browser
@@ -1877,6 +2027,7 @@ pub struct WebView {
     focus_policy: WebFocusPolicy,
     paint_state: StdRc<RefCell<PaintState>>,
     devtools_state: StdRc<RefCell<DevToolsState>>,
+    agent_runtime: StdRc<RefCell<AgentRuntime>>,
     js_dialog_backend: JsDialogBackend,
     host_bridge: Option<HostPaintBridge>,
     _devtools_observer: cef::DevToolsMessageObserver,
@@ -2007,6 +2158,7 @@ impl WebView {
                 focus_policy,
                 paint_state,
                 devtools_state,
+                agent_runtime: StdRc::new(RefCell::new(AgentRuntime::default())),
                 js_dialog_backend,
                 host_bridge: Some(host_bridge),
                 _devtools_observer: observer,
@@ -2220,14 +2372,19 @@ impl WebView {
         }
     }
 
-    fn eval_js_string_impl<F>(&mut self, script: &str, user_gesture: bool, callback: F)
-    where
-        F: FnOnce(Option<String>) + 'static,
+    fn eval_js_string_impl<F>(
+        &mut self,
+        script: &str,
+        user_gesture: bool,
+        deadline: Instant,
+        callback: F,
+    ) where
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
     {
         let mut params = match cef::dictionary_value_create() {
             Some(params) => params,
             None => {
-                callback(None);
+                callback(Err(devtools_error("Could not create Runtime.evaluate parameters")));
                 return;
             },
         };
@@ -2237,14 +2394,8 @@ impl WebView {
         dict_set_bool(&mut params, "userGesture", user_gesture);
 
         let browser = self.browser.clone();
-        self.devtools_execute("Runtime.evaluate", Some(params), move |result| {
-            let output = match result {
-                Ok(payload) => runtime_result_to_string(&payload),
-                Err(err) => {
-                    debug!("Runtime.evaluate failed: {err}");
-                    None
-                },
-            };
+        self.devtools_execute("Runtime.evaluate", Some(params), deadline, move |result| {
+            let output = result.and_then(|payload| runtime_result_to_string(&payload));
             invalidate_browser_surfaces(&browser);
             callback(output);
         });
@@ -2254,11 +2405,63 @@ impl WebView {
         &mut self,
         script: &str,
         user_gesture: bool,
+        deadline: Instant,
         callback: F,
     ) where
-        F: FnOnce(Option<String>) + 'static,
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
     {
-        self.eval_js_string_impl(script, user_gesture, callback);
+        self.eval_js_string_impl(script, user_gesture, deadline, callback);
+    }
+
+    pub(super) fn agent_eval_js_string_impl_for_host<F>(
+        &self,
+        script: &str,
+        user_gesture: bool,
+        deadline: Instant,
+        callback: F,
+    ) where
+        F: FnOnce(Result<Option<String>, IpcError>) + 'static,
+    {
+        let browser = self.browser.clone();
+        let devtools_state = self.devtools_state.clone();
+        let script = script.to_string();
+        self.run_when_agent_ready(deadline, move |readiness| match readiness {
+            Ok(()) => runtime_evaluate_with(
+                &browser,
+                &devtools_state,
+                &script,
+                user_gesture,
+                deadline,
+                callback,
+            ),
+            Err(error) => callback(Err(error)),
+        });
+    }
+
+    fn run_when_agent_ready<F>(&self, deadline: Instant, callback: F)
+    where
+        F: FnOnce(Result<(), IpcError>) + 'static,
+    {
+        let waiter = AgentReadyWaiter { deadline, callback: Box::new(callback) };
+        let action = self.agent_runtime.borrow_mut().enqueue(waiter);
+        match action {
+            AgentRuntimeQueueAction::Run(waiter) => {
+                run_agent_ready_waiters(VecDeque::from([waiter]), Ok(()));
+            },
+            AgentRuntimeQueueAction::Wait => {},
+            AgentRuntimeQueueAction::Register => dispatch_agent_runtime_registration(
+                &self.browser,
+                &self.devtools_state,
+                &self.agent_runtime,
+                deadline,
+            ),
+            AgentRuntimeQueueAction::Establish => dispatch_agent_runtime_establishment(
+                &self.browser,
+                &self.devtools_state,
+                &self.agent_runtime,
+                deadline,
+            ),
+        }
     }
 
     fn run_frame_edit_command(&self, command: FrameEditCommand) {
@@ -2297,18 +2500,19 @@ impl WebView {
         &self,
         method: &str,
         params: Option<JsonValue>,
+        deadline: Instant,
         callback: F,
-    ) -> Result<(), String>
+    ) -> Result<(), IpcError>
     where
-        F: FnOnce(Result<JsonValue, String>) + 'static,
+        F: FnOnce(Result<JsonValue, IpcError>) + 'static,
     {
         let params = match params {
             None => None,
             Some(JsonValue::Null) => None,
-            Some(value) => Some(json_to_cef_dictionary(&value)?),
+            Some(value) => Some(json_to_cef_dictionary(&value).map_err(devtools_error)?),
         };
 
-        self.devtools_execute_checked(method, params, callback)
+        self.devtools_execute_checked(method, params, deadline, callback)
     }
 
     pub fn renew_agent_event_capture(&self) {
@@ -2339,14 +2543,15 @@ impl WebView {
         &self,
         element_id: &str,
         paths: Vec<String>,
+        deadline: Instant,
         callback: F,
-    ) -> Result<(), String>
-    where
-        F: FnOnce(Result<String, String>) + 'static,
+    ) where
+        F: FnOnce(Result<String, IpcError>) + 'static,
     {
         let browser = self.browser.clone();
         let state = self.devtools_state.clone();
-        let callback: StringResultCallback = StdRc::new(RefCell::new(Some(Box::new(callback))));
+        let callback: SharedResultCallback<String> =
+            StdRc::new(RefCell::new(Some(Box::new(callback))));
         let selector = format!("[data-tabor-agent-id=\"{element_id}\"]");
         let inspect_script = format!(
             "(async () => {{\
@@ -2362,119 +2567,135 @@ impl WebView {
             selector = serde_json::to_string(&selector).unwrap(),
         );
 
-        let callback_for_root = callback.clone();
-        let browser_for_root = browser.clone();
-        let state_for_root = state.clone();
-        devtools_command_json_with(
-            &browser_for_root,
-            &state_for_root,
-            "DOM.getDocument",
-            Some(serde_json::json!({ "depth": 0 })),
-            move |result| {
-                let root_id = match result {
-                    Ok(payload) => payload
-                        .get("root")
-                        .and_then(|root| root.get("nodeId"))
-                        .and_then(JsonValue::as_u64),
-                    Err(err) => {
-                        finish_string_result_callback(&callback_for_root, Err(err));
-                        return;
-                    },
-                };
-                let Some(root_id) = root_id else {
-                    finish_string_result_callback(
-                        &callback_for_root,
-                        Err(String::from("DOM.getDocument returned no root node id")),
-                    );
-                    return;
-                };
+        let callback_for_readiness = callback.clone();
+        self.run_when_agent_ready(deadline, move |readiness| {
+            if let Err(error) = readiness {
+                finish_result_callback(&callback_for_readiness, Err(error));
+                return;
+            }
 
-                let browser = browser.clone();
-                let state = state.clone();
-                let selector = selector.clone();
-                let inspect_script = inspect_script.clone();
-                let paths = paths.clone();
-                let callback = callback_for_root.clone();
-                let browser_for_query = browser.clone();
-                let state_for_query = state.clone();
-                let query = devtools_command_json_with(
-                    &browser_for_query,
-                    &state_for_query,
-                    "DOM.querySelector",
-                    Some(serde_json::json!({
-                        "nodeId": root_id,
-                        "selector": selector,
-                    })),
-                    move |result| {
-                        let node_id = match result {
-                            Ok(payload) => payload.get("nodeId").and_then(JsonValue::as_u64),
-                            Err(err) => {
-                                finish_string_result_callback(&callback, Err(err));
-                                return;
-                            },
-                        };
-                        let Some(node_id) = node_id.filter(|node_id| *node_id != 0) else {
-                            finish_string_result_callback(
-                                &callback,
-                                Err(String::from("element not found")),
-                            );
+            let callback_for_root = callback.clone();
+            let callback_for_root_dispatch = callback.clone();
+            let browser_for_root = browser.clone();
+            let state_for_root = state.clone();
+            let root = devtools_command_json_with(
+                &browser_for_root,
+                &state_for_root,
+                "DOM.getDocument",
+                Some(serde_json::json!({ "depth": 0 })),
+                deadline,
+                move |result| {
+                    let root_id = match result {
+                        Ok(payload) => payload
+                            .get("root")
+                            .and_then(|root| root.get("nodeId"))
+                            .and_then(JsonValue::as_u64),
+                        Err(err) => {
+                            finish_result_callback(&callback_for_root, Err(err));
                             return;
-                        };
-
-                        let browser = browser.clone();
-                        let state = state.clone();
-                        let callback_for_set = callback.clone();
-                        let browser_for_set = browser.clone();
-                        let state_for_set = state.clone();
-                        let set_files = devtools_command_json_with(
-                            &browser_for_set,
-                            &state_for_set,
-                            "DOM.setFileInputFiles",
-                            Some(serde_json::json!({
-                                "nodeId": node_id,
-                                "files": paths,
-                            })),
-                            move |result| match result {
-                                Ok(_) => {
-                                    let callback_for_eval = callback_for_set.clone();
-                                    let browser_for_eval = browser.clone();
-                                    let state_for_eval = state.clone();
-                                    if let Err(err) = runtime_evaluate_with(
-                                        &browser_for_eval,
-                                        &state_for_eval,
-                                        &inspect_script,
-                                        false,
-                                        move |result| match result {
-                                            Some(raw) => finish_string_result_callback(
-                                                &callback_for_eval,
-                                                Ok(raw),
-                                            ),
-                                            None => finish_string_result_callback(
-                                                &callback_for_eval,
-                                                Err(String::from(
-                                                    "Runtime.evaluate returned no payload",
-                                                )),
-                                            ),
-                                        },
-                                    ) {
-                                        finish_string_result_callback(&callback_for_set, Err(err));
-                                    }
-                                },
-                                Err(err) => {
-                                    finish_string_result_callback(&callback_for_set, Err(err))
-                                },
-                            },
+                        },
+                    };
+                    let Some(root_id) = root_id else {
+                        finish_result_callback(
+                            &callback_for_root,
+                            Err(devtools_error("DOM.getDocument returned no root node id")),
                         );
-                        if let Err(err) = set_files {
-                            finish_string_result_callback(&callback, Err(err));
-                        }
-                    },
-                );
-                if let Err(err) = query {
-                    finish_string_result_callback(&callback_for_root, Err(err));
-                }
-            },
-        )
+                        return;
+                    };
+
+                    let browser = browser.clone();
+                    let state = state.clone();
+                    let selector = selector.clone();
+                    let inspect_script = inspect_script.clone();
+                    let paths = paths.clone();
+                    let callback = callback_for_root.clone();
+                    let browser_for_query = browser.clone();
+                    let state_for_query = state.clone();
+                    let query = devtools_command_json_with(
+                        &browser_for_query,
+                        &state_for_query,
+                        "DOM.querySelector",
+                        Some(serde_json::json!({
+                            "nodeId": root_id,
+                            "selector": selector,
+                        })),
+                        deadline,
+                        move |result| {
+                            let node_id = match result {
+                                Ok(payload) => payload.get("nodeId").and_then(JsonValue::as_u64),
+                                Err(err) => {
+                                    finish_result_callback(&callback, Err(err));
+                                    return;
+                                },
+                            };
+                            let Some(node_id) = node_id.filter(|node_id| *node_id != 0) else {
+                                finish_result_callback(
+                                    &callback,
+                                    Err(devtools_error("element not found")),
+                                );
+                                return;
+                            };
+
+                            let browser = browser.clone();
+                            let state = state.clone();
+                            let callback_for_set = callback.clone();
+                            let browser_for_set = browser.clone();
+                            let state_for_set = state.clone();
+                            let set_files = devtools_command_json_with(
+                                &browser_for_set,
+                                &state_for_set,
+                                "DOM.setFileInputFiles",
+                                Some(serde_json::json!({
+                                    "nodeId": node_id,
+                                    "files": paths,
+                                })),
+                                deadline,
+                                move |result| match result {
+                                    Ok(_) => {
+                                        let callback_for_eval = callback_for_set.clone();
+                                        let browser_for_eval = browser.clone();
+                                        let state_for_eval = state.clone();
+                                        runtime_evaluate_with(
+                                            &browser_for_eval,
+                                            &state_for_eval,
+                                            &inspect_script,
+                                            false,
+                                            deadline,
+                                            move |result| match result {
+                                                Ok(Some(raw)) => finish_result_callback(
+                                                    &callback_for_eval,
+                                                    Ok(raw),
+                                                ),
+                                                Ok(None) => finish_result_callback(
+                                                    &callback_for_eval,
+                                                    Err(devtools_error(
+                                                        "Runtime.evaluate returned no payload",
+                                                    )),
+                                                ),
+                                                Err(error) => finish_result_callback(
+                                                    &callback_for_eval,
+                                                    Err(error),
+                                                ),
+                                            },
+                                        );
+                                    },
+                                    Err(err) => finish_result_callback(&callback_for_set, Err(err)),
+                                },
+                            );
+                            if let Err(err) = set_files {
+                                finish_result_callback(&callback, Err(err));
+                            }
+                        },
+                    );
+                    if let Err(err) = query {
+                        finish_result_callback(&callback_for_root, Err(err));
+                    }
+                },
+            );
+            if let Err(error) = root {
+                finish_result_callback(&callback_for_root_dispatch, Err(error));
+            }
+        });
     }
 
     pub fn show_inspector(&mut self) -> bool {
@@ -2500,23 +2721,31 @@ impl WebView {
         self.js_dialog_backend.complete(dialog_id, accepted, prompt_text);
     }
 
-    fn devtools_execute<F>(&self, method: &str, params: Option<cef::DictionaryValue>, callback: F)
-    where
-        F: FnOnce(Result<JsonValue, String>) + 'static,
+    fn devtools_execute<F>(
+        &self,
+        method: &str,
+        params: Option<cef::DictionaryValue>,
+        deadline: Instant,
+        callback: F,
+    ) where
+        F: FnOnce(Result<JsonValue, IpcError>) + 'static,
     {
         let Some(host) = self.browser.host() else {
-            callback(Err(String::from("DevTools host unavailable")));
+            callback(Err(devtools_error("DevTools host unavailable")));
             return;
         };
 
         let method = CefString::from(method);
         let mut params = params;
-        let now = Instant::now();
-        fail_expired_devtools_callbacks(&self.devtools_state, now);
-        let id = match self.devtools_state.borrow_mut().insert_pending(Box::new(callback), now) {
+        fail_expired_devtools_callbacks(&self.devtools_state, Instant::now());
+        let id = match insert_scheduled_devtools_call(
+            &self.devtools_state,
+            Box::new(callback),
+            deadline,
+        ) {
             Ok(id) => id,
-            Err(callback) => {
-                callback(Err(String::from("Too many pending DevTools methods")));
+            Err((callback, error)) => {
+                callback(Err(error));
                 return;
             },
         };
@@ -2528,7 +2757,7 @@ impl WebView {
                 state.pending.remove(&id).map(|pending| pending.callback)
             };
             if let Some(callback) = callback {
-                callback(Err(String::from("DevTools method dispatch failed")));
+                callback(Err(devtools_error("DevTools method dispatch failed")));
             }
         }
     }
@@ -2537,22 +2766,26 @@ impl WebView {
         &self,
         method: &str,
         params: Option<cef::DictionaryValue>,
+        deadline: Instant,
         callback: F,
-    ) -> Result<(), String>
+    ) -> Result<(), IpcError>
     where
-        F: FnOnce(Result<JsonValue, String>) + 'static,
+        F: FnOnce(Result<JsonValue, IpcError>) + 'static,
     {
         let Some(host) = self.browser.host() else {
-            return Err(String::from("DevTools host unavailable"));
+            return Err(devtools_error("DevTools host unavailable"));
         };
 
         let method = CefString::from(method);
         let mut params = params;
-        let now = Instant::now();
-        fail_expired_devtools_callbacks(&self.devtools_state, now);
-        let id = match self.devtools_state.borrow_mut().insert_pending(Box::new(callback), now) {
+        fail_expired_devtools_callbacks(&self.devtools_state, Instant::now());
+        let id = match insert_scheduled_devtools_call(
+            &self.devtools_state,
+            Box::new(callback),
+            deadline,
+        ) {
             Ok(id) => id,
-            Err(_) => return Err(String::from("Too many pending DevTools methods")),
+            Err((_, error)) => return Err(error),
         };
 
         let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
@@ -2561,10 +2794,138 @@ impl WebView {
                 let mut state = self.devtools_state.borrow_mut();
                 state.pending.remove(&id)
             };
-            return Err(String::from("DevTools method dispatch failed"));
+            return Err(devtools_error("DevTools method dispatch failed"));
         }
 
         Ok(())
+    }
+}
+
+fn agent_bootstrap_source() -> String {
+    let placeholder_count =
+        AGENT_BOOTSTRAP_TEMPLATE.matches(AGENT_RUNTIME_VERSION_PLACEHOLDER).count();
+    assert_eq!(
+        placeholder_count, 1,
+        "agent bootstrap must contain exactly one runtime version placeholder"
+    );
+    AGENT_BOOTSTRAP_TEMPLATE.replacen(
+        AGENT_RUNTIME_VERSION_PLACEHOLDER,
+        &AGENT_RUNTIME_VERSION.to_string(),
+        1,
+    )
+}
+
+fn agent_runtime_establishment_expression() -> String {
+    let bootstrap = agent_bootstrap_source();
+    format!("{bootstrap};\nwindow.__taborAgent ? window.__taborAgent.version : null")
+}
+
+fn validate_agent_runtime_registration(result: &JsonValue) -> Result<(), IpcError> {
+    result
+        .get("identifier")
+        .and_then(JsonValue::as_str)
+        .filter(|identifier| !identifier.trim().is_empty())
+        .map(|_| ())
+        .ok_or_else(|| devtools_error("Agent runtime registration returned no identifier"))
+}
+
+fn dispatch_agent_runtime_registration(
+    browser: &cef::Browser,
+    devtools_state: &StdRc<RefCell<DevToolsState>>,
+    agent_runtime: &StdRc<RefCell<AgentRuntime>>,
+    deadline: Instant,
+) {
+    let browser_for_establishment = browser.clone();
+    let state_for_establishment = devtools_state.clone();
+    let runtime_for_result = agent_runtime.clone();
+    let dispatch = devtools_command_json_with(
+        browser,
+        devtools_state,
+        "Page.addScriptToEvaluateOnNewDocument",
+        Some(serde_json::json!({
+            "source": agent_bootstrap_source(),
+            "runImmediately": true,
+        })),
+        deadline,
+        move |result| {
+            let registration = result
+                .and_then(|result| validate_agent_runtime_registration(&result).map(|_| result));
+            match registration {
+                Ok(_) => {
+                    runtime_for_result.borrow_mut().registration_succeeded();
+                    dispatch_agent_runtime_establishment(
+                        &browser_for_establishment,
+                        &state_for_establishment,
+                        &runtime_for_result,
+                        deadline,
+                    );
+                },
+                Err(error) => fail_agent_runtime_registration(&runtime_for_result, error),
+            }
+        },
+    );
+    if let Err(error) = dispatch {
+        fail_agent_runtime_registration(agent_runtime, error);
+    }
+}
+
+fn fail_agent_runtime_registration(agent_runtime: &StdRc<RefCell<AgentRuntime>>, error: IpcError) {
+    let waiters = agent_runtime.borrow_mut().registration_failed();
+    run_agent_ready_waiters(waiters, Err(error));
+}
+
+fn dispatch_agent_runtime_establishment(
+    browser: &cef::Browser,
+    devtools_state: &StdRc<RefCell<DevToolsState>>,
+    agent_runtime: &StdRc<RefCell<AgentRuntime>>,
+    deadline: Instant,
+) {
+    let runtime_for_result = agent_runtime.clone();
+    runtime_evaluate_with(
+        browser,
+        devtools_state,
+        &agent_runtime_establishment_expression(),
+        false,
+        deadline,
+        move |result| {
+            complete_agent_runtime_establishment(
+                &runtime_for_result,
+                validate_agent_runtime_version(result),
+            );
+        },
+    );
+}
+
+fn validate_agent_runtime_version(
+    result: Result<Option<String>, IpcError>,
+) -> Result<(), IpcError> {
+    let actual =
+        result?.ok_or_else(|| devtools_error("Agent runtime establishment had no value"))?;
+    let expected = AGENT_RUNTIME_VERSION.to_string();
+    if actual == expected {
+        return Ok(());
+    }
+    Err(devtools_error(format!(
+        "Agent runtime version mismatch: expected {expected}, got {actual}"
+    )))
+}
+
+fn complete_agent_runtime_establishment(
+    agent_runtime: &StdRc<RefCell<AgentRuntime>>,
+    result: Result<(), IpcError>,
+) {
+    let waiters = agent_runtime.borrow_mut().finish_establishment(result.is_ok());
+    run_agent_ready_waiters(waiters, result);
+}
+
+fn run_agent_ready_waiters(waiters: VecDeque<AgentReadyWaiter>, readiness: Result<(), IpcError>) {
+    for waiter in waiters {
+        let result = if Instant::now() >= waiter.deadline {
+            Err(IpcError::new(IpcErrorCode::Timeout, "Agent runtime readiness timed out"))
+        } else {
+            readiness.clone()
+        };
+        (waiter.callback)(result);
     }
 }
 
@@ -2574,6 +2935,16 @@ fn should_run_frame_edit_inline(on_ui_thread: bool, handling_send_event: bool) -
 
 impl Drop for WebView {
     fn drop(&mut self) {
+        let callbacks = self
+            .devtools_state
+            .borrow_mut()
+            .pending
+            .drain()
+            .map(|(_, pending)| pending.callback)
+            .collect::<Vec<_>>();
+        for callback in callbacks {
+            callback(Err(devtools_error("web view closed")));
+        }
         if MainThreadMarker::new().is_some() {
             self.js_dialog_backend.cancel();
         }
@@ -2593,28 +2964,28 @@ fn devtools_command_json_with<F>(
     state: &StdRc<RefCell<DevToolsState>>,
     method: &str,
     params: Option<JsonValue>,
+    deadline: Instant,
     callback: F,
-) -> Result<(), String>
+) -> Result<(), IpcError>
 where
-    F: FnOnce(Result<JsonValue, String>) + 'static,
+    F: FnOnce(Result<JsonValue, IpcError>) + 'static,
 {
     let params = match params {
         None => None,
         Some(JsonValue::Null) => None,
-        Some(value) => Some(json_to_cef_dictionary(&value)?),
+        Some(value) => Some(json_to_cef_dictionary(&value).map_err(devtools_error)?),
     };
 
     let Some(host) = browser.host() else {
-        return Err(String::from("DevTools host unavailable"));
+        return Err(devtools_error("DevTools host unavailable"));
     };
 
     let method = CefString::from(method);
     let mut params = params;
-    let now = Instant::now();
-    fail_expired_devtools_callbacks(state, now);
-    let id = match state.borrow_mut().insert_pending(Box::new(callback), now) {
+    fail_expired_devtools_callbacks(state, Instant::now());
+    let id = match insert_scheduled_devtools_call(state, Box::new(callback), deadline) {
         Ok(id) => id,
-        Err(_) => return Err(String::from("Too many pending DevTools methods")),
+        Err((_, error)) => return Err(error),
     };
 
     let ok = host.execute_dev_tools_method(id, Some(&method), params.as_mut());
@@ -2623,7 +2994,7 @@ where
             let mut state = state.borrow_mut();
             state.pending.remove(&id)
         };
-        return Err(String::from("DevTools method dispatch failed"));
+        return Err(devtools_error("DevTools method dispatch failed"));
     }
 
     Ok(())
@@ -2634,12 +3005,15 @@ fn runtime_evaluate_with<F>(
     state: &StdRc<RefCell<DevToolsState>>,
     script: &str,
     user_gesture: bool,
+    deadline: Instant,
     callback: F,
-) -> Result<(), String>
-where
-    F: FnOnce(Option<String>) + 'static,
+) where
+    F: FnOnce(Result<Option<String>, IpcError>) + 'static,
 {
-    devtools_command_json_with(
+    let callback: SharedResultCallback<Option<String>> =
+        StdRc::new(RefCell::new(Some(Box::new(callback))));
+    let callback_for_result = callback.clone();
+    let dispatch = devtools_command_json_with(
         browser,
         state,
         "Runtime.evaluate",
@@ -2649,22 +3023,22 @@ where
             "awaitPromise": true,
             "userGesture": user_gesture,
         })),
+        deadline,
         move |result| {
-            let output = match result {
-                Ok(payload) => runtime_result_to_string(&payload),
-                Err(err) => {
-                    debug!("Runtime.evaluate failed: {err}");
-                    None
-                },
-            };
-            callback(output);
+            finish_result_callback(
+                &callback_for_result,
+                result.and_then(|payload| runtime_result_to_string(&payload)),
+            );
         },
-    )
+    );
+    if let Err(error) = dispatch {
+        finish_result_callback(&callback, Err(error));
+    }
 }
 
-type StringResultCallback = StdRc<RefCell<Option<Box<dyn FnOnce(Result<String, String>)>>>>;
+type SharedResultCallback<T> = StdRc<RefCell<Option<Box<dyn FnOnce(Result<T, IpcError>)>>>>;
 
-fn finish_string_result_callback(callback: &StringResultCallback, result: Result<String, String>) {
+fn finish_result_callback<T>(callback: &SharedResultCallback<T>, result: Result<T, IpcError>) {
     if let Some(callback) = callback.borrow_mut().take() {
         callback(result);
     }
@@ -2882,20 +3256,25 @@ fn first_char_u16(text: &str) -> u16 {
     ch as u16
 }
 
-fn runtime_result_to_string(payload: &JsonValue) -> Option<String> {
-    if payload.get("exceptionDetails").is_some() {
-        return None;
+fn runtime_result_to_string(payload: &JsonValue) -> Result<Option<String>, IpcError> {
+    if let Some(details) = payload.get("exceptionDetails") {
+        let description = details
+            .pointer("/exception/description")
+            .and_then(JsonValue::as_str)
+            .or_else(|| details.get("text").and_then(JsonValue::as_str))
+            .unwrap_or("JavaScript evaluation failed");
+        return Err(devtools_error(description));
     }
 
     let result = payload.get("result").unwrap_or(payload);
     if let Some(value) = result.get("value") {
         if let Some(text) = value.as_str() {
-            return Some(text.to_string());
+            return Ok(Some(text.to_string()));
         }
-        return Some(value.to_string());
+        return Ok(Some(value.to_string()));
     }
 
-    result.get("description").and_then(|value| value.as_str()).map(|value| value.to_string())
+    Ok(result.get("description").and_then(JsonValue::as_str).map(str::to_string))
 }
 
 fn dict_set_string(dict: &mut cef::DictionaryValue, key: &str, value: &str) {
@@ -3093,20 +3472,25 @@ fn close_browser_resources(browser: &cef::Browser) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENT_EVENT_CAPTURE_IDLE_TIMEOUT, DEVTOOLS_CALL_TIMEOUT, DevToolsState,
-        MAX_DEVTOOLS_EVENT_BYTES, MAX_DEVTOOLS_EVENTS, MAX_DEVTOOLS_EVENTS_BYTES,
-        MAX_PENDING_DEVTOOLS_CALLS, PaintState, WebFocusPolicy, WebViewDirtyNotifier,
+        AGENT_EVENT_CAPTURE_IDLE_TIMEOUT, AGENT_RUNTIME_VERSION, AGENT_RUNTIME_VERSION_PLACEHOLDER,
+        AgentReadyWaiter, AgentRuntime, AgentRuntimePhase, AgentRuntimeQueueAction,
+        DEVTOOLS_CALL_TIMEOUT, DevToolsState, MAX_DEVTOOLS_EVENT_BYTES, MAX_DEVTOOLS_EVENTS,
+        MAX_DEVTOOLS_EVENTS_BYTES, MAX_PENDING_DEVTOOLS_CALLS, PaintState, WebFocusPolicy,
+        WebViewDirtyNotifier, agent_bootstrap_source, agent_runtime_establishment_expression,
         browser_device_scale_factor, browser_screen_point, browser_settings, cef_mouse_button_flag,
-        cef_mouse_event_flags, handle_ime_composition_range_change, handle_text_selection_change,
-        parse_web_editable_focus_message, scaled_browser_wheel_delta_y,
-        should_invalidate_after_frame_edit, should_invalidate_after_key_input,
-        should_run_frame_edit_inline,
+        cef_mouse_event_flags, devtools_error, devtools_timeout,
+        handle_ime_composition_range_change, handle_text_selection_change,
+        parse_web_editable_focus_message, run_agent_ready_waiters, runtime_result_to_string,
+        scaled_browser_wheel_delta_y, should_invalidate_after_frame_edit,
+        should_invalidate_after_key_input, should_run_frame_edit_inline,
+        validate_agent_runtime_registration, validate_agent_runtime_version,
     };
     #[cfg(not(feature = "passkey-webauthn"))]
     use super::{
         PermissionDecision, media_access_decision, permission_decision, permission_request_result,
         should_block_media_access_request, should_log_allowed_permission_request,
     };
+    use crate::ipc::IpcErrorCode;
     use crate::macos::test_support::{EnvVarGuard, env_lock};
     use cef::sys::cef_event_flags_t;
     #[cfg(not(feature = "passkey-webauthn"))]
@@ -3117,9 +3501,158 @@ mod tests {
     use objc2_app_kit::NSEventModifierFlags;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use winit::event::{ElementState, MouseButton};
     use winit::window::WindowId;
+
+    #[test]
+    fn agent_runtime_registration_requires_a_nonempty_identifier() {
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({ "identifier": null }),
+            serde_json::json!({ "identifier": "" }),
+            serde_json::json!({ "identifier": "  " }),
+        ] {
+            assert!(validate_agent_runtime_registration(&malformed).is_err());
+        }
+        assert!(
+            validate_agent_runtime_registration(&serde_json::json!({
+                "identifier": "preload-1"
+            }))
+            .is_ok()
+        );
+
+        let mut runtime = AgentRuntime::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(matches!(
+            runtime.enqueue(AgentReadyWaiter { deadline, callback: Box::new(|_| {}) }),
+            AgentRuntimeQueueAction::Register
+        ));
+        let _ = runtime.registration_failed();
+        assert_eq!(runtime.phase, AgentRuntimePhase::Unregistered);
+        assert!(matches!(
+            runtime.enqueue(AgentReadyWaiter { deadline, callback: Box::new(|_| {}) }),
+            AgentRuntimeQueueAction::Register
+        ));
+    }
+
+    #[test]
+    fn agent_runtime_registration_and_establishment_drain_waiters_in_fifo_order() {
+        let completed = Rc::new(RefCell::new(Vec::new()));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut runtime = AgentRuntime::default();
+
+        for id in [1, 2] {
+            let completed = completed.clone();
+            let action = runtime.enqueue(AgentReadyWaiter {
+                deadline,
+                callback: Box::new(move |result| {
+                    completed.borrow_mut().push((id, result.map_err(|error| error.code)));
+                }),
+            });
+            if id == 1 {
+                assert!(matches!(action, AgentRuntimeQueueAction::Register));
+            } else {
+                assert!(matches!(action, AgentRuntimeQueueAction::Wait));
+            }
+        }
+
+        runtime.registration_succeeded();
+        assert_eq!(runtime.phase, AgentRuntimePhase::Establishing);
+        let waiters = runtime.finish_establishment(true);
+        run_agent_ready_waiters(waiters, Ok(()));
+        assert_eq!(runtime.phase, AgentRuntimePhase::Ready);
+        assert_eq!(*completed.borrow(), vec![(1, Ok(())), (2, Ok(()))]);
+    }
+
+    #[test]
+    fn agent_runtime_establishment_failure_retries_without_duplicate_registration() {
+        let failed = Rc::new(RefCell::new(None));
+        let failed_result = failed.clone();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut runtime = AgentRuntime::default();
+        assert!(matches!(
+            runtime.enqueue(AgentReadyWaiter {
+                deadline,
+                callback: Box::new(move |result| {
+                    *failed_result.borrow_mut() = Some(result.map_err(|error| error.code));
+                }),
+            }),
+            AgentRuntimeQueueAction::Register
+        ));
+        runtime.registration_succeeded();
+        let waiters = runtime.finish_establishment(false);
+        run_agent_ready_waiters(waiters, Err(devtools_error("establishment failed")));
+        assert_eq!(runtime.phase, AgentRuntimePhase::Registered);
+        assert_eq!(*failed.borrow(), Some(Err(IpcErrorCode::Internal)));
+        let retried = Rc::new(RefCell::new(None));
+        let retried_result = retried.clone();
+        assert!(matches!(
+            runtime.enqueue(AgentReadyWaiter {
+                deadline,
+                callback: Box::new(move |result| {
+                    *retried_result.borrow_mut() = Some(result.map_err(|error| error.code));
+                }),
+            }),
+            AgentRuntimeQueueAction::Establish
+        ));
+        assert_eq!(runtime.phase, AgentRuntimePhase::Establishing);
+        let waiters = runtime.finish_establishment(true);
+        run_agent_ready_waiters(waiters, Ok(()));
+        assert_eq!(runtime.phase, AgentRuntimePhase::Ready);
+        assert_eq!(*retried.borrow(), Some(Ok(())));
+    }
+
+    #[test]
+    fn agent_runtime_does_not_run_expired_waiter_after_registration() {
+        let outcome = Rc::new(RefCell::new(None));
+        let outcome_for_callback = outcome.clone();
+        let mut runtime = AgentRuntime::default();
+        let action = runtime.enqueue(AgentReadyWaiter {
+            deadline: Instant::now().checked_sub(Duration::from_millis(1)).unwrap(),
+            callback: Box::new(move |result| {
+                *outcome_for_callback.borrow_mut() = Some(result.map_err(|error| error.code));
+            }),
+        });
+        assert!(matches!(action, AgentRuntimeQueueAction::Register));
+
+        runtime.registration_succeeded();
+        let waiters = runtime.finish_establishment(true);
+        run_agent_ready_waiters(waiters, Ok(()));
+        assert_eq!(*outcome.borrow(), Some(Err(IpcErrorCode::Timeout)));
+    }
+
+    #[test]
+    fn agent_runtime_establishment_rejects_wrong_version() {
+        let expected = AGENT_RUNTIME_VERSION.to_string();
+        assert!(validate_agent_runtime_version(Ok(Some(expected.clone()))).is_ok());
+
+        let error = validate_agent_runtime_version(Ok(Some(format!("{expected}0")))).unwrap_err();
+        assert_eq!(error.code, IpcErrorCode::Internal);
+        assert!(error.message.contains("version mismatch"));
+
+        let bootstrap = agent_bootstrap_source();
+        let expression = agent_runtime_establishment_expression();
+        assert!(!expression.contains(AGENT_RUNTIME_VERSION_PLACEHOLDER));
+        assert!(bootstrap.contains(&format!("const VERSION = {expected};")));
+        assert!(expression.starts_with(&format!("{bootstrap};\n")));
+        assert!(expression.ends_with("window.__taborAgent ? window.__taborAgent.version : null"));
+    }
+
+    #[test]
+    fn agent_runtime_exception_payload_is_an_error() {
+        let error = runtime_result_to_string(&serde_json::json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": { "description": "ReferenceError: missing is not defined" }
+            }
+        }))
+        .unwrap_err();
+
+        assert_eq!(error.code, IpcErrorCode::Internal);
+        assert_eq!(error.message, "ReferenceError: missing is not defined");
+    }
 
     #[test]
     fn devtools_event_stress_keeps_retention_bounded() {
@@ -3180,9 +3713,9 @@ mod tests {
         let now = Instant::now();
 
         for _ in 0..MAX_PENDING_DEVTOOLS_CALLS {
-            assert!(state.insert_pending(Box::new(|_| {}), now).is_ok());
+            assert!(state.insert_pending(Box::new(|_| {}), now, DEVTOOLS_CALL_TIMEOUT).is_ok());
         }
-        assert!(state.insert_pending(Box::new(|_| {}), now).is_err());
+        assert!(state.insert_pending(Box::new(|_| {}), now, DEVTOOLS_CALL_TIMEOUT).is_err());
 
         let timeout_result = Rc::new(RefCell::new(None));
         let timeout_result_for_callback = Rc::clone(&timeout_result);
@@ -3193,6 +3726,7 @@ mod tests {
                 .insert_pending(
                     Box::new(move |result| *timeout_result_for_callback.borrow_mut() = Some(result)),
                     started_at,
+                    DEVTOOLS_CALL_TIMEOUT,
                 )
                 .is_ok()
         );
@@ -3201,14 +3735,14 @@ mod tests {
         assert_eq!(callbacks.len(), 1);
         assert!(state.pending.is_empty());
         for callback in callbacks {
-            callback(Err(String::from("DevTools method timed out")));
+            callback(Err(devtools_timeout()));
         }
         assert_eq!(
             timeout_result
                 .borrow()
                 .as_ref()
                 .and_then(|result| result.as_ref().err())
-                .map(String::as_str),
+                .map(|error| error.message.as_str()),
             Some("DevTools method timed out")
         );
     }

@@ -37,7 +37,6 @@ type MessagePumpNotifier = Arc<dyn Fn(Duration) + Send + Sync + 'static>;
 const METRICS_NONE: u64 = u64::MAX;
 const MAX_MESSAGE_PUMP_DELAY_MS: u64 = 10_000;
 const CEF_CACHE_LOCK_FILE_NAME: &str = ".tabor-cef-instance.lock";
-pub(crate) const CEF_RUNTIME_VERSION: &str = "151.3.12+gd9cea67+chromium-151.0.7922.47";
 #[cfg(test)]
 const CEF_CRATE_VERSION: &str = "151.1.0";
 const PAGE_DISCARDER_FIX_MIN_CHROMIUM_MAJOR: u32 = 146;
@@ -51,6 +50,10 @@ static CEF_PUMP_LAST_REQUESTED_DELAY_MS: AtomicU64 = AtomicU64::new(METRICS_NONE
 static CEF_PUMP_LAST_EFFECTIVE_DELAY_MS: AtomicU64 = AtomicU64::new(METRICS_NONE);
 static CEF_PUMP_HIDDEN_THROTTLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CEF_PUMP_LAST_RUN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+pub(crate) fn runtime_version() -> &'static str {
+    include_str!("../../../cef-version.txt").trim()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CefPumpMetrics {
@@ -429,7 +432,7 @@ pub(crate) fn ensure_initialized_for_host() -> Result<(), Box<dyn Error>> {
 }
 
 fn ensure_page_discarder_fix_floor() -> io::Result<()> {
-    let chromium_major = CEF_RUNTIME_VERSION
+    let chromium_major = runtime_version()
         .split("chromium-")
         .nth(1)
         .and_then(|version| version.split('.').next())
@@ -526,107 +529,17 @@ pub fn is_initialized_global() -> bool {
 }
 
 pub(crate) fn framework_dir() -> Option<PathBuf> {
-    if let Ok(exe) = env::current_exe() {
-        return framework_dir_for_exe(&exe);
-    }
-
-    env_configured_framework_dir().or_else(vendor_framework_dir)
-}
-
-fn env_configured_framework_dir() -> Option<PathBuf> {
-    if let Ok(path) = env::var("TABOR_CEF_FRAMEWORK_DIR") {
-        if let Some(framework) = resolve_framework_dir(Path::new(&path)) {
-            return Some(framework);
-        }
-    }
-
-    if let Ok(path) = env::var("TABOR_CEF_PATH").or_else(|_| env::var("CEF_PATH")) {
-        if let Some(framework) = resolve_framework_dir(Path::new(&path)) {
-            return Some(framework);
-        }
-    }
-
-    None
-}
-
-fn vendor_framework_dir() -> Option<PathBuf> {
-    let arch_tag = if env::consts::ARCH == "aarch64" { "macosarm64" } else { "macosx64" };
-
-    let vendor_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("vendor").join("cef");
-    if !vendor_root.exists() {
-        return None;
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&vendor_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.contains(arch_tag) {
-                continue;
-            }
-            if let Some(framework) = resolve_framework_dir(&path) {
-                candidates.push(framework);
-            }
-        }
-    }
-
-    candidates.sort();
-    candidates.pop()
+    env::current_exe().ok().and_then(|exe| framework_dir_for_exe(&exe))
 }
 
 fn framework_dir_for_exe(exe: &Path) -> Option<PathBuf> {
-    if let Some(framework) = bundled_framework_dir_for_exe(exe) {
-        return Some(framework);
-    }
-
-    if bundle_paths_for_exe(exe).is_some() {
-        return None;
-    }
-
-    env_configured_framework_dir().or_else(vendor_framework_dir)
-}
-
-fn bundled_framework_dir_for_exe(exe: &Path) -> Option<PathBuf> {
     let bundle_root = bundle_paths_for_exe(exe)?.main_bundle;
-    let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
-    resolve_framework_dir(&frameworks_dir)
-}
-
-fn resolve_framework_dir(path: &Path) -> Option<PathBuf> {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "Chromium Embedded Framework.framework")
-    {
-        return path.canonicalize().ok();
-    }
-
-    let release = path.join("Release").join("Chromium Embedded Framework.framework");
-    if release.exists() {
-        return release.canonicalize().ok();
-    }
-
-    let debug = path.join("Debug").join("Chromium Embedded Framework.framework");
-    if debug.exists() {
-        return debug.canonicalize().ok();
-    }
-
-    // Some CEF distributions include a framework at the root as well as in Release/Debug. Prefer
-    // Release/Debug above, since those contain sidecar libraries in `.../Libraries/`.
-    let direct = path.join("Chromium Embedded Framework.framework");
-    if direct.exists() {
-        return direct.canonicalize().ok();
-    }
-
-    None
+    bundle_root
+        .join("Contents")
+        .join("Frameworks")
+        .join("Chromium Embedded Framework.framework")
+        .canonicalize()
+        .ok()
 }
 
 fn load_library(framework_dir: &Path) -> Result<(), Box<dyn Error>> {
@@ -875,7 +788,7 @@ mod tests {
 
     #[test]
     fn cef_pins_include_page_discarder_lifecycle_unit_fix() {
-        let chromium_version = CEF_RUNTIME_VERSION
+        let chromium_version = runtime_version()
             .split("chromium-")
             .nth(1)
             .expect("CEF runtime pin includes Chromium version");
@@ -890,16 +803,16 @@ mod tests {
             "Chromium {chromium_major} predates the PageDiscarder kNoLifecycleUnit fix"
         );
 
-        let archive_name = format!("cef_binary_{CEF_RUNTIME_VERSION}_macosarm64.tar.bz2");
-        assert!(include_str!("../../../flake.nix").contains(&archive_name));
-        assert!(include_str!("../../../.github/workflows/release.yml").contains(&archive_name));
         assert!(
             include_str!("../../Cargo.toml")
                 .contains(&format!("cef = {{ version = \"{CEF_CRATE_VERSION}\""))
         );
+        let (cef_release, _) =
+            runtime_version().split_once('+').expect("CEF runtime pin includes build metadata");
         assert!(
-            include_str!("../../../Cargo.lock")
-                .contains(&format!("name = \"cef\"\nversion = \"{CEF_CRATE_VERSION}+151.3.12\""))
+            include_str!("../../../Cargo.lock").contains(&format!(
+                "name = \"cef\"\nversion = \"{CEF_CRATE_VERSION}+{cef_release}\""
+            ))
         );
     }
 
@@ -1021,8 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_app_framework_dir_ignores_env_override() {
-        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+    fn bundled_app_framework_dir_uses_bundled_framework() {
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let app_root = temp_dir.path().join("Tabor.app");
         let exe = app_root.join("Contents").join("MacOS").join("tabor");
@@ -1030,62 +942,33 @@ mod tests {
             .join("Contents")
             .join("Frameworks")
             .join("Chromium Embedded Framework.framework");
-        let external_framework =
-            temp_dir.path().join("external").join("Chromium Embedded Framework.framework");
         fs::create_dir_all(exe.parent().unwrap()).expect("failed to create bundle executable dir");
         fs::write(&exe, b"").expect("failed to create fake executable");
         fs::create_dir_all(&bundled_framework).expect("failed to create bundled framework dir");
-        fs::create_dir_all(&external_framework).expect("failed to create external framework dir");
 
         let bundled_framework = bundled_framework.canonicalize().expect("canonical bundle dir");
-        let _framework_override =
-            EnvVarGuard::set("TABOR_CEF_FRAMEWORK_DIR", &external_framework.display().to_string());
-        let _path_override =
-            EnvVarGuard::set("TABOR_CEF_PATH", &external_framework.display().to_string());
-        let _cef_path = EnvVarGuard::set("CEF_PATH", &external_framework.display().to_string());
 
         assert_eq!(framework_dir_for_exe(&exe), Some(bundled_framework));
     }
 
     #[test]
     fn bundled_app_framework_dir_fails_closed_without_bundled_framework() {
-        let _env_guard = env_lock().lock().expect("environment lock poisoned");
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let app_root = temp_dir.path().join("Tabor.app");
         let exe = app_root.join("Contents").join("MacOS").join("tabor");
-        let external_framework =
-            temp_dir.path().join("external").join("Chromium Embedded Framework.framework");
         fs::create_dir_all(exe.parent().unwrap()).expect("failed to create bundle executable dir");
         fs::write(&exe, b"").expect("failed to create fake executable");
-        fs::create_dir_all(&external_framework).expect("failed to create external framework dir");
-
-        let _framework_override =
-            EnvVarGuard::set("TABOR_CEF_FRAMEWORK_DIR", &external_framework.display().to_string());
-        let _path_override =
-            EnvVarGuard::set("TABOR_CEF_PATH", &external_framework.display().to_string());
-        let _cef_path = EnvVarGuard::set("CEF_PATH", &external_framework.display().to_string());
 
         assert_eq!(framework_dir_for_exe(&exe), None);
     }
 
     #[test]
-    fn non_app_framework_dir_uses_env_override() {
-        let _env_guard = env_lock().lock().expect("environment lock poisoned");
+    fn non_app_framework_dir_fails_closed() {
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let exe = temp_dir.path().join("bin").join("tabor");
-        let external_framework =
-            temp_dir.path().join("external").join("Chromium Embedded Framework.framework");
         fs::create_dir_all(exe.parent().unwrap()).expect("failed to create executable dir");
         fs::write(&exe, b"").expect("failed to create fake executable");
-        fs::create_dir_all(&external_framework).expect("failed to create external framework dir");
 
-        let external_framework = external_framework.canonicalize().expect("canonical external dir");
-        let _framework_override =
-            EnvVarGuard::set("TABOR_CEF_FRAMEWORK_DIR", &external_framework.display().to_string());
-        let _path_override =
-            EnvVarGuard::set("TABOR_CEF_PATH", &external_framework.display().to_string());
-        let _cef_path = EnvVarGuard::set("CEF_PATH", &external_framework.display().to_string());
-
-        assert_eq!(framework_dir_for_exe(&exe), Some(external_framework));
+        assert_eq!(framework_dir_for_exe(&exe), None);
     }
 }

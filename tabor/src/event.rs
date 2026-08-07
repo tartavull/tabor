@@ -1815,6 +1815,8 @@ pub enum EventType {
     #[cfg(target_os = "macos")]
     WebViewDirty,
     #[cfg(target_os = "macos")]
+    WebRequestDeadline,
+    #[cfg(target_os = "macos")]
     ImageLoaded {
         image: Result<LoadedImage, String>,
     },
@@ -6069,6 +6071,7 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::WebEditableFocus { .. }
                 | EventType::WebCursorRequest
                 | EventType::WebViewDirty
+                | EventType::WebRequestDeadline
                 | EventType::ImageLoaded { .. }
                 | EventType::PdfLoaded { .. }
                 | EventType::PdfPageRasterized { .. }

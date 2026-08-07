@@ -19,131 +19,41 @@ fi
 
 mkdir -p "$frameworks_dir"
 
-canonical_dir() {
-  local path="$1"
-  (
-    cd "$path"
-    pwd
-  )
-}
-
-resolve_framework_dir() {
-  local path="$1"
-
-  if [[ -d "$path" && "$(basename "$path")" == "Chromium Embedded Framework.framework" ]]; then
-    canonical_dir "$path"
-    return 0
-  fi
-
-  local release="$path/Release/Chromium Embedded Framework.framework"
-  if [[ -d "$release" ]]; then
-    canonical_dir "$release"
-    return 0
-  fi
-
-  local debug="$path/Debug/Chromium Embedded Framework.framework"
-  if [[ -d "$debug" ]]; then
-    canonical_dir "$debug"
-    return 0
-  fi
-
-  local direct="$path/Chromium Embedded Framework.framework"
-  if [[ -d "$direct" ]]; then
-    canonical_dir "$direct"
-    return 0
-  fi
-
-  return 1
-}
-
-detect_vendor_cef_framework() {
-  local arch_tag
-  if [[ "$(uname -m)" == "arm64" ]]; then
-    arch_tag="macosarm64"
-  else
-    arch_tag="macosx64"
-  fi
-
-  local vendor_root="$repo_root/vendor/cef"
-  if [[ ! -d "$vendor_root" ]]; then
-    return 1
-  fi
-
-  local candidate
-  local framework=""
-  local resolved=""
-  while IFS= read -r candidate; do
-    if resolved="$(resolve_framework_dir "$candidate" 2>/dev/null)"; then
-      framework="$resolved"
-    fi
-  done < <(find "$vendor_root" -mindepth 1 -maxdepth 1 -type d -name "*${arch_tag}*" | sort)
-
-  if [[ -z "$framework" ]]; then
-    return 1
-  fi
-
-  printf '%s\n' "$framework"
-}
-
-detect_cef_framework() {
-  local explicit_framework="${TABOR_CEF_FRAMEWORK_DIR:-}"
-  local resolved=""
-  if [[ -n "$explicit_framework" ]]; then
-    if resolved="$(resolve_framework_dir "$explicit_framework" 2>/dev/null)"; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
-    echo "TABOR_CEF_FRAMEWORK_DIR does not point to Chromium Embedded Framework.framework: $explicit_framework" >&2
+bundle_cef_runtime() {
+  if [[ -z "${CEF_PATH:-}" ]]; then
+    echo "CEF_PATH must point to the repo-pinned CEF distribution." >&2
     exit 1
   fi
 
-  local cef_root="${TABOR_CEF_PATH:-${CEF_PATH:-}}"
-  if [[ -n "$cef_root" ]]; then
-    if resolved="$(resolve_framework_dir "$cef_root" 2>/dev/null)"; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
-    echo "TABOR_CEF_PATH/CEF_PATH does not contain Chromium Embedded Framework.framework: $cef_root" >&2
+  local expected_version
+  expected_version="$(tr -d '\n' < "$repo_root/cef-version.txt")"
+  local version_header="$CEF_PATH/include/cef_version.h"
+  if [[ ! -f "$version_header" ]]; then
+    echo "CEF_PATH is missing the required version header: $version_header" >&2
+    exit 1
+  fi
+  local actual_version
+  actual_version="$(sed -nE 's/^#define CEF_VERSION "([^"]+)"$/\1/p' "$version_header")"
+  if [[ "$actual_version" != "$expected_version" ]]; then
+    echo "CEF version mismatch at $CEF_PATH: found ${actual_version:-unknown}, expected $expected_version" >&2
     exit 1
   fi
 
-  if resolved="$(detect_vendor_cef_framework 2>/dev/null)"; then
-    printf '%s\n' "$resolved"
-    return 0
+  local framework_src="$CEF_PATH/Release/Chromium Embedded Framework.framework"
+  if [[ ! -d "$framework_src" ]]; then
+    echo "CEF_PATH does not contain the required release framework: $framework_src" >&2
+    exit 1
   fi
 
-  return 1
-}
-
-find_cef_sidecar_dir() {
-  local framework_dir="$1"
-  local candidates=(
-    "$(dirname "$framework_dir")"
-    "$framework_dir/Libraries"
-    "$(dirname "$(dirname "$framework_dir")")"
-    "$framework_dir"
-  )
-
-  local candidate
-  for candidate in "${candidates[@]}"; do
-    [[ -d "$candidate" ]] || continue
-    if [[ -f "$candidate/libGLESv2.dylib" && -f "$candidate/libEGL.dylib" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
+  local sidecar_src="$framework_src/Libraries"
+  local sidecar_libs=(libGLESv2.dylib libEGL.dylib)
+  local lib
+  for lib in "${sidecar_libs[@]}"; do
+    if [[ ! -f "$sidecar_src/$lib" ]]; then
+      echo "Missing CEF sidecar library '$lib' in '$sidecar_src'" >&2
+      exit 1
     fi
   done
-
-  return 1
-}
-
-bundle_cef_runtime() {
-  local framework_src
-  framework_src="$(detect_cef_framework || true)"
-  if [[ -z "$framework_src" ]]; then
-    echo "Unable to locate CEF framework for app bundling." >&2
-    echo "Set TABOR_CEF_FRAMEWORK_DIR or TABOR_CEF_PATH/CEF_PATH, or provide vendor/cef/<...>." >&2
-    exit 1
-  fi
 
   local framework_dst="$frameworks_dir/Chromium Embedded Framework.framework"
   rm -rf "$framework_dst"
@@ -151,21 +61,9 @@ bundle_cef_runtime() {
   chmod -R u+w "$framework_dst"
   echo "Bundled Chromium Embedded Framework.framework"
 
-  local sidecar_src
-  sidecar_src="$(find_cef_sidecar_dir "$framework_src" || true)"
-  if [[ -z "$sidecar_src" ]]; then
-    echo "Missing CEF sidecar libraries near '$framework_src'" >&2
-    exit 1
-  fi
-
-  local lib
-  for lib in libGLESv2.dylib libEGL.dylib; do
+  for lib in "${sidecar_libs[@]}"; do
     local src="$sidecar_src/$lib"
     local dst="$frameworks_dir/$lib"
-    if [[ ! -f "$src" ]]; then
-      echo "Missing CEF sidecar library '$lib' in '$sidecar_src'" >&2
-      exit 1
-    fi
     cp -fp "$src" "$dst"
     chmod u+w "$dst"
     ln -sfn "../Frameworks/$lib" "$macos_dir/$lib"

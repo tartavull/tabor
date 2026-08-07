@@ -32,6 +32,7 @@ pub enum Topic {
     TabActivityTick,
     CefPump,
     CefWatchdog,
+    WebRequestDeadline,
     WebCursor,
     WorkspaceAutosave,
     Frame,

@@ -4,10 +4,6 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-if [[ -z "${CEF_PATH:-}" && -n "${TABOR_CEF_PATH:-}" ]]; then
-  export CEF_PATH="$TABOR_CEF_PATH"
-fi
-
 if [[ "$(uname -s)" == "Darwin" ]]; then
   passkey_enabled=false
   case "${TABOR_ENABLE_PASSKEY:-0}" in

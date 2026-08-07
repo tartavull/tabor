@@ -1,3 +1,4 @@
+use std::fs;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,39 @@ pub fn default_version(version: &str) -> String {
         .unwrap_or_else(|| version.to_string())
 }
 
-pub fn check_archive_json(_version: &str, _location: &str) -> Result<()> {
+pub fn check_archive_json(version: &str, location: &str) -> Result<()> {
+    let package_release = default_version(version);
+    let expected = include_str!("../../../cef-version.txt").trim();
+    let expected_release = expected.split_once('+').map_or(expected, |(release, _)| release);
+    if package_release != expected_release {
+        return Err(Error(format!(
+            "CEF package version {package_release} does not match repo pin {expected}"
+        )));
+    }
+
+    let version_header = Path::new(location).join("include/cef_version.h");
+    let contents = fs::read_to_string(&version_header).map_err(|error| {
+        Error(format!(
+            "failed to read CEF version header {}: {error}",
+            version_header.display()
+        ))
+    })?;
+    let actual = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("#define CEF_VERSION \"")?.strip_suffix('"'))
+        .ok_or_else(|| {
+            Error(format!(
+                "CEF version header {} does not define CEF_VERSION",
+                version_header.display()
+            ))
+        })?;
+    if actual != expected {
+        return Err(Error(format!(
+            "CEF version mismatch at {}: found {actual}, expected {expected}",
+            Path::new(location).display()
+        )));
+    }
+
     Ok(())
 }
 
