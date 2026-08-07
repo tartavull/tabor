@@ -1570,11 +1570,14 @@ impl ApplicationHandler<Event> for Processor {
                     return;
                 }
 
-                let exit_code = match terminal_event {
-                    TerminalEvent::ChildExit(code) => Some(code),
-                    _ => None,
-                };
-                window_context.record_terminal_exit(tab_id, exit_code);
+                #[cfg(unix)]
+                {
+                    let exit_code = match terminal_event {
+                        TerminalEvent::ChildExit(code) => Some(code),
+                        _ => None,
+                    };
+                    window_context.record_terminal_exit(tab_id, exit_code);
+                }
 
                 if window_context.display.window.hold {
                     return;
@@ -4716,6 +4719,7 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     "Reload is only available in web and PDF tabs",
                 )));
             },
+            #[cfg(target_os = "macos")]
             WindowKind::Pdf { source } => {
                 let source = source.clone();
                 if let Some(pdf_view) = self.pdf_view.as_mut() {
@@ -4731,6 +4735,12 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
                     *self.dirty = true;
                     return;
                 }
+                self.push_command_error(CommandError::Message(String::from(
+                    "PDF view is unavailable",
+                )));
+            },
+            #[cfg(not(target_os = "macos"))]
+            WindowKind::Pdf { .. } => {
                 self.push_command_error(CommandError::Message(String::from(
                     "PDF view is unavailable",
                 )));
@@ -6080,7 +6090,6 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::CefWatchdog
                 | EventType::TabSearch(_)
                 | EventType::OpenUrls(_)
-                | EventType::WorkspaceAutosave
                 | EventType::Frame => (),
                 #[cfg(not(target_os = "macos"))]
                 EventType::Message(_)
@@ -6091,8 +6100,9 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                 | EventType::SetMultiColumnCount(_)
                 | EventType::UpdateTabProgramName
                 | EventType::TabActivityTick
-                | EventType::WorkspaceAutosave
                 | EventType::Frame => (),
+                #[cfg(unix)]
+                EventType::WorkspaceAutosave => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -6134,6 +6144,7 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                         }
 
                         self.ctx.display.pending_update.set_dimensions(size);
+                        #[cfg(target_os = "macos")]
                         if self.ctx.tab_kind.is_pdf() {
                             self.ctx.request_visible_pdf_rasters_for_viewport(size);
                         }
@@ -6154,6 +6165,7 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                         self.ctx.window().set_mouse_visible(true);
                         self.mouse_wheel_input(delta, phase);
                     },
+                    #[cfg(target_os = "macos")]
                     WindowEvent::PinchGesture { delta, phase, .. } => {
                         self.ctx.window().set_mouse_visible(true);
                         if self.ctx.window_kind().is_pdf() {
@@ -6162,6 +6174,7 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                             self.ctx.image_pinch_gesture(delta, phase);
                         }
                     },
+                    #[cfg(target_os = "macos")]
                     WindowEvent::DoubleTapGesture { .. } => {
                         self.ctx.window().set_mouse_visible(true);
                         if self.ctx.window_kind().is_pdf() {
@@ -6170,10 +6183,12 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                             self.ctx.image_smart_magnify();
                         }
                     },
+                    #[cfg(target_os = "macos")]
                     WindowEvent::RotationGesture { delta, phase, .. } => {
                         self.ctx.window().set_mouse_visible(true);
                         self.ctx.image_rotation_gesture(delta, phase);
                     },
+                    #[cfg(target_os = "macos")]
                     WindowEvent::TouchpadPressure { pressure, stage, .. } => {
                         self.ctx.window().set_mouse_visible(true);
                         if self.ctx.window_kind().is_pdf() {
@@ -6294,6 +6309,11 @@ impl<N: Notify + OnResize> input::Processor<EventProxy, ActionContext<'_, N, Eve
                     | WindowEvent::HoveredFile(_)
                     | WindowEvent::RedrawRequested
                     | WindowEvent::Moved(_) => (),
+                    #[cfg(not(target_os = "macos"))]
+                    WindowEvent::PinchGesture { .. }
+                    | WindowEvent::DoubleTapGesture { .. }
+                    | WindowEvent::RotationGesture { .. }
+                    | WindowEvent::TouchpadPressure { .. } => (),
                 }
             },
             WinitEvent::Suspended

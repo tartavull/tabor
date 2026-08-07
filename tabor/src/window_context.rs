@@ -76,8 +76,11 @@ use crate::event::WebCommand;
 use crate::event::{
     ActionContext, CommandFooterFeedback, CommandHistory, CommandState, Event, EventProxy,
     EventType, InlineSearchState, Mouse, MultiColumnCommand, MultiColumnCommandScope, SearchState,
-    TouchPurpose, request_image_load, request_pdf_load, request_pdf_raster,
-    request_web_cursor_update,
+    TouchPurpose,
+};
+#[cfg(target_os = "macos")]
+use crate::event::{
+    request_image_load, request_pdf_load, request_pdf_raster, request_web_cursor_update,
 };
 #[cfg(unix)]
 use crate::input::ActionContext as _;
@@ -416,6 +419,7 @@ fn spawn_local_terminal_runtime(
     #[cfg(not(windows))]
     let shell_pid = pty.child().id();
 
+    #[cfg(unix)]
     let output_observer = if let Some(terminal_id) = terminal_id {
         Some(Box::new({
             let observer =
@@ -439,6 +443,8 @@ fn spawn_local_terminal_runtime(
     } else {
         None
     };
+    #[cfg(not(unix))]
+    let output_observer = None;
 
     let event_loop = PtyEventLoop::new(
         Arc::clone(terminal),
@@ -1349,10 +1355,10 @@ impl WindowContext {
         let terminal = Arc::new(FairMutex::new(terminal));
 
         #[cfg(not(target_os = "macos"))]
-        if matches!(window_kind, WindowKind::Web { .. }) {
+        if !window_kind.is_terminal() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "Web tabs are only supported on macOS",
+                "non-terminal tabs are only supported on macOS",
             )
             .into());
         }
@@ -1408,6 +1414,7 @@ impl WindowContext {
             WindowKind::Terminal | WindowKind::Web { .. } | WindowKind::Image { .. } => None,
         };
 
+        #[cfg(target_os = "macos")]
         let default_title = match &window_kind {
             WindowKind::Terminal => config.window.identity.title.clone(),
             WindowKind::Web { url } => {
@@ -1420,6 +1427,8 @@ impl WindowContext {
             WindowKind::Image { source } => ImageViewState::new(source.clone()).title,
             WindowKind::Pdf { source } => PdfViewState::new(source.clone()).title,
         };
+        #[cfg(not(target_os = "macos"))]
+        let default_title = config.window.identity.title.clone();
         let terminal_view_mode = match &window_kind {
             WindowKind::Terminal => terminal_view_mode_for_count(multi_column_defaults.terminal),
             WindowKind::Web { .. } | WindowKind::Image { .. } | WindowKind::Pdf { .. } => {
@@ -1670,6 +1679,7 @@ impl WindowContext {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn begin_tab_rename(&mut self, tab_id: TabId) {
         let Some(label) = self.tabs.tab_label(tab_id) else {
             return;
@@ -1696,6 +1706,7 @@ impl WindowContext {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn begin_group_rename(&mut self, group_id: usize) {
         let name = self
             .tabs
@@ -2296,6 +2307,7 @@ impl WindowContext {
                 #[cfg(target_os = "macos")]
                 active_tab.web_command_state.reset_mode();
             }
+            #[cfg(target_os = "macos")]
             self.display.tab_panel.cancel_edit();
             self.update_webview_visibility();
             #[cfg(target_os = "macos")]
