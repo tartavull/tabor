@@ -24,12 +24,13 @@ use winit::window::WindowId;
 
 use super::cef_host_protocol::{
     HostCommand, HostEvent, HostGeometry, PROTOCOL_VERSION, RequestId, SurfaceLeaseId, ViewId,
-    read_message, write_message,
+    read_message, remaining_until_unix_deadline, unix_deadline_after, write_message,
 };
 use super::cef_surface_transport::{
     SurfaceEndpoint, SurfaceFrame, SurfaceReceiveEvent, SurfaceReceiver, SurfaceSender,
 };
 use crate::event::{Event, EventType, WebCommand};
+use crate::ipc::{AGENT_APP_OPERATION_TIMEOUT, IpcError, IpcErrorCode};
 use crate::tabs::TabId;
 
 const HOST_ARGUMENT: &str = "--tabor-cef-host";
@@ -82,6 +83,10 @@ impl RemoteViewInbox {
 
     pub(super) fn drain(&self) -> Vec<RemoteViewEvent> {
         self.queue.lock().expect("CEF host view inbox poisoned").drain(..).collect()
+    }
+
+    pub(super) fn notify_request_deadline_changed(&self) {
+        let _ = self.proxy.send_event(Event::new(EventType::WebRequestDeadline, self.window_id));
     }
 
     fn push(&self, event: RemoteViewEvent) -> Vec<SurfaceLeaseId> {
@@ -255,7 +260,13 @@ pub(crate) fn simulate_memory_pressure_for_test(view_id: ViewId) -> Result<Reque
         metrics.last_memory_pressure_request_id = Some(request_id);
         metrics.last_memory_pressure_error = None;
     }
-    if supervisor.send(HostCommand::SimulateMemoryPressureForTest { view_id, request_id }) {
+    let expires_at_unix_millis =
+        unix_deadline_after(AGENT_APP_OPERATION_TIMEOUT).map_err(|error| error.to_string())?;
+    if supervisor.send(HostCommand::SimulateMemoryPressureForTest {
+        view_id,
+        request_id,
+        expires_at_unix_millis,
+    }) {
         Ok(request_id)
     } else {
         let metrics_cell = host_metrics_cell();
@@ -933,7 +944,7 @@ fn run_child_host(
     sender.send(HostEvent::Ready {
         protocol_version: PROTOCOL_VERSION,
         pid: std::process::id(),
-        cef_version: String::from(super::cef::CEF_RUNTIME_VERSION),
+        cef_version: String::from(super::cef::runtime_version()),
     });
     thread::Builder::new()
         .name(String::from("tabor-cef-host-commands"))
@@ -997,6 +1008,20 @@ fn process_child_commands() {
     for command in commands {
         process_child_command(command);
     }
+}
+
+fn child_request_deadline(expires_at_unix_millis: u64) -> Result<Instant, IpcError> {
+    let remaining = remaining_until_unix_deadline(expires_at_unix_millis).map_err(|error| {
+        let code = if error.kind() == io::ErrorKind::TimedOut {
+            IpcErrorCode::Timeout
+        } else {
+            IpcErrorCode::Internal
+        };
+        IpcError::new(code, error.to_string())
+    })?;
+    Instant::now()
+        .checked_add(remaining)
+        .ok_or_else(|| IpcError::new(IpcErrorCode::Internal, "CEF host deadline overflow"))
 }
 
 fn process_child_command(command: HostCommand) {
@@ -1109,32 +1134,119 @@ fn process_child_command(command: HostCommand) {
                     view.host_key_events(events, invalidate_after);
                 }
             },
-            HostCommand::Evaluate { view_id, request_id, script, user_gesture } => {
-                if let Some(view) = state.views.get_mut(&view_id) {
+            HostCommand::Evaluate {
+                view_id,
+                request_id,
+                script,
+                user_gesture,
+                expires_at_unix_millis,
+            } => match child_request_deadline(expires_at_unix_millis) {
+                Ok(deadline) if state.views.contains_key(&view_id) => {
                     let sender = state.sender.clone();
-                    view.eval_js_string_impl_for_host(&script, user_gesture, move |result| {
-                        sender.send(HostEvent::EvaluateResult { view_id, request_id, result });
+                    let view = state.views.get_mut(&view_id).expect("checked web view");
+                    view.eval_js_string_impl_for_host(
+                        &script,
+                        user_gesture,
+                        deadline,
+                        move |result| {
+                            sender.send(HostEvent::EvaluateResult { view_id, request_id, result });
+                        },
+                    );
+                },
+                Ok(_) => {
+                    state.sender.send(HostEvent::EvaluateResult {
+                        view_id,
+                        request_id,
+                        result: Err(IpcError::new(IpcErrorCode::NotFound, "web view not found")),
                     });
-                }
+                },
+                Err(error) => {
+                    state.sender.send(HostEvent::EvaluateResult {
+                        view_id,
+                        request_id,
+                        result: Err(error),
+                    });
+                },
+            },
+            HostCommand::AgentEvaluate {
+                view_id,
+                request_id,
+                script,
+                user_gesture,
+                expires_at_unix_millis,
+            } => match child_request_deadline(expires_at_unix_millis) {
+                Ok(deadline) if state.views.contains_key(&view_id) => {
+                    let sender = state.sender.clone();
+                    let view = state.views.get_mut(&view_id).expect("checked web view");
+                    view.agent_eval_js_string_impl_for_host(
+                        &script,
+                        user_gesture,
+                        deadline,
+                        move |result| {
+                            sender.send(HostEvent::EvaluateResult { view_id, request_id, result });
+                        },
+                    );
+                },
+                Ok(_) => {
+                    state.sender.send(HostEvent::EvaluateResult {
+                        view_id,
+                        request_id,
+                        result: Err(IpcError::new(IpcErrorCode::NotFound, "web view not found")),
+                    });
+                },
+                Err(error) => {
+                    state.sender.send(HostEvent::EvaluateResult {
+                        view_id,
+                        request_id,
+                        result: Err(error),
+                    });
+                },
             },
             HostCommand::FrameEdit { view_id, command } => {
                 if let Some(view) = state.views.get_mut(&view_id) {
                     view.host_frame_edit(command);
                 }
             },
-            HostCommand::DevTools { view_id, request_id, method, params } => {
-                if let Some(view) = state.views.get_mut(&view_id) {
+            HostCommand::DevTools {
+                view_id,
+                request_id,
+                method,
+                params,
+                expires_at_unix_millis,
+            } => match child_request_deadline(expires_at_unix_millis) {
+                Ok(deadline) if state.views.contains_key(&view_id) => {
                     let sender = state.sender.clone();
-                    if let Err(err) = view.devtools_command_json(&method, params, move |result| {
-                        sender.send(HostEvent::DevToolsResult { view_id, request_id, result });
-                    }) {
+                    let view = state.views.get_mut(&view_id).expect("checked web view");
+                    if let Err(error) =
+                        view.devtools_command_json(&method, params, deadline, move |result| {
+                            sender.send(HostEvent::DevToolsResult {
+                                view_id,
+                                request_id,
+                                result: result.map_err(|error| error.message),
+                            });
+                        })
+                    {
                         state.sender.send(HostEvent::DevToolsResult {
                             view_id,
                             request_id,
-                            result: Err(err),
+                            result: Err(error.message),
                         });
                     }
-                }
+                },
+                Ok(_) => {
+                    state.sender.send(HostEvent::DevToolsResult {
+                        view_id,
+                        request_id,
+                        result: Err(String::from("web view not found")),
+                    });
+                },
+                Err(error) => {
+                    state.sender.send(HostEvent::DevToolsResult {
+                        view_id,
+                        request_id,
+                        result: Err(error.message),
+                    });
+                },
             },
             HostCommand::RenewAgentEventCapture { view_id } => {
                 if let Some(view) = state.views.get(&view_id) {
@@ -1151,19 +1263,34 @@ fn process_child_command(command: HostCommand) {
                     view.release_inspector_session();
                 }
             },
-            HostCommand::SetFileInputFiles { view_id, request_id, element_id, paths } => {
-                if let Some(view) = state.views.get(&view_id) {
+            HostCommand::SetFileInputFiles {
+                view_id,
+                request_id,
+                element_id,
+                paths,
+                expires_at_unix_millis,
+            } => match child_request_deadline(expires_at_unix_millis) {
+                Ok(deadline) if state.views.contains_key(&view_id) => {
                     let sender = state.sender.clone();
-                    if let Err(err) = view.set_file_input_files(&element_id, paths, move |result| {
+                    let view = state.views.get(&view_id).expect("checked web view");
+                    view.set_file_input_files(&element_id, paths, deadline, move |result| {
                         sender.send(HostEvent::FileInputResult { view_id, request_id, result });
-                    }) {
-                        state.sender.send(HostEvent::FileInputResult {
-                            view_id,
-                            request_id,
-                            result: Err(err),
-                        });
-                    }
-                }
+                    });
+                },
+                Ok(_) => {
+                    state.sender.send(HostEvent::FileInputResult {
+                        view_id,
+                        request_id,
+                        result: Err(IpcError::new(IpcErrorCode::NotFound, "web view not found")),
+                    });
+                },
+                Err(error) => {
+                    state.sender.send(HostEvent::FileInputResult {
+                        view_id,
+                        request_id,
+                        result: Err(error),
+                    });
+                },
             },
             HostCommand::ShowInspector { view_id } => {
                 if let Some(view) = state.views.get_mut(&view_id) {
@@ -1180,38 +1307,51 @@ fn process_child_command(command: HostCommand) {
                     view.complete_host_js_dialog(dialog_id, accepted, prompt_text.as_deref());
                 }
             },
-            HostCommand::SimulateMemoryPressureForTest { view_id, request_id } => {
+            HostCommand::SimulateMemoryPressureForTest {
+                view_id,
+                request_id,
+                expires_at_unix_millis,
+            } => {
                 if !super::bundle_identifier().starts_with("com.pinkbot.tabor.test.") {
                     state.sender.send(HostEvent::TestResult {
                         view_id,
                         request_id,
                         result: Err(String::from("memory-pressure injection requires test bundle")),
                     });
-                } else if let Some(view) = state.views.get(&view_id) {
+                } else if let Ok(deadline) = child_request_deadline(expires_at_unix_millis) {
+                    let Some(view) = state.views.get(&view_id) else {
+                        state.sender.send(HostEvent::TestResult {
+                            view_id,
+                            request_id,
+                            result: Err(String::from("web view not found")),
+                        });
+                        return;
+                    };
                     let sender = state.sender.clone();
                     let result = view.devtools_command_json(
                         "Memory.simulatePressureNotification",
                         Some(serde_json::json!({ "level": "critical" })),
+                        deadline,
                         move |result| {
                             sender.send(HostEvent::TestResult {
                                 view_id,
                                 request_id,
-                                result: result.map(|_| ()),
+                                result: result.map(|_| ()).map_err(|error| error.message),
                             });
                         },
                     );
-                    if let Err(err) = result {
+                    if let Err(error) = result {
                         state.sender.send(HostEvent::TestResult {
                             view_id,
                             request_id,
-                            result: Err(err),
+                            result: Err(error.message),
                         });
                     }
                 } else {
                     state.sender.send(HostEvent::TestResult {
                         view_id,
                         request_id,
-                        result: Err(String::from("web view not found")),
+                        result: Err(String::from("CEF host request expired")),
                     });
                 }
             },

@@ -22,10 +22,11 @@ use crate::cli::{
 };
 use crate::clipboard::Clipboard;
 use crate::ipc::{
-    AgentActResult, AgentAction, AgentDownload, AgentElementDetail, AgentEvent, AgentObservation,
-    IpcConnection, IpcRequest, IpcTabGroup, IpcTabId, IpcTabState, IpcTerminalObservation,
-    IpcTerminalRead, IpcTerminalReadScope, SocketReply, TerminalKeyInput, WebKeyModifiers,
-    WebKeyState, resolve_socket_path,
+    AGENT_APP_OPERATION_TIMEOUT, AGENT_APP_UPLOAD_TIMEOUT, AgentActResult, AgentAction,
+    AgentDownload, AgentElementDetail, AgentEvent, AgentObservation, IpcConnection, IpcRequest,
+    IpcTabGroup, IpcTabId, IpcTabState, IpcTerminalObservation, IpcTerminalRead,
+    IpcTerminalReadScope, SocketReply, TerminalKeyInput, WebKeyModifiers, WebKeyState,
+    agent_app_act_timeout, resolve_socket_path,
 };
 #[cfg(target_os = "macos")]
 use crate::macos;
@@ -33,6 +34,8 @@ use crate::macos;
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CONTROLLER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROLLER_DISPATCH_MARGIN: Duration = Duration::from_secs(5);
+const CONTROLLER_REPLY_MARGIN: Duration = Duration::from_secs(5);
 const INTERNAL_SERVE_ARG: &str = "__tabor_agent_serve";
 
 fn ipc_terminal_read_scope(scope: TerminalReadScopeArg) -> IpcTerminalReadScope {
@@ -71,6 +74,75 @@ enum ControllerRequest {
     Close,
 }
 
+impl ControllerRequest {
+    fn app_operation_timeout(&self) -> Result<Option<Duration>, IoError> {
+        match self {
+            Self::Ping | Self::ClipboardGet | Self::ClipboardSet { .. } | Self::Close => Ok(None),
+            Self::Upload { .. } => Ok(Some(AGENT_APP_UPLOAD_TIMEOUT)),
+            Self::Act { actions, .. } => {
+                agent_app_act_timeout(actions).map(Some).ok_or_else(|| {
+                    IoError::new(ErrorKind::InvalidInput, "agent action timeout is too large")
+                })
+            },
+            _ => Ok(Some(AGENT_APP_OPERATION_TIMEOUT)),
+        }
+    }
+
+    fn controller_timeout(&self) -> Result<Duration, IoError> {
+        self.app_operation_timeout()?
+            .unwrap_or(Duration::ZERO)
+            .checked_add(CONTROLLER_DISPATCH_MARGIN)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "controller timeout is too large"))
+    }
+
+    fn controller_reply_timeout(&self) -> Result<Duration, IoError> {
+        self.controller_timeout()?
+            .checked_add(CONTROLLER_REPLY_MARGIN)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "controller timeout is too large"))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ControllerEnvelope {
+    expires_at_unix_millis: u64,
+    request: ControllerRequest,
+}
+
+impl ControllerEnvelope {
+    fn new(request: ControllerRequest, valid_for: Duration) -> Result<Self, IoError> {
+        let valid_for_millis = u64::try_from(valid_for.as_millis()).map_err(|_| {
+            IoError::new(ErrorKind::InvalidInput, "controller timeout is too large")
+        })?;
+        let expires_at_unix_millis = unix_time_millis()?
+            .checked_add(valid_for_millis)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "controller deadline overflow"))?;
+        Ok(Self { expires_at_unix_millis, request })
+    }
+
+    fn remaining(&self, maximum: Duration) -> Result<Duration, IoError> {
+        let remaining_millis = self
+            .expires_at_unix_millis
+            .checked_sub(unix_time_millis()?)
+            .filter(|remaining| *remaining > 0)
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::TimedOut,
+                    "controller request expired before it could be dispatched",
+                )
+            })?;
+        Ok(Duration::from_millis(remaining_millis).min(maximum))
+    }
+}
+
+fn unix_time_millis() -> Result<u64, IoError> {
+    let millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| IoError::other("system clock is before the Unix epoch"))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| IoError::new(ErrorKind::InvalidData, "system clock is out of range"))
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControllerReply {
@@ -96,6 +168,113 @@ enum ControllerReply {
 enum ClientOutcome {
     Continue,
     Close,
+}
+
+struct TaborConnection {
+    socket: PathBuf,
+    connection: Option<IpcConnection>,
+}
+
+impl TaborConnection {
+    fn connect(socket: PathBuf) -> Result<Self, IoError> {
+        let connection = IpcConnection::connect(Some(socket.clone()))?;
+        Ok(Self { socket, connection: Some(connection) })
+    }
+
+    fn transaction<'a>(
+        &'a mut self,
+        timeout: Duration,
+        client: &'a UnixStream,
+    ) -> Result<TaborTransaction<'a>, IoError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "agent timeout is too large"))?;
+        Ok(TaborTransaction { connection: self, client, deadline })
+    }
+}
+
+struct TaborTransaction<'a> {
+    connection: &'a mut TaborConnection,
+    client: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl TaborTransaction<'_> {
+    fn remaining(&self) -> Result<Duration, IoError> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or_else(|| {
+                IoError::new(ErrorKind::TimedOut, "Tabor controller operation timed out")
+            })
+    }
+
+    fn send_message(&mut self, request: &IpcRequest) -> Result<Option<SocketReply>, IoError> {
+        if self.connection.connection.is_none() {
+            self.connection.connection =
+                Some(IpcConnection::connect(Some(self.connection.socket.clone()))?);
+        }
+
+        if peer_disconnected(self.client)? {
+            return Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "controller client disconnected before Tabor request dispatch",
+            ));
+        }
+
+        let timeout = self.remaining()?;
+        if ipc_request_operation_timeout(request)?
+            .is_some_and(|operation_timeout| timeout <= operation_timeout)
+        {
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                "controller request no longer has enough time to start the Tabor operation",
+            ));
+        }
+
+        let connection = self.connection.connection.as_mut().expect("connection initialized");
+        let result = connection
+            .set_timeout(Some(timeout))
+            .and_then(|()| connection.send_message(request))
+            .map_err(normalize_ipc_timeout);
+
+        if !matches!(result, Ok(Some(_))) {
+            self.connection.connection = None;
+        }
+
+        result
+    }
+}
+
+fn ipc_request_operation_timeout(request: &IpcRequest) -> Result<Option<Duration>, IoError> {
+    match request {
+        IpcRequest::AgentAct { actions, .. } => agent_app_act_timeout(actions)
+            .map(Some)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "agent timeout is too large")),
+        IpcRequest::AgentUpload { .. } => Ok(Some(AGENT_APP_UPLOAD_TIMEOUT)),
+        IpcRequest::ListTabs
+        | IpcRequest::GetTabState { .. }
+        | IpcRequest::AgentObserve { .. }
+        | IpcRequest::AgentInspect { .. }
+        | IpcRequest::AgentScreenshot { .. }
+        | IpcRequest::AgentEvents { .. }
+        | IpcRequest::AgentPdf { .. }
+        | IpcRequest::AgentDownloads { .. }
+        | IpcRequest::TerminalObserve { .. }
+        | IpcRequest::TerminalRead { .. }
+        | IpcRequest::TerminalScreenshot { .. }
+        | IpcRequest::TerminalKey { .. }
+        | IpcRequest::SendInput { .. } => Ok(Some(AGENT_APP_OPERATION_TIMEOUT)),
+        _ => Ok(None),
+    }
+}
+
+fn normalize_ipc_timeout(error: IoError) -> IoError {
+    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        IoError::new(ErrorKind::TimedOut, format!("Tabor IPC transaction timed out: {error}"))
+    } else {
+        error
+    }
 }
 
 pub fn run(options: AgentOptions) -> Result<(), Box<dyn Error>> {
@@ -279,6 +458,7 @@ fn send_request(
 }
 
 fn ping_controller(state: &ControllerState) -> Result<Option<ControllerReply>, Box<dyn Error>> {
+    let envelope = ControllerEnvelope::new(ControllerRequest::Ping, CONTROLLER_REQUEST_TIMEOUT)?;
     let stream = match UnixStream::connect(&state.control_socket) {
         Ok(stream) => stream,
         Err(err) if matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
@@ -286,30 +466,28 @@ fn ping_controller(state: &ControllerState) -> Result<Option<ControllerReply>, B
         },
         Err(err) => return Err(err.into()),
     };
-    send_controller_request_on_stream(
-        stream,
-        ControllerRequest::Ping,
-        Some(CONTROLLER_REQUEST_TIMEOUT),
-    )
-    .map(Some)
+    send_controller_request_on_stream(stream, envelope, CONTROLLER_REQUEST_TIMEOUT).map(Some)
 }
 
 fn send_controller_request(
     state: &ControllerState,
     request: ControllerRequest,
 ) -> Result<ControllerReply, Box<dyn Error>> {
+    let controller_timeout = request.controller_timeout()?;
+    let reply_timeout = request.controller_reply_timeout()?;
+    let envelope = ControllerEnvelope::new(request, controller_timeout)?;
     let stream = UnixStream::connect(&state.control_socket)?;
-    send_controller_request_on_stream(stream, request, None)
+    send_controller_request_on_stream(stream, envelope, reply_timeout)
 }
 
 fn send_controller_request_on_stream(
     mut stream: UnixStream,
-    request: ControllerRequest,
-    timeout: Option<Duration>,
+    envelope: ControllerEnvelope,
+    timeout: Duration,
 ) -> Result<ControllerReply, Box<dyn Error>> {
-    stream.set_read_timeout(timeout)?;
-    stream.set_write_timeout(timeout)?;
-    let json = serde_json::to_string(&request)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let json = serde_json::to_string(&envelope)?;
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -337,7 +515,7 @@ fn serve_loop(
     options: &InternalServeOptions,
     listener: UnixListener,
 ) -> Result<(), Box<dyn Error>> {
-    let mut tabor = IpcConnection::connect(Some(options.socket.clone()))?;
+    let mut tabor = TaborConnection::connect(options.socket.clone())?;
     let state = ControllerState {
         tabor_socket: options.socket.clone(),
         control_socket: options.control_socket.clone(),
@@ -348,10 +526,7 @@ fn serve_loop(
     let mut selected_tab_id = None;
     loop {
         let (stream, _) = listener.accept()?;
-        if matches!(
-            serve_client(&options.socket, &mut tabor, &mut selected_tab_id, stream)?,
-            ClientOutcome::Close
-        ) {
+        if matches!(serve_client(&mut tabor, &mut selected_tab_id, stream)?, ClientOutcome::Close) {
             break;
         }
     }
@@ -360,8 +535,7 @@ fn serve_loop(
 }
 
 fn serve_client(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborConnection,
     selected_tab_id: &mut Option<IpcTabId>,
     mut stream: UnixStream,
 ) -> Result<ClientOutcome, serde_json::Error> {
@@ -371,15 +545,15 @@ fn serve_client(
         return Ok(ClientOutcome::Continue);
     }
 
-    let request = match read_request(&stream) {
-        Ok(request) => request,
+    let envelope = match read_request(&stream) {
+        Ok(envelope) => envelope,
         Err(err) => {
             let reply = serde_json::to_string(&ControllerReply::Error { error: err.to_string() })?;
             let _ = write_reply(&mut stream, &reply);
             return Ok(ClientOutcome::Continue);
         },
     };
-    let reply = match handle_request(tabor_socket, tabor, selected_tab_id, request) {
+    let reply = match dispatch_controller_request(tabor, selected_tab_id, &stream, envelope) {
         Ok(reply) => reply,
         Err(err) => ControllerReply::Error { error: err.to_string() },
     };
@@ -387,6 +561,52 @@ fn serve_client(
     let reply = serde_json::to_string(&reply)?;
     let _ = write_reply(&mut stream, &reply);
     Ok(if should_exit { ClientOutcome::Close } else { ClientOutcome::Continue })
+}
+
+fn dispatch_controller_request(
+    tabor: &mut TaborConnection,
+    selected_tab_id: &mut Option<IpcTabId>,
+    stream: &UnixStream,
+    envelope: ControllerEnvelope,
+) -> Result<ControllerReply, Box<dyn Error>> {
+    let app_timeout = envelope.request.app_operation_timeout()?;
+    let remaining = envelope.remaining(envelope.request.controller_timeout()?)?;
+    if app_timeout.is_some_and(|app_timeout| remaining <= app_timeout) {
+        return Err(IoError::new(
+            ErrorKind::TimedOut,
+            "controller request expired while waiting to be dispatched",
+        )
+        .into());
+    }
+    if peer_disconnected(stream)? {
+        return Err(IoError::new(
+            ErrorKind::BrokenPipe,
+            "controller client disconnected before request dispatch",
+        )
+        .into());
+    }
+    handle_request(tabor, selected_tab_id, stream, envelope.request, remaining)
+}
+
+fn peer_disconnected(stream: &UnixStream) -> Result<bool, IoError> {
+    let mut byte = 0_u8;
+    let result = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    if result > 0 {
+        return Ok(false);
+    }
+
+    let error = IoError::last_os_error();
+    if error.kind() == ErrorKind::WouldBlock { Ok(false) } else { Err(error) }
 }
 
 fn persist_controller_state(state: &ControllerState) -> Result<(), Box<dyn Error>> {
@@ -457,19 +677,22 @@ fn remove_file_if_exists(path: &Path) -> Result<(), IoError> {
 }
 
 fn handle_request(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborConnection,
     selected_tab_id: &mut Option<IpcTabId>,
+    client: &UnixStream,
     request: ControllerRequest,
+    controller_timeout: Duration,
 ) -> Result<ControllerReply, Box<dyn Error>> {
+    let mut transaction = tabor.transaction(controller_timeout, client)?;
+    let tabor = &mut transaction;
     match request {
         ControllerRequest::Ping => Ok(ControllerReply::Pong),
         ControllerRequest::App => {
-            let groups = list_tabs(tabor_socket, tabor)?;
+            let groups = list_tabs(tabor)?;
             Ok(ControllerReply::App { groups, selected_tab_id: *selected_tab_id })
         },
         ControllerRequest::UseActive => {
-            let groups = list_tabs(tabor_socket, tabor)?;
+            let groups = list_tabs(tabor)?;
             let tab = groups
                 .iter()
                 .flat_map(|group| group.tabs.iter())
@@ -480,8 +703,7 @@ fn handle_request(
             Ok(ControllerReply::Use { tab: Box::new(tab) })
         },
         ControllerRequest::UseTab { tab_id } => {
-            let reply =
-                send_tabor_request(tabor_socket, tabor, &IpcRequest::GetTabState { tab_id })?;
+            let reply = send_tabor_request(tabor, &IpcRequest::GetTabState { tab_id })?;
             let SocketReply::TabState { tab } = reply else {
                 return Err(IoError::other("unexpected tab state reply").into());
             };
@@ -489,11 +711,10 @@ fn handle_request(
             Ok(ControllerReply::Use { tab })
         },
         ControllerRequest::Observe => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             match &tab.kind {
                 crate::ipc::IpcTabKind::Terminal => {
                     let reply = send_tabor_request(
-                        tabor_socket,
                         tabor,
                         &IpcRequest::TerminalObserve { tab_id: Some(tab.tab_id) },
                     )?;
@@ -504,7 +725,6 @@ fn handle_request(
                 },
                 crate::ipc::IpcTabKind::Web { .. } => {
                     let reply = send_tabor_request(
-                        tabor_socket,
                         tabor,
                         &IpcRequest::AgentObserve { tab_id: Some(tab.tab_id) },
                     )?;
@@ -521,7 +741,7 @@ fn handle_request(
             }
         },
         ControllerRequest::Read { scope, max_lines } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             if !matches!(&tab.kind, crate::ipc::IpcTabKind::Terminal) {
                 return Err(IoError::new(
                     ErrorKind::InvalidInput,
@@ -530,7 +750,6 @@ fn handle_request(
                 .into());
             }
             let reply = send_tabor_request(
-                tabor_socket,
                 tabor,
                 &IpcRequest::TerminalRead { tab_id: Some(tab.tab_id), scope, max_lines },
             )?;
@@ -540,7 +759,7 @@ fn handle_request(
             Ok(ControllerReply::TerminalRead { read })
         },
         ControllerRequest::Inspect { element_id } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
                 return Err(IoError::new(
                     ErrorKind::InvalidInput,
@@ -549,7 +768,6 @@ fn handle_request(
                 .into());
             }
             let reply = send_tabor_request(
-                tabor_socket,
                 tabor,
                 &IpcRequest::AgentInspect { tab_id: Some(tab.tab_id), element_id },
             )?;
@@ -559,7 +777,7 @@ fn handle_request(
             Ok(ControllerReply::Element { element })
         },
         ControllerRequest::Screenshot { path, full_page, element_id } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             let screenshot = match &tab.kind {
                 crate::ipc::IpcTabKind::Terminal => {
                     if full_page {
@@ -577,7 +795,6 @@ fn handle_request(
                         .into());
                     }
                     let reply = send_tabor_request(
-                        tabor_socket,
                         tabor,
                         &IpcRequest::TerminalScreenshot { tab_id: Some(tab.tab_id) },
                     )?;
@@ -588,7 +805,6 @@ fn handle_request(
                 },
                 crate::ipc::IpcTabKind::Web { .. } => {
                     let reply = send_tabor_request(
-                        tabor_socket,
                         tabor,
                         &IpcRequest::AgentScreenshot { tab_id: Some(tab.tab_id), full_page },
                     )?;
@@ -612,7 +828,7 @@ fn handle_request(
             let mut height = if screenshot.height == 0 { image_height } else { screenshot.height };
 
             if let Some(element_id) = element_id {
-                let element = inspect_element(tabor_socket, tabor, tab.tab_id, element_id)?;
+                let element = inspect_element(tabor, tab.tab_id, element_id)?;
                 let bbox =
                     element.bbox.ok_or_else(|| IoError::other("element has no bounding box"))?;
                 let x = bbox.x.max(0) as u32;
@@ -635,7 +851,7 @@ fn handle_request(
             Ok(ControllerReply::Screenshot { path, width, height })
         },
         ControllerRequest::Events { since, max, kinds } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
                 return Err(IoError::new(
                     ErrorKind::InvalidInput,
@@ -644,7 +860,6 @@ fn handle_request(
                 .into());
             }
             let reply = send_tabor_request(
-                tabor_socket,
                 tabor,
                 &IpcRequest::AgentEvents {
                     tab_id: Some(tab.tab_id),
@@ -659,7 +874,7 @@ fn handle_request(
             Ok(ControllerReply::Events { last_event_id, events })
         },
         ControllerRequest::Pdf { path } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
                 return Err(IoError::new(
                     ErrorKind::InvalidInput,
@@ -667,11 +882,8 @@ fn handle_request(
                 )
                 .into());
             }
-            let reply = send_tabor_request(
-                tabor_socket,
-                tabor,
-                &IpcRequest::AgentPdf { tab_id: Some(tab.tab_id) },
-            )?;
+            let reply =
+                send_tabor_request(tabor, &IpcRequest::AgentPdf { tab_id: Some(tab.tab_id) })?;
             let SocketReply::AgentPdf { pdf } = reply else {
                 return Err(IoError::other("unexpected pdf reply").into());
             };
@@ -680,7 +892,7 @@ fn handle_request(
             Ok(ControllerReply::Pdf { path })
         },
         ControllerRequest::Upload { element_id, paths } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
                 return Err(IoError::new(
                     ErrorKind::InvalidInput,
@@ -689,7 +901,6 @@ fn handle_request(
                 .into());
             }
             let reply = send_tabor_request(
-                tabor_socket,
                 tabor,
                 &IpcRequest::AgentUpload {
                     tab_id: Some(tab.tab_id),
@@ -706,7 +917,7 @@ fn handle_request(
             Ok(ControllerReply::Upload { element })
         },
         ControllerRequest::Downloads => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             if !matches!(&tab.kind, crate::ipc::IpcTabKind::Web { .. }) {
                 return Err(IoError::new(
                     ErrorKind::InvalidInput,
@@ -715,7 +926,6 @@ fn handle_request(
                 .into());
             }
             let reply = send_tabor_request(
-                tabor_socket,
                 tabor,
                 &IpcRequest::AgentDownloads { tab_id: Some(tab.tab_id) },
             )?;
@@ -725,16 +935,14 @@ fn handle_request(
             Ok(ControllerReply::Downloads { downloads })
         },
         ControllerRequest::Act { actions, observe } => {
-            let tab = selected_tab_state(tabor_socket, tabor, *selected_tab_id)?;
+            let tab = selected_tab_state(tabor, *selected_tab_id)?;
             match &tab.kind {
                 crate::ipc::IpcTabKind::Terminal => {
-                    let result =
-                        run_terminal_actions(tabor_socket, tabor, tab.tab_id, actions, observe)?;
+                    let result = run_terminal_actions(tabor, tab.tab_id, actions, observe)?;
                     Ok(ControllerReply::Act { result })
                 },
                 crate::ipc::IpcTabKind::Web { .. } => {
                     let reply = send_tabor_request(
-                        tabor_socket,
                         tabor,
                         &IpcRequest::AgentAct { tab_id: Some(tab.tab_id), actions, observe },
                     )?;
@@ -765,13 +973,12 @@ fn handle_request(
 }
 
 fn selected_tab_state(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborTransaction<'_>,
     selected_tab_id: Option<IpcTabId>,
 ) -> Result<Box<IpcTabState>, Box<dyn Error>> {
     let tab_id =
         selected_tab_id.ok_or_else(|| IoError::new(ErrorKind::NotFound, "No selected tab"))?;
-    let reply = send_tabor_request(tabor_socket, tabor, &IpcRequest::GetTabState { tab_id })?;
+    let reply = send_tabor_request(tabor, &IpcRequest::GetTabState { tab_id })?;
     let SocketReply::TabState { tab } = reply else {
         return Err(IoError::other("unexpected tab state reply").into());
     };
@@ -779,8 +986,7 @@ fn selected_tab_state(
 }
 
 fn run_terminal_actions(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborTransaction<'_>,
     tab_id: IpcTabId,
     actions: Vec<AgentAction>,
     observe: bool,
@@ -788,7 +994,7 @@ fn run_terminal_actions(
     let mut results = Vec::with_capacity(actions.len());
 
     for (index, action) in actions.into_iter().enumerate() {
-        let outcome = dispatch_terminal_action(tabor_socket, tabor, tab_id, action);
+        let outcome = dispatch_terminal_action(tabor, tab_id, action);
         match outcome {
             Ok(()) => results.push(crate::ipc::AgentActionReport { index, ok: true, error: None }),
             Err(err) => {
@@ -807,11 +1013,8 @@ fn run_terminal_actions(
     }
 
     let terminal_observation = if observe {
-        let reply = send_tabor_request(
-            tabor_socket,
-            tabor,
-            &IpcRequest::TerminalObserve { tab_id: Some(tab_id) },
-        )?;
+        let reply =
+            send_tabor_request(tabor, &IpcRequest::TerminalObserve { tab_id: Some(tab_id) })?;
         let SocketReply::TerminalObservation { observation } = reply else {
             return Err(IoError::other("unexpected terminal observe reply").into());
         };
@@ -824,33 +1027,24 @@ fn run_terminal_actions(
 }
 
 fn dispatch_terminal_action(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborTransaction<'_>,
     tab_id: IpcTabId,
     action: AgentAction,
 ) -> Result<(), Box<dyn Error>> {
     match action {
         AgentAction::Type { text } | AgentAction::Paste { text } => expect_ok(send_tabor_request(
-            tabor_socket,
             tabor,
             &IpcRequest::SendInput { tab_id: Some(tab_id), text },
         )?),
         AgentAction::Press { key, modifiers } => {
-            dispatch_terminal_key(
-                tabor_socket,
-                tabor,
-                tab_id,
-                key.clone(),
-                modifiers,
-                WebKeyState::Down,
-            )?;
-            dispatch_terminal_key(tabor_socket, tabor, tab_id, key, modifiers, WebKeyState::Up)
+            dispatch_terminal_key(tabor, tab_id, key.clone(), modifiers, WebKeyState::Down)?;
+            dispatch_terminal_key(tabor, tab_id, key, modifiers, WebKeyState::Up)
         },
         AgentAction::KeyDown { key, modifiers } => {
-            dispatch_terminal_key(tabor_socket, tabor, tab_id, key, modifiers, WebKeyState::Down)
+            dispatch_terminal_key(tabor, tab_id, key, modifiers, WebKeyState::Down)
         },
         AgentAction::KeyUp { key, modifiers } => {
-            dispatch_terminal_key(tabor_socket, tabor, tab_id, key, modifiers, WebKeyState::Up)
+            dispatch_terminal_key(tabor, tab_id, key, modifiers, WebKeyState::Up)
         },
         AgentAction::Wait { ms: Some(ms), .. } => {
             std::thread::sleep(Duration::from_millis(ms));
@@ -870,15 +1064,13 @@ fn dispatch_terminal_action(
 }
 
 fn dispatch_terminal_key(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborTransaction<'_>,
     tab_id: IpcTabId,
     key: String,
     modifiers: WebKeyModifiers,
     state: WebKeyState,
 ) -> Result<(), Box<dyn Error>> {
     expect_ok(send_tabor_request(
-        tabor_socket,
         tabor,
         &IpcRequest::TerminalKey {
             tab_id: Some(tab_id),
@@ -894,11 +1086,8 @@ fn expect_ok(reply: SocketReply) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn list_tabs(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
-) -> Result<Vec<IpcTabGroup>, Box<dyn Error>> {
-    let reply = send_tabor_request(tabor_socket, tabor, &IpcRequest::ListTabs)?;
+fn list_tabs(tabor: &mut TaborTransaction<'_>) -> Result<Vec<IpcTabGroup>, Box<dyn Error>> {
+    let reply = send_tabor_request(tabor, &IpcRequest::ListTabs)?;
     let SocketReply::TabList { groups } = reply else {
         return Err(IoError::other("unexpected tab list reply").into());
     };
@@ -906,16 +1095,12 @@ fn list_tabs(
 }
 
 fn inspect_element(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborTransaction<'_>,
     tab_id: IpcTabId,
     element_id: String,
 ) -> Result<AgentElementDetail, Box<dyn Error>> {
-    let reply = send_tabor_request(
-        tabor_socket,
-        tabor,
-        &IpcRequest::AgentInspect { tab_id: Some(tab_id), element_id },
-    )?;
+    let reply =
+        send_tabor_request(tabor, &IpcRequest::AgentInspect { tab_id: Some(tab_id), element_id })?;
     let SocketReply::AgentElement { element } = reply else {
         return Err(IoError::other("unexpected inspect reply").into());
     };
@@ -923,39 +1108,17 @@ fn inspect_element(
 }
 
 fn send_tabor_request(
-    tabor_socket: &Path,
-    tabor: &mut IpcConnection,
+    tabor: &mut TaborTransaction<'_>,
     request: &IpcRequest,
 ) -> Result<SocketReply, Box<dyn Error>> {
-    let reply = match tabor.send_message(request) {
-        Ok(Some(reply)) => reply,
-        Ok(None) => {
-            *tabor = IpcConnection::connect(Some(tabor_socket.to_path_buf()))?;
-            tabor.send_message(request)?.ok_or_else(|| IoError::other("missing reply"))?
-        },
-        Err(err) if is_recoverable_ipc_error(&err) => {
-            *tabor = IpcConnection::connect(Some(tabor_socket.to_path_buf()))?;
-            tabor.send_message(request)?.ok_or_else(|| IoError::other("missing reply"))?
-        },
-        Err(err) => return Err(err.into()),
-    };
+    let reply = tabor
+        .send_message(request)?
+        .ok_or_else(|| IoError::new(ErrorKind::UnexpectedEof, "missing Tabor IPC reply"))?;
 
     match reply {
         SocketReply::Error { error } => Err(error.message.into()),
         other => Ok(other),
     }
-}
-
-fn is_recoverable_ipc_error(err: &IoError) -> bool {
-    matches!(
-        err.kind(),
-        ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionAborted
-            | ErrorKind::ConnectionRefused
-            | ErrorKind::ConnectionReset
-            | ErrorKind::NotConnected
-            | ErrorKind::UnexpectedEof
-    )
 }
 
 fn materialize_artifact(
@@ -977,7 +1140,7 @@ fn materialize_artifact(
     Ok(path)
 }
 
-fn read_request(stream: &UnixStream) -> Result<ControllerRequest, Box<dyn Error>> {
+fn read_request(stream: &UnixStream) -> Result<ControllerEnvelope, Box<dyn Error>> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;

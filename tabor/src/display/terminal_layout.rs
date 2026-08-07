@@ -191,10 +191,12 @@ impl TerminalViewportLayout {
         layout
     }
 
+    #[cfg(any(unix, test))]
     pub fn strip_count(&self) -> usize {
         self.strip_count
     }
 
+    #[cfg(any(unix, test))]
     pub fn target_columns(&self) -> usize {
         self.target_columns
     }

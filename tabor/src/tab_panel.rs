@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
 use crate::tabs::TabId;
+#[cfg(target_os = "macos")]
 use crate::window_kind::TabKind;
 
 #[cfg(target_os = "macos")]
@@ -58,6 +60,7 @@ impl TabActivity {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabPanelTab {
     pub tab_id: TabId,
@@ -69,6 +72,7 @@ pub struct TabPanelTab {
     pub favicon: Option<TabFavicon>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabPanelGroup {
     pub id: usize,
@@ -76,6 +80,7 @@ pub struct TabPanelGroup {
     pub tabs: Vec<TabPanelTab>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabPanelCommand {
     Focus(TabId),

@@ -48,8 +48,11 @@ use crate::config::window::Decorations;
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
-use crate::display::auxiliary_regions::{AuxiliaryTopRegion, EarAwareTopRegions};
+#[cfg(target_os = "macos")]
+use crate::display::auxiliary_regions::AuxiliaryTopRegion;
+use crate::display::auxiliary_regions::EarAwareTopRegions;
 use crate::display::bell::VisualBell;
+#[cfg(target_os = "macos")]
 use crate::display::browser_layout::BrowserViewportLayout;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{
@@ -73,6 +76,7 @@ use crate::macos::webview::{WebPopupSurfaceRef, WebView};
 use crate::message_bar::{MessageBuffer, MessageType};
 #[cfg(target_os = "macos")]
 use crate::renderer::BitmapCacheKey;
+#[cfg(target_os = "macos")]
 use crate::renderer::images::ImageSlice;
 #[cfg(target_os = "macos")]
 use crate::renderer::images::SurfaceSlot;

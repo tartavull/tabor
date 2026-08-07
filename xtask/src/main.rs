@@ -343,7 +343,7 @@ Environment:
   TABOR_REQUIRE_TEAM_CODESIGN (must remain 1 on macOS)
   TABOR_MAC_APP_STORE_CODESIGN_IDENTITY
   TABOR_MAC_APP_STORE_INSTALLER_IDENTITY
-  TABOR_CEF_PATH / CEF_PATH
+  CEF_PATH
 "
 }
 
@@ -569,6 +569,7 @@ fn build_app_bundle_at(
 
     let built_binary = tabor_binary_path(root, options.profile_release());
     fs::copy(&built_binary, &app_binary)?;
+    #[cfg(unix)]
     set_executable(&app_binary)?;
 
     let explicit_codesign_entitlements =
@@ -786,8 +787,9 @@ fn build_universal_tabor_binary(root: &Path, passkey: bool) -> Result<(), Box<dy
         run_checked(&mut build, &format!("build tabor binary for {target}"))?;
     }
 
-    let x86 = root.join("target").join("x86_64-apple-darwin").join("release").join("tabor");
-    let arm = root.join("target").join("aarch64-apple-darwin").join("release").join("tabor");
+    let target_dir = cargo_target_dir(root);
+    let x86 = target_dir.join("x86_64-apple-darwin").join("release").join("tabor");
+    let arm = target_dir.join("aarch64-apple-darwin").join("release").join("tabor");
     let output = tabor_binary_path(root, true);
 
     let mut lipo = Command::new("lipo");
@@ -1138,7 +1140,7 @@ fn staging_app_bundle_path() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn mac_app_store_output_root(root: &Path, release: bool) -> PathBuf {
-    root.join("target").join(profile_dir(release)).join("mas")
+    cargo_target_dir(root).join(profile_dir(release)).join("mas")
 }
 
 fn mac_app_store_app_bundle_path(root: &Path, release: bool) -> PathBuf {
@@ -1150,7 +1152,16 @@ fn mac_app_store_package_path(root: &Path, release: bool) -> PathBuf {
 }
 
 fn tabor_binary_path(root: &Path, release: bool) -> PathBuf {
-    root.join("target").join(profile_dir(release)).join("tabor")
+    cargo_target_dir(root).join(profile_dir(release)).join("tabor")
+}
+
+fn cargo_target_dir(root: &Path) -> PathBuf {
+    let Some(target_dir) = env::var_os("CARGO_TARGET_DIR") else {
+        return root.join("target");
+    };
+
+    let target_dir = PathBuf::from(target_dir);
+    if target_dir.is_absolute() { target_dir } else { root.join(target_dir) }
 }
 
 fn profile_dir(release: bool) -> &'static str {
@@ -1163,14 +1174,11 @@ fn make_tree_user_writable(path: &Path) -> Result<(), Box<dyn Error>> {
     run_checked(&mut command, "chmod app bundle writable")
 }
 
+#[cfg(unix)]
 fn set_executable(path: &Path) -> Result<(), Box<dyn Error>> {
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
-
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
     Ok(())
 }
 

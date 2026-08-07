@@ -30,17 +30,19 @@ all the colors of a standard terminal. The third enumerates the 24-bit colors.
 Run the integration test suite in `tabor/tests/web_e2e.rs` directly with Cargo:
 
 ```sh
-cargo test -p tabor --test web_e2e -- --nocapture
+cargo test -p tabor --features signed-web-e2e --test web_e2e -- --nocapture
 ```
+
+The explicit feature keeps team-signed application tests out of ordinary `cargo test` runs.
 
 Run a single smoke test:
 
 ```sh
-cargo test -p tabor --test web_e2e web_popup_smoke -- --exact --nocapture
-cargo test -p tabor --test web_e2e agent_fixture_smoke -- --exact --nocapture
-cargo test -p tabor --test web_e2e agent_wait_smoke -- --exact --nocapture
-cargo test -p tabor --test web_e2e agent_artifacts_smoke -- --exact --nocapture
-cargo test -p tabor --test web_e2e agent_events_smoke -- --exact --nocapture
+cargo test -p tabor --features signed-web-e2e --test web_e2e web_popup_smoke -- --exact --nocapture
+cargo test -p tabor --features signed-web-e2e --test web_e2e agent_fixture_smoke -- --exact --nocapture
+cargo test -p tabor --features signed-web-e2e --test web_e2e agent_wait_smoke -- --exact --nocapture
+cargo test -p tabor --features signed-web-e2e --test web_e2e agent_artifacts_smoke -- --exact --nocapture
+cargo test -p tabor --features signed-web-e2e --test web_e2e agent_events_smoke -- --exact --nocapture
 ```
 
 Use `cargo xtask` as the primary macOS entrypoint; commands always replace the canonical app bundle at `/Applications/Tabor.app`.

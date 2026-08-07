@@ -1062,6 +1062,69 @@ fn agent_actions_keep_background_web_tab_inactive() {
 }
 
 #[test]
+fn agent_opened_web_tab_keeps_user_terminal_active() {
+    let server = PopupServer::start();
+    let harness = TaborHarness::start();
+    let opener_url = server.url("/target-blank-opener.html");
+    let target_url = server.url("/target-blank-target.html");
+
+    let web_tab = harness.run_json(["msg", "create-tab", "--web", opener_url.as_str()]);
+    assert_eq!(web_tab.get("type").and_then(Value::as_str), Some("tab_created"));
+
+    harness.run_json(["agent", "attach"]);
+    harness.run_json(["agent", "use", "--active"]);
+
+    let ready_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        let opener_ready = flatten_tabs(&tabs).into_iter().any(|tab| {
+            tab_web_url(tab) == Some(opener_url.as_str())
+                && tab.get("title").and_then(Value::as_str) == Some("target-blank-opener")
+        });
+        if opener_ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "timed out waiting for target blank opener at {opener_url}: {tabs}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+
+    harness.run_ok(["msg", "select-tab", "--previous"]);
+    let before = harness.run_json(["msg", "list-tabs"]);
+    let active_terminal_id = active_tab(&before)
+        .filter(|tab| tab_kind_is(tab, "terminal"))
+        .and_then(tab_id_pair)
+        .unwrap_or_else(|| panic!("expected the terminal tab to be active: {before}"));
+
+    let actions = json!([{ "type": "click_at", "x": 50, "y": 50 }]).to_string();
+    let act = harness.run_json(["agent", "act", actions.as_str()]);
+    assert!(agent_action_results_all_ok(&act), "target blank click failed: {act}");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let tabs = loop {
+        let tabs = harness.run_json(["msg", "list-tabs"]);
+        let target_opened =
+            flatten_tabs(&tabs).into_iter().filter_map(tab_web_url).any(|url| url == target_url);
+        if target_opened {
+            break tabs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for agent-opened target tab at {target_url}: {tabs}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    };
+
+    assert_eq!(
+        active_tab(&tabs).and_then(tab_id_pair),
+        Some(active_terminal_id),
+        "agent-opened web tab replaced the user's active terminal: {tabs}"
+    );
+}
+
+#[test]
 fn web_popup_smoke() {
     let server = PopupServer::start();
     let harness = TaborHarness::start();

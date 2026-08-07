@@ -1,6 +1,6 @@
 [package]
 name = "tabor"
-version = "0.18.0"
+version = "0.19.0"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "A tabbed, cross-platform, OpenGL terminal emulator"
@@ -9,6 +9,10 @@ homepage = "https://github.com/tartavull/tabor"
 repository = "https://github.com/tartavull/tabor"
 edition.workspace = true
 rust-version.workspace = true
+
+[[test]]
+name = "web_e2e"
+required-features = ["signed-web-e2e"]
 
 [dependencies.tabor_terminal]
 path = "../tabor_terminal"
@@ -128,3 +132,4 @@ wayland = [
 ]
 nightly = []
 passkey-webauthn = []
+signed-web-e2e = []

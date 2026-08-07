@@ -715,12 +715,9 @@ fn read_file_payload(command: &KittyGraphicsCommand, payload: &[u8]) -> Result<V
 }
 
 fn reject_sensitive_path(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        for prefix in ["/dev", "/proc", "/sys"] {
-            if path.starts_with(prefix) {
-                return Err(String::from("EPERM:refusing sensitive graphics path"));
-            }
+    for prefix in ["/dev", "/proc", "/sys"] {
+        if path.starts_with(prefix) {
+            return Err(String::from("EPERM:refusing sensitive graphics path"));
         }
     }
     Ok(())

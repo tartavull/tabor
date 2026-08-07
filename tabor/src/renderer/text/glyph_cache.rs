@@ -244,10 +244,12 @@ impl GlyphCache {
         *self.cache.entry(glyph_key).or_insert(glyph)
     }
 
+    #[cfg(target_os = "macos")]
     pub fn has_glyph(&self, glyph_key: &GlyphKey) -> bool {
         self.cache.contains_key(glyph_key)
     }
 
+    #[cfg(target_os = "macos")]
     pub fn insert_custom_glyph<L>(
         &mut self,
         glyph_key: GlyphKey,

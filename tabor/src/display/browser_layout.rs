@@ -1,11 +1,16 @@
+#[cfg(any(unix, test))]
 use std::cmp::max;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(unix, test))]
 use tabor_terminal::grid::Dimensions;
 
+#[cfg(any(unix, test))]
 use crate::config::browser::MultiColumnBrowserConfig;
+#[cfg(any(unix, test))]
 use crate::display::SizeInfo;
+#[cfg(any(unix, test))]
 use crate::display::auxiliary_regions::EarAwareTopRegions;
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +29,7 @@ pub struct BrowserViewportRect {
     pub height: usize,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 impl BrowserViewportRect {
     fn right(&self) -> usize {
         self.x.saturating_add(self.width)
@@ -55,6 +60,7 @@ pub struct BrowserViewportLayout {
     columns: Vec<BrowserViewportColumn>,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct BrowserColumnLayoutParams {
     target_width_px: usize,
@@ -63,7 +69,9 @@ struct BrowserColumnLayoutParams {
     left_padding_px: usize,
 }
 
+#[cfg(any(unix, test))]
 impl BrowserViewportLayout {
+    #[cfg(any(unix, test))]
     pub fn normal(viewport: BrowserViewportRect, target_width_px: usize) -> Self {
         Self {
             mode: BrowserViewMode::Normal,
@@ -147,6 +155,7 @@ impl BrowserViewportLayout {
         self.viewport
     }
 
+    #[cfg(unix)]
     pub fn target_width_px(&self) -> usize {
         self.target_width_px
     }
@@ -175,7 +184,7 @@ impl BrowserViewportLayout {
         self.column(column_index).map(|column| column.logical_y)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(target_os = "macos", test))]
     pub fn visual_point_for_logical(&self, x: usize, y: usize) -> Option<(usize, usize)> {
         if self.viewport.height == 0 || x >= self.logical_width || y >= self.logical_height {
             return None;
@@ -187,7 +196,7 @@ impl BrowserViewportLayout {
         Some((column.rect.x.saturating_add(x), column.rect.y.saturating_add(y - column.logical_y)))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(any(target_os = "macos", test))]
     pub fn logical_point_for_visual(&self, x: usize, y: usize) -> Option<(usize, usize)> {
         let column = self.columns.iter().find(|column| column.rect.contains(x, y))?;
         Some((x - column.rect.x, column.logical_y + (y - column.rect.y)))

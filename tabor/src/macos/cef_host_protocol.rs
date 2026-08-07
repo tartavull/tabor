@@ -1,18 +1,45 @@
 use std::io::{self, Read, Write};
+use std::time::{Duration, SystemTime};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::display::browser_layout::BrowserViewportLayout;
-use crate::ipc::AgentDownload;
+use crate::ipc::{AgentDownload, IpcError};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 5;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 pub type ViewId = u64;
 pub type RequestId = u64;
 pub type SurfaceLeaseId = u64;
+
+pub fn unix_deadline_after(timeout: Duration) -> io::Result<u64> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| io::Error::other("system clock is before the Unix epoch"))?;
+    let now_millis = u64::try_from(now.as_millis())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "system clock is out of range"))?;
+    let timeout_millis = u64::try_from(timeout.as_millis())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "timeout is too large"))?;
+    now_millis
+        .checked_add(timeout_millis)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "deadline overflow"))
+}
+
+pub fn remaining_until_unix_deadline(expires_at_unix_millis: u64) -> io::Result<Duration> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| io::Error::other("system clock is before the Unix epoch"))?;
+    let now_millis = u64::try_from(now.as_millis())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "system clock is out of range"))?;
+    expires_at_unix_millis
+        .checked_sub(now_millis)
+        .filter(|remaining| *remaining > 0)
+        .map(Duration::from_millis)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "CEF host request expired"))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostGeometry {
@@ -175,6 +202,14 @@ pub enum HostCommand {
         request_id: RequestId,
         script: String,
         user_gesture: bool,
+        expires_at_unix_millis: u64,
+    },
+    AgentEvaluate {
+        view_id: ViewId,
+        request_id: RequestId,
+        script: String,
+        user_gesture: bool,
+        expires_at_unix_millis: u64,
     },
     FrameEdit {
         view_id: ViewId,
@@ -185,6 +220,7 @@ pub enum HostCommand {
         request_id: RequestId,
         method: String,
         params: Option<JsonValue>,
+        expires_at_unix_millis: u64,
     },
     RenewAgentEventCapture {
         view_id: ViewId,
@@ -200,6 +236,7 @@ pub enum HostCommand {
         request_id: RequestId,
         element_id: String,
         paths: Vec<String>,
+        expires_at_unix_millis: u64,
     },
     ShowInspector {
         view_id: ViewId,
@@ -217,6 +254,7 @@ pub enum HostCommand {
     SimulateMemoryPressureForTest {
         view_id: ViewId,
         request_id: RequestId,
+        expires_at_unix_millis: u64,
     },
     CrashForTest,
     Shutdown,
@@ -243,6 +281,7 @@ impl HostCommand {
             | Self::ImeCancel { view_id }
             | Self::KeyEvents { view_id, .. }
             | Self::Evaluate { view_id, .. }
+            | Self::AgentEvaluate { view_id, .. }
             | Self::FrameEdit { view_id, .. }
             | Self::DevTools { view_id, .. }
             | Self::RenewAgentEventCapture { view_id }
@@ -260,6 +299,7 @@ impl HostCommand {
     pub fn request_id(&self) -> Option<RequestId> {
         match self {
             Self::Evaluate { request_id, .. }
+            | Self::AgentEvaluate { request_id, .. }
             | Self::DevTools { request_id, .. }
             | Self::SetFileInputFiles { request_id, .. }
             | Self::SimulateMemoryPressureForTest { request_id, .. } => Some(*request_id),
@@ -314,7 +354,7 @@ pub enum HostEvent {
     EvaluateResult {
         view_id: ViewId,
         request_id: RequestId,
-        result: Option<String>,
+        result: Result<Option<String>, IpcError>,
     },
     DevToolsResult {
         view_id: ViewId,
@@ -329,7 +369,7 @@ pub enum HostEvent {
     FileInputResult {
         view_id: ViewId,
         request_id: RequestId,
-        result: Result<String, String>,
+        result: Result<String, IpcError>,
     },
     JsDialog {
         view_id: ViewId,
@@ -401,25 +441,48 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<T
 #[cfg(test)]
 mod tests {
     use super::{HostCommand, HostEvent, read_message, write_message};
+    use crate::ipc::{IpcError, IpcErrorCode};
 
     #[test]
     fn protocol_round_trip_preserves_embedded_newlines() {
-        let message = HostCommand::Evaluate {
+        let message = HostCommand::AgentEvaluate {
             view_id: 7,
             request_id: 11,
             script: String::from("one\ntwo"),
             user_gesture: true,
+            expires_at_unix_millis: 42_000,
         };
         let mut bytes = Vec::new();
         write_message(&mut bytes, &message).expect("serialize protocol message");
         let decoded: HostCommand =
             read_message(&mut bytes.as_slice()).expect("deserialize protocol message");
         match decoded {
-            HostCommand::Evaluate { script, user_gesture, .. } => {
+            HostCommand::AgentEvaluate { script, user_gesture, expires_at_unix_millis, .. } => {
                 assert_eq!(script, "one\ntwo");
                 assert!(user_gesture);
+                assert_eq!(expires_at_unix_millis, 42_000);
             },
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_input_result_round_trip_preserves_ipc_error() {
+        let event = HostEvent::FileInputResult {
+            view_id: 7,
+            request_id: 12,
+            result: Err(IpcError::new(IpcErrorCode::Timeout, "upload timed out")),
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &event).expect("serialize file input result");
+        let decoded: HostEvent =
+            read_message(&mut bytes.as_slice()).expect("deserialize file input result");
+        match decoded {
+            HostEvent::FileInputResult { result: Err(error), .. } => {
+                assert_eq!(error.code, IpcErrorCode::Timeout);
+                assert_eq!(error.message, "upload timed out");
+            },
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 

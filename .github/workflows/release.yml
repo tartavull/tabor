@@ -95,22 +95,16 @@ jobs:
         run: rustup update
       - name: Download CEF runtime
         run: |
-          CEF_URL="https://cef-builds.spotifycdn.com/cef_binary_151.3.12+gd9cea67+chromium-151.0.7922.47_macosarm64.tar.bz2"
-          CEF_ARCHIVE="$RUNNER_TEMP/cef_binary_macosarm64.tar.bz2"
-          CEF_EXTRACT_DIR="$RUNNER_TEMP/cef"
-
-          curl --fail --location "$CEF_URL" --output "$CEF_ARCHIVE"
-          mkdir -p "$CEF_EXTRACT_DIR"
-          tar -xjf "$CEF_ARCHIVE" -C "$CEF_EXTRACT_DIR"
-
-          CEF_ROOT="$(find "$CEF_EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-          if [ -z "$CEF_ROOT" ]; then
-            echo "Failed to locate extracted CEF directory."
-            exit 1
-          fi
-
-          echo "TABOR_CEF_PATH=$CEF_ROOT" >> "$GITHUB_ENV"
-          echo "CEF_PATH=$CEF_ROOT" >> "$GITHUB_ENV"
+          CEF_PATH="$(scripts/download-cef-runtime.sh native-macos "$RUNNER_TEMP/cef")"
+          echo "CEF_PATH=$CEF_PATH" >> "$GITHUB_ENV"
+      - name: Test signed macOS web integration
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          TABOR_CODESIGN_IDENTITY="$SIGNING_IDENTITY" \
+          TABOR_CODESIGN_TEAM_ID="${APPLE_TEAM_ID:-7A5AR5N85X}" \
+          TABOR_CODESIGN_HARDENED_RUNTIME=1 \
+          cargo test --release -p tabor --features signed-web-e2e --test web_e2e
       - name: Make DMG
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

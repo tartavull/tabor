@@ -28,11 +28,18 @@ pub enum Topic {
     DelayedSearch,
     BlinkCursor,
     BlinkTimeout,
+    #[cfg(unix)]
     ForegroundProcess,
     TabActivityTick,
+    #[cfg(target_os = "macos")]
     CefPump,
+    #[cfg(target_os = "macos")]
     CefWatchdog,
+    #[cfg(target_os = "macos")]
+    WebRequestDeadline,
+    #[cfg(target_os = "macos")]
     WebCursor,
+    #[cfg(unix)]
     WorkspaceAutosave,
     Frame,
 }
