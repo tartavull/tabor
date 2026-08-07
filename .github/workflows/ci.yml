@@ -39,7 +39,7 @@ jobs:
       - name: Clippy
         run: |
           rustup component add clippy
-          cargo clippy --all-targets
+          cargo clippy --all-targets --features signed-web-e2e
   check-macos-x86_64:
     runs-on: macos-latest
     steps:

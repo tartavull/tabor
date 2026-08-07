@@ -10,6 +10,10 @@ repository = "https://github.com/tartavull/tabor"
 edition.workspace = true
 rust-version.workspace = true
 
+[[test]]
+name = "web_e2e"
+required-features = ["signed-web-e2e"]
+
 [dependencies.tabor_terminal]
 path = "../tabor_terminal"
 version = "0.25.2-dev"
@@ -128,3 +132,4 @@ wayland = [
 ]
 nightly = []
 passkey-webauthn = []
+signed-web-e2e = []

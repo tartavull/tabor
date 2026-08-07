@@ -49,6 +49,7 @@
           packages = with pkgs; [
             rustToolchain
             cmake
+            ninja
             pkg-config
             python3
             gnumake
